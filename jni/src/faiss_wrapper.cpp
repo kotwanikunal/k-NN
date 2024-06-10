@@ -22,6 +22,8 @@
 #include "faiss/Index.h"
 #include "faiss/impl/IDSelector.h"
 #include "faiss/IndexIVFPQ.h"
+#include "faiss/IndexBinaryIVF.h"
+#include "faiss/IndexBinaryHNSW.h"
 
 #include <algorithm>
 #include <jni.h>
@@ -62,6 +64,8 @@ faiss::MetricType TranslateSpaceToMetric(const std::string& spaceType);
 // Set additional parameters on faiss index
 void SetExtraParameters(knn_jni::JNIUtilInterface * jniUtil, JNIEnv *env,
                         const std::unordered_map<std::string, jobject>& parametersCpp, faiss::Index * index);
+void SetExtraParameters(knn_jni::JNIUtilInterface * jniUtil, JNIEnv *env,
+                        const std::unordered_map<std::string, jobject>& parametersCpp, faiss::IndexBinary * index);
 
 // Train an index with data provided
 void InternalTrainIndex(faiss::Index * index, faiss::idx_t n, const float* x);
@@ -81,6 +85,91 @@ bool isIndexIVFPQL2(faiss::Index * index);
 // IndexIDMap which has member that will point to underlying index that stores the data
 faiss::IndexIVFPQ * extractIVFPQIndex(faiss::Index * index);
 
+void knn_jni::faiss_wrapper::CreateBinaryIndex(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jintArray idsJ, jlong vectorsAddressJ, jint dimJ,
+                        jstring indexPathJ, jobject parametersJ) {
+    if (idsJ == nullptr) {
+        throw std::runtime_error("IDs cannot be null");
+    }
+
+    if (vectorsAddressJ <= 0) {
+        throw std::runtime_error("VectorsAddress cannot be less than 0");
+    }
+
+    if(dimJ <= 0) {
+        throw std::runtime_error("Vectors dimensions cannot be less than or equal to 0");
+    }
+
+    if (indexPathJ == nullptr) {
+        throw std::runtime_error("Index path cannot be null");
+    }
+
+    if (parametersJ == nullptr) {
+        throw std::runtime_error("Parameters cannot be null");
+    }
+
+    // parametersJ is a Java Map<String, Object>. ConvertJavaMapToCppMap converts it to a c++ map<string, jobject>
+    // so that it is easier to access.
+    auto parametersCpp = jniUtil->ConvertJavaMapToCppMap(env, parametersJ);
+
+    // Get space type for this index
+    // Binary vector only support hamming distance and faiss does not receive any space type parameter
+//    jobject spaceTypeJ = knn_jni::GetJObjectFromMapOrThrow(parametersCpp, knn_jni::SPACE_TYPE);
+//    std::string spaceTypeCpp(jniUtil->ConvertJavaObjectToCppString(env, spaceTypeJ));
+//    faiss::MetricType metric = TranslateSpaceToMetric(spaceTypeCpp);
+
+    // Read vectors from memory address
+    auto *inputVectors = reinterpret_cast<std::vector<uint8_t>*>(vectorsAddressJ);
+    int dim = (int)dimJ;
+    // The number of vectors can be int here because a lucene segment number of total docs never crosses INT_MAX value
+    int numVectors = (int) (inputVectors->size() * 8 / (uint64_t) dim);
+    if(numVectors == 0) {
+        throw std::runtime_error("Number of vectors cannot be 0");
+    }
+
+    int numIds = jniUtil->GetJavaIntArrayLength(env, idsJ);
+    if (numIds != numVectors) {
+        throw std::runtime_error("Number of IDs does not match number of vectors");
+    }
+
+    // Create faiss index
+    jobject indexDescriptionJ = knn_jni::GetJObjectFromMapOrThrow(parametersCpp, knn_jni::INDEX_DESCRIPTION);
+    std::string indexDescriptionCpp(jniUtil->ConvertJavaObjectToCppString(env, indexDescriptionJ));
+
+    std::unique_ptr<faiss::IndexBinary> indexWriter;
+    indexWriter.reset(faiss::index_binary_factory(dim, indexDescriptionCpp.c_str()));
+
+    // Set thread count if it is passed in as a parameter. Setting this variable will only impact the current thread
+    if(parametersCpp.find(knn_jni::INDEX_THREAD_QUANTITY) != parametersCpp.end()) {
+        auto threadCount = jniUtil->ConvertJavaObjectToCppInteger(env, parametersCpp[knn_jni::INDEX_THREAD_QUANTITY]);
+        omp_set_num_threads(threadCount);
+    }
+
+    // Add extra parameters that cant be configured with the index factory
+    if(parametersCpp.find(knn_jni::PARAMETERS) != parametersCpp.end()) {
+        jobject subParametersJ = parametersCpp[knn_jni::PARAMETERS];
+        auto subParametersCpp = jniUtil->ConvertJavaMapToCppMap(env, subParametersJ);
+        SetExtraParameters(jniUtil, env, subParametersCpp, indexWriter.get());
+        jniUtil->DeleteLocalRef(env, subParametersJ);
+    }
+    jniUtil->DeleteLocalRef(env, parametersJ);
+
+    // Check that the index does not need to be trained
+    if(!indexWriter->is_trained) {
+        throw std::runtime_error("Index is not trained");
+    }
+
+    auto idVector = jniUtil->ConvertJavaIntArrayToCppIntVector(env, idsJ);
+    faiss::IndexBinaryIDMap idMap = faiss::IndexBinaryIDMap(indexWriter.get());
+    idMap.add_with_ids(numVectors, inputVectors->data(), idVector.data());
+
+    // Write the index to disk
+    std::string indexPathCpp(jniUtil->ConvertJavaStringToCppString(env, indexPathJ));
+    faiss::write_index_binary(&idMap, indexPathCpp.c_str());
+    // Releasing the vectorsAddressJ memory as that is not required once we have created the index.
+    // This is not the ideal approach, please refer this gh issue for long term solution:
+    // https://github.com/opensearch-project/k-NN/issues/1600
+    delete inputVectors;
+}
 void knn_jni::faiss_wrapper::CreateIndex(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jintArray idsJ, jlong vectorsAddressJ, jint dimJ,
                                          jstring indexPathJ, jobject parametersJ) {
 
@@ -247,6 +336,19 @@ jlong knn_jni::faiss_wrapper::LoadIndex(knn_jni::JNIUtilInterface * jniUtil, JNI
     return (jlong) indexReader;
 }
 
+jlong knn_jni::faiss_wrapper::LoadBinaryIndex(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jstring indexPathJ) {
+    if (indexPathJ == nullptr) {
+        throw std::runtime_error("Index path cannot be null");
+    }
+
+    std::string indexPathCpp(jniUtil->ConvertJavaStringToCppString(env, indexPathJ));
+    // Skipping IO_FLAG_PQ_SKIP_SDC_TABLE because the index is read only and the sdc table is only used during ingestion
+    // Skipping IO_PRECOMPUTE_TABLE because it is only needed for IVFPQ-l2 and it leads to high memory consumption if
+    // done for each segment. Instead, we will set it later on with `setSharedIndexState`
+    faiss::IndexBinary* indexReader = faiss::read_index_binary(indexPathCpp.c_str(), faiss::IO_FLAG_READ_ONLY | faiss::IO_FLAG_PQ_SKIP_SDC_TABLE | faiss::IO_FLAG_SKIP_PRECOMPUTE_TABLE);
+    return (jlong) indexReader;
+}
+
 bool knn_jni::faiss_wrapper::IsSharedIndexStateRequired(jlong indexPointerJ) {
     auto * index = reinterpret_cast<faiss::Index*>(indexPointerJ);
     return isIndexIVFPQL2(index);
@@ -409,6 +511,114 @@ jobjectArray knn_jni::faiss_wrapper::QueryIndex_WithFilter(knn_jni::JNIUtilInter
     return results;
 }
 
+jobjectArray knn_jni::faiss_wrapper::QueryBinaryIndex_WithFilter(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jlong indexPointerJ,
+                                                jbyteArray queryVectorJ, jint kJ, jlongArray filterIdsJ, jint filterIdsTypeJ, jintArray parentIdsJ) {
+
+    if (queryVectorJ == nullptr) {
+        throw std::runtime_error("Query Vector cannot be null");
+    }
+
+    auto *indexReader = reinterpret_cast<faiss::IndexBinaryIDMap *>(indexPointerJ);
+
+    if (indexReader == nullptr) {
+        throw std::runtime_error("Invalid pointer to index");
+    }
+
+    // The ids vector will hold the top k ids from the search and the dis vector will hold the top k distances from
+    // the query point
+    std::vector<int32_t> dis(kJ);
+    std::vector<faiss::idx_t> ids(kJ);
+    int8_t* rawQueryvector = jniUtil->GetByteArrayElements(env, queryVectorJ, nullptr);
+    /*
+        Setting the omp_set_num_threads to 1 to make sure that no new OMP threads are getting created.
+    */
+    omp_set_num_threads(1);
+    // create the filterSearch params if the filterIdsJ is not a null pointer
+    if(filterIdsJ != nullptr) {
+        jlong *filteredIdsArray = jniUtil->GetLongArrayElements(env, filterIdsJ, nullptr);
+        int filterIdsLength = jniUtil->GetJavaLongArrayLength(env, filterIdsJ);
+        std::unique_ptr<faiss::IDSelector> idSelector;
+        if(filterIdsTypeJ == BITMAP) {
+            idSelector.reset(new faiss::IDSelectorJlongBitmap(filterIdsLength, filteredIdsArray));
+        } else {
+            faiss::idx_t* batchIndices = reinterpret_cast<faiss::idx_t*>(filteredIdsArray);
+            idSelector.reset(new faiss::IDSelectorBatch(filterIdsLength, batchIndices));
+        }
+        faiss::SearchParameters *searchParameters;
+        faiss::SearchParametersHNSW hnswParams;
+        faiss::SearchParametersIVF ivfParams;
+        std::unique_ptr<faiss::IDGrouperBitmap> idGrouper;
+        std::vector<uint64_t> idGrouperBitmap;
+        auto hnswReader = dynamic_cast<const faiss::IndexBinaryHNSW*>(indexReader->index);
+        if(hnswReader) {
+            // Setting the ef_search value equal to what was provided during index creation. SearchParametersHNSW has a default
+            // value of ef_search = 16 which will then be used.
+            hnswParams.efSearch = hnswReader->hnsw.efSearch;
+            hnswParams.sel = idSelector.get();
+            if (parentIdsJ != nullptr) {
+                idGrouper = buildIDGrouperBitmap(jniUtil, env, parentIdsJ, &idGrouperBitmap);
+                hnswParams.grp = idGrouper.get();
+            }
+            searchParameters = &hnswParams;
+        } else {
+            auto ivfReader = dynamic_cast<const faiss::IndexBinaryIVF*>(indexReader->index);
+            if(ivfReader) {
+                ivfParams.sel = idSelector.get();
+                searchParameters = &ivfParams;
+            }
+        }
+        try {
+            indexReader->search(1, reinterpret_cast<uint8_t*>(rawQueryvector), kJ, dis.data(), ids.data(), searchParameters);
+        } catch (...) {
+            jniUtil->ReleaseByteArrayElements(env, queryVectorJ, rawQueryvector, JNI_ABORT);
+            jniUtil->ReleaseLongArrayElements(env, filterIdsJ, filteredIdsArray, JNI_ABORT);
+            throw;
+        }
+        jniUtil->ReleaseLongArrayElements(env, filterIdsJ, filteredIdsArray, JNI_ABORT);
+    } else {
+        faiss::SearchParameters *searchParameters = nullptr;
+        faiss::SearchParametersHNSW hnswParams;
+        std::unique_ptr<faiss::IDGrouperBitmap> idGrouper;
+        std::vector<uint64_t> idGrouperBitmap;
+        auto hnswReader = dynamic_cast<const faiss::IndexBinaryHNSW*>(indexReader->index);
+        if(hnswReader!= nullptr && parentIdsJ != nullptr) {
+            // Setting the ef_search value equal to what was provided during index creation. SearchParametersHNSW has a default
+            // value of ef_search = 16 which will then be used.
+            hnswParams.efSearch = hnswReader->hnsw.efSearch;
+            idGrouper = buildIDGrouperBitmap(jniUtil, env, parentIdsJ, &idGrouperBitmap);
+            hnswParams.grp = idGrouper.get();
+            searchParameters = &hnswParams;
+        }
+        try {
+            indexReader->search(1, reinterpret_cast<uint8_t*>(rawQueryvector), kJ, dis.data(), ids.data(), searchParameters);
+        } catch (...) {
+            jniUtil->ReleaseByteArrayElements(env, queryVectorJ, rawQueryvector, JNI_ABORT);
+            throw;
+        }
+    }
+    jniUtil->ReleaseByteArrayElements(env, queryVectorJ, rawQueryvector, JNI_ABORT);
+
+    // If there are not k results, the results will be padded with -1. Find the first -1, and set result size to that
+    // index
+    int resultSize = kJ;
+    auto it = std::find(ids.begin(), ids.end(), -1);
+    if (it != ids.end()) {
+        resultSize = it - ids.begin();
+    }
+
+    jclass resultClass = jniUtil->FindClass(env,"org/opensearch/knn/index/query/KNNQueryResult");
+    jmethodID allArgs = jniUtil->FindMethod(env, "org/opensearch/knn/index/query/KNNQueryResult", "<init>");
+
+    jobjectArray results = jniUtil->NewObjectArray(env, resultSize, resultClass, nullptr);
+
+    jobject result;
+    for(int i = 0; i < resultSize; ++i) {
+        result = jniUtil->NewObject(env, resultClass, allArgs, ids[i], dis[i]);
+        jniUtil->SetObjectArrayElement(env, results, i, result);
+    }
+    return results;
+}
+
 void knn_jni::faiss_wrapper::Free(jlong indexPointer) {
     auto *indexWrapper = reinterpret_cast<faiss::Index*>(indexPointer);
     delete indexWrapper;
@@ -524,6 +734,34 @@ void SetExtraParameters(knn_jni::JNIUtilInterface * jniUtil, JNIEnv *env,
     }
 
     if (auto * indexHnsw = dynamic_cast<faiss::IndexHNSW*>(index)) {
+
+        if ((value = parametersCpp.find(knn_jni::EF_CONSTRUCTION)) != parametersCpp.end()) {
+            indexHnsw->hnsw.efConstruction = jniUtil->ConvertJavaObjectToCppInteger(env, value->second);
+        }
+
+        if ((value = parametersCpp.find(knn_jni::EF_SEARCH)) != parametersCpp.end()) {
+            indexHnsw->hnsw.efSearch = jniUtil->ConvertJavaObjectToCppInteger(env, value->second);
+        }
+    }
+}
+
+void SetExtraParameters(knn_jni::JNIUtilInterface * jniUtil, JNIEnv *env,
+                        const std::unordered_map<std::string, jobject>& parametersCpp, faiss::IndexBinary * index) {
+
+    std::unordered_map<std::string,jobject>::const_iterator value;
+    if (auto * indexIvf = dynamic_cast<faiss::IndexBinaryIVF*>(index)) {
+        if ((value = parametersCpp.find(knn_jni::NPROBES)) != parametersCpp.end()) {
+            indexIvf->nprobe = jniUtil->ConvertJavaObjectToCppInteger(env, value->second);
+        }
+
+        if ((value = parametersCpp.find(knn_jni::COARSE_QUANTIZER)) != parametersCpp.end()
+                && indexIvf->quantizer != nullptr) {
+            auto subParametersCpp = jniUtil->ConvertJavaMapToCppMap(env, value->second);
+            SetExtraParameters(jniUtil, env, subParametersCpp, indexIvf->quantizer);
+        }
+    }
+
+    if (auto * indexHnsw = dynamic_cast<faiss::IndexBinaryHNSW*>(index)) {
 
         if ((value = parametersCpp.find(knn_jni::EF_CONSTRUCTION)) != parametersCpp.end()) {
             indexHnsw->hnsw.efConstruction = jniUtil->ConvertJavaObjectToCppInteger(env, value->second);

@@ -28,10 +28,20 @@ namespace knn_jni {
                                      jlong vectorsAddressJ, jint dimJ, jstring indexPathJ, jbyteArray templateIndexJ,
                                      jobject parametersJ);
 
+        // Create an binary index with ids and vectors. The configuration is defined by values in the Java map, parametersJ.
+        // The index is serialized to indexPathJ.
+        void CreateBinaryIndex(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jintArray idsJ, jlong vectorsAddressJ, jint dimJ,
+                         jstring indexPathJ, jobject parametersJ);
+
         // Load an index from indexPathJ into memory.
         //
         // Return a pointer to the loaded index
         jlong LoadIndex(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jstring indexPathJ);
+
+        // Load a binary index from indexPathJ into memory.
+        //
+        // Return a pointer to the loaded index
+        jlong LoadBinaryIndex(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jstring indexPathJ);
 
         // Check if a loaded index requires shared state
         bool IsSharedIndexStateRequired(jlong indexPointerJ);
@@ -57,6 +67,12 @@ namespace knn_jni {
         jobjectArray QueryIndex_WithFilter(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jlong indexPointerJ,
                                                                 jfloatArray queryVectorJ, jint kJ, jlongArray filterIdsJ,
                                                                 jint filterIdsTypeJ, jintArray parentIdsJ);
+
+        // Execute a query against the binary index located in memory at indexPointerJ along with Filters
+        //
+        // Return an array of KNNQueryResults
+        jobjectArray QueryBinaryIndex_WithFilter(knn_jni::JNIUtilInterface * jniUtil, JNIEnv * env, jlong indexPointerJ,
+                                                 jbyteArray queryVectorJ, jint kJ, jlongArray filterIdsJ, jint filterIdsTypeJ, jintArray parentIdsJ);
 
         // Free the index located in memory at indexPointerJ
         void Free(jlong indexPointer);

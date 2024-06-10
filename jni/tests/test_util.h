@@ -46,6 +46,8 @@ namespace test_util {
                     (JNIEnv * env, jobjectArray array2dJ, int dim));
         MOCK_METHOD(void, Convert2dJavaObjectArrayAndStoreToFloatVector,
                     (JNIEnv * env, jobjectArray array2dJ, int dim, std::vector<float>*vect));
+        MOCK_METHOD(void, Convert2dJavaObjectArrayAndStoreToByteVector,
+                    (JNIEnv * env, jobjectArray array2dJ, int dim, std::vector<uint8_t>*vect));
         MOCK_METHOD(std::vector<int64_t>, ConvertJavaIntArrayToCppIntVector,
                     (JNIEnv * env, jintArray arrayJ));
         MOCK_METHOD2(ConvertJavaMapToCppMap,
@@ -63,6 +65,8 @@ namespace test_util {
         MOCK_METHOD(jfloat*, GetFloatArrayElements,
                     (JNIEnv * env, jfloatArray array, jboolean* isCopy));
         MOCK_METHOD(int, GetInnerDimensionOf2dJavaFloatArray,
+                    (JNIEnv * env, jobjectArray array2dJ));
+        MOCK_METHOD(int, GetInnerDimensionOf2dJavaByteArray,
                     (JNIEnv * env, jobjectArray array2dJ));
         MOCK_METHOD(jint*, GetIntArrayElements,
                     (JNIEnv * env, jintArray array, jboolean* isCopy));
