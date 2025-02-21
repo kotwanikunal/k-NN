@@ -629,20 +629,20 @@ JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_FaissService_innerProductSc
 
 JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_FaissService_innerProductScaledNativeOffHeapPinnedQuery
   (JNIEnv *env, jclass cls, jlong queryAddr, jlong address, jlong dimension) {
-    std::cout << "called with address "  << address << " , performing noop" << std::endl;
+//    std::cout << "called with address "  << address << " , performing noop" << std::endl;
 
     jfloat *queryArr = reinterpret_cast<jfloat*>(queryAddr);
     jfloat *inputArr = reinterpret_cast<jfloat*>(address);
 
     jsize length = (jsize) dimension;
 
-    for (int i = 0; i < length; ++i) {
-        std::cout << "queryArr[" << i << "] = " << queryArr[i] << std::endl;
-
-    }
-    for (int i = 0; i < length; ++i) {
-        std::cout << "inputArr[" << i << "] = " << inputArr[i] << std::endl;
-    }
+//    for (int i = 0; i < length; ++i) {
+//        std::cout << "queryArr[" << i << "] = " << queryArr[i] << std::endl;
+//
+//    }
+//    for (int i = 0; i < length; ++i) {
+//        std::cout << "inputArr[" << i << "] = " << inputArr[i] << std::endl;
+//    }
 
     int sum = 0.0f;
     for (int i = 0; i < length; i++) {
