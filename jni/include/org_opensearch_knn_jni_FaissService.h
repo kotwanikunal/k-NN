@@ -18,6 +18,16 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_FaissService_innerProductScaledNative
+  (JNIEnv *env, jclass cls, jfloatArray queryVector, jfloatArray inputVector);
+
+JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_FaissService_innerProductScaledNativeOffHeapPinnedQuery
+  (JNIEnv *env, jclass cls, jlong queryAddr, jlong address, jlong dimension);
+
+JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_FaissService_innerProductScaledNativeOffHeap
+  (JNIEnv *env, jclass cls, jfloatArray queryVector, jlong address);
+
 /*
  * Class:     org_opensearch_knn_jni_FaissService
  * Method:    initIndex

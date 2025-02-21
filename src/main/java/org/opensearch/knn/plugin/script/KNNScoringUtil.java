@@ -15,6 +15,7 @@ import org.apache.lucene.util.VectorUtil;
 import org.opensearch.knn.index.KNNVectorScriptDocValues;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.jni.FaissService;
 
 import static org.opensearch.knn.common.KNNValidationUtil.validateByteVectorValue;
 
@@ -252,6 +253,24 @@ public class KNNScoringUtil {
         requireEqualDimension(queryVector, inputVector);
         return VectorUtil.dotProduct(queryVector, inputVector);
     }
+
+    public static float innerProductScaledNative(float[] queryVector, float[] inputVector) {
+        requireEqualDimension(queryVector, inputVector);
+//        return
+        return FaissService.innerProductScaledNative(queryVector, inputVector);
+    }
+
+    public static float innerProductScaledNativeOffHeap(float[] query, long address) {
+
+        return FaissService.innerProductScaledNativeOffHeap(query, address);
+    }
+
+    public static float innerProductScaledNativeOffHeapPinnedQuery(long queryAddress, long address, int dimension) {
+
+        return FaissService.innerProductScaledNativeOffHeapPinnedQuery(queryAddress, address, (long) dimension);
+    }
+
+
 
     /**
      *********************************************************************************************

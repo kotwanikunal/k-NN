@@ -16,6 +16,44 @@ public enum KNNVectorSimilarityFunction {
     DOT_PRODUCT(VectorSimilarityFunction.DOT_PRODUCT),
     COSINE(VectorSimilarityFunction.COSINE),
     MAXIMUM_INNER_PRODUCT(VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT),
+    MAXIMUM_INNER_PRODUCT_NATIVE(null) {
+        @Override
+        public float compare(float[] v1, float[] v2) {
+
+
+            return KNNScoringUtil.innerProductScaledNative(v1, v2);
+
+
+        }
+
+
+        @Override
+
+
+        public float compare(byte[] v1, byte[] v2) {
+
+
+            throw new IllegalStateException("can't binary compare in native for Maximum Inner Product Native space");
+
+
+        }
+
+//        public float compareOffHeap(float[] v1, long address) {
+//            return
+//        }
+
+
+        @Override
+        public VectorSimilarityFunction getVectorSimilarityFunction() {
+
+
+            throw new IllegalStateException("VectorSimilarityFunction is not available for Maximum Inner Product Native space");
+
+
+        }
+
+
+    },
     HAMMING(null) {
         @Override
         public float compare(float[] v1, float[] v2) {

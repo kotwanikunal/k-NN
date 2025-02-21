@@ -481,3 +481,209 @@ JNIEXPORT jobjectArray JNICALL Java_org_opensearch_knn_jni_FaissService_rangeSea
     }
     return nullptr;
 }
+
+JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_FaissService_innerProductScaledNative
+
+
+
+  (JNIEnv *env, jclass cls, jfloatArray queryVector, jfloatArray inputVector) {
+
+
+// -> queryvector w fixed mem addr.
+
+
+    jfloat *queryArr = env->GetFloatArrayElements(queryVector, NULL);
+
+
+    jfloat *inputArr = env->GetFloatArrayElements(inputVector, NULL);
+
+
+    jsize length = env->GetArrayLength(queryVector);
+
+
+
+
+
+    // TODO overflow issues?
+
+
+    float sum = 0.0f;
+
+
+    for (int i = 0; i < length; i++) {
+
+
+        float acc = queryArr[i] * inputArr[i];
+
+
+        sum += acc;
+
+
+    }
+
+
+
+
+
+    // scale due to lucene restrictions.
+
+
+    if (
+
+
+        sum < 0.0f
+
+
+    ) {
+
+
+        sum = 1 / (1 + -1 * sum);
+
+
+    } else {
+
+
+        sum += 1;
+
+
+    }
+
+
+
+
+
+    env->ReleaseFloatArrayElements(queryVector, queryArr, JNI_ABORT);
+
+
+    env->ReleaseFloatArrayElements(inputVector, inputArr, JNI_ABORT);
+
+
+
+
+
+    return sum;
+
+
+}
+
+JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_FaissService_innerProductScaledNativeOffHeap
+  (JNIEnv *env, jclass cls, jfloatArray queryVector, jlong address) {
+    std::cout << "called with address "  << address << " , performing noop" << std::endl;
+
+    jfloat *queryArr = env->GetFloatArrayElements(queryVector, NULL);
+    jfloat *inputArr = reinterpret_cast<jfloat*>(address);
+
+    jsize length = env->GetArrayLength(queryVector);
+
+    for (int i = 0; i < length; ++i) {
+        std::cout << "queryArr[" << i << "] = " << queryArr[i] << std::endl;
+
+    }
+    for (int i = 0; i < length; ++i) {
+        std::cout << "inputArr[" << i << "] = " << inputArr[i] << std::endl;
+    }
+
+    int sum = 0.0f;
+    for (int i = 0; i < length; i++) {
+
+
+        float acc = queryArr[i] * inputArr[i];
+
+
+        sum += acc;
+
+
+    }
+
+
+
+
+
+    // scale due to lucene restrictions.
+
+
+    if (
+
+
+        sum < 0.0f
+
+
+    ) {
+
+
+        sum = 1 / (1 + -1 * sum);
+
+
+    } else {
+
+
+        sum += 1;
+
+
+    }
+
+    env->ReleaseFloatArrayElements(queryVector, queryArr, JNI_ABORT);
+
+    return sum;
+  }
+
+JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_FaissService_innerProductScaledNativeOffHeapPinnedQuery
+  (JNIEnv *env, jclass cls, jlong queryAddr, jlong address, jlong dimension) {
+    std::cout << "called with address "  << address << " , performing noop" << std::endl;
+
+    jfloat *queryArr = reinterpret_cast<jfloat*>(queryAddr);
+    jfloat *inputArr = reinterpret_cast<jfloat*>(address);
+
+    jsize length = (jsize) dimension;
+
+    for (int i = 0; i < length; ++i) {
+        std::cout << "queryArr[" << i << "] = " << queryArr[i] << std::endl;
+
+    }
+    for (int i = 0; i < length; ++i) {
+        std::cout << "inputArr[" << i << "] = " << inputArr[i] << std::endl;
+    }
+
+    int sum = 0.0f;
+    for (int i = 0; i < length; i++) {
+
+
+        float acc = queryArr[i] * inputArr[i];
+
+
+        sum += acc;
+
+
+    }
+
+
+
+
+
+    // scale due to lucene restrictions.
+
+
+    if (
+
+
+        sum < 0.0f
+
+
+    ) {
+
+
+        sum = 1 / (1 + -1 * sum);
+
+
+    } else {
+
+
+        sum += 1;
+
+
+    }
+
+//    env->ReleaseFloatArrayElements(queryVector, queryArr, JNI_ABORT);
+
+    return sum;
+  }

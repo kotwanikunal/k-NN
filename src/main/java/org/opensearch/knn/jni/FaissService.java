@@ -36,7 +36,7 @@ import static org.opensearch.knn.jni.PlatformUtils.isAVX512SPRSupportedBySystem;
  *      src/main/java/org/opensearch/knn/index/query/KNNQueryResult.java
  *      src/main/java/org/opensearch/knn/common/KNNConstants.java
  */
-class FaissService {
+public class FaissService {
 
     static {
         AccessController.doPrivileged((PrivilegedAction<Void>) () -> {
@@ -60,6 +60,9 @@ class FaissService {
         });
     }
 
+    public static native float innerProductScaledNative(float[] queryVector, float[] inputVector);
+    public static native float innerProductScaledNativeOffHeap(float[] queryVector, long inputVectorAddress);
+    public static native float innerProductScaledNativeOffHeapPinnedQuery(long queryVectorAddress, long inputVectorAddress, long dimension);
     /**
      * Initialize an index for the native library. Takes in numDocs to
      * allocate the correct amount of memory.

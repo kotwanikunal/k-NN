@@ -41,7 +41,8 @@ public class LuceneHNSWMethod extends AbstractKNNMethod {
         SpaceType.L2,
         SpaceType.COSINESIMIL,
         SpaceType.INNER_PRODUCT,
-        SpaceType.HAMMING
+        SpaceType.HAMMING,
+        SpaceType.INNER_PRODUCT_NATIVE
     );
 
     final static Encoder SQ_ENCODER = new LuceneSQEncoder();
