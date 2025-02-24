@@ -568,22 +568,22 @@ JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_FaissService_innerProductSc
 
 JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_FaissService_innerProductScaledNativeOffHeap
   (JNIEnv *env, jclass cls, jfloatArray queryVector, jlong address) {
-    std::cout << "called with address "  << address << " , performing noop" << std::endl;
+//    std::cout << "called with address "  << address << " , performing noop" << std::endl;
 
     jfloat *queryArr = env->GetFloatArrayElements(queryVector, NULL);
     jfloat *inputArr = reinterpret_cast<jfloat*>(address);
 
     jsize length = env->GetArrayLength(queryVector);
 
-    for (int i = 0; i < length; ++i) {
-        std::cout << "queryArr[" << i << "] = " << queryArr[i] << std::endl;
+//    for (int i = 0; i < length; ++i) {
+//        std::cout << "queryArr[" << i << "] = " << queryArr[i] << std::endl;
+//
+//    }
+//    for (int i = 0; i < length; ++i) {
+//        std::cout << "inputArr[" << i << "] = " << inputArr[i] << std::endl;
+//    }
 
-    }
-    for (int i = 0; i < length; ++i) {
-        std::cout << "inputArr[" << i << "] = " << inputArr[i] << std::endl;
-    }
-
-    int sum = 0.0f;
+    float sum = 0.0f;
     for (int i = 0; i < length; i++) {
 
 
@@ -644,7 +644,7 @@ JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_FaissService_innerProductSc
 //        std::cout << "inputArr[" << i << "] = " << inputArr[i] << std::endl;
 //    }
 
-    int sum = 0.0f;
+    float sum = 0.0f;
     for (int i = 0; i < length; i++) {
 
 
