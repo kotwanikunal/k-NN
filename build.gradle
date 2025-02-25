@@ -80,9 +80,6 @@ plugins {
     id 'c'
 }
 
-lombok {
-    version = "1.18.36"  // otherwise it breaks with JDK 23; see https://github.com/projectlombok/lombok/issues/3722
-}
 
 apply from: 'gradle/formatting.gradle'
 apply plugin: 'opensearch.opensearchplugin'
@@ -199,8 +196,7 @@ allprojects {
     }
     apply from: rootProject.file('build-tools/repositories.gradle').absoluteFile
     plugins.withId('java') {
-//        sourceCompatibility = targetCompatibility = "21"
-        sourceCompatibility = targetCompatibility = "23"
+        sourceCompatibility = targetCompatibility = "21"
     }
 
     afterEvaluate {
@@ -513,7 +509,6 @@ testClusters.integTest {
         def debugPort = 5005
         nodes.forEach { node ->
             node.jvmArgs("-agentlib:jdwp=transport=dt_socket,server=n,suspend=y,address=${debugPort}")
-//            node.jvmArgs("--enable-preview")
             debugPort += 1
         }
     }
@@ -548,7 +543,6 @@ task integTestRemote(type: RestIntegTestTask) {
 run {
     useCluster project.testClusters.integTest
     dependsOn buildJniLib
-//    jvmArgs += ['--enable-preview']  // Add this line
     doFirst {
         // There seems to be an issue when running multi node run or integ tasks with unicast_hosts
         // not being written, the waitForAllConditions ensures it's written

@@ -50,67 +50,55 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
         private final float[] queryVector;
         private final MemorySegment queryVectorMemorySegment;
         private final int dimension;
+        private final int FLOAT_SZ = 4;
         NativeLuceneVectorScorer(FloatVectorValues vectorValues, float[] query) {
             this.queryVector = query;
             this.vectorValues = vectorValues;
-            // NOTE: we can't pin queryVector due to memory lifetime constraints.
-            // this.queryVector is a reference to the float[] query that's provided via a lucene search.
-            // if we were to allocate a MemorySegment, then we would need to deallocate the memorysegment.
-            // if the scorer instances goes out of bounds such as during a lucene search.
             this.dimension = vectorValues.dimension();
-            int FLOAT_SZ = 4;
-            int BYTE_ALIGN = 8; // should maybe be 4?
+            int BYTE_ALIGN = 8; // TODO check this. should maybe be 4?
             this.queryVectorMemorySegment = Arena.ofAuto().allocate(FLOAT_SZ * dimension, BYTE_ALIGN);
-            MemorySegment castedQueryVector = MemorySegment.ofArray(query); // TODO maybe more efficient way to get
-            // queryVector off-heap, but this ofArray() call is linked to the thread's lifetime so we can't just put it directly.
+            MemorySegment castedQueryVector = MemorySegment.ofArray(query); // TODO probably more efficient way to get
+            // the queryVector values off-heap. Here we use ofArray() call as it is linked to the thread's lifetime so
+            // it will be GCed and not leaked. Alternatively we could implement Closeable and deallocate the memory
+            // there.
+
             MemorySegment.copy(
                     castedQueryVector,                          // Source array
                     0,                                   // Source offset
                     this.queryVectorMemorySegment,            // Destination memory segment
                     0,                                   // Destination offset
-                    this.queryVector.length * Float.BYTES     // Number of bytes to copy TODO maybe change to just dimension.
+                    this.dimension * Float.BYTES // Number of bytes to copy
             );
-
-            /*
-
-
-            pin queryVector in memory.
-
-             */
-
-//            MemorySegment floatQuery = MemorySegment.ofArray()
         }
 
         @Override
         public float score(int node) throws IOException {
-            // TODO modify here.
-//            return KNNVectorSimilarityFunction.EUCLIDEAN.compare(queryVector, vectorValues.vectorValue(node));
-            // it's not always an offheap vector values.
-            // for instance due to deferred segment creation we do not have it off-heap during indexing.
-            // it's typically only during search that this occurs.
+            // vectorValues are not always offheap.
+            // for instance due to deferred segment creation the vectorValues are on-heap during indexing.
+            // from testing it seems that vectorValues are only off-heap during search.
             if (vectorValues instanceof OffHeapFloatVectorValues) {
+                // access vectorValues slice.
                 MemorySegmentAccessInput slice = (MemorySegmentAccessInput) ((OffHeapFloatVectorValues) vectorValues).getSlice();
+                // get MemorySegment from slice.
                 MemorySegment seg = slice.segmentSliceOrNull(0, slice.length());
                 // see https://github.com/apache/lucene/blob/27079706ef1f8341b2033efde767e95045c91f6c/lucene/core/src/java21/org/apache/lucene/internal/vectorization/PanamaVectorizationProvider.java#L91
-                //                MemorySegment segxent = slice.curSegment;
-//                int offset = slice.curOffset;
-                long address = seg.address();
-                // from segment's address, find the actual vector's address.
+
+                long baseSegmentAddress = seg.address();
+                // given segment's address, find the actual vector's address.
                 // Since MemorySegments are contiguous, this is probably given by
                 // address + node * sizeof float * dimension
-                long outAddress = address + (long) node * 4 * vectorValues.dimension();
-//                return KNNScoringUtil.innerProductScaledNativeOffHeap(queryVector, outAddress);
-//                return KNNVectorSimilarityFunction.MAXIMUM_INNER_PRODUCT_NATIVE.compareOffHeap(queryVector, address);
-//                return KNNVectorSimilarityFunction.MAXIMUM_INNER_PRODUCT_NATIVE.compare(queryVector, vectorValues.vectorValue(node));
+                long vectorAddress = baseSegmentAddress + (long) node * FLOAT_SZ * vectorValues.dimension();
+
                 return KNNScoringUtil.innerProductScaledNativeOffHeapPinnedQuery(
                         queryVectorMemorySegment.address(),
-                        outAddress, dimension
+                        vectorAddress, dimension
                 );
             } else {
-                return KNNVectorSimilarityFunction.MAXIMUM_INNER_PRODUCT_NATIVE.compare(queryVector, vectorValues.vectorValue(node));
+                // vectors are on java heap so do not call JNI function and waste a copy.
+                return KNNVectorSimilarityFunction.MAXIMUM_INNER_PRODUCT.compare(queryVector, vectorValues.vectorValue(node));
             }
 
-            // FFM
+            // **UNFINISHED** FFM Implementation
 //            if (vectorValues instanceof OffHeapFloatVectorValues) {
 //                MemorySegmentAccessInput slice = (MemorySegmentAccessInput) ((OffHeapFloatVectorValues) vectorValues).getSlice();
 //                MemorySegment seg = slice.segmentSliceOrNull(0, slice.length());
@@ -125,25 +113,10 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
 //                return KNNVectorSimilarityFunction.MAXIMUM_INNER_PRODUCT.compare(queryVector, vectorValues.vectorValue(node));
 //            }
         }
-
-//        public float score_ffm(int node) {
-//            // try-with-resources
-//            try (Arena arena = Arena.ofConfined()) {
-//                MemorySegment queryVec = arean.allocateFrom(queryVector);
-//
-//                Linker linker = Linker.nativeLinker(); // probably super high overhead?
-//
-//
-//
-//
-//
-//            } catch (Exception e) {
-//                throw new RuntimeException(e);
-//            }
-//
 //        }
 
-        // TODO Finn
+        // TODO Finn -- probably unnecessary since GC will clean up queryVectorMemorySegment,
+        //  but we should consider if we need to manually deallocate the queryVectorMemorySegment.
 //        @Override
 //        public void close() {
 //
