@@ -656,13 +656,7 @@ JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_FaissService_innerProductSc
 
     }
 
-
-
-
-
     // scale due to lucene restrictions.
-
-
     if (
 
 

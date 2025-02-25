@@ -77,6 +77,11 @@ plugins {
     id "com.diffplug.spotless" version "6.25.0" apply false
     id 'io.freefair.lombok' version '8.4'
     id "de.undercouch.download" version "5.3.0"
+    id 'c'
+}
+
+lombok {
+    version = "1.18.36"  // otherwise it breaks with JDK 23; see https://github.com/projectlombok/lombok/issues/3722
 }
 
 apply from: 'gradle/formatting.gradle'
@@ -84,6 +89,7 @@ apply plugin: 'opensearch.opensearchplugin'
 apply plugin: 'opensearch.rest-test'
 apply plugin: 'opensearch.pluginzip'
 apply plugin: 'opensearch.repositories'
+apply plugin: 'c'
 
 
 def opensearch_tmp_dir = rootProject.file('build/private/opensearch_tmp').absoluteFile
@@ -193,7 +199,8 @@ allprojects {
     }
     apply from: rootProject.file('build-tools/repositories.gradle').absoluteFile
     plugins.withId('java') {
-        sourceCompatibility = targetCompatibility = "21"
+//        sourceCompatibility = targetCompatibility = "21"
+        sourceCompatibility = targetCompatibility = "23"
     }
 
     afterEvaluate {
@@ -251,6 +258,7 @@ publishing {
 }
 
 compileJava {
+    options.compilerArgs.add('--enable-preview')
     options.compilerArgs.addAll(["-processor", 'lombok.launch.AnnotationProcessorHider$AnnotationProcessor'])
 }
 compileTestJava {
@@ -284,9 +292,41 @@ opensearchplugin {
     noticeFile = rootProject.file('NOTICE.txt')
 }
 
+task compileNative(type:Exec) {
+//    dependsOn cmakeJniLib
+    def osName = System.getProperty('os.name').toLowerCase()
+    def osArch = System.getProperty('os.arch').toLowerCase()
+    def projectRoot = '/Users/finnrobl/Documents/k-NN'
+
+    def outputName = osName.contains('windows') ? 'ffm_native.dll' :
+            osName.contains('mac') ? 'libffm_native.dylib' :
+                    'libffm_native.so'
+
+    // Change working directory to the ffm folder
+    workingDir "${projectRoot}/ffm"
+
+    if (osName.contains('windows')) {
+        commandLine 'gcc', '-shared', '-o', outputName, 'innerProductFFM.c'
+    } else {
+        commandLine 'gcc', '-shared', '-fPIC', '-o', outputName, 'innerProductFFM.c'
+    }
+
+    doLast {
+        copy {
+            from "${projectRoot}/ffm/${outputName}"
+            into "${projectRoot}/jni/build/release"
+            into "${projectRoot}/src/main/resources"
+        }
+    }
+}
+
+//jar.dependsOn compileNative
+
 tasks.named("integTest").configure {
     it.dependsOn(project.tasks.named("bundlePlugin"))
+    it.dependsOn(project.tasks.named("compileNative"))
 }
+
 
 task release(type: Copy, group: 'build') {
     dependsOn project.tasks.build
@@ -400,6 +440,7 @@ def _numNodes = findProperty('numNodes') as Integer ?: 1
 integTest {
     if (integTestDependOnJniLib) {
         dependsOn buildJniLib
+        dependsOn compileNative
     }
     systemProperty 'tests.security.manager', 'false'
     systemProperty 'java.io.tmpdir', opensearch_tmp_dir.absolutePath
@@ -450,7 +491,7 @@ testClusters.integTest {
 
     //Used for circuit breaker integration tests
     setting 'node.attr.knn_cb_tier', 'integ'
-
+    jvmArgs('--enable-preview')
     // Optionally install security
     if (System.getProperty("security.enabled") != null) {
         configureSecurityPlugin(testClusters.integTest)
@@ -472,6 +513,7 @@ testClusters.integTest {
         def debugPort = 5005
         nodes.forEach { node ->
             node.jvmArgs("-agentlib:jdwp=transport=dt_socket,server=n,suspend=y,address=${debugPort}")
+//            node.jvmArgs("--enable-preview")
             debugPort += 1
         }
     }
@@ -506,6 +548,7 @@ task integTestRemote(type: RestIntegTestTask) {
 run {
     useCluster project.testClusters.integTest
     dependsOn buildJniLib
+//    jvmArgs += ['--enable-preview']  // Add this line
     doFirst {
         // There seems to be an issue when running multi node run or integ tasks with unicast_hosts
         // not being written, the waitForAllConditions ensures it's written
@@ -544,3 +587,42 @@ task updateVersion {
         }
     }
 }
+//
+////
+//model {
+//    binaries {
+//        all {
+//            cCompiler.args "--shared", "-O3", "-march=native", "-funroll-loops"
+//        }
+//    }
+//
+//    toolChains {
+//        gcc(Gcc) {
+//            target("linux_aarch64") {
+//                cCompiler.executable = System.getenv("CC")
+//            }
+//        }
+//        clang(Clang) {
+//            target("osx_aarch64"){
+//                cCompiler.executable = System.getenv("CC")
+//            }
+//        }
+//    }
+//
+//    components {
+//        cInnerProduct(NativeLibrarySpec) {
+//            sources {
+//                c {
+//                    source {
+//                        srcDir 'ffm/c' // Path to your C source files
+//                        include "ffm/*.c"
+//                    }
+//                    exportedHeaders {
+//                        srcDir "ffm/c"
+//                        include "ffm/*.h"
+//                    }
+//                }
+//            }
+//        }
+//    }
+//}

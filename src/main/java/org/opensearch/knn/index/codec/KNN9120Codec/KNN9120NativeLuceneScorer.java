@@ -22,6 +22,7 @@ import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.apache.lucene.util.hnsw.RandomVectorScorerSupplier;
 import org.opensearch.knn.index.KNNVectorSimilarityFunction;
 import org.opensearch.knn.plugin.script.KNNScoringUtil;
+import org.opensearch.knn.ffm.FFMInterface;
 
 import java.io.IOException;
 
@@ -108,6 +109,21 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
             } else {
                 return KNNVectorSimilarityFunction.MAXIMUM_INNER_PRODUCT_NATIVE.compare(queryVector, vectorValues.vectorValue(node));
             }
+
+            // FFM
+//            if (vectorValues instanceof OffHeapFloatVectorValues) {
+//                MemorySegmentAccessInput slice = (MemorySegmentAccessInput) ((OffHeapFloatVectorValues) vectorValues).getSlice();
+//                MemorySegment seg = slice.segmentSliceOrNull(0, slice.length());
+//                long vectorAddress = seg.address() + (long) node * 4 * vectorValues.dimension();
+//
+//                return FFMInterface.computeInnerProduct(
+//                        queryVectorMemorySegment.address(),
+//                        vectorAddress,
+//                        vectorValues.dimension()
+//                );
+//            } else {
+//                return KNNVectorSimilarityFunction.MAXIMUM_INNER_PRODUCT.compare(queryVector, vectorValues.vectorValue(node));
+//            }
         }
 
 //        public float score_ffm(int node) {
