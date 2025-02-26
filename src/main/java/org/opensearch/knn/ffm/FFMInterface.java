@@ -23,7 +23,6 @@ package org.opensearch.knn.ffm;
  */
 //package org.ap/ache.lucene.internal.vectorization;
 
-import static java.lang.foreign.ValueLayout.JAVA_BYTE;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
 
 import java.lang.foreign.AddressLayout;
@@ -74,14 +73,15 @@ public final class FFMInterface {
     private FFMInterface() {}
 
     // Update this line to use correct sequenceLayout syntax
-    public static final AddressLayout POINTER =
-            ValueLayout.ADDRESS.withTargetLayout(MemoryLayout.sequenceLayout(Long.MAX_VALUE, ValueLayout.JAVA_BYTE));
+    public static final AddressLayout POINTER = ValueLayout.ADDRESS.withTargetLayout(
+        MemoryLayout.sequenceLayout(Long.MAX_VALUE, ValueLayout.JAVA_BYTE)
+    );
 
     private static final Linker LINKER = Linker.nativeLinker();
     private static final SymbolLookup SYMBOL_LOOKUP;
 
     static {
-//        System.loadLibrary("ffm_native");
+        // System.loadLibrary("ffm_native");
         try {
             AccessController.doPrivileged((PrivilegedAction<Void>) () -> {
                 System.loadLibrary("ffm_native");
@@ -94,14 +94,11 @@ public final class FFMInterface {
         SYMBOL_LOOKUP = name -> loaderLookup.find(name).or(() -> LINKER.defaultLookup().find(name));
     }
 
-    private static final FunctionDescriptor innerProdDesc =
-            FunctionDescriptor.of(ValueLayout.JAVA_FLOAT, POINTER, POINTER, JAVA_INT);
+    private static final FunctionDescriptor innerProdDesc = FunctionDescriptor.of(ValueLayout.JAVA_FLOAT, POINTER, POINTER, JAVA_INT);
 
-    private static final MethodHandle innerProdMH =
-            SYMBOL_LOOKUP
-                    .find("innerprod_native")
-                    .map(addr -> LINKER.downcallHandle(addr, innerProdDesc))
-                    .orElse(null);
+    private static final MethodHandle innerProdMH = SYMBOL_LOOKUP.find("innerprod_native")
+        .map(addr -> LINKER.downcallHandle(addr, innerProdDesc))
+        .orElse(null);
 
     static final MethodHandle INNER_PRODUCT_IMPL = innerProdMH;
 
@@ -113,6 +110,3 @@ public final class FFMInterface {
         }
     }
 }
-
-
-

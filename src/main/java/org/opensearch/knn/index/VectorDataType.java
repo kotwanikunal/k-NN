@@ -102,10 +102,10 @@ public enum VectorDataType {
         public FieldType createKnnVectorFieldType(int dimension, KNNVectorSimilarityFunction knnVectorSimilarityFunction) {
             return KnnFloatVectorField.createFieldType(dimension, VectorSimilarityFunction.EUCLIDEAN);
         }
-//            return KnnFloatVectorField.createFieldType(dimension,
-//
-//                    knnVectorSimilarityFunction.getVectorSimilarityFunction());
-//        }
+        // return KnnFloatVectorField.createFieldType(dimension,
+        //
+        // knnVectorSimilarityFunction.getVectorSimilarityFunction());
+        // }
 
         @Override
         public float[] getVectorFromBytesRef(BytesRef binaryValue) {

@@ -9,7 +9,6 @@ package org.opensearch.knn.index.codec.KNN9120Codec;
 //import jdk.incubator.foreign.MemorySegment;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.Arena;
-import java.lang.foreign.ValueLayout;
 import org.apache.lucene.codecs.hnsw.FlatVectorsScorer;
 import org.apache.lucene.codecs.lucene95.OffHeapFloatVectorValues;
 import org.apache.lucene.index.FloatVectorValues;
@@ -22,26 +21,36 @@ import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.apache.lucene.util.hnsw.RandomVectorScorerSupplier;
 import org.opensearch.knn.index.KNNVectorSimilarityFunction;
 import org.opensearch.knn.plugin.script.KNNScoringUtil;
-import org.opensearch.knn.ffm.FFMInterface;
 
 import java.io.IOException;
 
 public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
-       // TODO Finn
+    // TODO Finn
     // extends Closeable
 
     @Override
-    public RandomVectorScorerSupplier getRandomVectorScorerSupplier(VectorSimilarityFunction similarityFunction, KnnVectorValues vectorValues) throws IOException {
+    public RandomVectorScorerSupplier getRandomVectorScorerSupplier(
+        VectorSimilarityFunction similarityFunction,
+        KnnVectorValues vectorValues
+    ) throws IOException {
         return new NativeLuceneRandomVectorScorerSupplier((FloatVectorValues) vectorValues);
     }
 
     @Override
-    public RandomVectorScorer getRandomVectorScorer(VectorSimilarityFunction similarityFunction, KnnVectorValues vectorValues, float[] target) throws IOException {
+    public RandomVectorScorer getRandomVectorScorer(
+        VectorSimilarityFunction similarityFunction,
+        KnnVectorValues vectorValues,
+        float[] target
+    ) throws IOException {
         return new NativeLuceneVectorScorer((FloatVectorValues) vectorValues, target);
     }
 
     @Override
-    public RandomVectorScorer getRandomVectorScorer(VectorSimilarityFunction similarityFunction, KnnVectorValues vectorValues, byte[] target) throws IOException {
+    public RandomVectorScorer getRandomVectorScorer(
+        VectorSimilarityFunction similarityFunction,
+        KnnVectorValues vectorValues,
+        byte[] target
+    ) throws IOException {
         throw new IllegalArgumentException("native lucene vectors do not support byte[] targets");
     }
 
@@ -51,6 +60,7 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
         private final MemorySegment queryVectorMemorySegment;
         private final int dimension;
         private final int FLOAT_SZ = 4;
+
         NativeLuceneVectorScorer(FloatVectorValues vectorValues, float[] query) {
             this.queryVector = query;
             this.vectorValues = vectorValues;
@@ -63,11 +73,11 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
             // there.
 
             MemorySegment.copy(
-                    castedQueryVector,                          // Source array
-                    0,                                   // Source offset
-                    this.queryVectorMemorySegment,            // Destination memory segment
-                    0,                                   // Destination offset
-                    this.dimension * Float.BYTES // Number of bytes to copy
+                castedQueryVector,                          // Source array
+                0,                                   // Source offset
+                this.queryVectorMemorySegment,            // Destination memory segment
+                0,                                   // Destination offset
+                this.dimension * Float.BYTES // Number of bytes to copy
             );
         }
 
@@ -81,7 +91,8 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
                 MemorySegmentAccessInput slice = (MemorySegmentAccessInput) ((OffHeapFloatVectorValues) vectorValues).getSlice();
                 // get MemorySegment from slice.
                 MemorySegment seg = slice.segmentSliceOrNull(0, slice.length());
-                // see https://github.com/apache/lucene/blob/27079706ef1f8341b2033efde767e95045c91f6c/lucene/core/src/java21/org/apache/lucene/internal/vectorization/PanamaVectorizationProvider.java#L91
+                // see
+                // https://github.com/apache/lucene/blob/27079706ef1f8341b2033efde767e95045c91f6c/lucene/core/src/java21/org/apache/lucene/internal/vectorization/PanamaVectorizationProvider.java#L91
 
                 long baseSegmentAddress = seg.address();
                 // given segment's address, find the actual vector's address.
@@ -90,8 +101,9 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
                 long vectorAddress = baseSegmentAddress + (long) node * FLOAT_SZ * vectorValues.dimension();
 
                 return KNNScoringUtil.innerProductScaledNativeOffHeapPinnedQuery(
-                        queryVectorMemorySegment.address(),
-                        vectorAddress, dimension
+                    queryVectorMemorySegment.address(),
+                    vectorAddress,
+                    dimension
                 );
             } else {
                 // vectors are on java heap so do not call JNI function and waste a copy.
@@ -99,28 +111,28 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
             }
 
             // **UNFINISHED** FFM Implementation
-//            if (vectorValues instanceof OffHeapFloatVectorValues) {
-//                MemorySegmentAccessInput slice = (MemorySegmentAccessInput) ((OffHeapFloatVectorValues) vectorValues).getSlice();
-//                MemorySegment seg = slice.segmentSliceOrNull(0, slice.length());
-//                long vectorAddress = seg.address() + (long) node * 4 * vectorValues.dimension();
-//
-//                return FFMInterface.computeInnerProduct(
-//                        queryVectorMemorySegment.address(),
-//                        vectorAddress,
-//                        vectorValues.dimension()
-//                );
-//            } else {
-//                return KNNVectorSimilarityFunction.MAXIMUM_INNER_PRODUCT.compare(queryVector, vectorValues.vectorValue(node));
-//            }
+            // if (vectorValues instanceof OffHeapFloatVectorValues) {
+            // MemorySegmentAccessInput slice = (MemorySegmentAccessInput) ((OffHeapFloatVectorValues) vectorValues).getSlice();
+            // MemorySegment seg = slice.segmentSliceOrNull(0, slice.length());
+            // long vectorAddress = seg.address() + (long) node * 4 * vectorValues.dimension();
+            //
+            // return FFMInterface.computeInnerProduct(
+            // queryVectorMemorySegment.address(),
+            // vectorAddress,
+            // vectorValues.dimension()
+            // );
+            // } else {
+            // return KNNVectorSimilarityFunction.MAXIMUM_INNER_PRODUCT.compare(queryVector, vectorValues.vectorValue(node));
+            // }
         }
-//        }
+        // }
 
         // TODO Finn -- probably unnecessary since GC will clean up queryVectorMemorySegment,
-        //  but we should consider if we need to manually deallocate the queryVectorMemorySegment.
-//        @Override
-//        public void close() {
-//
-//        }
+        // but we should consider if we need to manually deallocate the queryVectorMemorySegment.
+        // @Override
+        // public void close() {
+        //
+        // }
         @Override
         public int maxOrd() {
             return vectorValues.size();

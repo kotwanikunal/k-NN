@@ -30,65 +30,62 @@ public class KNN9120PerFieldKnnVectorsFormat extends BasePerFieldKnnVectorsForma
     }
 
     public KNN9120PerFieldKnnVectorsFormat(
-            final Optional<MapperService> mapperService,
-            NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory
+        final Optional<MapperService> mapperService,
+        NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory
     ) {
         super(
-                mapperService,
-                Lucene99HnswVectorsFormat.DEFAULT_MAX_CONN,
-                Lucene99HnswVectorsFormat.DEFAULT_BEAM_WIDTH,
-                Lucene99HnswVectorsFormat::new,
-                knnVectorsFormatParams -> {
-                    final Tuple<Integer, ExecutorService> mergeThreadCountAndExecutorService = getMergeThreadCountAndExecutorService();
-                    // There is an assumption here that hamming space will only be used for binary vectors. This will need to be fixed if that
-                    // changes in the future.
-                    if (knnVectorsFormatParams.getSpaceType() == SpaceType.HAMMING) {
-                        return new KNN9120HnswBinaryVectorsFormat(
-                                knnVectorsFormatParams.getMaxConnections(),
-                                knnVectorsFormatParams.getBeamWidth(),
-                                // number of merge threads
-                                mergeThreadCountAndExecutorService.v1(),
-                                // executor service
-                                mergeThreadCountAndExecutorService.v2()
-                        );
-                    }
-                    else if (knnVectorsFormatParams.getSpaceType() == SpaceType.INNER_PRODUCT_NATIVE
-                    ) {
-                        return new KNN9120HnswNativeLuceneVectorsFormat(
-                                knnVectorsFormatParams.getMaxConnections(),
-                                knnVectorsFormatParams.getBeamWidth(),
-// number of merge threads
-                                mergeThreadCountAndExecutorService.v1(),
-// executor service
-                                mergeThreadCountAndExecutorService.v2()
-                        );
-                    }
-                    else {
-                        return new Lucene99HnswVectorsFormat(
-                                knnVectorsFormatParams.getMaxConnections(),
-                                knnVectorsFormatParams.getBeamWidth(),
-                                // number of merge threads
-                                mergeThreadCountAndExecutorService.v1(),
-                                // executor service
-                                mergeThreadCountAndExecutorService.v2()
-                        );
-                    }
-                },
-                knnScalarQuantizedVectorsFormatParams -> {
-                    final Tuple<Integer, ExecutorService> mergeThreadCountAndExecutorService = getMergeThreadCountAndExecutorService();
-                    return new Lucene99HnswScalarQuantizedVectorsFormat(
-                            knnScalarQuantizedVectorsFormatParams.getMaxConnections(),
-                            knnScalarQuantizedVectorsFormatParams.getBeamWidth(),
-                            // Number of merge threads
-                            mergeThreadCountAndExecutorService.v1(),
-                            knnScalarQuantizedVectorsFormatParams.getBits(),
-                            knnScalarQuantizedVectorsFormatParams.isCompressFlag(),
-                            knnScalarQuantizedVectorsFormatParams.getConfidenceInterval(),
-                            // Executor service
-                            mergeThreadCountAndExecutorService.v2()
+            mapperService,
+            Lucene99HnswVectorsFormat.DEFAULT_MAX_CONN,
+            Lucene99HnswVectorsFormat.DEFAULT_BEAM_WIDTH,
+            Lucene99HnswVectorsFormat::new,
+            knnVectorsFormatParams -> {
+                final Tuple<Integer, ExecutorService> mergeThreadCountAndExecutorService = getMergeThreadCountAndExecutorService();
+                // There is an assumption here that hamming space will only be used for binary vectors. This will need to be fixed if that
+                // changes in the future.
+                if (knnVectorsFormatParams.getSpaceType() == SpaceType.HAMMING) {
+                    return new KNN9120HnswBinaryVectorsFormat(
+                        knnVectorsFormatParams.getMaxConnections(),
+                        knnVectorsFormatParams.getBeamWidth(),
+                        // number of merge threads
+                        mergeThreadCountAndExecutorService.v1(),
+                        // executor service
+                        mergeThreadCountAndExecutorService.v2()
                     );
-                },
-                nativeIndexBuildStrategyFactory
+                } else if (knnVectorsFormatParams.getSpaceType() == SpaceType.INNER_PRODUCT_NATIVE) {
+                    return new KNN9120HnswNativeLuceneVectorsFormat(
+                        knnVectorsFormatParams.getMaxConnections(),
+                        knnVectorsFormatParams.getBeamWidth(),
+                        // number of merge threads
+                        mergeThreadCountAndExecutorService.v1(),
+                        // executor service
+                        mergeThreadCountAndExecutorService.v2()
+                    );
+                } else {
+                    return new Lucene99HnswVectorsFormat(
+                        knnVectorsFormatParams.getMaxConnections(),
+                        knnVectorsFormatParams.getBeamWidth(),
+                        // number of merge threads
+                        mergeThreadCountAndExecutorService.v1(),
+                        // executor service
+                        mergeThreadCountAndExecutorService.v2()
+                    );
+                }
+            },
+            knnScalarQuantizedVectorsFormatParams -> {
+                final Tuple<Integer, ExecutorService> mergeThreadCountAndExecutorService = getMergeThreadCountAndExecutorService();
+                return new Lucene99HnswScalarQuantizedVectorsFormat(
+                    knnScalarQuantizedVectorsFormatParams.getMaxConnections(),
+                    knnScalarQuantizedVectorsFormatParams.getBeamWidth(),
+                    // Number of merge threads
+                    mergeThreadCountAndExecutorService.v1(),
+                    knnScalarQuantizedVectorsFormatParams.getBits(),
+                    knnScalarQuantizedVectorsFormatParams.isCompressFlag(),
+                    knnScalarQuantizedVectorsFormatParams.getConfidenceInterval(),
+                    // Executor service
+                    mergeThreadCountAndExecutorService.v2()
+                );
+            },
+            nativeIndexBuildStrategyFactory
         );
     }
 

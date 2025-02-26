@@ -256,7 +256,7 @@ public class KNNScoringUtil {
 
     public static float innerProductScaledNative(float[] queryVector, float[] inputVector) {
         requireEqualDimension(queryVector, inputVector);
-//        return
+        // return
         return FaissService.innerProductScaledNative(queryVector, inputVector);
     }
 
@@ -269,8 +269,6 @@ public class KNNScoringUtil {
 
         return FaissService.innerProductScaledNativeOffHeapPinnedQuery(queryAddress, address, (long) dimension);
     }
-
-
 
     /**
      *********************************************************************************************

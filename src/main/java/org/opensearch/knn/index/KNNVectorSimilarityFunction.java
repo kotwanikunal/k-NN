@@ -20,38 +20,28 @@ public enum KNNVectorSimilarityFunction {
         @Override
         public float compare(float[] v1, float[] v2) {
 
-
             return KNNScoringUtil.innerProductScaledNative(v1, v2);
 
-
         }
-
 
         @Override
 
-
         public float compare(byte[] v1, byte[] v2) {
-
 
             throw new IllegalStateException("can't binary compare in native for Maximum Inner Product Native space");
 
-
         }
 
-//        public float compareOffHeap(float[] v1, long address) {
-//            return
-//        }
-
+        // public float compareOffHeap(float[] v1, long address) {
+        // return
+        // }
 
         @Override
         public VectorSimilarityFunction getVectorSimilarityFunction() {
 
-
             throw new IllegalStateException("VectorSimilarityFunction is not available for Maximum Inner Product Native space");
 
-
         }
-
 
     },
     HAMMING(null) {

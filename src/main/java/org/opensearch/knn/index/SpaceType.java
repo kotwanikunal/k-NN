@@ -136,43 +136,27 @@ public enum SpaceType {
     },
     INNER_PRODUCT_NATIVE("innerproduct_native") {
 
-
-
         @Override
-
 
         public float scoreTranslation(float rawScore) {
 
-
             if (rawScore >= 0) {
-
 
                 return 1 / (1 + rawScore);
 
-
             }
-
 
             return -rawScore + 1;
 
-
         }
-
-
-
-
 
         @Override
 
-
         public KNNVectorSimilarityFunction getKnnVectorSimilarityFunction() {
-
 
             return KNNVectorSimilarityFunction.MAXIMUM_INNER_PRODUCT_NATIVE;
 
-
         }
-
 
     },
     HAMMING("hamming") {

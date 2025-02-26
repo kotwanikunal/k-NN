@@ -63,12 +63,12 @@ public final class KNN9120HnswNativeLuceneVectorsFormat extends KnnVectorsFormat
         super(NAME);
         if (maxConn <= 0 || maxConn > MAXIMUM_MAX_CONN) {
             throw new IllegalArgumentException(
-                    "maxConn must be positive and less than or equal to " + MAXIMUM_MAX_CONN + "; maxConn=" + maxConn
+                "maxConn must be positive and less than or equal to " + MAXIMUM_MAX_CONN + "; maxConn=" + maxConn
             );
         }
         if (beamWidth <= 0 || beamWidth > MAXIMUM_BEAM_WIDTH) {
             throw new IllegalArgumentException(
-                    "beamWidth must be positive and less than or equal to " + MAXIMUM_BEAM_WIDTH + "; beamWidth=" + beamWidth
+                "beamWidth must be positive and less than or equal to " + MAXIMUM_BEAM_WIDTH + "; beamWidth=" + beamWidth
             );
         }
         this.maxConn = maxConn;
@@ -87,12 +87,12 @@ public final class KNN9120HnswNativeLuceneVectorsFormat extends KnnVectorsFormat
     @Override
     public KnnVectorsWriter fieldsWriter(SegmentWriteState state) throws IOException {
         return new Lucene99HnswVectorsWriter(
-                state,
-                this.maxConn,
-                this.beamWidth,
-                flatVectorsFormat.fieldsWriter(state),
-                this.numMergeWorkers,
-                this.mergeExec
+            state,
+            this.maxConn,
+            this.beamWidth,
+            flatVectorsFormat.fieldsWriter(state),
+            this.numMergeWorkers,
+            this.mergeExec
         );
     }
 
@@ -109,11 +109,11 @@ public final class KNN9120HnswNativeLuceneVectorsFormat extends KnnVectorsFormat
     @Override
     public String toString() {
         return "KNN9120HnswNativeLuceneVectorsFormat(name=KNN9120HnswNativeLuceneVectorsFormat, maxConn="
-                + this.maxConn
-                + ", beamWidth="
-                + this.beamWidth
-                + ", flatVectorFormat="
-                + flatVectorsFormat
-                + ")";
+            + this.maxConn
+            + ", beamWidth="
+            + this.beamWidth
+            + ", flatVectorFormat="
+            + flatVectorsFormat
+            + ")";
     }
 }
