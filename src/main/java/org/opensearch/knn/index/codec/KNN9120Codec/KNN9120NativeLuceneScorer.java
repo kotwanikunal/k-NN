@@ -54,19 +54,21 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
         throw new IllegalArgumentException("native lucene vectors do not support byte[] targets");
     }
 
-    static class NativeLuceneVectorScorer implements RandomVectorScorer {
+    static class NativeLuceneVectorScorer implements RandomVectorScorer, AutoCloseable {
         private final FloatVectorValues vectorValues;
         private final float[] queryVector;
         private final MemorySegment queryVectorMemorySegment;
         private final int dimension;
         private final int FLOAT_SZ = 4;
+        private final Arena arena;
 
         NativeLuceneVectorScorer(FloatVectorValues vectorValues, float[] query) {
             this.queryVector = query;
             this.vectorValues = vectorValues;
             this.dimension = vectorValues.dimension();
+            this.arena = Arena.ofAuto();
             int BYTE_ALIGN = 8; // TODO check this. should maybe be 4?
-            this.queryVectorMemorySegment = Arena.ofAuto().allocate(FLOAT_SZ * dimension, BYTE_ALIGN);
+            this.queryVectorMemorySegment = this.arena.allocate(FLOAT_SZ * dimension, BYTE_ALIGN);
             MemorySegment castedQueryVector = MemorySegment.ofArray(query); // TODO probably more efficient way to get
             // the queryVector values off-heap. Here we use ofArray() call as it is linked to the thread's lifetime so
             // it will be GCed and not leaked. Alternatively we could implement Closeable and deallocate the memory
@@ -106,6 +108,7 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
                     dimension
                 );
             } else {
+                // need a way to avoid allocating the memory here for the query vector.
                 // vectors are on java heap so do not call JNI function and waste a copy.
                 return KNNVectorSimilarityFunction.MAXIMUM_INNER_PRODUCT.compare(queryVector, vectorValues.vectorValue(node));
             }
@@ -143,6 +146,10 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
             return vectorValues.ordToDoc(ord);
         }
 
+        @Override
+        public void close() throws Exception {
+            this.arena.close();
+        }
     }
 
     static class NativeLuceneRandomVectorScorerSupplier implements RandomVectorScorerSupplier {
