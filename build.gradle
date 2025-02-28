@@ -80,6 +80,10 @@ plugins {
     id 'c'
 }
 
+lombok {
+    version = "1.18.36"  // otherwise it breaks with JDK 23; see https://github.com/projectlombok/lombok/issues/3722
+}
+
 
 apply from: 'gradle/formatting.gradle'
 apply plugin: 'opensearch.opensearchplugin'
@@ -196,8 +200,9 @@ allprojects {
     }
     apply from: rootProject.file('build-tools/repositories.gradle').absoluteFile
     plugins.withId('java') {
-        sourceCompatibility = targetCompatibility = "21"
-    }
+       sourceCompatibility = targetCompatibility = "23"
+	
+  }
 
     afterEvaluate {
         project.dependencyLicenses.enabled = false
@@ -254,7 +259,6 @@ publishing {
 }
 
 compileJava {
-    options.compilerArgs.add('--enable-preview')
     options.compilerArgs.addAll(["-processor", 'lombok.launch.AnnotationProcessorHider$AnnotationProcessor'])
 }
 compileTestJava {
@@ -487,7 +491,6 @@ testClusters.integTest {
 
     //Used for circuit breaker integration tests
     setting 'node.attr.knn_cb_tier', 'integ'
-    jvmArgs('--enable-preview')
     // Optionally install security
     if (System.getProperty("security.enabled") != null) {
         configureSecurityPlugin(testClusters.integTest)
@@ -581,11 +584,11 @@ task updateVersion {
         }
     }
 }
-tasks.withType(Javadoc).configureEach {
-    CoreJavadocOptions opt = options as CoreJavadocOptions
-    opt.addStringOption("source", "21")
-    opt.addBooleanOption("-enable-preview", true)
-}
+//tasks.withType(Javadoc).configureEach {
+//    CoreJavadocOptions opt = options as CoreJavadocOptions
+//    opt.addStringOption("source", "21")
+//    opt.addBooleanOption("-enable-preview", true)
+//}
 
 // task generateJavadocs(type: Javadoc) {
 //     options {
