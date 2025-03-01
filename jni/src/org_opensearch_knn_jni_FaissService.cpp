@@ -578,8 +578,8 @@ JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_FaissService_innerProductSc
     #if defined(__GNUC__) || defined(__clang__)
     #pragma GCC ivdep
     #endif
-    #pragma omp simd reduction(+:sum) aligned(queryArr,inputArr:32)
-//    #pragma unroll 4
+//    #pragma omp simd reduction(+:sum) aligned(queryArr,inputArr:32)
+    #pragma unroll 4
     for (int i = 0; i < length; i++) {
         // FMA pattern: sum = sum + (queryArr[i] * inputArr[i])
         sum = std::fma(queryArr[i], inputArr[i], sum);
