@@ -40,6 +40,7 @@ public class LuceneEngineKnnVectorQuery extends Query {
      */
     @Override
     public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost) throws IOException {
+        // note that here is the endpoint that both lucene and native lucene searches will hit.
         Query rewrittenQuery = luceneQuery.rewrite(searcher);
         return rewrittenQuery.createWeight(searcher, scoreMode, boost);
     }

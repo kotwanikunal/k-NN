@@ -67,6 +67,8 @@ if(NOT KNN_PLUGIN_VERSION)
     set(KNN_PLUGIN_VERSION "0.0.0")
 endif()
 
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -ftree-vectorize -ffast-math")
+
 # Set architecture specific variables
 if (${CMAKE_SYSTEM_PROCESSOR} STREQUAL aarch64)
     set(MACH_ARCH arm64)
