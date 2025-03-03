@@ -63,15 +63,23 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
         private final float[] queryVector;
         private final int dimension;
         private final int FLOAT_SZ = 4;
+        private final boolean isOffHeap;
         private final MemorySegment queryVectorMemorySegment;
 
         NativeLuceneVectorScorer(FloatVectorValues vectorValues, float[] query) {
-            this.arena = Arena.ofAuto();
+            this.isOffHeap = vectorValues instanceof OffHeapFloatVectorValues;
             this.queryVector = query;
             this.vectorValues = vectorValues;
             this.dimension = vectorValues.dimension();
             int BYTE_ALIGN = 8; // TODO check this. should maybe be 4?
-            this.queryVectorMemorySegment = arena.allocateFrom(ValueLayout.JAVA_FLOAT, query);
+
+            if (this.isOffHeap) {
+                this.arena = Arena.ofAuto();
+                this.queryVectorMemorySegment = arena.allocateFrom(ValueLayout.JAVA_FLOAT, query);
+            } else {
+                this.arena = null;
+                this.queryVectorMemorySegment = null;
+            }
 
             // this.queryVectorMemorySegment = this.arena.allocate(FLOAT_SZ * dimension, BYTE_ALIGN);
 
@@ -95,7 +103,7 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
             // vectorValues are not always offheap.
             // for instance due to deferred segment creation the vectorValues are on-heap during indexing.
             // from testing it seems that vectorValues are only off-heap during search.
-            if (vectorValues instanceof OffHeapFloatVectorValues) {
+            if (this.isOffHeap) {
                 // access vectorValues slice.
                 MemorySegmentAccessInput slice = (MemorySegmentAccessInput) ((OffHeapFloatVectorValues) vectorValues).getSlice();
                 // get MemorySegment from slice.
@@ -141,7 +149,9 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
         // but we should consider if we need to manually deallocate the queryVectorMemorySegment.
         @Override
         public void close() {
-            this.arena.close();
+            if (this.isOffHeap) {
+                this.arena.close();
+            }
         }
 
         @Override
