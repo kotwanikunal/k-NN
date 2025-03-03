@@ -7,7 +7,11 @@ package org.opensearch.knn.index.codec.KNN9120Codec;
 
 //import jdk.incubator.foreign.MemorySegment;
 //import jdk.incubator.foreign.MemorySegment;
+
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.Arena;
+import java.lang.foreign.ValueLayout;
+
 import org.apache.lucene.codecs.hnsw.FlatVectorsScorer;
 import org.apache.lucene.codecs.lucene95.OffHeapFloatVectorValues;
 import org.apache.lucene.index.FloatVectorValues;
@@ -53,16 +57,37 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
         throw new IllegalArgumentException("native lucene vectors do not support byte[] targets");
     }
 
-    static class NativeLuceneVectorScorer implements RandomVectorScorer {
+    static class NativeLuceneVectorScorer implements RandomVectorScorer, AutoCloseable {
         private final FloatVectorValues vectorValues;
+        private final Arena arena;
         private final float[] queryVector;
         private final int dimension;
         private final int FLOAT_SZ = 4;
+        private final MemorySegment queryVectorMemorySegment;
 
         NativeLuceneVectorScorer(FloatVectorValues vectorValues, float[] query) {
+            this.arena = Arena.ofAuto();
             this.queryVector = query;
             this.vectorValues = vectorValues;
             this.dimension = vectorValues.dimension();
+            int BYTE_ALIGN = 8; // TODO check this. should maybe be 4?
+            this.queryVectorMemorySegment = arena.allocateFrom(ValueLayout.JAVA_FLOAT, query);
+
+            // this.queryVectorMemorySegment = this.arena.allocate(FLOAT_SZ * dimension, BYTE_ALIGN);
+
+            // MemorySegment castedQueryVector = MemorySegment.ofArray(query); // TODO probably more efficient way to get
+            // // the queryVector values off-heap. Here we use ofArray() call as it is linked to the thread's lifetime so
+            // // it will be GCed and not leaked. Alternatively we could implement Closeable and deallocate the memory
+            //
+            // // there.
+            // MemorySegment.copy(
+            // castedQueryVector, // Source array
+            // 0, // Source offset
+            // this.queryVectorMemorySegment, // Destination memory segment
+            // 0, // Destination offset
+            // this.dimension * Float.BYTES // Number of bytes to copy
+            // );
+
         }
 
         @Override
@@ -83,7 +108,12 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
                 // Since MemorySegments are contiguous, this is probably given by
                 // address + node * sizeof float * dimension
                 long vectorAddress = baseSegmentAddress + (long) node * FLOAT_SZ * vectorValues.dimension();
-                return KNNScoringUtil.innerProductScaledNativeOffHeap(queryVector, vectorAddress);
+                // return KNNScoringUtil.innerProductScaledNativeOffHeap(queryVector, vectorAddress);
+                return KNNScoringUtil.innerProductScaledNativeOffHeapPinnedQuery(
+                    queryVectorMemorySegment.address(),
+                    vectorAddress,
+                    dimension
+                );
             } else {
                 // need a way to avoid allocating the memory here for the query vector.
                 // vectors are on java heap so do not call JNI function and waste a copy.
@@ -109,10 +139,11 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
 
         // TODO Finn -- probably unnecessary since GC will clean up queryVectorMemorySegment,
         // but we should consider if we need to manually deallocate the queryVectorMemorySegment.
-        // @Override
-        // public void close() {
-        //
-        // }
+        @Override
+        public void close() {
+            this.arena.close();
+        }
+
         @Override
         public int maxOrd() {
             return vectorValues.size();

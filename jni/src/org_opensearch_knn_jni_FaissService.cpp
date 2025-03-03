@@ -641,37 +641,21 @@ JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_FaissService_innerProductSc
 //    }
 
     float sum = 0.0f;
+
+    // Align arrays for better vectorization
+    #if defined(__GNUC__) || defined(__clang__)
+    #pragma GCC ivdep
+    #endif
+//    #pragma omp simd reduction(+:sum) aligned(queryArr,inputArr:32)
+    #pragma unroll 4
     for (int i = 0; i < length; i++) {
-
-
-        float acc = queryArr[i] * inputArr[i];
-
-
-        sum += acc;
-
-
+        // FMA pattern: sum = sum + (queryArr[i] * inputArr[i])
+        sum = std::fma(queryArr[i], inputArr[i], sum);
     }
 
-    // scale due to lucene restrictions.
-    if (
+    // scale due to lucene restrictions
+    sum = (sum < 0.0f) ? (1.0f / (1.0f - sum)) : (sum + 1.0f);
 
-
-        sum < 0.0f
-
-
-    ) {
-
-
-        sum = 1 / (1 + -1 * sum);
-
-
-    } else {
-
-
-        sum += 1;
-
-
-    }
 
 //    env->ReleaseFloatArrayElements(queryVector, queryArr, JNI_ABORT);
 
