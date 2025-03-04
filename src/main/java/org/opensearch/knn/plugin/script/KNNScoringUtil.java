@@ -270,6 +270,15 @@ public class KNNScoringUtil {
         return FaissService.innerProductScaledNativeOffHeapPinnedQuery(queryAddress, address, (long) dimension);
     }
 
+    public static long allocatePinnedQueryVector(float[] queryVector, long dimension) {
+
+        return FaissService.allocatePinnedQueryVector(queryVector, dimension);
+    }
+
+    public static void deallocatePinnedQueryVector(long queryAddress) {
+        FaissService.deallocatePinnedQueryVector(queryAddress); // void method
+    }
+
     /**
      *********************************************************************************************
      * Functions to be used in painless script which is defined in knn_allowlist.txt

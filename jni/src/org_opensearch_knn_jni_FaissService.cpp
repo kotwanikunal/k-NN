@@ -482,6 +482,22 @@ JNIEXPORT jobjectArray JNICALL Java_org_opensearch_knn_jni_FaissService_rangeSea
     return nullptr;
 }
 
+
+JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_FaissService_allocatePinnedQueryVector(JNIEnv * env, jclass cls,
+jfloatArray queryVector, jlong dimension) {
+    jfloat *queryArr = env->GetFloatArrayElements(queryVector, NULL);
+    auto * addr = new float[dimension];
+    std::copy(queryArr, queryArr + dimension, addr);
+    env->ReleaseFloatArrayElements(queryVector, queryArr, JNI_ABORT);
+    return reinterpret_cast<jlong>(addr);
+}
+
+JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_FaissService_deallocatePinnedQueryVector(JNIEnv * env, jclass cls,
+jlong address) {
+    auto * addr = reinterpret_cast<float*>(address);
+    delete[] addr;
+}
+
 JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_FaissService_innerProductScaledNative
 
 

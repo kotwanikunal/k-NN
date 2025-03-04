@@ -66,6 +66,10 @@ public class FaissService {
 
     public static native float innerProductScaledNativeOffHeapPinnedQuery(long queryVectorAddress, long inputVectorAddress, long dimension);
 
+    public static native long allocatePinnedQueryVector(float[] queryVector, long dimension);
+
+    public static native void deallocatePinnedQueryVector(long queryVectorAddress);
+
     /**
      * Initialize an index for the native library. Takes in numDocs to
      * allocate the correct amount of memory.

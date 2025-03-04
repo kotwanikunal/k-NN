@@ -9,8 +9,6 @@ package org.opensearch.knn.index.codec.KNN9120Codec;
 //import jdk.incubator.foreign.MemorySegment;
 
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.Arena;
-import java.lang.foreign.ValueLayout;
 
 import org.apache.lucene.codecs.hnsw.FlatVectorsScorer;
 import org.apache.lucene.codecs.lucene95.OffHeapFloatVectorValues;
@@ -25,11 +23,15 @@ import org.apache.lucene.util.hnsw.RandomVectorScorerSupplier;
 import org.opensearch.knn.index.KNNVectorSimilarityFunction;
 import org.opensearch.knn.plugin.script.KNNScoringUtil;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
 import java.io.IOException;
 
 public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
     // TODO Finn
     // extends Closeable
+    // private static final Claner CLEANER = Cleaner.create();
 
     @Override
     public RandomVectorScorerSupplier getRandomVectorScorerSupplier(
@@ -45,7 +47,18 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
         KnnVectorValues vectorValues,
         float[] target
     ) throws IOException {
+        // going to take finalizer approach
+        // grab resources
+        // allocate memorysegment
+
+        // use jni to pin the queryVector, native function returns mem addr
+        // NewNativeLuceneVectorScorer((FloatVectorValues) vectorValues, target_addr);
         return new NativeLuceneVectorScorer((FloatVectorValues) vectorValues, target);
+        // use jni to release the queryVector address memory.
+        // on kNN Search, collector/query level drop the query vector.
+        // kNNWeight
+        // auto release resources
+        // somehow with some java feature have the memorysegment auto close/deallocate.
     }
 
     @Override
@@ -57,14 +70,19 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
         throw new IllegalArgumentException("native lucene vectors do not support byte[] targets");
     }
 
-    static class NativeLuceneVectorScorer implements RandomVectorScorer, AutoCloseable {
+    // static class to wrap the memorysegment.
+    // queryVector -> memory location. (think about overhead)
+
+    static class NativeLuceneVectorScorer implements RandomVectorScorer {
         private final FloatVectorValues vectorValues;
-        private final Arena arena;
+        // private final Arena arena; // inner static class
         private final float[] queryVector;
         private final int dimension;
         private final int FLOAT_SZ = 4;
         private final boolean isOffHeap;
-        private final MemorySegment queryVectorMemorySegment;
+        // private final MemorySegment queryVectorMemorySegment;
+        Logger logger = LogManager.getLogger(NativeLuceneVectorScorer.class);
+        private final long queryVectorAddress;
 
         NativeLuceneVectorScorer(FloatVectorValues vectorValues, float[] query) {
             this.isOffHeap = vectorValues instanceof OffHeapFloatVectorValues;
@@ -72,13 +90,20 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
             this.vectorValues = vectorValues;
             this.dimension = vectorValues.dimension();
             int BYTE_ALIGN = 8; // TODO check this. should maybe be 4?
-
+            // logger.info("IN CTOR");
             if (this.isOffHeap) {
-                this.arena = Arena.ofAuto();
-                this.queryVectorMemorySegment = arena.allocateFrom(ValueLayout.JAVA_FLOAT, query);
+
+                this.queryVectorAddress = KNNScoringUtil.allocatePinnedQueryVector(query, this.dimension);
+                // see if we can do memory allocation through JNI, and hold.
+                // explicitly call .close()?
+                // this.arena = Arena.ofAuto();
+                // this.arena.close() -> error
+                // this.queryVectorMemorySegment = arena.allocateFrom(ValueLayout.JAVA_FLOAT, query);
+
             } else {
-                this.arena = null;
-                this.queryVectorMemorySegment = null;
+                this.queryVectorAddress = 0;
+                // this.arena = null;
+                // this.queryVectorMemorySegment = null;
             }
 
             // this.queryVectorMemorySegment = this.arena.allocate(FLOAT_SZ * dimension, BYTE_ALIGN);
@@ -117,11 +142,12 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
                 // address + node * sizeof float * dimension
                 long vectorAddress = baseSegmentAddress + (long) node * FLOAT_SZ * vectorValues.dimension();
                 // return KNNScoringUtil.innerProductScaledNativeOffHeap(queryVector, vectorAddress);
-                return KNNScoringUtil.innerProductScaledNativeOffHeapPinnedQuery(
-                    queryVectorMemorySegment.address(),
-                    vectorAddress,
-                    dimension
-                );
+                // return KNNScoringUtil.innerProductScaledNativeOffHeapPinnedQuery(
+                // queryVectorMemorySegment.address(),
+                // vectorAddress,
+                // dimension
+                // );
+                return KNNScoringUtil.innerProductScaledNativeOffHeapPinnedQuery(this.queryVectorAddress, vectorAddress, dimension);
             } else {
                 // need a way to avoid allocating the memory here for the query vector.
                 // vectors are on java heap so do not call JNI function and waste a copy.
@@ -147,11 +173,29 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
 
         // TODO Finn -- probably unnecessary since GC will clean up queryVectorMemorySegment,
         // but we should consider if we need to manually deallocate the queryVectorMemorySegment.
+        // @Override
+        // public void close() {
+        //
+        // if (this.isOffHeap) {
+        // logger.error("ABOUT TO CLOSE ARENA");
+        //// this.queryVectorMemorySegment.deallocate();
+        //// this.arena.close(); // wrong
+        // }
+        // else {
+        // logger.error("ARENA NOT CLOSED");
+        // }
+        // }
+
         @Override
-        public void close() {
+        protected void finalize() throws Throwable {
+            logger.info("Object being finalized!!!");
             if (this.isOffHeap) {
-                this.arena.close();
+                logger.info("ABOUT TO DEALLOCATE PINNED QUERY");
+                KNNScoringUtil.deallocatePinnedQueryVector(this.queryVectorAddress);
+            } else {
+                logger.info("NOT DEALLOCATING PINNED QUERY");
             }
+            super.finalize();
         }
 
         @Override
@@ -182,6 +226,7 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
             return new KNN9120NativeLuceneScorer.NativeLuceneVectorScorer(vectorValues2, queryVector);
         }
 
+        // TODO: issues here?
         @Override
         public RandomVectorScorerSupplier copy() throws IOException {
             return new KNN9120NativeLuceneScorer.NativeLuceneRandomVectorScorerSupplier(vectorValues.copy());

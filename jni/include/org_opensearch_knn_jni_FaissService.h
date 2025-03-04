@@ -29,6 +29,12 @@ JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_FaissService_innerProductSc
 JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_FaissService_innerProductScaledNativeOffHeap
   (JNIEnv *env, jclass cls, jfloatArray queryVector, jlong address);
 
+
+JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_FaissService_allocatePinnedQueryVector(JNIEnv * env, jclass cls,
+jfloatArray queryVector, jlong dimension);
+
+JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_FaissService_deallocatePinnedQueryVector(JNIEnv * env, jclass cls,
+jlong address);
 /*
  * Class:     org_opensearch_knn_jni_FaissService
  * Method:    initIndex
