@@ -188,13 +188,14 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
 
         @Override
         protected void finalize() throws Throwable {
-            logger.info("Object being finalized!!!");
+            // logger.info("Object being finalized!!!");
             if (this.isOffHeap) {
-                logger.info("ABOUT TO DEALLOCATE PINNED QUERY");
+                // logger.info("ABOUT TO DEALLOCATE PINNED QUERY");
                 KNNScoringUtil.deallocatePinnedQueryVector(this.queryVectorAddress);
-            } else {
-                logger.info("NOT DEALLOCATING PINNED QUERY");
             }
+            // else {
+            //// logger.info("NOT DEALLOCATING PINNED QUERY");
+            // }
             super.finalize();
         }
 
