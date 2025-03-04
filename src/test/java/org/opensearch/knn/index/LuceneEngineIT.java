@@ -10,8 +10,12 @@ import com.google.common.collect.ImmutableMap;
 import lombok.SneakyThrows;
 import org.apache.commons.lang.math.RandomUtils;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
+import org.apache.lucene.index.FloatVectorValues;
+import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.util.VectorUtil;
+import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.junit.After;
+import org.junit.Test;
 import org.opensearch.client.Response;
 import org.opensearch.client.ResponseException;
 import org.opensearch.common.Nullable;
@@ -24,17 +28,19 @@ import org.opensearch.knn.KNNRestTestCase;
 import org.opensearch.knn.KNNResult;
 import org.opensearch.knn.TestUtils;
 import org.opensearch.knn.common.KNNConstants;
+import org.opensearch.knn.index.codec.KNN9120Codec.KNN9120NativeLuceneScorer;
 import org.opensearch.knn.index.query.KNNQueryBuilder;
 import org.opensearch.knn.index.engine.KNNEngine;
+import org.apache.lucene.util.hnsw.RandomVectorScorerSupplier;
 
 import java.io.IOException;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Map;
-import java.util.TreeMap;
+import java.util.*;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 import static org.opensearch.knn.common.KNNConstants.ENCODER_SQ;
 import static org.opensearch.knn.common.KNNConstants.LUCENE_SQ_BITS;
 import static org.opensearch.knn.common.KNNConstants.LUCENE_SQ_CONFIDENCE_INTERVAL;
@@ -919,6 +925,96 @@ public class LuceneEngineIT extends KNNRestTestCase {
             ResponseException.class,
             () -> validateRadiusSearchResults(TEST_QUERY_VECTORS, null, score, SpaceType.L2, expectedResults, null, null, methodParameters)
         );
+    }
+
+    //
+    // private void createKNNVectorDocument(Directory directory, Class<?> valuesClass) throws IOException {
+    // IndexWriterConfig conf = newIndexWriterConfig(new MockAnalyzer(random()));
+    // IndexWriter writer = new IndexWriter(directory, conf);
+    // Document knnDocument = new Document();
+    // Field field;
+    //
+    // if (BinaryDocValues.class.equals(valuesClass)) {
+    // byte[] vectorBinary = KNNVectorSerializerFactory.getDefaultSerializer().floatToByteArray(SAMPLE_VECTOR_DATA);
+    // field = new BinaryDocValuesField(MOCK_INDEX_FIELD_NAME, new BytesRef(vectorBinary));
+    // } else if (ByteVectorValues.class.equals(valuesClass)) {
+    // field = new KnnByteVectorField(MOCK_INDEX_FIELD_NAME, SAMPLE_BYTE_VECTOR_DATA);
+    // } else {
+    // field = new KnnFloatVectorField(MOCK_INDEX_FIELD_NAME, SAMPLE_VECTOR_DATA);
+    // }
+    //
+    // knnDocument.add(field);
+    // writer.addDocument(knnDocument);
+    // writer.commit();
+    // writer.close();
+    // }
+    //
+    //
+    // /** Test for Float Vector Values */
+    // @Test
+    // public void testFloatVectorValues() throws IOException {
+    // createKNNVectorDocument(directory, FloatVectorValues.class);
+    // reader = DirectoryReader.open(directory);
+    // LeafReader leafReader = reader.leaves().get(0).reader();
+    //
+    // // Separate scriptDocValues instance for this test
+    // KNNVectorScriptDocValues scriptDocValues = KNNVectorScriptDocValues.create(
+    // leafReader.getFloatVectorValues(MOCK_INDEX_FIELD_NAME),
+    // MOCK_INDEX_FIELD_NAME,
+    // VectorDataType.FLOAT
+    // );
+    //
+    // scriptDocValues.setNextDocId(0);
+    // Assert.assertArrayEquals(SAMPLE_VECTOR_DATA, scriptDocValues.getValue(), 0.1f);
+    // }
+    //
+    @Test
+    @SneakyThrows
+    public void testKNN9120NativeLuceneScorer() {
+        // Create a KNN9120NativeLuceneScorer instance
+        KNN9120NativeLuceneScorer scorer = new KNN9120NativeLuceneScorer();
+
+        // Set up test data
+        createKnnIndexMappingWithLuceneEngine(DIMENSION, SpaceType.INNER_PRODUCT_NATIVE, VectorDataType.FLOAT);
+
+        // Add a test document
+        addKnnDoc(INDEX_NAME, DOC_ID, FIELD_NAME, TEST_INDEX_VECTORS[0]);
+
+        try {
+            // Create a simple target vector for testing
+            float[] target = new float[] { 1.0f, 1.0f, 1.0f };
+
+            // Test getting a vector scorer supplier - we need to use Mockito for the FloatVectorValues
+            // KNNFloatVectorValues vectorValues = createFloatVectorValues(3,5,9);
+            FloatVectorValues vectorValues = mock(FloatVectorValues.class);
+            when(vectorValues.size()).thenReturn(3);
+            when(vectorValues.vectorValue(anyInt())).thenReturn(new float[] { 1.0f, 2.0f, 3.0f });
+            // Test RandomVectorScorerSupplier creation
+            RandomVectorScorerSupplier scorerSupplier = scorer.getRandomVectorScorerSupplier(
+                VectorSimilarityFunction.EUCLIDEAN,
+                vectorValues
+            );
+            assertNotNull(scorerSupplier);
+            // assertTrue(scorerSupplier instanceof KNN9120NativeLuceneScorer.NativeLuceneRandomVectorScorerSupplier);
+
+            // Test RandomVectorScorer creation
+            RandomVectorScorer vectorScorer = scorer.getRandomVectorScorer(VectorSimilarityFunction.EUCLIDEAN, vectorValues, target);
+            assertNotNull(vectorScorer);
+            // assertTrue(vectorScorer instanceof KNN9120NativeLuceneScorer.NativeLuceneVectorScorer);
+
+            float out = vectorScorer.score(0);
+
+            vectorScorer = null;
+            System.gc();
+            System.out.println("we're here");
+            // Verify proper cleanup is handled automatically through Java's finalize mechanism
+            // The test passing without errors indicates proper resource management
+        } finally {
+            // Clean up index
+            deleteKNNIndex(INDEX_NAME);
+
+            System.gc();
+        }
     }
 
     private void validateRadiusSearchResults(

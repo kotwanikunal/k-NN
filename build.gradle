@@ -291,39 +291,8 @@ opensearchplugin {
     noticeFile = rootProject.file('NOTICE.txt')
 }
 
-//task compileNative(type:Exec) {
-//    dependsOn cmakeJniLib
-//    def osName = System.getProperty('os.name').toLowerCase()
-//    def osArch = System.getProperty('os.arch').toLowerCase()
-//    def projectRoot = '/Users/finnrobl/Documents/k-NN'
-//
-//    def outputName = osName.contains('windows') ? 'ffm_native.dll' :
-//            osName.contains('mac') ? 'libffm_native.dylib' :
-//                    'libffm_native.so'
-//
-//    // Change working directory to the ffm folder
-//    workingDir "${projectRoot}/ffm"
-//
-//    if (osName.contains('windows')) {
-//        commandLine 'gcc', '-shared', '-o', outputName, 'innerProductFFM.c'
-//    } else {
-//        commandLine 'gcc', '-shared', '-fPIC', '-o', outputName, 'innerProductFFM.c'
-//    }
-//
-//    doLast {
-//        copy {
-//            from "${projectRoot}/ffm/${outputName}"
-//            into "${projectRoot}/jni/build/release"
-//            into "${projectRoot}/src/main/resources"
-//        }
-//    }
-//}
-
-//jar.dependsOn compileNative
-
 tasks.named("integTest").configure {
     it.dependsOn(project.tasks.named("bundlePlugin"))
-//    it.dependsOn(project.tasks.named("compileNative"))
 }
 
 
@@ -439,7 +408,6 @@ def _numNodes = findProperty('numNodes') as Integer ?: 1
 integTest {
     if (integTestDependOnJniLib) {
         dependsOn buildJniLib
-//        dependsOn compileNative
     }
     systemProperty 'tests.security.manager', 'false'
     systemProperty 'java.io.tmpdir', opensearch_tmp_dir.absolutePath
@@ -583,64 +551,3 @@ task updateVersion {
         }
     }
 }
-//tasks.withType(Javadoc).configureEach {
-//    CoreJavadocOptions opt = options as CoreJavadocOptions
-//    opt.addStringOption("source", "21")
-//    opt.addBooleanOption("-enable-preview", true)
-//}
-
-// task generateJavadocs(type: Javadoc) {
-//     options {
-//         addBooleanOption('--enable-preview', true)
-//         addStringOption('-release', '21')
-//     }
-// }
-
-// tasks.withType(Javadoc) {
-// options {
-//         addStringOption('enable-preview', '')
-//         source = '21'
-//     }
-// 
-//     jvmArgs += ['--enable-preview']
-// }
-
-//
-////
-//model {
-//    binaries {
-//        all {
-//            cCompiler.args "--shared", "-O3", "-march=native", "-funroll-loops"
-//        }
-//    }
-//
-//    toolChains {
-//        gcc(Gcc) {
-//            target("linux_aarch64") {
-//                cCompiler.executable = System.getenv("CC")
-//            }
-//        }
-//        clang(Clang) {
-//            target("osx_aarch64"){
-//                cCompiler.executable = System.getenv("CC")
-//            }
-//        }
-//    }
-//
-//    components {
-//        cInnerProduct(NativeLibrarySpec) {
-//            sources {
-//                c {
-//                    source {
-//                        srcDir 'ffm/c' // Path to your C source files
-//                        include "ffm/*.c"
-//                    }
-//                    exportedHeaders {
-//                        srcDir "ffm/c"
-//                        include "ffm/*.h"
-//                    }
-//                }
-//            }
-//        }
-//    }
-//}
