@@ -485,10 +485,8 @@ JNIEXPORT jobjectArray JNICALL Java_org_opensearch_knn_jni_FaissService_rangeSea
 
 JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_FaissService_allocatePinnedQueryVector(JNIEnv * env, jclass cls,
 jfloatArray queryVector, jlong dimension) {
-    jfloat *queryArr = env->GetFloatArrayElements(queryVector, NULL);
     auto * addr = new float[dimension];
-    std::copy(queryArr, queryArr + dimension, addr);
-    env->ReleaseFloatArrayElements(queryVector, queryArr, JNI_ABORT);
+    env->GetFloatArrayRegion(queryVector, 0, dimension, addr);
     return reinterpret_cast<jlong>(addr);
 }
 
