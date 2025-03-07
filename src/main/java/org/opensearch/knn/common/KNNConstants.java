@@ -99,6 +99,8 @@ public class KNNConstants {
     public static final String HNSW_ALGO_EF_SEARCH = "efSearch";
     public static final String INDEX_THREAD_QTY = "indexThreadQty";
 
+    public static final String NATIVE_LUCENE_NAME = "nativelucene";
+
     // Faiss specific constants
     public static final String FAISS_NAME = "faiss";
     public final static String FAISS_EXTENSION = ".faiss";
@@ -147,6 +149,7 @@ public class KNNConstants {
 
     public static final String COMMON_JNI_LIBRARY_NAME = JNI_LIBRARY_PREFIX + COMMONS_NAME;
 
+    public static final String NATIVE_LUCENE_JNI_LIBRARY_NAME = JNI_LIBRARY_PREFIX + NATIVE_LUCENE_NAME;
     // API Constants
     public static final String CLEAR_CACHE = "clear_cache";
 

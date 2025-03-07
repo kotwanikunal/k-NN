@@ -16,6 +16,7 @@ import org.opensearch.knn.index.KNNVectorScriptDocValues;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.jni.FaissService;
+import org.opensearch.knn.jni.NativeLuceneService;
 
 import static org.opensearch.knn.common.KNNValidationUtil.validateByteVectorValue;
 
@@ -266,17 +267,16 @@ public class KNNScoringUtil {
     }
 
     public static float innerProductScaledNativeOffHeapPinnedQuery(long queryAddress, long address, int dimension) {
-
-        return FaissService.innerProductScaledNativeOffHeapPinnedQuery(queryAddress, address, (long) dimension);
+        return NativeLuceneService.innerProductScaledNativeOffHeapPinnedQuery(queryAddress, address, (long) dimension);
+        // return FaissService.innerProductScaledNativeOffHeapPinnedQuery(queryAddress, address, (long) dimension);
     }
 
     public static long allocatePinnedQueryVector(float[] queryVector, long dimension) {
-
-        return FaissService.allocatePinnedQueryVector(queryVector, dimension);
+        return NativeLuceneService.allocatePinnedQueryVector(queryVector, dimension);
     }
 
     public static void deallocatePinnedQueryVector(long queryAddress) {
-        FaissService.deallocatePinnedQueryVector(queryAddress); // void method
+        NativeLuceneService.deallocatePinnedQueryVector(queryAddress); // void method
     }
 
     /**
