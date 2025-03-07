@@ -16,6 +16,7 @@ set(TARGET_LIB_UTIL opensearchknn_util)
 set(TARGET_LIB_COMMON opensearchknn_common)  # common lib for JNI
 set(TARGET_LIB_NMSLIB opensearchknn_nmslib)  # nmslib JNI
 set(TARGET_LIB_FAISS opensearchknn_faiss)    # faiss JNI
+set(TARGET_LIB_NATIVE_LUCENE opensearchknn_nativelucene)
 set(TARGET_LIBS "")  # Libs to be installed
 
 set(CMAKE_CXX_STANDARD 17)
@@ -76,12 +77,27 @@ elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL x86_64)
     set(MACH_ARCH x64)
 endif()
 # ----------------------------------------------------------------------------
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/org_opensearch_knn_jni_NativeLuceneService.cpp")
+    message(FATAL_ERROR "Source file not found: ${CMAKE_CURRENT_SOURCE_DIR}/src/org_opensearch_knn_jni_NativeLuceneService.cpp")
+endif()
+
+
+
 
 # ---------------------------------- UTIL ----------------------------------
 add_library(${TARGET_LIB_UTIL} SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/jni_util.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/commons.cpp)
 target_include_directories(${TARGET_LIB_UTIL} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include $ENV{JAVA_HOME}/include $ENV{JAVA_HOME}/include/${JVM_OS_TYPE})
 opensearch_set_common_properties(${TARGET_LIB_UTIL})
 list(APPEND TARGET_LIBS ${TARGET_LIB_UTIL})
+# ----------------------------------------------------------------------------
+
+# ---------------------------------- NATIVE LUCENE ----------------------------------
+add_library(${TARGET_LIB_NATIVE_LUCENE} SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/org_opensearch_knn_jni_NativeLuceneService.cpp)
+target_include_directories(${TARGET_LIB_NATIVE_LUCENE} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include $ENV{JAVA_HOME}/include $ENV{JAVA_HOME}/include/${JVM_OS_TYPE})
+target_compile_options(${TARGET_LIB_NATIVE_LUCENE} PRIVATE -O3 -march=native -ffast-math -ftree-vectorize -funroll-loops)
+opensearch_set_common_properties(${TARGET_LIB_NATIVE_LUCENE})
+list(APPEND TARGET_LIBS ${TARGET_LIB_NATIVE_LUCENE})
+target_link_libraries(${TARGET_LIB_NATIVE_LUCENE} ${TARGET_LIB_UTIL})
 # ----------------------------------------------------------------------------
 
 # ---------------------------------- COMMON ----------------------------------
@@ -129,6 +145,11 @@ endif ()
 
 # ---------------------------------------------------------------------------
 
+message(STATUS "TARGET_LIB_NATIVE_LUCENE: ${TARGET_LIB_NATIVE_LUCENE}")
+message(STATUS "Source file: ${CMAKE_CURRENT_SOURCE_DIR}/src/org_opensearch_knn_jni_NativeLuceneService.cpp")
+message(STATUS "TARGET_LIBS: ${TARGET_LIBS}")
+
+
 # --------------------------------- TESTS -----------------------------------
 # Windows : Comment the TESTS for now because the tests are failing(failing to build jni_tests.exe) if we are building our target libraries as SHARED libraries.
 # TODO: Fix the failing JNI TESTS on Windows
@@ -172,6 +193,7 @@ if ("${WIN32}" STREQUAL "")
                 ${TARGET_LIB_NMSLIB}
                 ${TARGET_LIB_COMMON}
                 ${TARGET_LIB_UTIL}
+                ${TARGET_LIB_NATIVE_LUCENE}
         )
 
         target_include_directories(jni_test PRIVATE
