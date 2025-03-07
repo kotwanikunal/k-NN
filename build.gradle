@@ -385,6 +385,7 @@ tasks.register('buildJniLib', Exec) {
     if (project.hasProperty('knn_libs')) {
         knn_libs = ['opensearchknn_common'] + project.knn_libs.split(',').collect { it.trim() }
     }
+
     args.addAll(knn_libs)
     args.add("--parallel")
     args.add("${nproc_count}")
@@ -392,6 +393,14 @@ tasks.register('buildJniLib', Exec) {
     commandLine args
 }
 task buildNativeLuceneLib(type:Exec) {
+
+    commandLine cmakePath,
+            '--build', 'jni/build',
+            '--target', 'opensearchknn_nmslib',
+            '--parallel', "${nproc_count}"
+}
+
+task buildJniLib(type:Exec) {
     dependsOn cmakeJniLib
     def cmakePath = findExecutable("cmake")
     logger.lifecycle("Using cmake at: ${cmakePath}")
@@ -402,13 +411,27 @@ task buildNativeLuceneLib(type:Exec) {
 
     commandLine cmakePath,
             '--build', 'jni/build',
-            '--target', 'opensearchknn_nativelucene',
+            '--target', 'opensearchknn_faiss', 'opensearchknn_common', 'opensearchknn_nativelucene',
             '--parallel', "${nproc_count}"
 }
+//task buildNativeLuceneLib(type:Exec) {
+//    dependsOn cmakeJniLib
+//    def cmakePath = findExecutable("cmake")
+//    logger.lifecycle("Using cmake at: ${cmakePath}")
+//
+//    if (cmakePath.isEmpty()) {
+//        throw new GradleException("CMake not found in PATH. Please install CMake.")
+//    }
+//
+//    commandLine cmakePath,
+//            '--build', 'jni/build',
+//            '--target', 'opensearchknn_nativelucene',
+//            '--parallel', "${nproc_count}"
+//}
 
 test {
     dependsOn buildJniLib
-    dependsOn buildNativeLuceneLib
+//    dependsOn buildNativeLuceneLib
     systemProperty 'tests.security.manager', 'false'
     systemProperty "java.library.path", "$rootDir/jni/build/release"
     //this change enables mockito-inline that supports mocking of static classes/calls
@@ -423,7 +446,7 @@ def _numNodes = findProperty('numNodes') as Integer ?: 1
 integTest {
     if (integTestDependOnJniLib) {
         dependsOn buildJniLib
-        dependsOn buildNativeLuceneLib
+//        dependsOn buildNativeLuceneLib
     }
     systemProperty 'tests.security.manager', 'false'
     systemProperty 'java.io.tmpdir', opensearch_tmp_dir.absolutePath
@@ -529,7 +552,7 @@ task integTestRemote(type: RestIntegTestTask) {
 run {
     useCluster project.testClusters.integTest
     dependsOn buildJniLib
-    dependsOn buildNativeLuceneLib
+//    dependsOn buildNativeLuceneLib
     doFirst {
         // There seems to be an issue when running multi node run or integ tasks with unicast_hosts
         // not being written, the waitForAllConditions ensures it's written
