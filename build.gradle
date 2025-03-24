@@ -77,12 +77,11 @@ plugins {
     id "com.diffplug.spotless" version "6.25.0" apply false
     id 'io.freefair.lombok' version '8.4'
     id "de.undercouch.download" version "5.3.0"
-    id 'c'
 }
 
-lombok {
-    version = "1.18.36"  // otherwise it breaks with JDK 23; see https://github.com/projectlombok/lombok/issues/3722
-}
+//lombok {
+//    version = "1.18.30"  // otherwise it breaks with JDK 23; see https://github.com/projectlombok/lombok/issues/3722
+//}
 
 
 apply from: 'gradle/formatting.gradle'
@@ -90,7 +89,6 @@ apply plugin: 'opensearch.opensearchplugin'
 apply plugin: 'opensearch.rest-test'
 apply plugin: 'opensearch.pluginzip'
 apply plugin: 'opensearch.repositories'
-apply plugin: 'c'
 
 
 def opensearch_tmp_dir = rootProject.file('build/private/opensearch_tmp').absoluteFile
@@ -200,7 +198,7 @@ allprojects {
     }
     apply from: rootProject.file('build-tools/repositories.gradle').absoluteFile
     plugins.withId('java') {
-       sourceCompatibility = targetCompatibility = "23"
+       sourceCompatibility = targetCompatibility = "21"
   }
 
     afterEvaluate {
@@ -258,12 +256,15 @@ publishing {
 }
 
 compileJava {
+    options.compilerArgs.add('--enable-preview')
     options.compilerArgs.addAll(["-processor", 'lombok.launch.AnnotationProcessorHider$AnnotationProcessor'])
 }
 compileTestJava {
+    options.compilerArgs.add('--enable-preview')
     options.compilerArgs.addAll(["-processor", 'lombok.launch.AnnotationProcessorHider$AnnotationProcessor'])
 }
 compileTestFixturesJava {
+    options.compilerArgs.add('--enable-preview')
     options.compilerArgs.addAll(["-processor", 'lombok.launch.AnnotationProcessorHider$AnnotationProcessor'])
 }
 
@@ -374,6 +375,32 @@ tasks.clean.doFirst {
     delete "${projectDir}/jni/build"
 }
 
+//tasks.register('buildJniLib', Exec) {
+//    dependsOn cmakeJniLib
+//    def args = []
+//    args.add("cmake")
+//    args.add("--build")
+//    args.add("jni/build")
+//    args.add("--target")
+//    def knn_libs = ['opensearchknn_faiss', 'opensearchknn_common', 'opensearchknn_nmslib']
+//    if (project.hasProperty('knn_libs')) {
+//        knn_libs = ['opensearchknn_common'] + project.knn_libs.split(',').collect { it.trim() }
+//    }
+//
+//    args.addAll(knn_libs)
+//    args.add("--parallel")
+//    args.add("${nproc_count}")
+//    logger.lifecycle("Build command: ${args.join(' ')}")
+//    commandLine args
+//}
+//task buildNativeLuceneLib(type:Exec) {
+//
+//    commandLine cmakePath,
+//            '--build', 'jni/build',
+//            '--target', 'opensearchknn_nmslib',
+//            '--parallel', "${nproc_count}"
+//}
+
 tasks.register('buildJniLib', Exec) {
     dependsOn cmakeJniLib
     def args = []
@@ -381,38 +408,26 @@ tasks.register('buildJniLib', Exec) {
     args.add("--build")
     args.add("jni/build")
     args.add("--target")
-    def knn_libs = ['opensearchknn_faiss', 'opensearchknn_common', 'opensearchknn_nmslib']
+    def knn_libs = ['opensearchknn_faiss', 'opensearchknn_common', 'opensearchknn_nmslib', 'opensearchknn_nativelucene']
     if (project.hasProperty('knn_libs')) {
         knn_libs = ['opensearchknn_common'] + project.knn_libs.split(',').collect { it.trim() }
     }
-
     args.addAll(knn_libs)
     args.add("--parallel")
     args.add("${nproc_count}")
     logger.lifecycle("Build command: ${args.join(' ')}")
     commandLine args
-}
-task buildNativeLuceneLib(type:Exec) {
+//    def cmakePath = findExecutable("cmake")
+//    logger.lifecycle("Using cmake at: ${cmakePath}")
 
-    commandLine cmakePath,
-            '--build', 'jni/build',
-            '--target', 'opensearchknn_nmslib',
-            '--parallel', "${nproc_count}"
-}
+//    if (cmakePath.isEmpty()) {
+//        throw new GradleException("CMake not found in PATH. Please install CMake.")
+//    }
 
-task buildJniLib(type:Exec) {
-    dependsOn cmakeJniLib
-    def cmakePath = findExecutable("cmake")
-    logger.lifecycle("Using cmake at: ${cmakePath}")
-
-    if (cmakePath.isEmpty()) {
-        throw new GradleException("CMake not found in PATH. Please install CMake.")
-    }
-
-    commandLine cmakePath,
-            '--build', 'jni/build',
-            '--target', 'opensearchknn_faiss', 'opensearchknn_common', 'opensearchknn_nativelucene',
-            '--parallel', "${nproc_count}"
+//    commandLine cmakePath,
+//            '--build', 'jni/build',
+//            '--target', 'opensearchknn_faiss', 'opensearchknn_common', 'opensearchknn_nativelucene',
+//            '--parallel', "${nproc_count}"
 }
 //task buildNativeLuceneLib(type:Exec) {
 //    dependsOn cmakeJniLib
@@ -494,6 +509,7 @@ integTest {
 
 testClusters.integTest {
     testDistribution = "ARCHIVE"
+    jvmArgs('--enable-preview')
 
     //Used for circuit breaker integration tests
     setting 'node.attr.knn_cb_tier', 'integ'
@@ -590,4 +606,21 @@ task updateVersion {
             ant.replaceregexp(file:".github/workflows/backwards_compatibility_tests_workflow.yml", match: oldBWCVersion, replace: oldBWCVersion + '", "' + opensearch_version.tokenize('-')[0], flags:'g', byline:true)
         }
     }
+
+    tasks.withType(JavaCompile).configureEach {
+        options.compilerArgs += '--enable-preview'
+    }
+
+    tasks.withType(Test).configureEach {
+        jvmArgs.add('--enable-preview')
+    }
+
+    tasks.withType(JavaExec).configureEach {
+        jvmArgs.add('--enable-preview')
+    }
+
+    tasks.withType(Javadoc).configureEach {
+        failOnError false
+    }
+
 }

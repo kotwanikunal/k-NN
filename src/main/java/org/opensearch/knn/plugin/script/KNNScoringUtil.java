@@ -262,13 +262,11 @@ public class KNNScoringUtil {
     }
 
     public static float innerProductScaledNativeOffHeap(float[] query, long address) {
-
         return FaissService.innerProductScaledNativeOffHeap(query, address);
     }
 
     public static float innerProductScaledNativeOffHeapPinnedQuery(long queryAddress, long address, int dimension) {
         return NativeLuceneService.innerProductScaledNativeOffHeapPinnedQuery(queryAddress, address, (long) dimension);
-        // return FaissService.innerProductScaledNativeOffHeapPinnedQuery(queryAddress, address, (long) dimension);
     }
 
     public static long allocatePinnedQueryVector(float[] queryVector, long dimension) {

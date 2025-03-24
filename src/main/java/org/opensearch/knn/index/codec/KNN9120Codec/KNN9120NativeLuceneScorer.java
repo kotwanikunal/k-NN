@@ -18,6 +18,7 @@ import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.index.KnnVectorValues;
 
 import org.apache.lucene.store.MemorySegmentAccessInput;
+import org.apache.lucene.util.VectorUtil;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.apache.lucene.util.hnsw.RandomVectorScorerSupplier;
 import org.opensearch.knn.index.KNNVectorSimilarityFunction;
@@ -147,6 +148,19 @@ public class KNN9120NativeLuceneScorer implements FlatVectorsScorer {
                 // vectorAddress,
                 // dimension
                 // );
+//                try {
+//                    float[] query = {1.0f,1.0f};
+//                    float[] nodev = {1.0f,1.0f};
+//                    long queryAdd = KNNScoringUtil.allocatePinnedQueryVector(query, 2);
+//                    long nodeAdd = KNNScoringUtil.allocatePinnedQueryVector(nodev, 2);
+//                    float dis = KNNScoringUtil.innerProductScaledNativeOffHeapPinnedQuery(queryAdd, nodeAdd, 2);
+//                    float dis2 = KNNVectorSimilarityFunction.MAXIMUM_INNER_PRODUCT.compare(queryVector, nodev);
+//                    logger.error("Kunal: Native: {}, Util: {}", dis, dis2);
+//                    KNNScoringUtil.deallocatePinnedQueryVector(queryAdd);
+//                    KNNScoringUtil.deallocatePinnedQueryVector(nodeAdd);
+//                } finally {
+//
+//                }
                 return KNNScoringUtil.innerProductScaledNativeOffHeapPinnedQuery(this.queryVectorAddress, vectorAddress, dimension);
             } else {
                 // need a way to avoid allocating the memory here for the query vector.
