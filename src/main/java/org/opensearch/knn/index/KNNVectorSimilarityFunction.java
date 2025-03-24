@@ -17,7 +17,6 @@ public enum KNNVectorSimilarityFunction {
     COSINE(VectorSimilarityFunction.COSINE),
     MAXIMUM_INNER_PRODUCT(VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT),
 
-
     MAXIMUM_INNER_PRODUCT_NATIVE(null) {
         @Override
         public float compare(float[] v1, float[] v2) {
