@@ -1,7 +1,11 @@
 #include <jni.h>
 #include <cmath>
 #include <stdexcept>
+#if defined(__AVX__) || defined(__AVX2__)  // AVX for Intel/AMD (x86_64)
+#include <immintrin.h>
+#elif defined(__ARM_NEON)  // NEON for ARM (Graviton, Apple M-series)
 #include <arm_neon.h>
+#endif
 #include "org_opensearch_knn_jni_NativeLuceneService.h"
 
 JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_NativeLuceneService_allocatePinnedQueryVector(JNIEnv * env, jclass cls,
@@ -21,31 +25,19 @@ JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_NativeLuceneService_innerPr
   (JNIEnv *env, jclass cls, jlong queryAddr, jlong address, jlong dimension) {
     jfloat *queryArr = reinterpret_cast<jfloat*>(queryAddr);
     jfloat *inputArr = reinterpret_cast<jfloat*>(address);
-    jsize length = (jsize) dimension;
+    jsize length = static_cast<jsize>(dimension);
 
-     float sum = 0.0f;
+    float sum = 0.0f;
 
-    // Calculate dot product
-    /* for (jsize i = 0; i < length; i++) {
-        float diff = queryArr[i] - inputArr[i];
-        sum = std::fma(diff, diff, sum);
-    }
-
-    // Scale using Lucene's exact formula
-    float result = 1 / (1 + sum);
-
-    return result;*/
-
-    #if defined(__AVX__) || defined(__AVX2__)  // AVX2 on x86_64 (Intel, AMD)
+    #if defined(__AVX__) || defined(__AVX2__)  // AVX2 on Intel/AMD
         __m256 sumVec = _mm256_setzero_ps();
         jsize i = 0;
-        for (; i <= length - 8; i += 8) { // Process 8 floats per iteration
+        for (; i <= length - 8; i += 8) {  // Process 8 floats per iteration
             __m256 queryVec = _mm256_loadu_ps(&queryArr[i]);
             __m256 inputVec = _mm256_loadu_ps(&inputArr[i]);
-            __m256 diffVec = _mm256_sub_ps(queryVec, inputVec);
-            sumVec = _mm256_fmadd_ps(diffVec, diffVec, sumVec);
+            sumVec = _mm256_fmadd_ps(queryVec, inputVec, sumVec);
         }
-        // Horizontal sum of sumVec
+        // Reduce the vector sum to a scalar
         float temp[8];
         _mm256_storeu_ps(temp, sumVec);
         for (int j = 0; j < 8; j++) sum += temp[j];
@@ -53,11 +45,10 @@ JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_NativeLuceneService_innerPr
     #elif defined(__ARM_NEON)  // NEON on ARM (Graviton, Apple M-series)
         float32x4_t sumVec = vdupq_n_f32(0.0f);
         jsize i = 0;
-        for (; i <= length - 4; i += 4) { // Process 4 floats per iteration
+        for (; i <= length - 4; i += 4) {  // Process 4 floats per iteration
             float32x4_t queryVec = vld1q_f32(&queryArr[i]);
             float32x4_t inputVec = vld1q_f32(&inputArr[i]);
-            float32x4_t diffVec = vsubq_f32(queryVec, inputVec);
-            sumVec = vfmaq_f32(sumVec, diffVec, diffVec);
+            sumVec = vfmaq_f32(sumVec, queryVec, inputVec);
         }
         // Reduce sumVec to scalar
         sum += vaddvq_f32(sumVec);
@@ -66,13 +57,12 @@ JNIEXPORT jfloat JNICALL Java_org_opensearch_knn_jni_NativeLuceneService_innerPr
         jsize i = 0;
     #endif
 
-        // Handle remaining elements (if any)
+        // Handle remaining elements
         for (; i < length; i++) {
-            float diff = queryArr[i] - inputArr[i];
-            sum = std::fma(diff, diff, sum);
+            sum = std::fma(queryArr[i], inputArr[i], sum);
         }
 
-        // Scale using Lucene's formula
-        float result = 1 / (1 + sum);
+        // Scale using Lucene's exact formula
+        float result = (sum < 0) ? (1 / (1 + (-1 * sum))) : (sum + 1);
         return result;
-  }
+}
