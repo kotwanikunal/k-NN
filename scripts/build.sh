@@ -142,7 +142,6 @@ if [ "$PLATFORM" != "windows" ] && [ "$ARCHITECTURE" = "x64" ]; then
   # If we apply patches again, it fails with conflict
   rm -rf jni/build/CMakeCache.txt jni/build/CMakeFiles
   ./gradlew :buildJniLib -Pknn_libs=opensearchknn_faiss -Davx2.enabled=true -Davx512.enabled=false -Davx512_spr.enabled=false -Dbuild.lib.commit_patches=false -Dbuild.lib.apply_patches=false
-  ./gradlew :buildJniLib -Pknn_libs=opensearchknn_nativelucene -Davx512.enabled=false -Davx512_spr.enabled=false -Davx2.enabled=false -Dnproc.count=${NPROC_COUNT:-1}
 
   echo "Building k-NN library after enabling AVX512"
   ./gradlew :buildJniLib -Pknn_libs=opensearchknn_faiss -Davx512.enabled=true -Davx512_spr.enabled=false -Dbuild.lib.commit_patches=false -Dbuild.lib.apply_patches=false
@@ -152,6 +151,8 @@ if [ "$PLATFORM" != "windows" ] && [ "$ARCHITECTURE" = "x64" ]; then
 
 else
   ./gradlew :buildJniLib -Pknn_libs=opensearchknn_nmslib -Dbuild.lib.commit_patches=false -Dbuild.lib.apply_patches=false
+  ./gradlew :buildJniLib -Pknn_libs=opensearchknn_nativelucene -Dbuild.lib.commit_patches=false -Dbuild.lib.apply_patches=false
+
 fi
 
 ./gradlew publishPluginZipPublicationToZipStagingRepository -Dopensearch.version=$VERSION -Dbuild.snapshot=$SNAPSHOT -Dbuild.version_qualifier=$QUALIFIER
