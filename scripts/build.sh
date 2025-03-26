@@ -131,7 +131,6 @@ fi
 cd $work_dir
 ./gradlew build --no-daemon --refresh-dependencies -x integTest -x test -Dopensearch.version=$VERSION -Dbuild.snapshot=$SNAPSHOT -Dbuild.version_qualifier=$QUALIFIER -Dbuild.lib.commit_patches=false
 ./gradlew :buildJniLib -Pknn_libs=opensearchknn_faiss -Davx512.enabled=false -Davx512_spr.enabled=false -Davx2.enabled=false -Dbuild.lib.commit_patches=false -Dnproc.count=${NPROC_COUNT:-1}
-./gradlew :buildJniLib -Pknn_libs=opensearchknn_nativelucene -Davx512.enabled=false -Davx512_spr.enabled=false -Davx2.enabled=false -Dbuild.lib.commit_patches=false -Dnproc.count=${NPROC_COUNT:-1}
 
 if [ "$PLATFORM" != "windows" ] && [ "$ARCHITECTURE" = "x64" ]; then
   echo "Building k-NN library nmslib with gcc 10 on non-windows x64"
@@ -143,6 +142,7 @@ if [ "$PLATFORM" != "windows" ] && [ "$ARCHITECTURE" = "x64" ]; then
   # If we apply patches again, it fails with conflict
   rm -rf jni/build/CMakeCache.txt jni/build/CMakeFiles
   ./gradlew :buildJniLib -Pknn_libs=opensearchknn_faiss -Davx2.enabled=true -Davx512.enabled=false -Davx512_spr.enabled=false -Dbuild.lib.commit_patches=false -Dbuild.lib.apply_patches=false
+  ./gradlew :buildJniLib -Pknn_libs=opensearchknn_nativelucene -Davx512.enabled=false -Davx512_spr.enabled=false -Davx2.enabled=false -Dnproc.count=${NPROC_COUNT:-1}
 
   echo "Building k-NN library after enabling AVX512"
   ./gradlew :buildJniLib -Pknn_libs=opensearchknn_faiss -Davx512.enabled=true -Davx512_spr.enabled=false -Dbuild.lib.commit_patches=false -Dbuild.lib.apply_patches=false
