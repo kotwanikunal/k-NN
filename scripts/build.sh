@@ -131,6 +131,7 @@ fi
 cd $work_dir
 ./gradlew build --no-daemon --refresh-dependencies -x integTest -x test -Dopensearch.version=$VERSION -Dbuild.snapshot=$SNAPSHOT -Dbuild.version_qualifier=$QUALIFIER -Dbuild.lib.commit_patches=false
 ./gradlew :buildJniLib -Pknn_libs=opensearchknn_faiss -Davx512.enabled=false -Davx512_spr.enabled=false -Davx2.enabled=false -Dbuild.lib.commit_patches=false -Dnproc.count=${NPROC_COUNT:-1}
+./gradlew :buildJniLib -Pknn_libs=opensearchknn_nativelucene -Davx512.enabled=false -Davx512_spr.enabled=false -Davx2.enabled=false -Dbuild.lib.commit_patches=false -Dnproc.count=${NPROC_COUNT:-1}
 
 if [ "$PLATFORM" != "windows" ] && [ "$ARCHITECTURE" = "x64" ]; then
   echo "Building k-NN library nmslib with gcc 10 on non-windows x64"
