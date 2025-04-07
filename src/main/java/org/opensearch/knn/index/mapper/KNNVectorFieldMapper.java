@@ -95,7 +95,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
         protected Boolean ignoreMalformed;
 
         protected final Parameter<Boolean> stored = Parameter.storeParam(m -> toType(m).stored, false);
-        protected final Parameter<Boolean> hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, false);
+        protected final Parameter<Boolean> hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, true);
         protected final Parameter<Integer> dimension = new Parameter<>(
             KNNConstants.DIMENSION,
             false,
@@ -256,6 +256,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             final Map<String, String> metaValue = meta.getValue();
 
             if (modelId.get() != null) {
+                updateDocValueDefaults();
                 return ModelFieldMapper.createFieldMapper(
                     buildFullName(context),
                     name,
@@ -276,13 +277,6 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             // return FlatVectorFieldMapper only for indices that are created on or after 2.17.0, for others, use
             // EngineFieldMapper to maintain backwards compatibility
             if (originalParameters.getResolvedKnnMethodContext() == null && indexCreatedVersion.onOrAfter(Version.V_2_17_0)) {
-                // Prior to 3.0.0, hasDocValues defaulted to false. However, FlatVectorFieldMapper requires
-                // hasDocValues to be true to maintain proper functionality for vector search operations.
-                // For indices created on or after 3.0.0, we automatically set hasDocValues to true if not
-                // explicitly configured to ensure consistent behavior.
-                if (indexCreatedVersion.onOrAfter(Version.V_3_0_0)) {
-                    hasDocValues.setValue(true);
-                }
                 return FlatVectorFieldMapper.createFieldMapper(
                     buildFullName(context),
                     name,
@@ -300,7 +294,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                     originalParameters
                 );
             }
-
+            updateDocValueDefaults();
             return EngineFieldMapper.createFieldMapper(
                 buildFullName(context),
                 name,
@@ -313,6 +307,23 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                 hasDocValues.getValue(),
                 originalParameters
             );
+        }
+
+        /*
+         * For indices created on or after OpenSearch 3.0.0, docValues
+         * defaults to false when not explicitly configured. This reduces storage
+         * overhead and improves indexing performance for k-NN vector fields.
+         * Changing the default value breaks BwC for existing indices on a cluster.
+         *
+         * Behavior matrix:
+         * - Index < 3.0.0: Uses original default value
+         * - Index >= 3.0.0, docValues not configured: Sets to false
+         * - Any version, docValues explicitly configured: Respects configured value
+         */
+        private void updateDocValueDefaults() {
+            if (indexCreatedVersion.onOrAfter(Version.V_3_0_0) && hasDocValues.isConfigured() == false) {
+                hasDocValues.setValue(false);
+            }
         }
 
         /**
