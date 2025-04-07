@@ -277,6 +277,10 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             // or
             // MethodFieldMapper to maintain backwards compatibility
             if (originalParameters.getResolvedKnnMethodContext() == null && indexCreatedVersion.onOrAfter(Version.V_2_17_0)) {
+                // TODO: Add comment why
+                if (indexCreatedVersion.onOrAfter(Version.V_3_0_0)) {
+                    hasDocValues.setValue(true);
+                }
                 return FlatVectorFieldMapper.createFieldMapper(
                     buildFullName(context),
                     name,
@@ -290,7 +294,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                     copyToBuilder,
                     ignoreMalformed,
                     stored.get(),
-                    hasDocValues.isConfigured() ? hasDocValues.getValue() : true,
+                    hasDocValues.getValue(),
                     originalParameters
                 );
             }
