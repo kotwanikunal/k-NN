@@ -95,7 +95,8 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
         protected Boolean ignoreMalformed;
 
         protected final Parameter<Boolean> stored = Parameter.storeParam(m -> toType(m).stored, false);
-        protected final Parameter<Boolean> hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, true);
+        protected final Parameter<Boolean> hasDocValues;
+
         protected final Parameter<Integer> dimension = new Parameter<>(
             KNNConstants.DIMENSION,
             false,
@@ -216,6 +217,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             this.indexCreatedVersion = indexCreatedVersion;
             this.knnMethodConfigContext = knnMethodConfigContext;
             this.originalParameters = originalParameters;
+            hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, getDefaultDocValues());
         }
 
         @Override
@@ -232,6 +234,26 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                 compressionLevel,
                 topLevelSpaceType
             );
+        }
+
+        private boolean getDefaultDocValues() {
+            if (useModelFieldMapper()) {
+                return indexCreatedVersion.onOrAfter(Version.V_3_0_0) == false;
+            }
+            if (useFlatFieldMapper()) {
+                return true;
+            }
+            return indexCreatedVersion.onOrAfter(Version.V_3_0_0) == false;
+        }
+
+        private boolean useModelFieldMapper() {
+            return modelId.get() != null;
+        }
+
+        private boolean useFlatFieldMapper() {
+            return originalParameters != null
+                && originalParameters.getResolvedKnnMethodContext() == null
+                && indexCreatedVersion.onOrAfter(Version.V_2_17_0);
         }
 
         protected Explicit<Boolean> ignoreMalformed(BuilderContext context) {
@@ -255,8 +277,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             final Explicit<Boolean> ignoreMalformed = ignoreMalformed(context);
             final Map<String, String> metaValue = meta.getValue();
 
-            if (modelId.get() != null) {
-                updateDocValueDefaults();
+            if (useModelFieldMapper()) {
                 return ModelFieldMapper.createFieldMapper(
                     buildFullName(context),
                     name,
@@ -276,7 +297,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
 
             // return FlatVectorFieldMapper only for indices that are created on or after 2.17.0, for others, use
             // EngineFieldMapper to maintain backwards compatibility
-            if (originalParameters.getResolvedKnnMethodContext() == null && indexCreatedVersion.onOrAfter(Version.V_2_17_0)) {
+            if (useFlatFieldMapper()) {
                 return FlatVectorFieldMapper.createFieldMapper(
                     buildFullName(context),
                     name,
@@ -294,7 +315,6 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                     originalParameters
                 );
             }
-            updateDocValueDefaults();
             return EngineFieldMapper.createFieldMapper(
                 buildFullName(context),
                 name,
@@ -321,9 +341,9 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
          * - Any version, docValues explicitly configured: Respects configured value
          */
         private void updateDocValueDefaults() {
-            if (indexCreatedVersion.onOrAfter(Version.V_3_0_0) && hasDocValues.isConfigured() == false) {
-                hasDocValues.setValue(false);
-            }
+            // if (indexCreatedVersion.onOrAfter(Version.V_3_0_0) && hasDocValues.isConfigured() == false) {
+            // hasDocValues.setValue(false);
+            // }
         }
 
         /**
