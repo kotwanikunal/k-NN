@@ -341,6 +341,7 @@ public class FaissIT extends KNNRestTestCase {
             .startObject(fieldName)
             .field("type", "knn_vector")
             .field("model_id", modelId)
+            .field("doc_values", false)
             .endObject()
             .endObject()
             .endObject();
@@ -553,6 +554,7 @@ public class FaissIT extends KNNRestTestCase {
             .startObject(fieldName)
             .field("type", "knn_vector")
             .field("model_id", modelId)
+            .field("doc_values", false)
             .endObject()
             .endObject()
             .endObject();
@@ -1258,6 +1260,7 @@ public class FaissIT extends KNNRestTestCase {
             .startObject(fieldName)
             .field("type", "knn_vector")
             .field("model_id", modelId)
+            .field("doc_values", false)
             .endObject()
             .endObject()
             .endObject();
@@ -1387,6 +1390,7 @@ public class FaissIT extends KNNRestTestCase {
             .startObject(FIELD_NAME)
             .field("type", "knn_vector")
             .field("model_id", modelId)
+            .field("doc_values", false)
             .endObject()
             .endObject()
             .endObject();
