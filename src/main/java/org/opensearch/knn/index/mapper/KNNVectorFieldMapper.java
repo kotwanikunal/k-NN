@@ -23,6 +23,7 @@ import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.index.IndexOptions;
 import org.opensearch.Version;
+import org.opensearch.common.Booleans;
 import org.opensearch.common.Explicit;
 import org.opensearch.common.ValidationException;
 import org.opensearch.common.settings.Settings;
@@ -217,7 +218,18 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             this.indexCreatedVersion = indexCreatedVersion;
             this.knnMethodConfigContext = knnMethodConfigContext;
             this.originalParameters = originalParameters;
-            hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, getDefaultDocValues());
+            // hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, getDefaultDocValues());
+            hasDocValues = new Parameter<Boolean>("doc_values", false, () -> true, (n, c, o) -> {
+                if (o == null) {
+                    // Check the index version and set appropriate default
+                    if (useFlatFieldMapper()) {
+                        return true;
+                    }
+                    Version indexVersion = c.indexVersionCreated();
+                    return indexVersion.onOrAfter(Version.V_3_0_0) == false;
+                }
+                return Booleans.parseBoolean(o.toString());
+            }, m -> toType(m).hasDocValues);
         }
 
         @Override
@@ -236,6 +248,17 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             );
         }
 
+        /*
+         * For indices created on or after OpenSearch 3.0.0, docValues
+         * defaults to false when not explicitly configured. This reduces storage
+         * overhead and improves indexing performance for k-NN vector fields.
+         * Changing the default value breaks BwC for existing indices on a cluster.
+         *
+         * Behavior matrix:
+         * - Index < 3.0.0: Uses original default value
+         * - Index >= 3.0.0, docValues not configured: Sets to false
+         * - Any version, docValues explicitly configured: Respects configured value
+         */
         private boolean getDefaultDocValues() {
             if (useModelFieldMapper()) {
                 return indexCreatedVersion.onOrAfter(Version.V_3_0_0) == false;
@@ -311,7 +334,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                     copyToBuilder,
                     ignoreMalformed,
                     stored.get(),
-                    hasDocValues.getValue(),
+                    hasDocValues.get(),
                     originalParameters
                 );
             }
@@ -327,23 +350,6 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                 hasDocValues.getValue(),
                 originalParameters
             );
-        }
-
-        /*
-         * For indices created on or after OpenSearch 3.0.0, docValues
-         * defaults to false when not explicitly configured. This reduces storage
-         * overhead and improves indexing performance for k-NN vector fields.
-         * Changing the default value breaks BwC for existing indices on a cluster.
-         *
-         * Behavior matrix:
-         * - Index < 3.0.0: Uses original default value
-         * - Index >= 3.0.0, docValues not configured: Sets to false
-         * - Any version, docValues explicitly configured: Respects configured value
-         */
-        private void updateDocValueDefaults() {
-            // if (indexCreatedVersion.onOrAfter(Version.V_3_0_0) && hasDocValues.isConfigured() == false) {
-            // hasDocValues.setValue(false);
-            // }
         }
 
         /**
