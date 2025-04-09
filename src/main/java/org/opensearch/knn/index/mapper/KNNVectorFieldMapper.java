@@ -95,7 +95,9 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
         protected Boolean ignoreMalformed;
 
         protected final Parameter<Boolean> stored = Parameter.storeParam(m -> toType(m).stored, false);
-        protected final Parameter<Boolean> hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, true);
+        // protected Parameter<Boolean> hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, true);
+        protected Parameter<Boolean> hasDocValues = null;
+
         protected final Parameter<Integer> dimension = new Parameter<>(
             KNNConstants.DIMENSION,
             false,
@@ -216,6 +218,23 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             this.indexCreatedVersion = indexCreatedVersion;
             this.knnMethodConfigContext = knnMethodConfigContext;
             this.originalParameters = originalParameters;
+            if (indexCreatedVersion.before(Version.V_3_0_0)) {
+                hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, true);
+            } else {
+                hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, false);
+            }
+            // hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, getDefaultDocValues());
+            // hasDocValues = new Parameter<Boolean>("doc_values", false, () -> true, (n, c, o) -> {
+            // if (o == null) {
+            // // Check the index version and set appropriate default
+            // if (useFlatFieldMapper()) {
+            // return true;
+            // }
+            // Version indexVersion = c.indexVersionCreated();
+            // return indexVersion.onOrAfter(Version.V_3_0_0) == false;
+            // }
+            // return Booleans.parseBoolean(o.toString());
+            // }, m -> toType(m).hasDocValues);
         }
 
         @Override
@@ -232,6 +251,37 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                 compressionLevel,
                 topLevelSpaceType
             );
+        }
+
+        /*
+         * For indices created on or after OpenSearch 3.0.0, docValues
+         * defaults to false when not explicitly configured. This reduces storage
+         * overhead and improves indexing performance for k-NN vector fields.
+         * Changing the default value breaks BwC for existing indices on a cluster.
+         *
+         * Behavior matrix:
+         * - Index < 3.0.0: Uses original default value
+         * - Index >= 3.0.0, docValues not configured: Sets to false
+         * - Any version, docValues explicitly configured: Respects configured value
+         */
+        private boolean getDefaultDocValues() {
+            if (useModelFieldMapper()) {
+                return indexCreatedVersion.onOrAfter(Version.V_3_0_0) == false;
+            }
+            if (useFlatFieldMapper()) {
+                return true;
+            }
+            return indexCreatedVersion.onOrAfter(Version.V_3_0_0) == false;
+        }
+
+        private boolean useModelFieldMapper() {
+            return modelId.get() != null;
+        }
+
+        private boolean useFlatFieldMapper() {
+            return originalParameters != null
+                && originalParameters.getResolvedKnnMethodContext() == null
+                && indexCreatedVersion.onOrAfter(Version.V_2_17_0);
         }
 
         protected Explicit<Boolean> ignoreMalformed(BuilderContext context) {
@@ -255,7 +305,10 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             final Explicit<Boolean> ignoreMalformed = ignoreMalformed(context);
             final Map<String, String> metaValue = meta.getValue();
 
-            if (modelId.get() != null) {
+            if (useModelFieldMapper()) {
+                if (indexCreatedVersion.onOrAfter(Version.V_3_0_0)) {
+                    hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, false);
+                }
                 return ModelFieldMapper.createFieldMapper(
                     buildFullName(context),
                     name,
@@ -273,10 +326,10 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                 );
             }
 
-            // return FlatVectorFieldMapper only for indices that are created on or after 2.17.0, for others, use either LuceneFieldMapper
-            // or
-            // MethodFieldMapper to maintain backwards compatibility
-            if (originalParameters.getResolvedKnnMethodContext() == null && indexCreatedVersion.onOrAfter(Version.V_2_17_0)) {
+            // return FlatVectorFieldMapper only for indices that are created on or after 2.17.0, for others, use
+            // EngineFieldMapper to maintain backwards compatibility
+            if (useFlatFieldMapper()) {
+                hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, true);
                 return FlatVectorFieldMapper.createFieldMapper(
                     buildFullName(context),
                     name,
@@ -294,29 +347,10 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                     originalParameters
                 );
             }
-
-            if (originalParameters.getResolvedKnnMethodContext().getKnnEngine() == KNNEngine.LUCENE) {
-                log.debug(String.format(Locale.ROOT, "Use [LuceneFieldMapper] mapper for field [%s]", name));
-                LuceneFieldMapper.CreateLuceneFieldMapperInput createLuceneFieldMapperInput = LuceneFieldMapper.CreateLuceneFieldMapperInput
-                    .builder()
-                    .name(name)
-                    .multiFields(multiFieldsBuilder)
-                    .copyTo(copyToBuilder)
-                    .ignoreMalformed(ignoreMalformed)
-                    .stored(stored.getValue())
-                    .hasDocValues(hasDocValues.getValue())
-                    .originalKnnMethodContext(knnMethodContext.get())
-                    .build();
-                return LuceneFieldMapper.createFieldMapper(
-                    buildFullName(context),
-                    metaValue,
-                    knnMethodConfigContext,
-                    createLuceneFieldMapperInput,
-                    originalParameters
-                );
+            if (indexCreatedVersion.onOrAfter(Version.V_3_0_0)) {
+                hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, false);
             }
-
-            return MethodFieldMapper.createFieldMapper(
+            return EngineFieldMapper.createFieldMapper(
                 buildFullName(context),
                 name,
                 metaValue,

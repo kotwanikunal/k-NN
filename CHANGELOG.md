@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 * [Lucene On Faiss] Add a new mode, memory-optimized-search enable user to run vector search on FAISS index under memory constrained environment. [#2630](https://github.com/opensearch-project/k-NN/pull/2630)
 * [Remote Vector Index Build] Add metric collection for remote build process [#2615](https://github.com/opensearch-project/k-NN/pull/2615)
 ### Enhancements
+* Disable doc value storage for vector field storage [#2646](https://github.com/opensearch-project/k-NN/pull/2646)
 ### Bug Fixes
 * Fixing bug to prevent NullPointerException while doing PUT mappings [#2556](https://github.com/opensearch-project/k-NN/issues/2556)
 * Add index operation listener to update translog source [#2629](https://github.com/opensearch-project/k-NN/pull/2629)
@@ -26,6 +27,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ### Refactoring
 * Switch derived source from field attributes to segment attribute [#2606](https://github.com/opensearch-project/k-NN/pull/2606)
 * Migrate derived source from filter to mask [#2612](https://github.com/opensearch-project/k-NN/pull/2612)
+* Consolidate MethodFieldMapper and LuceneFieldMapper into EngineFieldMapper [#2646](https://github.com/opensearch-project/k-NN/pull/2646)
 
 ## [Unreleased 2.x](https://github.com/opensearch-project/k-NN/compare/2.19...2.x)
 ### Features
