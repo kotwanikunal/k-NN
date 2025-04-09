@@ -306,7 +306,8 @@ public class KNNVectorFieldMapperTests extends KNNTestCase {
             buildParserContext(indexName, settings) // Version >= 3.0.0
         );
         assertNotNull(builderAfterV3);
-        assertFalse(builderAfterV3.hasDocValues.getValue());
+        Mapper.BuilderContext builderContext = new Mapper.BuilderContext(settings, new ContentPath());
+        assertFalse(builderAfterV3.build(builderContext).hasDocValues);
     }
 
     public void testKNNVectorFieldMapperModel_docValueDefaults() throws IOException {
@@ -347,7 +348,8 @@ public class KNNVectorFieldMapperTests extends KNNTestCase {
             buildParserContext(indexName, settings) // Version >= 3.0.0
         );
         assertNotNull(builderAfterV3);
-        assertFalse(builderAfterV3.hasDocValues.getValue());
+        Mapper.BuilderContext builderContext = new Mapper.BuilderContext(settings, new ContentPath());
+        assertFalse(builderAfterV3.build(builderContext).hasDocValues);
     }
 
     public void testTypeParser_withDifferentSpaceTypeCombinations_thenSuccess() throws IOException {

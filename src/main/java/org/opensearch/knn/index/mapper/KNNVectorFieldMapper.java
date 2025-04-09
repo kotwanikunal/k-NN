@@ -23,7 +23,6 @@ import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.index.IndexOptions;
 import org.opensearch.Version;
-import org.opensearch.common.Booleans;
 import org.opensearch.common.Explicit;
 import org.opensearch.common.ValidationException;
 import org.opensearch.common.settings.Settings;
@@ -96,7 +95,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
         protected Boolean ignoreMalformed;
 
         protected final Parameter<Boolean> stored = Parameter.storeParam(m -> toType(m).stored, false);
-        protected final Parameter<Boolean> hasDocValues;
+        protected Parameter<Boolean> hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, true);
 
         protected final Parameter<Integer> dimension = new Parameter<>(
             KNNConstants.DIMENSION,
@@ -219,17 +218,17 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             this.knnMethodConfigContext = knnMethodConfigContext;
             this.originalParameters = originalParameters;
             // hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, getDefaultDocValues());
-            hasDocValues = new Parameter<Boolean>("doc_values", false, () -> true, (n, c, o) -> {
-                if (o == null) {
-                    // Check the index version and set appropriate default
-                    if (useFlatFieldMapper()) {
-                        return true;
-                    }
-                    Version indexVersion = c.indexVersionCreated();
-                    return indexVersion.onOrAfter(Version.V_3_0_0) == false;
-                }
-                return Booleans.parseBoolean(o.toString());
-            }, m -> toType(m).hasDocValues);
+            // hasDocValues = new Parameter<Boolean>("doc_values", false, () -> true, (n, c, o) -> {
+            // if (o == null) {
+            // // Check the index version and set appropriate default
+            // if (useFlatFieldMapper()) {
+            // return true;
+            // }
+            // Version indexVersion = c.indexVersionCreated();
+            // return indexVersion.onOrAfter(Version.V_3_0_0) == false;
+            // }
+            // return Booleans.parseBoolean(o.toString());
+            // }, m -> toType(m).hasDocValues);
         }
 
         @Override
@@ -301,6 +300,9 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             final Map<String, String> metaValue = meta.getValue();
 
             if (useModelFieldMapper()) {
+                if (indexCreatedVersion.onOrAfter(Version.V_3_0_0) && hasDocValues.isConfigured() == false) {
+                    hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, false);
+                }
                 return ModelFieldMapper.createFieldMapper(
                     buildFullName(context),
                     name,
@@ -337,6 +339,9 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                     hasDocValues.get(),
                     originalParameters
                 );
+            }
+            if (indexCreatedVersion.onOrAfter(Version.V_3_0_0) && hasDocValues.isConfigured() == false) {
+                hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, false);
             }
             return EngineFieldMapper.createFieldMapper(
                 buildFullName(context),
