@@ -6,6 +6,7 @@
 package org.opensearch.knn.plugin;
 
 import com.google.common.collect.ImmutableList;
+import org.apache.lucene.search.KnnFloatVectorQuery;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.cluster.NamedDiff;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
@@ -30,6 +31,7 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.codec.CodecServiceFactory;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.mapper.Mapper;
+import org.opensearch.index.shard.SearchOperationListener;
 import org.opensearch.indices.SystemIndexDescriptor;
 import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
 import org.opensearch.knn.index.KNNCircuitBreaker;
@@ -41,6 +43,7 @@ import org.opensearch.knn.index.memory.NativeMemoryCacheManager;
 import org.opensearch.knn.index.memory.NativeMemoryLoadStrategy;
 import org.opensearch.knn.index.query.KNNQueryBuilder;
 import org.opensearch.knn.index.query.KNNWeight;
+import org.opensearch.knn.index.query.lucene.LuceneEngineKnnVectorQuery;
 import org.opensearch.knn.index.query.parser.KNNQueryBuilderParser;
 import org.opensearch.knn.index.util.KNNClusterUtil;
 import org.opensearch.knn.indices.ModelCache;
@@ -54,6 +57,7 @@ import org.opensearch.knn.plugin.rest.RestKNNWarmupHandler;
 import org.opensearch.knn.plugin.rest.RestSearchModelHandler;
 import org.opensearch.knn.plugin.rest.RestTrainModelHandler;
 import org.opensearch.knn.plugin.script.KNNScoringScriptEngine;
+import org.opensearch.knn.plugin.script.KNNScoringUtil;
 import org.opensearch.knn.plugin.search.KNNConcurrentSearchRequestDecider;
 import org.opensearch.knn.plugin.stats.KNNStats;
 import org.opensearch.knn.plugin.transport.ClearCacheAction;
@@ -103,6 +107,7 @@ import org.opensearch.script.ScriptContext;
 import org.opensearch.script.ScriptEngine;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.deciders.ConcurrentSearchRequestDecider;
+import org.opensearch.search.internal.SearchContext;
 import org.opensearch.threadpool.ExecutorBuilder;
 import org.opensearch.threadpool.FixedExecutorBuilder;
 import org.opensearch.threadpool.ThreadPool;
@@ -303,6 +308,7 @@ public class KNNPlugin extends Plugin
 
     @Override
     public void onIndexModule(IndexModule indexModule) {
+        indexModule.addSearchOperationListener(new KnnSearchOpListener());
         KNNSettings.state().onIndexModule(indexModule);
     }
 
@@ -398,5 +404,28 @@ public class KNNPlugin extends Plugin
             SecureString password = KNNSettings.KNN_REMOTE_BUILD_CLIENT_PASSWORD_SETTING.get(settings);
             RemoteIndexHTTPClient.reloadAuthHeader(username, password);
         }
+    }
+
+    static class KnnSearchOpListener implements SearchOperationListener {
+        @Override
+        public void onFetchPhase(SearchContext searchContext, long tookInNanos) {
+            if (searchContext.query() instanceof LuceneEngineKnnVectorQuery
+                && ((LuceneEngineKnnVectorQuery) searchContext.query()).getLuceneQuery() instanceof KnnFloatVectorQuery) {
+                float[] query = ((KnnFloatVectorQuery) ((LuceneEngineKnnVectorQuery) searchContext.query()).getLuceneQuery())
+                    .getTargetCopy();
+                KNNScoringUtil.cleanupPinnedQueryVectors(Arrays.hashCode(query));
+            }
+        }
+
+        @Override
+        public void onFailedQueryPhase(SearchContext searchContext) {
+            if (searchContext.query() instanceof LuceneEngineKnnVectorQuery
+                && ((LuceneEngineKnnVectorQuery) searchContext.query()).getLuceneQuery() instanceof KnnFloatVectorQuery) {
+                float[] query = ((KnnFloatVectorQuery) ((LuceneEngineKnnVectorQuery) searchContext.query()).getLuceneQuery())
+                    .getTargetCopy();
+                KNNScoringUtil.cleanupPinnedQueryVectors(Arrays.hashCode(query));
+            }
+        }
+
     }
 }

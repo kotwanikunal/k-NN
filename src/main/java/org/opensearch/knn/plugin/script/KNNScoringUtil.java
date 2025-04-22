@@ -6,6 +6,7 @@
 package org.opensearch.knn.plugin.script;
 
 import java.math.BigInteger;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -17,11 +18,15 @@ import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.jni.FaissService;
 import org.opensearch.knn.jni.NativeLuceneService;
+import java.util.ArrayList;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 import static org.opensearch.knn.common.KNNValidationUtil.validateByteVectorValue;
 
 public class KNNScoringUtil {
     private static Logger logger = LogManager.getLogger(KNNScoringUtil.class);
+    private static final ConcurrentMap<String, List<Long>> pinnedPerQuery = new ConcurrentHashMap<>();
 
     /**
      * checks both query vector and input vector has equal dimension
@@ -270,11 +275,29 @@ public class KNNScoringUtil {
     }
 
     public static long allocatePinnedQueryVector(float[] queryVector, long dimension) {
-        return NativeLuceneService.allocatePinnedQueryVector(queryVector, dimension);
+        String queryId = String.valueOf(Arrays.hashCode(queryVector));
+
+        if (pinnedPerQuery.containsKey(queryId)) {
+            return pinnedPerQuery.get(queryId).getFirst();
+        } else {
+            long address = NativeLuceneService.allocatePinnedQueryVector(queryVector, dimension);
+            pinnedPerQuery.computeIfAbsent(queryId, _ -> new ArrayList<>()).add(address);
+            return address;
+        }
     }
 
     public static void deallocatePinnedQueryVector(long queryAddress) {
         NativeLuceneService.deallocatePinnedQueryVector(queryAddress); // void method
+    }
+
+    public static void cleanupPinnedQueryVectors(long queryId) {
+        List<Long> addresses = pinnedPerQuery.remove(String.valueOf(queryId));
+        if (addresses != null) {
+            logger.error("Kunal: Cleaning up {} addresses", addresses.size());
+            for (long addr : addresses) {
+                deallocatePinnedQueryVector(addr);
+            }
+        }
     }
 
     /**
