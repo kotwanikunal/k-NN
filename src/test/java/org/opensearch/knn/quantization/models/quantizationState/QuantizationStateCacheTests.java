@@ -19,7 +19,6 @@ import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.quantization.models.quantizationParams.ScalarQuantizationParams;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
-import org.opensearch.transport.client.Client;
 
 import java.io.IOException;
 import java.util.concurrent.CountDownLatch;
