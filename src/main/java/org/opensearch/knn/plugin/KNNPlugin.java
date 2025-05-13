@@ -11,9 +11,11 @@ import org.opensearch.core.ParseField;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.index.codec.CodecServiceFactory;
 import org.opensearch.index.engine.EngineFactory;
+import org.opensearch.index.shard.IndexSettingProvider;
 import org.opensearch.indices.SystemIndexDescriptor;
 import org.opensearch.knn.index.KNNCircuitBreaker;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManager;
+import org.opensearch.knn.index.store.SequentialIODirectoryFactory;
 import org.opensearch.knn.plugin.search.KNNConcurrentSearchRequestDecider;
 import org.opensearch.knn.index.util.KNNClusterUtil;
 import org.opensearch.knn.index.query.KNNQueryBuilder;
@@ -88,6 +90,7 @@ import org.opensearch.knn.training.VectorReader;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.ExtensiblePlugin;
+import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.plugins.MapperPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.ScriptPlugin;
@@ -159,7 +162,9 @@ public class KNNPlugin extends Plugin
         EnginePlugin,
         ScriptPlugin,
         ExtensiblePlugin,
-        SystemIndexPlugin {
+        SystemIndexPlugin,
+        IndexSettingProvider,
+        IndexStorePlugin {
 
     public static final String LEGACY_KNN_BASE_URI = "/_opendistro/_knn";
     public static final String KNN_BASE_URI = "/_plugins/_knn";
@@ -382,5 +387,19 @@ public class KNNPlugin extends Plugin
     @Override
     public Optional<ConcurrentSearchRequestDecider.Factory> getConcurrentSearchRequestDeciderFactory() {
         return Optional.of(new KNNConcurrentSearchRequestDecider.Factory());
+    }
+
+    @Override
+    public Map<String, DirectoryFactory> getDirectoryFactories() {
+        return Map.of("seq", new SequentialIODirectoryFactory());
+    }
+
+    @Override
+    public Settings getAdditionalIndexSettings(String indexName, boolean isDataStreamIndex, Settings templateAndRequestSettings) {
+        if (templateAndRequestSettings.isEmpty() == false
+            && templateAndRequestSettings.getAsBoolean(KNNSettings.IS_KNN_INDEX_SETTING.getKey(), false)) {
+            return Settings.builder().put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), "seq").build();
+        }
+        return Settings.EMPTY;
     }
 }
