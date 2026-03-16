@@ -12,6 +12,7 @@ import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.MergePolicy;
 import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.codecs.lucene104.QuantizedByteVectorValues;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.common.bytes.BytesArray;
@@ -62,6 +63,8 @@ public class NativeIndexWriter {
     private final NativeIndexBuildStrategyFactory indexBuilderFactory;
     @Nullable
     private final QuantizationState quantizationState;
+    @Nullable
+    private final Supplier<QuantizedByteVectorValues> quantizedVectorValuesSupplier;
 
     /**
      * Gets the correct writer type from fieldInfo
@@ -70,7 +73,7 @@ public class NativeIndexWriter {
      * @return correct NativeIndexWriter to make index specified in fieldInfo
      */
     public static NativeIndexWriter getWriter(final FieldInfo fieldInfo, SegmentWriteState state) {
-        return createWriter(fieldInfo, state, null, new NativeIndexBuildStrategyFactory());
+        return createWriter(fieldInfo, state, null, new NativeIndexBuildStrategyFactory(), null);
     }
 
     /**
@@ -93,7 +96,19 @@ public class NativeIndexWriter {
         final QuantizationState quantizationState,
         final NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory
     ) {
-        return createWriter(fieldInfo, state, quantizationState, nativeIndexBuildStrategyFactory);
+        return createWriter(fieldInfo, state, quantizationState, nativeIndexBuildStrategyFactory, null);
+    }
+
+    /**
+     * Gets a writer for Faiss BBQ fields with pre-read quantized vector values.
+     */
+    public static NativeIndexWriter getWriter(
+        final FieldInfo fieldInfo,
+        final SegmentWriteState state,
+        final QuantizationState quantizationState,
+        final Supplier<QuantizedByteVectorValues> quantizedVectorValuesSupplier
+    ) {
+        return createWriter(fieldInfo, state, quantizationState, new NativeIndexBuildStrategyFactory(), quantizedVectorValuesSupplier);
     }
 
     /**
@@ -159,11 +174,13 @@ public class NativeIndexWriter {
                 totalLiveDocs,
                 isFlush
             );
-            NativeIndexBuildStrategy indexBuilder = indexBuilderFactory.getBuildStrategy(
-                fieldInfo,
-                totalLiveDocs,
-                knnVectorValuesSupplier.get()
-            );
+            NativeIndexBuildStrategy indexBuilder = quantizedVectorValuesSupplier != null
+                ? MemOptimizedBBQIndexBuildStrategy.getInstance()
+                : indexBuilderFactory.getBuildStrategy(
+                    fieldInfo,
+                    totalLiveDocs,
+                    knnVectorValuesSupplier.get()
+                );
             indexBuilder.buildAndWriteIndex(nativeIndexParams);
             CodecUtil.writeFooter(output);
         }
@@ -205,6 +222,7 @@ public class NativeIndexWriter {
             .totalLiveDocs(totalLiveDocs)
             .segmentWriteState(state)
             .isFlush(isFlush)
+            .quantizedVectorValuesSupplier(quantizedVectorValuesSupplier)
             .build();
     }
 
@@ -332,8 +350,9 @@ public class NativeIndexWriter {
         final FieldInfo fieldInfo,
         final SegmentWriteState state,
         @Nullable final QuantizationState quantizationState,
-        NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory
+        NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory,
+        @Nullable final Supplier<QuantizedByteVectorValues> quantizedVectorValuesSupplier
     ) {
-        return new NativeIndexWriter(state, fieldInfo, nativeIndexBuildStrategyFactory, quantizationState);
+        return new NativeIndexWriter(state, fieldInfo, nativeIndexBuildStrategyFactory, quantizationState, quantizedVectorValuesSupplier);
     }
 }

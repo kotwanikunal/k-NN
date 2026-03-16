@@ -8,6 +8,7 @@ package org.opensearch.knn.index.codec.nativeindex.model;
 import lombok.Builder;
 import lombok.ToString;
 import lombok.Value;
+import org.apache.lucene.codecs.lucene104.QuantizedByteVectorValues;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.SegmentWriteState;
 import org.opensearch.common.Nullable;
@@ -38,4 +39,11 @@ public class BuildIndexParams {
     int totalLiveDocs;
     SegmentWriteState segmentWriteState;
     boolean isFlush;
+    /**
+     * Quantized vector values from Lucene's on-disk scalar quantized format.
+     * Used when the flat vector writer has already quantized vectors (e.g., BBQ 1-bit, 2-bit, 4-bit)
+     * and the native index build strategy needs to consume them for graph construction.
+     */
+    @Nullable
+    Supplier<QuantizedByteVectorValues> quantizedVectorValuesSupplier;
 }

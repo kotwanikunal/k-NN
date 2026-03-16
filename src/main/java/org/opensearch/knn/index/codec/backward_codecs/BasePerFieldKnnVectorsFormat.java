@@ -14,11 +14,13 @@ import org.opensearch.index.mapper.MapperService;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.codec.KNN1040BasePerFieldKnnVectorsFormat;
 import org.opensearch.knn.index.codec.KNN990Codec.NativeEngines990KnnVectorsFormat;
+import org.opensearch.knn.index.codec.KNN990Codec.FaissBBQ990KnnVectorsFormat;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactory;
 import org.opensearch.knn.index.codec.params.KNNScalarQuantizedVectorsFormatParams;
 import org.opensearch.knn.index.codec.params.KNNVectorsFormatParams;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.engine.KNNMethodContext;
+import org.opensearch.knn.index.engine.MethodComponentContext;
 import org.opensearch.knn.index.mapper.KNNMappingConfig;
 import org.opensearch.knn.index.mapper.KNNVectorFieldType;
 
@@ -30,6 +32,7 @@ import java.util.function.Supplier;
 import static org.opensearch.knn.common.KNNConstants.LUCENE_SQ_BITS;
 import static org.opensearch.knn.common.KNNConstants.LUCENE_SQ_CONFIDENCE_INTERVAL;
 import static org.opensearch.knn.common.KNNConstants.METHOD_ENCODER_PARAMETER;
+import static org.opensearch.knn.common.KNNConstants.ENCODER_FAISS_BBQ;
 
 /**
  * Base class for PerFieldKnnVectorsFormat used by backward codecs (KNN920 through KNN9120).
@@ -155,6 +158,13 @@ public abstract class BasePerFieldKnnVectorsFormat extends PerFieldKnnVectorsFor
             return vectorsFormatSupplier.apply(knnVectorsFormatParams);
         }
 
+        // Check for Faiss BBQ encoder
+        if (engine == KNNEngine.FAISS && isFaissBBQEncoder(params)) {
+            final int approximateThreshold = getApproximateThresholdValue();
+            log.debug("Initialize Faiss BBQ vector format for field [{}]", field);
+            return new FaissBBQ990KnnVectorsFormat(approximateThreshold);
+        }
+
         // All native engines to use NativeEngines990KnnVectorsFormat
         return nativeEngineVectorsFormat();
     }
@@ -164,6 +174,17 @@ public abstract class BasePerFieldKnnVectorsFormat extends PerFieldKnnVectorsFor
         // addition isPresent check here.
         final int approximateThreshold = getApproximateThresholdValue();
         return new NativeEngines990KnnVectorsFormat(approximateThreshold, nativeIndexBuildStrategyFactory);
+    }
+
+    private static boolean isFaissBBQEncoder(Map<String, Object> params) {
+        if (params == null || !params.containsKey(METHOD_ENCODER_PARAMETER)) {
+            return false;
+        }
+        Object encoderObj = params.get(METHOD_ENCODER_PARAMETER);
+        if (encoderObj instanceof MethodComponentContext encoderContext) {
+            return ENCODER_FAISS_BBQ.equals(encoderContext.getName());
+        }
+        return false;
     }
 
     private int getApproximateThresholdValue() {

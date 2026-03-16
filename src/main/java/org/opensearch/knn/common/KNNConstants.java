@@ -127,6 +127,7 @@ public class KNNConstants {
     public static final String ENCODER_FLAT = "flat";
     public static final String ENCODER_PQ = "pq";
     public static final String ENCODER_BINARY = "binary";
+    public static final String ENCODER_FAISS_BBQ = "faiss_bbq";
     public static final String ENCODER_PARAMETER_PQ_M = "m";
     public static final String ENCODER_PARAMETER_PQ_CODE_SIZE = "code_size";
     public static final String FAISS_HNSW_DESCRIPTION = "HNSW";
