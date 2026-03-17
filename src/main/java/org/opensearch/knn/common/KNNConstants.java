@@ -76,6 +76,7 @@ public class KNNConstants {
     public static final String SEARCH_SIZE_PARAMETER = "search_size";
 
     public static final String QFRAMEWORK_CONFIG = "qframe_config";
+    public static final String FAISS_BBQ_CONFIG = "faiss_bbq_config";
 
     public static final String VECTOR_DATA_TYPE_FIELD = "data_type";
     public static final String EXPAND_NESTED = "expand_nested_docs";
@@ -105,6 +106,10 @@ public class KNNConstants {
     public static final double MAXIMUM_CONFIDENCE_INTERVAL = 1.0;
     public static final String LUCENE_SQ_BITS = "bits";
     public static final int LUCENE_SQ_DEFAULT_BITS = 7;
+    // Lucene BBQ encoder constants — see https://github.com/opensearch-project/k-NN/pull/3144
+    public static final String ENCODER_BBQ = "bbq";
+    public static final int LUCENE_BBQ_DEFAULT_BITS = 1;
+    public static final String LUCENE_BBQ_BITS = "bits";
     public static final String MAX_CONNECTIONS = "max_connections";
     public static final String BEAM_WIDTH = "beam_width";
 

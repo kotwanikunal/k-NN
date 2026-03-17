@@ -20,7 +20,7 @@ import org.opensearch.knn.index.mapper.CompressionLevel;
 import org.opensearch.knn.index.mapper.Mode;
 
 import java.util.Map;
-
+import static org.opensearch.knn.common.KNNConstants.ENCODER_FAISS_BBQ;
 import static org.opensearch.knn.common.KNNConstants.ENCODER_FLAT;
 import static org.opensearch.knn.common.KNNConstants.METHOD_ENCODER_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.METHOD_HNSW;
@@ -37,7 +37,7 @@ public class FaissMethodResolverTests extends KNNTestCase {
             false,
             SpaceType.INNER_PRODUCT
         );
-        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x1, SpaceType.INNER_PRODUCT, ENCODER_FLAT, false);
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x32, SpaceType.INNER_PRODUCT, ENCODER_FAISS_BBQ, true);
 
         resolvedMethodContext = TEST_RESOLVER.resolveMethod(
             null,
@@ -49,7 +49,7 @@ public class FaissMethodResolverTests extends KNNTestCase {
             false,
             SpaceType.INNER_PRODUCT
         );
-        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x32, SpaceType.INNER_PRODUCT, QFrameBitEncoder.NAME, true);
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x32, SpaceType.INNER_PRODUCT, ENCODER_FAISS_BBQ, true);
 
         resolvedMethodContext = TEST_RESOLVER.resolveMethod(
             null,
@@ -128,7 +128,7 @@ public class FaissMethodResolverTests extends KNNTestCase {
             false,
             SpaceType.L2
         );
-        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x1, SpaceType.L2, ENCODER_FLAT, false);
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x32, SpaceType.L2, ENCODER_FAISS_BBQ, true);
 
         resolvedMethodContext = TEST_RESOLVER.resolveMethod(
             new KNNMethodContext(KNNEngine.FAISS, SpaceType.L2, new MethodComponentContext(METHOD_HNSW, Map.of())),
@@ -282,5 +282,99 @@ public class FaissMethodResolverTests extends KNNTestCase {
             validationException.getMessage().contains("Training request ENCODER_PARAMETER_PQ_M is not divisible by vector dimensions")
         );
 
+    }
+
+    public void testResolveMethod_whenPreV360_thenUseLegacyDefaults() {
+        // Pre-3.6.0: minimal config should resolve to x1 with flat encoder (no BBQ)
+        ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            KNNMethodConfigContext.builder().vectorDataType(VectorDataType.FLOAT).versionCreated(Version.V_3_5_0).build(),
+            false,
+            SpaceType.L2
+        );
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x1, SpaceType.L2, ENCODER_FLAT, false);
+
+        // Pre-3.6.0: ON_DISK should resolve to x32 with QFrameBitEncoder (not BBQ)
+        resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            KNNMethodConfigContext.builder()
+                .vectorDataType(VectorDataType.FLOAT)
+                .mode(Mode.ON_DISK)
+                .versionCreated(Version.V_3_5_0)
+                .build(),
+            false,
+            SpaceType.L2
+        );
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x32, SpaceType.L2, QFrameBitEncoder.NAME, true);
+    }
+
+    public void testResolveMethod_whenV360WithExplicitBQ_thenUseBQ() {
+        // User explicitly specifies binary (QFrameBitEncoder) on 3.6.0+ — should be honored
+        ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            new KNNMethodContext(
+                KNNEngine.FAISS,
+                SpaceType.L2,
+                new MethodComponentContext(
+                    METHOD_HNSW,
+                    Map.of(
+                        METHOD_ENCODER_PARAMETER,
+                        new MethodComponentContext(
+                            QFrameBitEncoder.NAME,
+                            Map.of(QFrameBitEncoder.BITCOUNT_PARAM, CompressionLevel.x32.numBitsForFloat32())
+                        )
+                    )
+                )
+            ),
+            KNNMethodConfigContext.builder().vectorDataType(VectorDataType.FLOAT).versionCreated(Version.CURRENT).build(),
+            false,
+            SpaceType.L2
+        );
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x32, SpaceType.L2, QFrameBitEncoder.NAME, true);
+    }
+
+    public void testResolveMethod_whenV360WithInMemoryMode_thenUseBBQ() {
+        // in_memory mode on 3.6.0+ should still default to x32 with BBQ
+        ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            KNNMethodConfigContext.builder()
+                .vectorDataType(VectorDataType.FLOAT)
+                .mode(Mode.IN_MEMORY)
+                .versionCreated(Version.CURRENT)
+                .build(),
+            false,
+            SpaceType.L2
+        );
+        validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x32, SpaceType.L2, ENCODER_FAISS_BBQ, true);
+    }
+
+    public void testResolveMethod_whenV360DefaultConfig_thenModeIsOnDisk() {
+        // Minimal config on 3.6.0+ should set mode to ON_DISK
+        KNNMethodConfigContext configContext = KNNMethodConfigContext.builder()
+            .vectorDataType(VectorDataType.FLOAT)
+            .versionCreated(Version.CURRENT)
+            .build();
+        TEST_RESOLVER.resolveMethod(null, configContext, false, SpaceType.L2);
+        assertEquals(Mode.ON_DISK, configContext.getMode());
+    }
+
+    public void testResolveMethod_whenPreV360DefaultConfig_thenModeNotChanged() {
+        // Pre-3.6.0 minimal config should NOT change mode
+        KNNMethodConfigContext configContext = KNNMethodConfigContext.builder()
+            .vectorDataType(VectorDataType.FLOAT)
+            .versionCreated(Version.V_3_5_0)
+            .build();
+        TEST_RESOLVER.resolveMethod(null, configContext, false, SpaceType.L2);
+        assertEquals(Mode.NOT_CONFIGURED, configContext.getMode());
+    }
+
+    public void testResolveMethod_whenBinaryDataType_thenNoCompression() {
+        // BINARY data type should not get BBQ regardless of version
+        ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            KNNMethodConfigContext.builder().vectorDataType(VectorDataType.BINARY).versionCreated(Version.CURRENT).build(),
+            false,
+            SpaceType.L2
+        );
+        assertEquals(CompressionLevel.x1, resolvedMethodContext.getCompressionLevel());
     }
 }

@@ -70,6 +70,7 @@ public class FaissHNSWMethod extends AbstractFaissMethod {
     final static Encoder SQ_ENCODER = new FaissSQEncoder();
     final static Encoder HNSW_PQ_ENCODER = new FaissHNSWPQEncoder();
     final static Encoder QFRAME_BIT_ENCODER = new QFrameBitEncoder();
+    final static Encoder FAISS_BBQ_ENCODER = new FaissBBQEncoder();
     final static Map<String, Encoder> SUPPORTED_ENCODERS = Map.of(
         FLAT_ENCODER.getName(),
         FLAT_ENCODER,
@@ -78,7 +79,9 @@ public class FaissHNSWMethod extends AbstractFaissMethod {
         HNSW_PQ_ENCODER.getName(),
         HNSW_PQ_ENCODER,
         QFRAME_BIT_ENCODER.getName(),
-        QFRAME_BIT_ENCODER
+        QFRAME_BIT_ENCODER,
+        FAISS_BBQ_ENCODER.getName(),
+        FAISS_BBQ_ENCODER
     );
     final static MethodComponent HNSW_COMPONENT = initMethodComponent();
 

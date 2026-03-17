@@ -18,10 +18,11 @@ import org.opensearch.knn.index.engine.MethodComponentContext;
 import java.util.Map;
 import java.util.Optional;
 
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 import static org.opensearch.knn.common.KNNConstants.ENCODER_FAISS_BBQ;
 import static org.opensearch.knn.common.KNNConstants.METHOD_ENCODER_PARAMETER;
+
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Unit tests for {@link FaissCodecFormatResolver}.
@@ -150,6 +151,24 @@ public class FaissCodecFormatResolverTests extends KNNTestCase {
         Map<String, Object> params = Map.of(METHOD_ENCODER_PARAMETER, encoderContext);
 
         KnnVectorsFormat result = resolver.resolve(TEST_FIELD, null, params, DEFAULT_MAX_CONN, DEFAULT_BEAM_WIDTH);
+        assertTrue(
+            "Expected NativeEngines990KnnVectorsFormat but got " + result.getClass().getSimpleName(),
+            result instanceof NativeEngines990KnnVectorsFormat
+        );
+    }
+
+    public void testResolve_whenCalledWithFieldContext_thenFallsBackToDefaultFormat() {
+        MapperService mapperService = mock(MapperService.class);
+        IndexSettings indexSettings = mock(IndexSettings.class);
+        when(indexSettings.getValue(KNNSettings.INDEX_KNN_ADVANCED_APPROXIMATE_THRESHOLD_SETTING)).thenReturn(null);
+        when(mapperService.getIndexSettings()).thenReturn(indexSettings);
+
+        FaissCodecFormatResolver resolver = new FaissCodecFormatResolver(
+            Optional.of(mapperService),
+            mock(NativeIndexBuildStrategyFactory.class)
+        );
+        // Null params should fall back to default native format
+        KnnVectorsFormat result = resolver.resolve(TEST_FIELD, null, null, DEFAULT_MAX_CONN, DEFAULT_BEAM_WIDTH);
         assertTrue(
             "Expected NativeEngines990KnnVectorsFormat but got " + result.getClass().getSimpleName(),
             result instanceof NativeEngines990KnnVectorsFormat

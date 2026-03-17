@@ -5,6 +5,7 @@
 
 package org.opensearch.knn.index.engine.lucene;
 
+import org.opensearch.Version;
 import org.opensearch.common.ValidationException;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.engine.AbstractMethodResolver;
@@ -21,6 +22,9 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 
+import static org.opensearch.knn.common.KNNConstants.ENCODER_BBQ;
+import static org.opensearch.knn.common.KNNConstants.LUCENE_BBQ_BITS;
+import static org.opensearch.knn.common.KNNConstants.LUCENE_BBQ_DEFAULT_BITS;
 import static org.opensearch.knn.common.KNNConstants.METHOD_ENCODER_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.METHOD_HNSW;
 import static org.opensearch.knn.index.engine.lucene.LuceneHNSWMethod.HNSW_METHOD_COMPONENT;
@@ -34,7 +38,11 @@ import static org.opensearch.knn.index.engine.lucene.LuceneHNSWMethod.SQ_ENCODER
  */
 public class LuceneHNSWMethodResolver extends AbstractMethodResolver {
 
-    private static final Set<CompressionLevel> SUPPORTED_COMPRESSION_LEVELS = Set.of(CompressionLevel.x1, CompressionLevel.x4);
+    private static final Set<CompressionLevel> SUPPORTED_COMPRESSION_LEVELS = Set.of(
+        CompressionLevel.x1,
+        CompressionLevel.x4,
+        CompressionLevel.x32
+    );
 
     @Override
     public ResolvedMethodContext resolveMethod(
@@ -75,13 +83,30 @@ public class LuceneHNSWMethodResolver extends AbstractMethodResolver {
         }
 
         MethodComponentContext methodComponentContext = resolvedKNNMethodContext.getMethodComponentContext();
-        MethodComponentContext encoderComponentContext = new MethodComponentContext(SQ_ENCODER.getName(), new HashMap<>());
-        Map<String, Object> resolvedParams = MethodComponent.getParameterMapWithDefaultsAdded(
-            encoderComponentContext,
-            SQ_ENCODER.getMethodComponent(),
-            knnMethodConfigContext
-        );
-        encoderComponentContext.getParameters().putAll(resolvedParams);
+        MethodComponentContext encoderComponentContext;
+
+        // For x32 on 3.6.0+, use the BBQ encoder. For x4 (or x32 on older versions), use SQ.
+        if (CompressionLevel.x32 == resolvedCompressionLevel
+            && knnMethodConfigContext.getVersionCreated() != null
+            && knnMethodConfigContext.getVersionCreated().onOrAfter(Version.V_3_6_0)) {
+            encoderComponentContext = new MethodComponentContext(ENCODER_BBQ, new HashMap<>());
+            encoderComponentContext.getParameters().put(LUCENE_BBQ_BITS, LUCENE_BBQ_DEFAULT_BITS);
+            Map<String, Object> resolvedParams = MethodComponent.getParameterMapWithDefaultsAdded(
+                encoderComponentContext,
+                LuceneHNSWMethod.BBQ_ENCODER.getMethodComponent(),
+                knnMethodConfigContext
+            );
+            encoderComponentContext.getParameters().putAll(resolvedParams);
+        } else {
+            encoderComponentContext = new MethodComponentContext(SQ_ENCODER.getName(), new HashMap<>());
+            Map<String, Object> resolvedParams = MethodComponent.getParameterMapWithDefaultsAdded(
+                encoderComponentContext,
+                SQ_ENCODER.getMethodComponent(),
+                knnMethodConfigContext
+            );
+            encoderComponentContext.getParameters().putAll(resolvedParams);
+        }
+
         methodComponentContext.getParameters().put(METHOD_ENCODER_PARAMETER, encoderComponentContext);
     }
 
@@ -104,8 +129,16 @@ public class LuceneHNSWMethodResolver extends AbstractMethodResolver {
         if (CompressionLevel.isConfigured(knnMethodConfigContext.getCompressionLevel())) {
             return knnMethodConfigContext.getCompressionLevel();
         }
+        // ON_DISK was already x4 pre-3.6.0 via SQ; now it's x32 via BBQ.
         if (knnMethodConfigContext.getMode() == Mode.ON_DISK) {
-            return CompressionLevel.x4;
+            return CompressionLevel.x32;
+        }
+        // Same default change as Faiss — see FaissMethodResolver.getDefaultCompressionLevel()
+        if (knnMethodConfigContext.getVersionCreated() != null && knnMethodConfigContext.getVersionCreated().onOrAfter(Version.V_3_6_0)) {
+            if (Mode.isConfigured(knnMethodConfigContext.getMode()) == false) {
+                knnMethodConfigContext.setMode(Mode.ON_DISK);
+            }
+            return CompressionLevel.x32;
         }
         return CompressionLevel.x1;
     }

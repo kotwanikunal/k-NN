@@ -32,6 +32,12 @@ public enum LuceneVectorsFormatType {
     SCALAR_QUANTIZED,
 
     /**
+     * HNSW format with BBQ (Better Binary Quantization) encoding.
+     * See https://github.com/opensearch-project/k-NN/pull/3144
+     */
+    BBQ,
+
+    /**
      * Flat vector format (e.g., BBQ flat via Lucene).
      */
     FLAT

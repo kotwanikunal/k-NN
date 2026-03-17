@@ -39,7 +39,7 @@ public class LuceneHNSWMethodResolverTests extends KNNTestCase {
         assertFalse(resolvedMethodContext.getKnnMethodContext().getMethodComponentContext().getParameters().isEmpty());
         assertEquals(KNNEngine.LUCENE, resolvedMethodContext.getKnnMethodContext().getKnnEngine());
         assertEquals(SpaceType.INNER_PRODUCT, resolvedMethodContext.getKnnMethodContext().getSpaceType());
-        assertEquals(CompressionLevel.x1, resolvedMethodContext.getCompressionLevel());
+        assertEquals(CompressionLevel.x32, resolvedMethodContext.getCompressionLevel());
 
         resolvedMethodContext = TEST_RESOLVER.resolveMethod(
             null,
@@ -58,7 +58,7 @@ public class LuceneHNSWMethodResolverTests extends KNNTestCase {
         );
         assertEquals(KNNEngine.LUCENE, resolvedMethodContext.getKnnMethodContext().getKnnEngine());
         assertEquals(SpaceType.INNER_PRODUCT, resolvedMethodContext.getKnnMethodContext().getSpaceType());
-        assertEquals(CompressionLevel.x4, resolvedMethodContext.getCompressionLevel());
+        assertEquals(CompressionLevel.x32, resolvedMethodContext.getCompressionLevel());
 
         resolvedMethodContext = TEST_RESOLVER.resolveMethod(
             null,
@@ -101,7 +101,7 @@ public class LuceneHNSWMethodResolverTests extends KNNTestCase {
         );
         assertEquals(KNNEngine.LUCENE, resolvedMethodContext.getKnnMethodContext().getKnnEngine());
         assertEquals(SpaceType.INNER_PRODUCT, resolvedMethodContext.getKnnMethodContext().getSpaceType());
-        assertEquals(CompressionLevel.x4, resolvedMethodContext.getCompressionLevel());
+        assertEquals(CompressionLevel.x32, resolvedMethodContext.getCompressionLevel());
         assertNotEquals(knnMethodContext, resolvedMethodContext.getKnnMethodContext());
 
         knnMethodContext = new KNNMethodContext(
@@ -178,21 +178,6 @@ public class LuceneHNSWMethodResolverTests extends KNNTestCase {
             )
         );
 
-        // Invalid compression for HNSW
-        expectThrows(
-            ValidationException.class,
-            () -> TEST_RESOLVER.resolveMethod(
-                null,
-                KNNMethodConfigContext.builder()
-                    .vectorDataType(VectorDataType.FLOAT)
-                    .compressionLevel(CompressionLevel.x32)
-                    .versionCreated(Version.CURRENT)
-                    .build(),
-                false,
-                SpaceType.L2
-            )
-        );
-
         // Invalid spec ondisk and compression is 1
         expectThrows(
             ValidationException.class,
@@ -210,4 +195,77 @@ public class LuceneHNSWMethodResolverTests extends KNNTestCase {
         );
     }
 
+    public void testResolveMethod_whenPreV360_thenUseLegacyDefaults() {
+        // Pre-3.6.0: minimal config should resolve to x1 with no encoder
+        ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            KNNMethodConfigContext.builder().vectorDataType(VectorDataType.FLOAT).versionCreated(Version.V_3_5_0).build(),
+            false,
+            SpaceType.L2
+        );
+        assertEquals(CompressionLevel.x1, resolvedMethodContext.getCompressionLevel());
+        assertFalse(
+            resolvedMethodContext.getKnnMethodContext().getMethodComponentContext().getParameters().containsKey(METHOD_ENCODER_PARAMETER)
+        );
+
+        // Pre-3.6.0: ON_DISK should resolve to x4 with SQ encoder (not BBQ)
+        resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            KNNMethodConfigContext.builder()
+                .vectorDataType(VectorDataType.FLOAT)
+                .mode(Mode.ON_DISK)
+                .versionCreated(Version.V_3_5_0)
+                .build(),
+            false,
+            SpaceType.L2
+        );
+        assertEquals(CompressionLevel.x4, resolvedMethodContext.getCompressionLevel());
+        assertEquals(
+            ENCODER_SQ,
+            ((MethodComponentContext) resolvedMethodContext.getKnnMethodContext()
+                .getMethodComponentContext()
+                .getParameters()
+                .get(METHOD_ENCODER_PARAMETER)).getName()
+        );
+    }
+
+    public void testResolveMethod_whenV360DefaultConfig_thenModeIsOnDisk() {
+        KNNMethodConfigContext configContext = KNNMethodConfigContext.builder()
+            .vectorDataType(VectorDataType.FLOAT)
+            .versionCreated(Version.CURRENT)
+            .build();
+        TEST_RESOLVER.resolveMethod(null, configContext, false, SpaceType.L2);
+        assertEquals(Mode.ON_DISK, configContext.getMode());
+    }
+
+    public void testResolveMethod_whenPreV360DefaultConfig_thenModeNotChanged() {
+        KNNMethodConfigContext configContext = KNNMethodConfigContext.builder()
+            .vectorDataType(VectorDataType.FLOAT)
+            .versionCreated(Version.V_3_5_0)
+            .build();
+        TEST_RESOLVER.resolveMethod(null, configContext, false, SpaceType.L2);
+        assertEquals(Mode.NOT_CONFIGURED, configContext.getMode());
+    }
+
+    public void testResolveMethod_whenV360WithExplicitX4_thenUseSQ() {
+        // Explicit x4 compression on 3.6.0+ should still use SQ encoder
+        ResolvedMethodContext resolvedMethodContext = TEST_RESOLVER.resolveMethod(
+            null,
+            KNNMethodConfigContext.builder()
+                .vectorDataType(VectorDataType.FLOAT)
+                .compressionLevel(CompressionLevel.x4)
+                .versionCreated(Version.CURRENT)
+                .build(),
+            false,
+            SpaceType.L2
+        );
+        assertEquals(CompressionLevel.x4, resolvedMethodContext.getCompressionLevel());
+        assertEquals(
+            ENCODER_SQ,
+            ((MethodComponentContext) resolvedMethodContext.getKnnMethodContext()
+                .getMethodComponentContext()
+                .getParameters()
+                .get(METHOD_ENCODER_PARAMETER)).getName()
+        );
+    }
 }

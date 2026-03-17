@@ -5,6 +5,7 @@
 
 package org.opensearch.knn.index.engine;
 
+import org.opensearch.Version;
 import org.opensearch.common.ValidationException;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
@@ -120,7 +121,13 @@ public abstract class AbstractMethodResolver implements MethodResolver {
 
         if (CompressionLevel.isConfigured(knnMethodConfigContext.getCompressionLevel()) == false
             && Mode.ON_DISK != knnMethodConfigContext.getMode()) {
-            return false;
+            // On 3.6.0+, allow encoder resolution even when compression and mode are not configured
+            // so that the default compression (x32 with BBQ) can be applied. Before 3.6.0, the
+            // absence of compression/mode meant "no compression" and we'd bail out here. Now we
+            // let it through so the engine-specific resolver can apply its version-aware defaults.
+            if (knnMethodConfigContext.getVersionCreated() == null || knnMethodConfigContext.getVersionCreated().before(Version.V_3_6_0)) {
+                return false;
+            }
         }
 
         if (VectorDataType.FLOAT != knnMethodConfigContext.getVectorDataType()) {

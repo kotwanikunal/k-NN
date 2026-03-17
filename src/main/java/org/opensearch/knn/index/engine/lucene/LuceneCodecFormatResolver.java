@@ -9,6 +9,7 @@ import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.codecs.KnnVectorsFormat;
 import org.opensearch.knn.index.codec.KnnVectorsFormatContext;
 import org.opensearch.knn.index.codec.LuceneVectorsFormatType;
+import org.opensearch.knn.index.codec.params.KNN1040ScalarQuantizedVectorsFormatParams;
 import org.opensearch.knn.index.codec.params.KNNScalarQuantizedVectorsFormatParams;
 import org.opensearch.knn.index.engine.CodecFormatResolver;
 import org.opensearch.knn.index.engine.KNNMethodContext;
@@ -86,6 +87,17 @@ public class LuceneCodecFormatResolver implements CodecFormatResolver {
         }
 
         if (params != null && params.containsKey(METHOD_ENCODER_PARAMETER)) {
+            // Check for BBQ encoder first — see https://github.com/opensearch-project/k-NN/pull/3144
+            KNN1040ScalarQuantizedVectorsFormatParams bbqParams = new KNN1040ScalarQuantizedVectorsFormatParams(
+                params,
+                defaultMaxConnections,
+                defaultBeamWidth
+            );
+            if (bbqParams.validate(params)) {
+                log.debug("Initialize KNN vector format for field [{}] with Lucene BBQ HNSW format", field);
+                return LuceneVectorsFormatType.BBQ;
+            }
+
             KNNScalarQuantizedVectorsFormatParams sqParams = new KNNScalarQuantizedVectorsFormatParams(
                 params,
                 defaultMaxConnections,

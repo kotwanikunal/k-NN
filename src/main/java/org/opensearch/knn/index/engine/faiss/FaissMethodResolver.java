@@ -5,6 +5,7 @@
 
 package org.opensearch.knn.index.engine.faiss;
 
+import org.opensearch.Version;
 import org.opensearch.common.ValidationException;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.engine.AbstractMethodResolver;
@@ -24,6 +25,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 
+import static org.opensearch.knn.common.KNNConstants.ENCODER_FAISS_BBQ;
 import static org.opensearch.knn.common.KNNConstants.ENCODER_FLAT;
 import static org.opensearch.knn.common.KNNConstants.ENCODER_SQ;
 import static org.opensearch.knn.common.KNNConstants.FAISS_SQ_ENCODER_FP16;
@@ -124,9 +126,21 @@ public class FaissMethodResolver extends AbstractMethodResolver {
         }
 
         if (CompressionLevel.x32 == resolvedCompressionLevel) {
-            encoderComponentContext = new MethodComponentContext(QFrameBitEncoder.NAME, new HashMap<>());
-            encoder = encoderMap.get(QFrameBitEncoder.NAME);
-            encoderComponentContext.getParameters().put(QFrameBitEncoder.BITCOUNT_PARAM, CompressionLevel.x32.numBitsForFloat32());
+            // Starting 3.6.0, x32 compression uses BBQ instead of the older QFrameBitEncoder (binary).
+            // BBQ delegates quantization to Lucene's flat format rather than the k-NN quantization
+            // framework, which gives better recall. We also guard on encoderMap.containsKey because
+            // IVF method doesn't support BBQ — only HNSW does.
+            if (knnMethodConfigContext.getVersionCreated() != null
+                && knnMethodConfigContext.getVersionCreated().onOrAfter(Version.V_3_6_0)
+                && encoderMap.containsKey(ENCODER_FAISS_BBQ)) {
+                encoderComponentContext = new MethodComponentContext(ENCODER_FAISS_BBQ, new HashMap<>());
+                encoder = encoderMap.get(ENCODER_FAISS_BBQ);
+                encoderComponentContext.getParameters().put(FaissBBQEncoder.BITCOUNT_PARAM, FaissBBQEncoder.DEFAULT_BITS);
+            } else {
+                encoderComponentContext = new MethodComponentContext(QFrameBitEncoder.NAME, new HashMap<>());
+                encoder = encoderMap.get(QFrameBitEncoder.NAME);
+                encoderComponentContext.getParameters().put(QFrameBitEncoder.BITCOUNT_PARAM, CompressionLevel.x32.numBitsForFloat32());
+            }
         }
 
         Map<String, Object> resolvedParams = MethodComponent.getParameterMapWithDefaultsAdded(
@@ -183,6 +197,16 @@ public class FaissMethodResolver extends AbstractMethodResolver {
             return knnMethodConfigContext.getCompressionLevel();
         }
         if (knnMethodConfigContext.getMode() == Mode.ON_DISK) {
+            return CompressionLevel.x32;
+        }
+        // On 3.6.0+, default to x32 compression with on_disk mode. This makes BBQ the default
+        // for all new Faiss indices. The mode is set to ON_DISK because x32 compression is
+        // designed for disk-based search with rescoring. We only set the mode if the user
+        // didn't explicitly provide one — if they said "in_memory", we respect that.
+        if (knnMethodConfigContext.getVersionCreated() != null && knnMethodConfigContext.getVersionCreated().onOrAfter(Version.V_3_6_0)) {
+            if (Mode.isConfigured(knnMethodConfigContext.getMode()) == false) {
+                knnMethodConfigContext.setMode(Mode.ON_DISK);
+            }
             return CompressionLevel.x32;
         }
         return CompressionLevel.x1;

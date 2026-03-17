@@ -73,6 +73,8 @@ import static org.mockito.Mockito.when;
 import static org.opensearch.Version.CURRENT;
 import static org.opensearch.knn.common.KNNConstants.COMPRESSION_LEVEL_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.DIMENSION;
+import static org.opensearch.knn.common.KNNConstants.ENCODER_BBQ;
+import static org.opensearch.knn.common.KNNConstants.ENCODER_FAISS_BBQ;
 import static org.opensearch.knn.common.KNNConstants.ENCODER_SQ;
 import static org.opensearch.knn.common.KNNConstants.KNN_ENGINE;
 import static org.opensearch.knn.common.KNNConstants.KNN_METHOD;
@@ -2086,14 +2088,17 @@ public class KNNVectorFieldMapperTests extends KNNTestCase {
         );
         assertNull(builder.getOriginalParameters().getKnnMethodContext());
         assertTrue(builder.getOriginalParameters().isLegacyMapping());
+        // Original mode is NOT_CONFIGURED (user didn't specify), but resolved mode is ON_DISK (3.6.0+ default)
+        assertEquals(Mode.NOT_CONFIGURED, Mode.fromName(builder.getOriginalParameters().getMode()));
+        assertEquals(Mode.ON_DISK, builder.getKnnMethodConfigContext().getMode());
         validateBuilderAfterParsing(
             builder,
             KNNEngine.DEFAULT,
             SpaceType.L2,
             VectorDataType.FLOAT,
-            CompressionLevel.x1,
+            CompressionLevel.x32,
             CompressionLevel.NOT_CONFIGURED,
-            Mode.NOT_CONFIGURED,
+            Mode.ON_DISK,
             false
         );
 
@@ -2566,18 +2571,18 @@ public class KNNVectorFieldMapperTests extends KNNTestCase {
 
         assertEquals(expectedResolvedCompressionLevel, builder.getKnnMethodConfigContext().getCompressionLevel());
         assertEquals(expectedOriginalCompressionLevel, CompressionLevel.fromName(builder.getOriginalParameters().getCompressionLevel()));
-        assertEquals(expectedMode, Mode.fromName(builder.getOriginalParameters().getMode()));
         assertEquals(expectedMode, builder.getKnnMethodConfigContext().getMode());
         assertFalse(builder.getOriginalParameters().getResolvedKnnMethodContext().getMethodComponentContext().getParameters().isEmpty());
 
         if (shouldUsesBinaryQFramework) {
-            assertEquals(
-                QFrameBitEncoder.NAME,
-                ((MethodComponentContext) builder.getOriginalParameters()
-                    .getResolvedKnnMethodContext()
-                    .getMethodComponentContext()
-                    .getParameters()
-                    .get(METHOD_ENCODER_PARAMETER)).getName()
+            String encoderName = ((MethodComponentContext) builder.getOriginalParameters()
+                .getResolvedKnnMethodContext()
+                .getMethodComponentContext()
+                .getParameters()
+                .get(METHOD_ENCODER_PARAMETER)).getName();
+            assertTrue(
+                "Expected binary or faiss_bbq encoder but got: " + encoderName,
+                QFrameBitEncoder.NAME.equals(encoderName) || ENCODER_FAISS_BBQ.equals(encoderName) || ENCODER_BBQ.equals(encoderName)
             );
             assertEquals(
                 expectedResolvedCompressionLevel.numBitsForFloat32(),

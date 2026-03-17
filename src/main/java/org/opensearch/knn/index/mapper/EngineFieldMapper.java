@@ -23,6 +23,8 @@ import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.engine.KNNLibraryIndexingContext;
 import org.opensearch.knn.index.engine.KNNMethodConfigContext;
 import org.opensearch.knn.index.engine.KNNMethodContext;
+import org.opensearch.knn.index.engine.MethodComponentContext;
+import org.opensearch.knn.index.engine.faiss.FaissBBQEncoder;
 import org.opensearch.knn.index.engine.qframe.QuantizationConfig;
 import org.opensearch.knn.index.engine.qframe.QuantizationConfigParser;
 
@@ -33,7 +35,10 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.opensearch.knn.common.KNNConstants.DIMENSION;
+import static org.opensearch.knn.common.KNNConstants.ENCODER_FAISS_BBQ;
+import static org.opensearch.knn.common.KNNConstants.FAISS_BBQ_CONFIG;
 import static org.opensearch.knn.common.KNNConstants.KNN_ENGINE;
+import static org.opensearch.knn.common.KNNConstants.METHOD_ENCODER_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.PARAMETERS;
 import static org.opensearch.knn.common.KNNConstants.QFRAMEWORK_CONFIG;
 import static org.opensearch.knn.common.KNNConstants.SPACE_TYPE;
@@ -184,9 +189,18 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
             this.fieldType = new FieldType(KNNVectorFieldMapper.Defaults.FIELD_TYPE);
             this.fieldType.putAttribute(DIMENSION, String.valueOf(knnMappingConfig.getDimension()));
             this.fieldType.putAttribute(SPACE_TYPE, resolvedKnnMethodContext.getSpaceType().getValue());
-            // Conditionally add quantization config
-            if (quantizationConfig != null && quantizationConfig != QuantizationConfig.EMPTY) {
-                this.fieldType.putAttribute(QFRAMEWORK_CONFIG, QuantizationConfigParser.toCsv(quantizationConfig));
+
+            if (isFaissBBQEncoder(resolvedKnnMethodContext)) {
+                // BBQ has its own per-field format that handles quantization internally, so we
+                // don't set qframe_config (which drives the k-NN quantization framework). Instead
+                // we store a separate faiss_bbq_config attribute as a quick way for readers to
+                // identify BBQ fields without parsing the full PARAMETERS JSON.
+                this.fieldType.putAttribute(FAISS_BBQ_CONFIG, getFaissBBQConfigValue(resolvedKnnMethodContext));
+            } else {
+                // Conditionally add quantization config
+                if (quantizationConfig != null && quantizationConfig != QuantizationConfig.EMPTY) {
+                    this.fieldType.putAttribute(QFRAMEWORK_CONFIG, QuantizationConfigParser.toCsv(quantizationConfig));
+                }
             }
 
             this.fieldType.putAttribute(VECTOR_DATA_TYPE_FIELD, vectorDataType.getValue());
@@ -301,5 +315,26 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
     void updateEngineStats() {
         Optional.ofNullable(originalMappingParameters)
             .ifPresent(params -> params.getResolvedKnnMethodContext().getKnnEngine().setInitialized(true));
+    }
+
+    /**
+     * Checks whether the resolved method context uses the faiss_bbq encoder.
+     * This determines whether we store faiss_bbq_config in field attributes.
+     */
+    private static boolean isFaissBBQEncoder(KNNMethodContext methodContext) {
+        Object encoderObj = methodContext.getMethodComponentContext().getParameters().get(METHOD_ENCODER_PARAMETER);
+        return encoderObj instanceof MethodComponentContext encoderCtx && ENCODER_FAISS_BBQ.equals(encoderCtx.getName());
+    }
+
+    /**
+     * Builds the faiss_bbq_config attribute value as a JSON string.
+     * This is stored alongside the PARAMETERS attribute as a fast-path identifier for BBQ fields.
+     */
+    private static String getFaissBBQConfigValue(KNNMethodContext methodContext) {
+        MethodComponentContext encoderCtx = (MethodComponentContext) methodContext.getMethodComponentContext()
+            .getParameters()
+            .get(METHOD_ENCODER_PARAMETER);
+        Object bits = encoderCtx.getParameters().getOrDefault(FaissBBQEncoder.BITCOUNT_PARAM, FaissBBQEncoder.DEFAULT_BITS);
+        return "{\"" + FaissBBQEncoder.BITCOUNT_PARAM + "\":" + bits + "}";
     }
 }

@@ -23,6 +23,7 @@ import org.opensearch.knn.index.engine.qframe.QuantizationConfig;
 import org.opensearch.knn.index.engine.qframe.QuantizationConfigParser;
 
 import static org.opensearch.knn.common.KNNConstants.QFRAMEWORK_CONFIG;
+import static org.opensearch.knn.common.KNNConstants.FAISS_BBQ_CONFIG;
 import org.opensearch.knn.indices.ModelDao;
 
 import java.util.Locale;
@@ -82,6 +83,26 @@ public class FieldInfoExtractor {
             return QuantizationConfig.EMPTY;
         }
         return QuantizationConfigParser.fromCsv(quantizationConfigString);
+    }
+
+    /**
+     * Check if the field uses Faiss BBQ encoding.
+     *
+     * @param fieldInfo {@link FieldInfo}
+     * @return true if the field has a faiss_bbq_config attribute
+     */
+    public static boolean isFaissBBQField(final FieldInfo fieldInfo) {
+        return StringUtils.isNotEmpty(fieldInfo.getAttribute(FAISS_BBQ_CONFIG));
+    }
+
+    /**
+     * Extract the faiss_bbq_config attribute value from field info.
+     *
+     * @param fieldInfo {@link FieldInfo}
+     * @return the raw faiss_bbq_config string, or null if not present
+     */
+    public static String extractFaissBBQConfig(final FieldInfo fieldInfo) {
+        return fieldInfo.getAttribute(FAISS_BBQ_CONFIG);
     }
 
     /**
