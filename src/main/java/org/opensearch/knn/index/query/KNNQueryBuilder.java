@@ -35,6 +35,7 @@ import org.opensearch.knn.index.engine.KNNMethodConfigContext;
 import org.opensearch.knn.index.engine.KNNMethodContext;
 import org.opensearch.knn.index.engine.MemoryOptimizedSearchSupportSpec;
 import org.opensearch.knn.index.engine.MethodComponentContext;
+import org.opensearch.knn.index.engine.ResolvedIndexSpec;
 import org.opensearch.knn.index.engine.model.QueryContext;
 import org.opensearch.knn.index.engine.qframe.QuantizationConfig;
 import org.opensearch.knn.index.mapper.CompressionLevel;
@@ -446,7 +447,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         MethodComponentContext methodComponentContext = queryConfigFromMapping.getMethodComponentContext();
         SpaceType spaceType = queryConfigFromMapping.getSpaceType();
         VectorDataType vectorDataType = queryConfigFromMapping.getVectorDataType();
-        RescoreContext processedRescoreContext = knnVectorFieldType.resolveRescoreContext(rescoreContext);
+        RescoreContext processedRescoreContext = resolveRescore(knnVectorFieldType, rescoreContext);
         // Transform the query vector if it's required. It will return `vector` itself if transform is not needed.
         // Otherwise, it will return a new transformed vector.
         final float[] transformedQueryVector = knnVectorFieldType.transformQueryVector(vector);
@@ -481,19 +482,24 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
         }
 
         if (this.maxDistance != null || this.minScore != null) {
-            if (!ENGINES_SUPPORTING_RADIAL_SEARCH.contains(knnEngine)) {
-                throw new UnsupportedOperationException(
-                    String.format(Locale.ROOT, "Engine [%s] does not support radial search", knnEngine)
-                );
-            }
-            if (vectorDataType == VectorDataType.BINARY) {
-                throw new UnsupportedOperationException(String.format(Locale.ROOT, "Binary data type does not support radial search"));
-            }
-
-            if ((knnMappingConfig.getQuantizationConfig() != QuantizationConfig.EMPTY)
-                // If compression level is 32x, then radial search should be blocked.
-                || (knnMappingConfig.getCompressionLevel() == CompressionLevel.x32)) {
-                throw new UnsupportedOperationException("Radial search is not supported for indices which have quantization enabled");
+            ResolvedIndexSpec spec = knnVectorFieldType.getResolvedSpec();
+            if (spec != null) {
+                if (!spec.supportsRadialSearch()) {
+                    throw new UnsupportedOperationException("Radial search is not supported for indices which have quantization enabled");
+                }
+            } else {
+                if (!ENGINES_SUPPORTING_RADIAL_SEARCH.contains(knnEngine)) {
+                    throw new UnsupportedOperationException(
+                        String.format(Locale.ROOT, "Engine [%s] does not support radial search", knnEngine)
+                    );
+                }
+                if (vectorDataType == VectorDataType.BINARY) {
+                    throw new UnsupportedOperationException(String.format(Locale.ROOT, "Binary data type does not support radial search"));
+                }
+                if ((knnMappingConfig.getQuantizationConfig() != QuantizationConfig.EMPTY)
+                    || (knnMappingConfig.getCompressionLevel() == CompressionLevel.x32)) {
+                    throw new UnsupportedOperationException("Radial search is not supported for indices which have quantization enabled");
+                }
             }
         }
 
@@ -791,6 +797,17 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
             }
         }
         return super.doRewrite(queryShardContext);
+    }
+
+    private static RescoreContext resolveRescore(KNNVectorFieldType fieldType, RescoreContext userContext) {
+        ResolvedIndexSpec spec = fieldType.getResolvedSpec();
+        if (spec == null) {
+            return fieldType.resolveRescoreContext(userContext);
+        }
+        if (userContext != null) {
+            return userContext;
+        }
+        return spec.getRescoreContext();
     }
 
     @Getter
