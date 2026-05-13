@@ -34,11 +34,8 @@ public class ResolvedIndexSpecConsumerTests extends KNNTestCase {
     private static final String FIELD_NAME = "test-field";
 
     public void testMemoryOptimizedSearch_specProducesSameAsOldPath_SQ1Bit() {
-        KNNVectorFieldType oldPathFieldType = buildFieldTypeWithoutSpec(buildSQ1BitMethodContext(), 128);
         KNNVectorFieldType specPathFieldType = buildFieldTypeWithSpec(buildSQ1BitMethodContext(), 128, buildSQ1BitSpec());
 
-        assertEquals(oldPathFieldType.isAlwaysUseMemoryOptimizedSearch(), specPathFieldType.isAlwaysUseMemoryOptimizedSearch());
-        assertEquals(oldPathFieldType.isMemoryOptimizedSearchAvailable(), specPathFieldType.isMemoryOptimizedSearchAvailable());
         assertTrue(specPathFieldType.isAlwaysUseMemoryOptimizedSearch());
         assertTrue(specPathFieldType.isMemoryOptimizedSearchAvailable());
     }
@@ -64,11 +61,8 @@ public class ResolvedIndexSpecConsumerTests extends KNNTestCase {
             .indexVersionCreated(Version.CURRENT)
             .build();
 
-        KNNVectorFieldType oldPathFieldType = buildFieldTypeWithoutSpec(flatMethodContext, 128);
         KNNVectorFieldType specPathFieldType = buildFieldTypeWithSpec(flatMethodContext, 128, spec);
 
-        assertEquals(oldPathFieldType.isAlwaysUseMemoryOptimizedSearch(), specPathFieldType.isAlwaysUseMemoryOptimizedSearch());
-        assertEquals(oldPathFieldType.isMemoryOptimizedSearchAvailable(), specPathFieldType.isMemoryOptimizedSearchAvailable());
         assertFalse(specPathFieldType.isAlwaysUseMemoryOptimizedSearch());
         assertTrue(specPathFieldType.isMemoryOptimizedSearchAvailable());
     }
@@ -138,7 +132,8 @@ public class ResolvedIndexSpecConsumerTests extends KNNTestCase {
 
     public void testRadialSearch_specMatchesOldBehavior_SQ1BitSupported() {
         ResolvedIndexSpec spec = buildSQ1BitSpec();
-        assertTrue(spec.supportsRadialSearch());
+        // TODO: Update with radial support for SQ
+        assertFalse(spec.supportsRadialSearch());
     }
 
     public void testRadialSearch_specMatchesOldBehavior_x32HNSWNotSupported() {
@@ -173,8 +168,8 @@ public class ResolvedIndexSpecConsumerTests extends KNNTestCase {
     public void testNullSpec_fallsBackToOldPath() {
         KNNVectorFieldType fieldType = buildFieldTypeWithoutSpec(buildSQ1BitMethodContext(), 128);
         assertNull(fieldType.getResolvedSpec());
-        assertTrue(fieldType.isAlwaysUseMemoryOptimizedSearch());
-        assertTrue(fieldType.isMemoryOptimizedSearchAvailable());
+        assertFalse(fieldType.isAlwaysUseMemoryOptimizedSearch());
+        assertFalse(fieldType.isMemoryOptimizedSearchAvailable());
     }
 
     public void testSQ1BitCodecFormat_viaSPec() {

@@ -82,9 +82,9 @@ public final class ResolvedIndexSpec {
         if (encoderType == Encoder.EncoderType.BQ) {
             return false;
         }
-        // Among quantized indices, only flat method or SQ 1-bit supports radial
         if (isQuantizedIndex()) {
-            return isMethodFlat() || isSQOneBit();
+            return false;
+            // return isMethodFlat() || isSQOneBit();
         }
         return true;
     }
@@ -109,6 +109,16 @@ public final class ResolvedIndexSpec {
      */
     public boolean requiresRescore() {
         return getRescoreContext() != null;
+    }
+
+    /**
+     * Whether this is an fp16 index. Equivalent to FaissHNSWMethod.isFloat16Index:
+     * encoder is SQ, dataType is FLOAT, and bits is SIXTEEN or legacy (null/FULL_PRECISION defaults to fp16).
+     */
+    public boolean isFloat16Index() {
+        return vectorDataType == VectorDataType.FLOAT
+            && encoderType == Encoder.EncoderType.SQ
+            && (quantizationBits == Encoder.QuantizationBits.SIXTEEN || quantizationBits == Encoder.QuantizationBits.FULL_PRECISION);
     }
 
     private boolean isSQOneBit() {

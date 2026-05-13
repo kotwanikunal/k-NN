@@ -21,7 +21,6 @@ import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategy;
 import org.opensearch.knn.index.codec.nativeindex.model.BuildIndexParams;
 import org.opensearch.knn.index.engine.KNNLibraryIndexingContext;
 import org.opensearch.knn.index.engine.ResolvedIndexSpec;
-import org.opensearch.knn.index.engine.faiss.FaissHNSWMethod;
 import org.opensearch.knn.index.remote.RemoteIndexWaiter;
 import org.opensearch.knn.index.remote.RemoteIndexWaiterFactory;
 import org.opensearch.knn.index.vectorvalues.KNNVectorValues;
@@ -334,14 +333,10 @@ public class RemoteIndexBuildStrategy implements NativeIndexBuildStrategy {
         final ResolvedIndexSpec resolvedSpec
     ) {
         if (dataType == VectorDataType.FLOAT) {
-            if (resolvedSpec != null) {
-                if (resolvedSpec.usesSQ1BitCodecFormat()) {
-                    return dataType.getValue();
-                }
-            } else if (FaissHNSWMethod.isSQOneBitIndex(dataType, parameters)) {
+            if (resolvedSpec.usesSQ1BitCodecFormat()) {
                 return dataType.getValue();
             }
-            if (FaissHNSWMethod.isFloat16Index(dataType, parameters)) {
+            if (resolvedSpec.isFloat16Index()) {
                 return FLOAT16_VECTOR_TYPE_STRING;
             }
         }
@@ -354,10 +349,7 @@ public class RemoteIndexBuildStrategy implements NativeIndexBuildStrategy {
         final Map<String, Object> parameters,
         final ResolvedIndexSpec resolvedSpec
     ) {
-        if (resolvedSpec != null) {
-            return resolvedSpec.usesSQ1BitCodecFormat();
-        }
-        return FaissHNSWMethod.isSQOneBitIndex(vectorDataType, parameters);
+        return resolvedSpec.usesSQ1BitCodecFormat();
     }
 
     /**

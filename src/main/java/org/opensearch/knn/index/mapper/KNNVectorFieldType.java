@@ -22,11 +22,8 @@ import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.QueryShardException;
 import org.opensearch.knn.index.KNNVectorIndexFieldData;
 import org.opensearch.knn.index.VectorDataType;
-import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.engine.KNNMethodContext;
 import org.opensearch.knn.index.engine.ResolvedIndexSpec;
-import org.opensearch.knn.index.engine.faiss.FaissSQEncoder;
-import org.opensearch.knn.index.engine.MemoryOptimizedSearchSupportSpec;
 import org.opensearch.knn.index.query.rescore.RescoreContext;
 import org.opensearch.knn.indices.ModelDao;
 import org.opensearch.knn.indices.ModelMetadata;
@@ -40,7 +37,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.function.Supplier;
 
-import static org.opensearch.knn.common.KNNConstants.METHOD_FLAT;
 import static org.opensearch.knn.index.mapper.KNNVectorFieldMapperUtil.deserializeStoredVector;
 
 /**
@@ -115,15 +111,6 @@ public class KNNVectorFieldType extends MappedFieldType {
         if (resolvedSpec != null) {
             this.alwaysUseMemoryOptimizedSearch = resolvedSpec.alwaysUseMemoryOptimizedSearch();
             this.memoryOptimizedSearchAvailable = resolvedSpec.isMemoryOptimizedEligible();
-        } else {
-            this.alwaysUseMemoryOptimizedSearch = MemoryOptimizedSearchSupportSpec.isAlwaysUseMemoryOptimizedSearch(
-                knnMappingConfig.getKnnMethodContext()
-            );
-            this.memoryOptimizedSearchAvailable = MemoryOptimizedSearchSupportSpec.isSupportedFieldType(
-                knnMappingConfig.getKnnMethodContext(),
-                annConfig.getQuantizationConfig(),
-                annConfig.getModelId()
-            );
         }
         this.indexCreatedVersion = indexCreatedVersion;
     }
@@ -196,27 +183,10 @@ public class KNNVectorFieldType extends MappedFieldType {
         if (userProvidedContext != null) {
             return userProvidedContext;
         }
-        final KNNMappingConfig knnMappingConfig = getKnnMappingConfig();
-        final Optional<KNNMethodContext> methodContext = knnMappingConfig.getKnnMethodContext();
-        final boolean isFlatMethod = methodContext.isPresent()
-            && METHOD_FLAT.equals(methodContext.get().getMethodComponentContext().getName());
-        final boolean isSQOneBit = methodContext.map(mc -> FaissSQEncoder.isSQOneBit(mc.getMethodComponentContext().getParameters()))
-            .orElse(false);
-        final int dimension = knnMappingConfig.getDimension();
-        final CompressionLevel compressionLevel = knnMappingConfig.getCompressionLevel();
-        final Mode mode = knnMappingConfig.getMode();
-        KNNEngine engine = null;
-        if (methodContext.isPresent()) {
-            engine = methodContext.get().getKnnEngine();
+        if (resolvedSpec == null) {
+            return null;
         }
-        return compressionLevel.getDefaultRescoreContext(
-            mode,
-            dimension,
-            knnMappingConfig.getIndexCreatedVersion(),
-            isFlatMethod,
-            isSQOneBit,
-            engine
-        );
+        return resolvedSpec.getRescoreContext();
     }
 
     /**

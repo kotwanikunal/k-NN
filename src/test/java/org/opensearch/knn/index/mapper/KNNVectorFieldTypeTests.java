@@ -60,7 +60,6 @@ public class KNNVectorFieldTypeTests extends KNNTestCase {
         assertSame(userContext, buildFlatFieldType().resolveRescoreContext(userContext));
     }
 
-    // After resolution, flat method always has x32 compression set in the mapping config
     private KNNVectorFieldType buildFlatFieldType() {
         KNNMethodContext flatMethodContext = new KNNMethodContext(
             KNNEngine.LUCENE,
@@ -83,7 +82,16 @@ public class KNNVectorFieldTypeTests extends KNNTestCase {
                 return CompressionLevel.x32;
             }
         };
-        return new KNNVectorFieldType(FIELD_NAME, Collections.emptyMap(), VectorDataType.FLOAT, mappingConfig);
+        ResolvedIndexSpec spec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.LUCENE)
+            .methodName(METHOD_FLAT)
+            .encoderType(Encoder.EncoderType.FLAT)
+            .compressionLevel(CompressionLevel.x32)
+            .vectorDataType(VectorDataType.FLOAT)
+            .dimension(128)
+            .indexVersionCreated(Version.CURRENT)
+            .build();
+        return new KNNVectorFieldType(FIELD_NAME, Collections.emptyMap(), VectorDataType.FLOAT, mappingConfig, Version.CURRENT, spec);
     }
 
     public void testKNNVectorFieldType_whenSQOneBitEncoder_thenAlwaysUseMemoryOptimizedSearchIsTrue() {
@@ -123,7 +131,18 @@ public class KNNVectorFieldTypeTests extends KNNTestCase {
             )
         );
         KNNMappingConfig mappingConfig = getMappingConfigForMethodMapping(sqOneBitMethodContext, 128);
-        return new KNNVectorFieldType(FIELD_NAME, Collections.emptyMap(), VectorDataType.FLOAT, mappingConfig, Version.CURRENT);
+        ResolvedIndexSpec spec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.FAISS)
+            .methodName(METHOD_HNSW)
+            .encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.ONE)
+            .compressionLevel(CompressionLevel.x32)
+            .mode(Mode.ON_DISK)
+            .vectorDataType(VectorDataType.FLOAT)
+            .dimension(128)
+            .indexVersionCreated(Version.CURRENT)
+            .build();
+        return new KNNVectorFieldType(FIELD_NAME, Collections.emptyMap(), VectorDataType.FLOAT, mappingConfig, Version.CURRENT, spec);
     }
 
     public void testKNNVectorFieldType_resolvedSpecStoredWhenProvided() {
@@ -184,12 +203,22 @@ public class KNNVectorFieldTypeTests extends KNNTestCase {
             )
         );
         KNNMappingConfig mappingConfig = getMappingConfigForMethodMapping(flatMethodContext, 128);
+        ResolvedIndexSpec spec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.FAISS)
+            .methodName(METHOD_HNSW)
+            .encoderType(Encoder.EncoderType.FLAT)
+            .compressionLevel(CompressionLevel.NOT_CONFIGURED)
+            .vectorDataType(VectorDataType.FLOAT)
+            .dimension(128)
+            .indexVersionCreated(Version.CURRENT)
+            .build();
         KNNVectorFieldType fieldType = new KNNVectorFieldType(
             FIELD_NAME,
             Collections.emptyMap(),
             VectorDataType.FLOAT,
             mappingConfig,
-            Version.CURRENT
+            Version.CURRENT,
+            spec
         );
         assertFalse(fieldType.isAlwaysUseMemoryOptimizedSearch());
         assertTrue(fieldType.isMemoryOptimizedSearchAvailable());

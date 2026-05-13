@@ -33,5 +33,28 @@ public interface CodecFormatResolver {
         int defaultBeamWidth
     );
 
+    /**
+     * Resolves the appropriate {@link KnnVectorsFormat} for a given field using the resolved index spec.
+     * Implementations should prefer the spec when non-null and fall back to parameter inspection otherwise.
+     *
+     * @param field                 the field name
+     * @param methodContext         the KNN method context; may be null for model-based fields
+     * @param params                the method component parameters; may be null
+     * @param defaultMaxConnections default max connections for HNSW
+     * @param defaultBeamWidth      default beam width for HNSW
+     * @param resolvedSpec          the resolved index spec
+     * @return the resolved {@link KnnVectorsFormat}
+     */
+    default KnnVectorsFormat resolve(
+        String field,
+        KNNMethodContext methodContext,
+        Map<String, Object> params,
+        int defaultMaxConnections,
+        int defaultBeamWidth,
+        ResolvedIndexSpec resolvedSpec
+    ) {
+        return resolve(field, methodContext, params, defaultMaxConnections, defaultBeamWidth);
+    }
+
     KnnVectorsFormat resolve();
 }

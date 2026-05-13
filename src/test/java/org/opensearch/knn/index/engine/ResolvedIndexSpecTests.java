@@ -111,7 +111,8 @@ public class ResolvedIndexSpecTests extends KNNTestCase {
 
     public void testRadialSearch_SQ1BitSupported() {
         ResolvedIndexSpec spec = baseFaissSQ1Bit().build();
-        assertTrue(spec.supportsRadialSearch());
+        // TODO: Update with radial support for SQ
+        assertFalse(spec.supportsRadialSearch());
     }
 
     public void testRadialSearch_FlatMethodWithX32Supported() {
@@ -120,7 +121,8 @@ public class ResolvedIndexSpecTests extends KNNTestCase {
             .quantizationBits(Encoder.QuantizationBits.FULL_PRECISION)
             .compressionLevel(CompressionLevel.x32)
             .build();
-        assertTrue(spec.supportsRadialSearch());
+        // TODO: Update with radial support for SQ
+        assertFalse(spec.supportsRadialSearch());
     }
 
     public void testRadialSearch_NonQuantizedAlwaysSupported() {

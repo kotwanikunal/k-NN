@@ -37,8 +37,6 @@ import org.opensearch.knn.index.engine.MemoryOptimizedSearchSupportSpec;
 import org.opensearch.knn.index.engine.MethodComponentContext;
 import org.opensearch.knn.index.engine.ResolvedIndexSpec;
 import org.opensearch.knn.index.engine.model.QueryContext;
-import org.opensearch.knn.index.engine.qframe.QuantizationConfig;
-import org.opensearch.knn.index.mapper.CompressionLevel;
 import org.opensearch.knn.index.mapper.KNNMappingConfig;
 import org.opensearch.knn.index.mapper.KNNVectorFieldType;
 import org.opensearch.knn.index.query.parser.KNNQueryBuilderParser;
@@ -62,7 +60,6 @@ import static org.opensearch.knn.common.KNNConstants.METHOD_PARAMETER_EF_SEARCH;
 import static org.opensearch.knn.common.KNNConstants.METHOD_PARAMETER_NPROBES;
 import static org.opensearch.knn.common.KNNConstants.MIN_SCORE;
 import static org.opensearch.knn.common.KNNValidationUtil.validateByteVectorValue;
-import static org.opensearch.knn.index.engine.KNNEngine.ENGINES_SUPPORTING_RADIAL_SEARCH;
 import static org.opensearch.knn.index.engine.KNNEngine.FAISS;
 import static org.opensearch.knn.index.engine.validation.ParameterValidator.validateParameters;
 import static org.opensearch.knn.index.query.parser.MethodParametersParser.validateMethodParameters;
@@ -483,23 +480,8 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
 
         if (this.maxDistance != null || this.minScore != null) {
             ResolvedIndexSpec spec = knnVectorFieldType.getResolvedSpec();
-            if (spec != null) {
-                if (!spec.supportsRadialSearch()) {
-                    throw new UnsupportedOperationException("Radial search is not supported for indices which have quantization enabled");
-                }
-            } else {
-                if (!ENGINES_SUPPORTING_RADIAL_SEARCH.contains(knnEngine)) {
-                    throw new UnsupportedOperationException(
-                        String.format(Locale.ROOT, "Engine [%s] does not support radial search", knnEngine)
-                    );
-                }
-                if (vectorDataType == VectorDataType.BINARY) {
-                    throw new UnsupportedOperationException(String.format(Locale.ROOT, "Binary data type does not support radial search"));
-                }
-                if ((knnMappingConfig.getQuantizationConfig() != QuantizationConfig.EMPTY)
-                    || (knnMappingConfig.getCompressionLevel() == CompressionLevel.x32)) {
-                    throw new UnsupportedOperationException("Radial search is not supported for indices which have quantization enabled");
-                }
+            if (spec != null && !spec.supportsRadialSearch()) {
+                throw new UnsupportedOperationException("Radial search is not supported for indices which have quantization enabled");
             }
         }
 
@@ -800,14 +782,7 @@ public class KNNQueryBuilder extends AbstractQueryBuilder<KNNQueryBuilder> imple
     }
 
     private static RescoreContext resolveRescore(KNNVectorFieldType fieldType, RescoreContext userContext) {
-        ResolvedIndexSpec spec = fieldType.getResolvedSpec();
-        if (spec == null) {
-            return fieldType.resolveRescoreContext(userContext);
-        }
-        if (userContext != null) {
-            return userContext;
-        }
-        return spec.getRescoreContext();
+        return fieldType.resolveRescoreContext(userContext);
     }
 
     @Getter
