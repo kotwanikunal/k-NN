@@ -19,7 +19,6 @@ import org.opensearch.knn.index.engine.ResolvedMethodContext;
 import org.opensearch.knn.index.engine.TrainingConfigValidationInput;
 import org.opensearch.knn.index.engine.TrainingConfigValidationOutput;
 import org.opensearch.knn.index.mapper.CompressionLevel;
-import org.opensearch.knn.index.mapper.Mode;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -206,13 +205,7 @@ public class FaissMethodResolver extends AbstractMethodResolver {
     }
 
     private CompressionLevel getDefaultCompressionLevel(KNNMethodConfigContext knnMethodConfigContext) {
-        if (CompressionLevel.isConfigured(knnMethodConfigContext.getCompressionLevel())) {
-            return knnMethodConfigContext.getCompressionLevel();
-        }
-        if (knnMethodConfigContext.getMode() == Mode.ON_DISK) {
-            return CompressionLevel.x32;
-        }
-        return CompressionLevel.x1;
+        return getDefaultCompressionLevel(knnMethodConfigContext, CompressionLevel.x32);
     }
 
     /**

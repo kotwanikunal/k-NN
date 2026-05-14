@@ -29,10 +29,28 @@ public final class KNNMethodConfigContext {
     private VectorDataType vectorDataType;
     private Integer dimension;
     private Version versionCreated;
+    @Deprecated
     @Builder.Default
     private Mode mode = Mode.NOT_CONFIGURED;
     @Builder.Default
     private CompressionLevel compressionLevel = CompressionLevel.NOT_CONFIGURED;
 
     public static final KNNMethodConfigContext EMPTY = KNNMethodConfigContext.builder().build();
+
+    /**
+     * Derives the appropriate {@link Mode} from the given {@link CompressionLevel}.
+     * For V_3_7_0+ indices, mode is derived from compression rather than being an independent axis.
+     *
+     * @param compressionLevel the compression level to derive mode from
+     * @return the derived mode
+     */
+    public static Mode deriveMode(CompressionLevel compressionLevel) {
+        if (!CompressionLevel.isConfigured(compressionLevel)) {
+            return Mode.NOT_CONFIGURED;
+        }
+        if (compressionLevel == CompressionLevel.x1 || compressionLevel == CompressionLevel.x2) {
+            return Mode.IN_MEMORY;
+        }
+        return Mode.ON_DISK;
+    }
 }

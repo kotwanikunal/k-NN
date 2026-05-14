@@ -104,8 +104,17 @@ public final class EngineResolver {
         Mode mode = knnMethodConfigContext.getMode();
         CompressionLevel compressionLevel = knnMethodConfigContext.getCompressionLevel();
 
-        // If both mode and compression are not specified, we can just default
-        if (Mode.isConfigured(mode) == false && CompressionLevel.isConfigured(compressionLevel) == false) {
+        // On V_3_7_0+, log deprecation warning if user explicitly provided mode
+        if (version != null && version.onOrAfter(Version.V_3_7_0) && Mode.isConfigured(mode)) {
+            logger.warn(
+                "[Deprecation] The 'mode' parameter is deprecated starting with version 3.7.0. "
+                    + "Mode is now derived from 'compression_level'. Explicitly setting 'mode' will be "
+                    + "removed in a future release."
+            );
+        }
+
+        // If compression is not specified, we can default unless mode is configured (legacy path)
+        if (CompressionLevel.isConfigured(compressionLevel) == false && Mode.isConfigured(mode) == false) {
             return KNNEngine.DEFAULT;
         }
 
