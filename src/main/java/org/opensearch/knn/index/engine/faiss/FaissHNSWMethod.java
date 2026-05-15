@@ -17,6 +17,7 @@ import org.opensearch.knn.index.engine.KNNMethodContext;
 import org.opensearch.knn.index.engine.MethodComponent;
 import org.opensearch.knn.index.engine.MethodComponentContext;
 import org.opensearch.knn.index.engine.Parameter;
+import org.opensearch.knn.index.engine.ResolvedIndexSpec;
 import org.opensearch.knn.index.engine.TrainingConfigValidationInput;
 import org.opensearch.knn.index.engine.TrainingConfigValidationOutput;
 import org.opensearch.remoteindexbuild.model.RemoteFaissHNSWIndexParameters;
@@ -194,7 +195,7 @@ public class FaissHNSWMethod extends AbstractFaissMethod {
      * }
      * @return true if the method parameters + vector data type combination is supported for remote index build
      */
-    @SuppressWarnings("unchecked")
+    @SuppressWarnings({ "unchecked", "deprecation" })
     static boolean supportsRemoteIndexBuild(final Map<String, Object> parameters) {
         try {
             final VectorDataType vectorDataType = extractVectorDataType(parameters);
@@ -250,9 +251,12 @@ public class FaissHNSWMethod extends AbstractFaissMethod {
     /**
      * From indexing library parameter, it determines whether configured index is FP16, scalar quantized.
      *
+     * @param vectorDataType The vector data type.
      * @param parameters KNN library indexing parameters.
-     * @return Trye if FP16, otherwise False.
+     * @return True if FP16, otherwise False.
+     * @deprecated Use {@link ResolvedIndexSpec#isFloat16Index()} instead.
      */
+    @Deprecated(forRemoval = true)
     public static boolean isFloat16Index(final VectorDataType vectorDataType, final Map<String, Object> parameters) {
         try {
             // Check whether if vector type is float
@@ -327,14 +331,13 @@ public class FaissHNSWMethod extends AbstractFaissMethod {
     /**
      * Checks whether the given parameters represent an SQ 1-bit index (encoder: sq, bits: 1).
      *
-     * TODO: Consolidate the logic in this function with {@link FaissSQEncoder#isSQOneBit} into one function,
-     * so that there is a single source of truth. Currently, this is not possible because
-     * {@link FaissSQEncoder#isSQOneBit} assumes the encoder object is a {@link MethodComponentContext}.
-     *
      * @param vectorDataType The data type for the vector field
      * @param parameters KNN library indexing parameters
      * @return true if SQ 1 bit, false otherwise
+     * @deprecated Use {@link ResolvedIndexSpec#usesSQ1BitCodecFormat()} instead. Retained for the
+     *             remote index build path which operates on serialized parameter maps.
      */
+    @Deprecated(forRemoval = true)
     public static boolean isSQOneBitIndex(final VectorDataType vectorDataType, final Map<String, Object> parameters) {
         try {
             if (vectorDataType != VectorDataType.FLOAT) {

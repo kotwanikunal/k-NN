@@ -62,6 +62,7 @@ public abstract class KNN1040BasePerFieldKnnVectorsFormat extends PerFieldKnnVec
         this.nativeIndexBuildStrategyFactory = nativeIndexBuildStrategyFactory;
     }
 
+    @SuppressWarnings("removal")
     @Override
     public KnnVectorsFormat getKnnVectorsFormatForField(final String field) {
         if (isKnnVectorFieldType(field) == false) {

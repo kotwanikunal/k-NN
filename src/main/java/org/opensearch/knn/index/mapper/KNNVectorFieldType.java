@@ -53,7 +53,7 @@ public class KNNVectorFieldType extends MappedFieldType {
      * cluster-level setting. This is determined at mapping time based on the encoder type
      * (e.g., FAISS SQ encoder always requires memory-optimized search).
      *
-     * @see MemoryOptimizedSearchSupportSpec#isAlwaysUseMemoryOptimizedSearch(java.util.Optional)
+     * @see ResolvedIndexSpec#alwaysUseMemoryOptimizedSearch()
      */
     boolean alwaysUseMemoryOptimizedSearch;
     /**
@@ -62,8 +62,7 @@ public class KNNVectorFieldType extends MappedFieldType {
      * memory-optimized search but still require the cluster-level setting to be enabled, unless
      * {@link #alwaysUseMemoryOptimizedSearch} is {@code true}.
      *
-     * @see MemoryOptimizedSearchSupportSpec#isSupportedFieldType(java.util.Optional,
-     *      org.opensearch.knn.index.engine.qframe.QuantizationConfig, java.util.Optional)
+     * @see ResolvedIndexSpec#isMemoryOptimizedEligible()
      */
     boolean memoryOptimizedSearchAvailable;
     Version indexCreatedVersion;

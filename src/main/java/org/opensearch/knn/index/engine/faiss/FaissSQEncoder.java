@@ -13,6 +13,7 @@ import org.opensearch.knn.index.engine.Encoder;
 import org.opensearch.knn.index.engine.KNNLibraryIndexingContextImpl;
 import org.opensearch.knn.index.engine.KNNMethodConfigContext;
 import org.opensearch.knn.index.engine.KNNMethodContext;
+import org.opensearch.knn.index.engine.ResolvedIndexSpec;
 import org.opensearch.knn.index.engine.MethodComponent;
 import org.opensearch.knn.index.engine.MethodComponentContext;
 import org.opensearch.knn.index.engine.Parameter;
@@ -233,7 +234,10 @@ public class FaissSQEncoder implements Encoder {
      *
      * @param params map that may contain a {@code METHOD_ENCODER_PARAMETER} entry
      * @return true if the encoder is sq with bits=1
+     * @deprecated Use {@link ResolvedIndexSpec#usesSQ1BitCodecFormat()} or
+     *             {@link ResolvedIndexSpec#alwaysUseMemoryOptimizedSearch()} instead.
      */
+    @Deprecated(forRemoval = true)
     public static boolean isSQOneBit(Map<String, Object> params) {
         if (params == null) {
             return false;

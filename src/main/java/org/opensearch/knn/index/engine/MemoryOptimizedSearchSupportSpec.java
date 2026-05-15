@@ -21,8 +21,6 @@ import java.util.Optional;
 import java.util.Set;
 
 import static org.opensearch.knn.common.KNNConstants.ENCODER_BINARY;
-
-import static org.opensearch.knn.common.KNNConstants.ENCODER_BINARY;
 import static org.opensearch.knn.common.KNNConstants.ENCODER_FLAT;
 import static org.opensearch.knn.common.KNNConstants.ENCODER_SQ;
 import static org.opensearch.knn.common.KNNConstants.METHOD_ENCODER_PARAMETER;
@@ -91,7 +89,9 @@ public class MemoryOptimizedSearchSupportSpec {
      * @param quantizationConfig Quantization configuration.
      * @param modelId            Model id.
      * @return True if memory-optimized-search is supported, otherwise false.
+     * @deprecated Use {@link ResolvedIndexSpec#isMemoryOptimizedEligible()} via the field type's resolved spec instead.
      */
+    @Deprecated(forRemoval = true)
     public static boolean isSupportedFieldType(
         final Optional<KNNMethodContext> methodContextOpt,
         final QuantizationConfig quantizationConfig,
@@ -158,7 +158,10 @@ public class MemoryOptimizedSearchSupportSpec {
      *
      * @param knnMethodContext Optional method context containing engine, space type, and encoder information.
      * @return {@code true} if memory-optimized search should always be enabled, {@code false} otherwise.
+     * @deprecated Use {@link ResolvedIndexSpec#alwaysUseMemoryOptimizedSearch()} via the field type's resolved spec instead.
      */
+    @SuppressWarnings("removal")
+    @Deprecated(forRemoval = true)
     public static boolean isAlwaysUseMemoryOptimizedSearch(final Optional<KNNMethodContext> knnMethodContext) {
         return knnMethodContext.isPresent()
             && FaissSQEncoder.isSQOneBit(knnMethodContext.get().getMethodComponentContext().getParameters());

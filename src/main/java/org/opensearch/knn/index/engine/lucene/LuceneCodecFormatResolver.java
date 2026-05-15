@@ -48,6 +48,7 @@ public class LuceneCodecFormatResolver implements CodecFormatResolver {
         );
     }
 
+    @Deprecated(forRemoval = true)
     @Override
     public KnnVectorsFormat resolve(
         String field,

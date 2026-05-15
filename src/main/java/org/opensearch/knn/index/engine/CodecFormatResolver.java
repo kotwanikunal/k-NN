@@ -24,7 +24,9 @@ public interface CodecFormatResolver {
      * @param defaultMaxConnections default max connections for HNSW
      * @param defaultBeamWidth      default beam width for HNSW
      * @return the resolved {@link KnnVectorsFormat}
+     * @deprecated Use the overload accepting {@link ResolvedIndexSpec} instead.
      */
+    @Deprecated(forRemoval = true)
     KnnVectorsFormat resolve(
         String field,
         KNNMethodContext methodContext,
