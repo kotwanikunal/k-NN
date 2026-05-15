@@ -139,12 +139,10 @@ public class LuceneHNSWMethodResolver extends AbstractMethodResolver {
         String encoderName = encoderComponentContext.getName();
         Encoder encoder = SUPPORTED_ENCODERS.get(encoderName);
 
-        // Skip the additional validation at the end if not using SQ
-        // TODO: Once validateEncoderParams is defined as an interface method, we can clean this up
-        if (encoder == null || !encoderName.equals(ENCODER_SQ)) {
+        if (encoder == null) {
             return;
         }
-        validateEncoderParams(resolvedKNNMethodContext, knnMethodConfigContext);
+        encoder.validate(resolvedKNNMethodContext, knnMethodConfigContext);
     }
 
     // Method validates for explicit contradictions in the config

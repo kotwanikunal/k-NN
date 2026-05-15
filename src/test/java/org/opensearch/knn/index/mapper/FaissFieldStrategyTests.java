@@ -145,4 +145,74 @@ public class FaissFieldStrategyTests extends KNNTestCase {
         );
         assertNull(result);
     }
+
+    public void testBuildFieldTypeConfigForFaissWithBQEncoder() {
+        KNNMappingConfig mappingConfig = mock(KNNMappingConfig.class);
+        when(mappingConfig.getDimension()).thenReturn(TEST_DIMENSION);
+
+        KNNMethodContext methodContext = mock(KNNMethodContext.class);
+        when(methodContext.getSpaceType()).thenReturn(SpaceType.L2);
+        when(methodContext.getKnnEngine()).thenReturn(KNNEngine.FAISS);
+
+        ResolvedIndexSpec resolvedSpec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.FAISS)
+            .methodName("hnsw")
+            .encoderType(Encoder.EncoderType.BQ)
+            .quantizationBits(Encoder.QuantizationBits.ONE)
+            .compressionLevel(CompressionLevel.x32)
+            .mode(Mode.ON_DISK)
+            .vectorDataType(VectorDataType.FLOAT)
+            .dimension(TEST_DIMENSION)
+            .indexVersionCreated(Version.CURRENT)
+            .build();
+
+        KNNLibraryIndexingContext libraryContext = mock(KNNLibraryIndexingContext.class);
+        when(libraryContext.getQuantizationConfig()).thenReturn(QuantizationConfig.EMPTY);
+        when(libraryContext.getLibraryParameters()).thenReturn(Collections.emptyMap());
+        when(libraryContext.getResolvedSpec()).thenReturn(resolvedSpec);
+        when(libraryContext.getVectorTransformer()).thenReturn(null);
+
+        FieldTypeConfig config = FaissFieldStrategy.INSTANCE.buildFieldTypeConfig(
+            mappingConfig,
+            methodContext,
+            libraryContext,
+            VectorDataType.FLOAT,
+            Version.CURRENT,
+            true
+        );
+
+        assertNotNull(config.getFieldType());
+        assertTrue(config.isUseLuceneBasedVectorField());
+        FieldType fieldType = config.getFieldType();
+        assertEquals(String.valueOf(TEST_DIMENSION), fieldType.getAttributes().get(DIMENSION));
+        assertNull(fieldType.getAttributes().get(SQ_CONFIG));
+    }
+
+    public void testBuildFieldTypeConfigForFaissWithNullResolvedSpec() {
+        KNNMappingConfig mappingConfig = mock(KNNMappingConfig.class);
+        when(mappingConfig.getDimension()).thenReturn(TEST_DIMENSION);
+
+        KNNMethodContext methodContext = mock(KNNMethodContext.class);
+        when(methodContext.getSpaceType()).thenReturn(SpaceType.L2);
+        when(methodContext.getKnnEngine()).thenReturn(KNNEngine.FAISS);
+
+        KNNLibraryIndexingContext libraryContext = mock(KNNLibraryIndexingContext.class);
+        when(libraryContext.getQuantizationConfig()).thenReturn(QuantizationConfig.EMPTY);
+        when(libraryContext.getLibraryParameters()).thenReturn(Collections.emptyMap());
+        when(libraryContext.getResolvedSpec()).thenReturn(null);
+        when(libraryContext.getVectorTransformer()).thenReturn(null);
+
+        FieldTypeConfig config = FaissFieldStrategy.INSTANCE.buildFieldTypeConfig(
+            mappingConfig,
+            methodContext,
+            libraryContext,
+            VectorDataType.FLOAT,
+            Version.CURRENT,
+            true
+        );
+
+        assertNotNull(config.getFieldType());
+        assertTrue(config.isUseLuceneBasedVectorField());
+        assertNull(config.getFieldType().getAttributes().get(SQ_CONFIG));
+    }
 }

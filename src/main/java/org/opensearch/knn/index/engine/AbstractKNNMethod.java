@@ -10,6 +10,7 @@ import org.opensearch.common.ValidationException;
 import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.index.mapper.Mode;
 import org.opensearch.knn.index.mapper.PerDimensionProcessor;
 import org.opensearch.knn.index.mapper.PerDimensionValidator;
 import org.opensearch.knn.index.mapper.SpaceVectorValidator;
@@ -174,7 +175,7 @@ public abstract class AbstractKNNMethod implements KNNMethod {
             .encoderType(encoderType)
             .quantizationBits(quantizationBits)
             .compressionLevel(knnMethodConfigContext.getCompressionLevel())
-            .mode(knnMethodConfigContext.getMode())
+            .mode(resolveEffectiveMode(knnMethodConfigContext))
             .vectorDataType(knnMethodConfigContext.getVectorDataType())
             .dimension(dimension != null ? dimension : 0)
             .indexVersionCreated(knnMethodConfigContext.getVersionCreated())
@@ -184,6 +185,13 @@ public abstract class AbstractKNNMethod implements KNNMethod {
     @Override
     public KNNLibrarySearchContext getKNNLibrarySearchContext() {
         return knnLibrarySearchContext;
+    }
+
+    private static Mode resolveEffectiveMode(KNNMethodConfigContext ctx) {
+        if (Mode.isConfigured(ctx.getMode())) {
+            return ctx.getMode();
+        }
+        return KNNMethodConfigContext.deriveMode(ctx.getCompressionLevel());
     }
 
     /**
