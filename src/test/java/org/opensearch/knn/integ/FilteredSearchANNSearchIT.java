@@ -18,18 +18,35 @@ import org.opensearch.knn.index.KNNSettings;
 import java.util.List;
 import org.opensearch.knn.common.annotation.ExpectRemoteBuildValidation;
 
+import static org.opensearch.knn.common.KNNConstants.COMPRESSION_LEVEL_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.FAISS_NAME;
 import static org.opensearch.knn.common.KNNConstants.METHOD_HNSW;
 
 @Log4j2
 public class FilteredSearchANNSearchIT extends KNNRestTestCase {
+    // Pinned to FP32: relies on uncompressed score precision
     @SneakyThrows
     @ExpectRemoteBuildValidation
     public void testFilteredSearchWithFaissHnsw_whenFiltersMatchAllDocs_thenReturnCorrectResults() {
         String filterFieldName = "color";
         final int expectResultSize = randomIntBetween(1, 3);
         final String filterValue = "red";
-        createKnnIndex(INDEX_NAME, getKNNDefaultIndexSettings(), createKnnIndexMapping(FIELD_NAME, 3, METHOD_HNSW, FAISS_NAME));
+        String mapping = XContentFactory.jsonBuilder()
+            .startObject()
+            .startObject("properties")
+            .startObject(FIELD_NAME)
+            .field("type", "knn_vector")
+            .field("dimension", 3)
+            .field(COMPRESSION_LEVEL_PARAMETER, "1x")
+            .startObject("method")
+            .field("name", METHOD_HNSW)
+            .field("engine", FAISS_NAME)
+            .endObject()
+            .endObject()
+            .endObject()
+            .endObject()
+            .toString();
+        createKnnIndex(INDEX_NAME, getKNNDefaultIndexSettings(), mapping);
 
         // ingest 5 vector docs into the index with the same field {"color": "red"}
         for (int i = 0; i < 5; i++) {
@@ -63,18 +80,19 @@ public class FilteredSearchANNSearchIT extends KNNRestTestCase {
      * Deletes a vector doc, creating a new segment with deleted docs but no docs present.
      * Validates filtered k-NN search functionality works without errors.
      */
+    // Pinned to FP32: relies on uncompressed score precision
     @SneakyThrows
     public void testFilteredSearchWithNonVectorFields_whenValid_thenSucceed() {
         String filterFieldName = "category";
         String filterValue = "electronics";
 
-        // Create mapping with both vector and non-vector fields
         String mapping = XContentFactory.jsonBuilder()
             .startObject()
             .startObject("properties")
             .startObject(FIELD_NAME)
             .field("type", "knn_vector")
             .field("dimension", 3)
+            .field(COMPRESSION_LEVEL_PARAMETER, "1x")
             .startObject("method")
             .field("name", METHOD_HNSW)
             .field("engine", FAISS_NAME)
@@ -157,18 +175,19 @@ public class FilteredSearchANNSearchIT extends KNNRestTestCase {
      * Creates separate segments: one with vector docs, one with only non-vector doc.
      * Validates filtered k-NN search functionality works without errors.
      */
+    // Pinned to FP32: relies on uncompressed score precision
     @SneakyThrows
     public void testMixedSegmentsFilteredSearch_whenValid_thenSucceed() {
         String filterFieldName = "category";
         String filterValue = "electronics";
 
-        // Create mapping with both vector and non-vector fields
         String mapping = XContentFactory.jsonBuilder()
             .startObject()
             .startObject("properties")
             .startObject(FIELD_NAME)
             .field("type", "knn_vector")
             .field("dimension", 3)
+            .field(COMPRESSION_LEVEL_PARAMETER, "1x")
             .startObject("method")
             .field("name", METHOD_HNSW)
             .field("engine", FAISS_NAME)
@@ -251,6 +270,7 @@ public class FilteredSearchANNSearchIT extends KNNRestTestCase {
      * Creates a doc with vector field, then updates it to remove the vector field.
      * Validates filtered k-NN search functionality works without errors.
      */
+    // Pinned to FP32: relies on uncompressed score precision
     @SneakyThrows
     public void testVectorFieldRemovalByUpdate_whenValid_thenSucceed() {
         String filterFieldName = "category";
@@ -261,6 +281,7 @@ public class FilteredSearchANNSearchIT extends KNNRestTestCase {
             .startObject(FIELD_NAME)
             .field("type", "knn_vector")
             .field("dimension", 3)
+            .field(COMPRESSION_LEVEL_PARAMETER, "1x")
             .startObject("method")
             .field("name", METHOD_HNSW)
             .field("engine", FAISS_NAME)

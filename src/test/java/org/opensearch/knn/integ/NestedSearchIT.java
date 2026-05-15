@@ -27,6 +27,7 @@ import java.util.Locale;
 
 import static org.opensearch.knn.common.Constants.FIELD_FILTER;
 import static org.opensearch.knn.common.Constants.FIELD_TERM;
+import static org.opensearch.knn.common.KNNConstants.COMPRESSION_LEVEL_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.DIMENSION;
 import static org.opensearch.knn.common.KNNConstants.K;
 import static org.opensearch.knn.common.KNNConstants.KNN;
@@ -323,6 +324,7 @@ public class NestedSearchIT extends KNNRestTestCase {
         createKnnIndex(dimension, engine, Mode.IN_MEMORY);
     }
 
+    // Pinned to FP32: relies on uncompressed score precision
     private void createKnnIndex(final int dimension, final String engine, Mode mode) throws Exception {
         XContentBuilder builder = XContentFactory.jsonBuilder()
             .startObject()
@@ -336,8 +338,11 @@ public class NestedSearchIT extends KNNRestTestCase {
             .startObject(FIELD_NAME_VECTOR)
             .field(TYPE, TYPE_KNN_VECTOR)
             .field(DIMENSION, dimension)
-            .field(MODE_PARAMETER, mode.getName())
-            .startObject(KNN_METHOD)
+            .field(MODE_PARAMETER, mode.getName());
+        if (mode != Mode.ON_DISK) {
+            builder.field(COMPRESSION_LEVEL_PARAMETER, "1x");
+        }
+        builder.startObject(KNN_METHOD)
             .field(NAME, METHOD_HNSW)
             .field(METHOD_PARAMETER_SPACE_TYPE, SPACE_TYPE)
             .field(KNN_ENGINE, engine)

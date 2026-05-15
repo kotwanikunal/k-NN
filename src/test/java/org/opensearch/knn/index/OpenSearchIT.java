@@ -48,6 +48,7 @@ import java.util.Map;
 import java.util.TreeMap;
 
 import static org.hamcrest.Matchers.containsString;
+import static org.opensearch.knn.common.KNNConstants.COMPRESSION_LEVEL_PARAMETER;
 import static org.opensearch.knn.index.KNNSettings.ADVANCED_FILTERED_EXACT_SEARCH_THRESHOLD;
 import static org.opensearch.knn.index.KNNSettings.INDEX_KNN_BUILD_VECTOR_DATA_STRUCTURE_THRESHOLD_MAX;
 import static org.opensearch.knn.index.KNNSettings.INDEX_KNN_BUILD_VECTOR_DATA_STRUCTURE_THRESHOLD_MIN;
@@ -68,6 +69,7 @@ public class OpenSearchIT extends KNNRestTestCase {
         testData = new TestUtils.TestData(testIndexVectors.getPath(), testQueries.getPath());
     }
 
+    // Pinned to FP32: relies on uncompressed score precision
     @ExpectRemoteBuildValidation
     public void testEndToEnd() throws Exception {
         String indexName = "test-index-1";
@@ -85,6 +87,7 @@ public class OpenSearchIT extends KNNRestTestCase {
             .startObject(fieldName)
             .field("type", "knn_vector")
             .field("dimension", dimension)
+            .field(COMPRESSION_LEVEL_PARAMETER, "1x")
             .startObject(KNNConstants.KNN_METHOD)
             .field(KNNConstants.NAME, KNNConstants.METHOD_HNSW)
             .field(KNNConstants.METHOD_PARAMETER_SPACE_TYPE, spaceType.getValue())
@@ -641,6 +644,7 @@ public class OpenSearchIT extends KNNRestTestCase {
         then, confirm hits because of exact search though there are no graph. In next step, update setting to 0, force merge segment to 1, perform knn search and confirm expected
         hits are returned.
      */
+    // Pinned to FP32: relies on uncompressed score precision
     @ExpectRemoteBuildValidation
     public void testKNNIndex_whenBuildVectorGraphThresholdIsProvidedEndToEnd_thenBuildGraphBasedOnSetting() throws Exception {
         final String indexName = "test-index-1";
@@ -648,16 +652,16 @@ public class OpenSearchIT extends KNNRestTestCase {
         final Integer dimension = testData.indexData.vectors[0].length;
         final Settings knnIndexSettings = buildKNNIndexSettings(-1);
 
-        // Create an index with a single FAISS knn_vector field
         final XContentBuilder builder = XContentFactory.jsonBuilder()
             .startObject()
             .startObject("properties")
             .startObject(fieldName)
             .field("type", "knn_vector")
             .field("dimension", dimension)
+            .field(COMPRESSION_LEVEL_PARAMETER, "1x")
             .startObject(KNNConstants.KNN_METHOD)
             .field(KNNConstants.NAME, KNNConstants.METHOD_HNSW)
-            .field(KNNConstants.KNN_ENGINE, KNNEngine.FAISS.getName()) // FAISS only
+            .field(KNNConstants.KNN_ENGINE, KNNEngine.FAISS.getName())
             .startObject(KNNConstants.PARAMETERS)
             .endObject()
             .endObject()
@@ -708,6 +712,7 @@ public class OpenSearchIT extends KNNRestTestCase {
         then, confirm expected hits are returned. Here, we don't need force merge to build graph, since, threshold is less than
         actual number of documents in segments
      */
+    // Pinned to FP32: relies on uncompressed score precision
     @ExpectRemoteBuildValidation
     public void testKNNIndex_whenBuildVectorDataStructureIsLessThanDocCount_thenBuildGraphBasedSuccessfully() throws Exception {
         final String indexName = "test-index-1";
@@ -716,13 +721,13 @@ public class OpenSearchIT extends KNNRestTestCase {
         final Integer dimension = testData.indexData.vectors[0].length;
         final Settings knnIndexSettings = buildKNNIndexSettings(testData.indexData.docs.length);
 
-        // Create an index
         final XContentBuilder builder = XContentFactory.jsonBuilder()
             .startObject()
             .startObject("properties")
             .startObject(fieldName)
             .field("type", "knn_vector")
             .field("dimension", dimension)
+            .field(COMPRESSION_LEVEL_PARAMETER, "1x")
             .startObject(KNNConstants.KNN_METHOD)
             .field(KNNConstants.NAME, KNNConstants.METHOD_HNSW)
             .field(KNNConstants.KNN_ENGINE, KNNEngine.FAISS.getName())
@@ -792,6 +797,7 @@ public class OpenSearchIT extends KNNRestTestCase {
       then, confirm hits because of exact search though there are no graph. In next step, update setting to 0, force merge segment to 1, perform knn search and confirm expected
       hits are returned.
     */
+    // Pinned to FP32: relies on uncompressed score precision
     @ExpectRemoteBuildValidation
     public void testKNNIndex_whenBuildVectorGraphThresholdIsProvidedEndToEnd_thenBuildGraphBasedOnSettingUsingRadialSearch()
         throws Exception {
@@ -802,13 +808,13 @@ public class OpenSearchIT extends KNNRestTestCase {
         final Integer dimension = testData.indexData.vectors[0].length;
         final Settings knnIndexSettings = buildKNNIndexSettings(-1);
 
-        // Create an index
         final XContentBuilder builder = XContentFactory.jsonBuilder()
             .startObject()
             .startObject("properties")
             .startObject(fieldName1)
             .field("type", "knn_vector")
             .field("dimension", dimension)
+            .field(COMPRESSION_LEVEL_PARAMETER, "1x")
             .startObject(KNNConstants.KNN_METHOD)
             .field(KNNConstants.NAME, KNNConstants.METHOD_HNSW)
             .field(KNNConstants.KNN_ENGINE, KNNEngine.FAISS.getName())
@@ -819,6 +825,7 @@ public class OpenSearchIT extends KNNRestTestCase {
             .startObject(fieldName2)
             .field("type", "knn_vector")
             .field("dimension", dimension)
+            .field(COMPRESSION_LEVEL_PARAMETER, "1x")
             .startObject(KNNConstants.KNN_METHOD)
             .field(KNNConstants.NAME, KNNConstants.METHOD_HNSW)
             .field(KNNConstants.KNN_ENGINE, KNNEngine.FAISS.getName())

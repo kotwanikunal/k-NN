@@ -38,6 +38,7 @@ import static com.carrotsearch.randomizedtesting.RandomizedTest.$;
 import static com.carrotsearch.randomizedtesting.RandomizedTest.$$;
 import static org.opensearch.knn.common.Constants.FIELD_FILTER;
 import static org.opensearch.knn.common.Constants.FIELD_TERM;
+import static org.opensearch.knn.common.KNNConstants.COMPRESSION_LEVEL_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.DIMENSION;
 import static org.opensearch.knn.common.KNNConstants.EXPAND_NESTED;
 import static org.opensearch.knn.common.KNNConstants.K;
@@ -385,34 +386,7 @@ public class ExpandNestedDocsIT extends KNNRestTestCase {
         createKnnIndex(engine, mode, dimension, vectorDataType, 1);
     }
 
-    /**
-     * {
-     * 		"dynamic": false,
-     *      "properties": {
-     *          "test_nested": {
-     *              "type": "nested",
-     *              "properties": {
-     *                  "test_vector": {
-     *                      "type": "knn_vector",
-     *                      "dimension": 3,
-     *                      "mode": "in_memory",
-     *                      "data_type: "float",
-     *                      "method": {
-     *                          "name": "hnsw",
-     *                          "engine": "lucene"
-     *                      }
-     *                  },
-     *                  "storage": {
-     *                      "type": "boolean"
-     *                  }
-     *              }
-     *          },
-     *          "parking": {
-     *              "type": "boolean"
-     *          }
-     *      }
-     *  }
-     */
+    // Pinned to FP32: relies on uncompressed score precision
     private void createKnnIndex(
         final KNNEngine engine,
         final Mode mode,
@@ -431,8 +405,11 @@ public class ExpandNestedDocsIT extends KNNRestTestCase {
             .field(TYPE, TYPE_KNN_VECTOR)
             .field(DIMENSION, dimension)
             .field(MODE_PARAMETER, Mode.NOT_CONFIGURED.equals(mode) ? null : mode.getName())
-            .field(VECTOR_DATA_TYPE_FIELD, vectorDataType.getValue())
-            .startObject(KNN_METHOD)
+            .field(VECTOR_DATA_TYPE_FIELD, vectorDataType.getValue());
+        if (mode != Mode.ON_DISK && vectorDataType == VectorDataType.FLOAT) {
+            builder.field(COMPRESSION_LEVEL_PARAMETER, "1x");
+        }
+        builder.startObject(KNN_METHOD)
             .field(NAME, METHOD_HNSW)
             .field(KNN_ENGINE, engine.getName())
             .endObject()

@@ -11,8 +11,8 @@ import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.junit.BeforeClass;
 import org.opensearch.client.Response;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.xcontent.XContentBuilder;
-import org.opensearch.knn.KNNJsonIndexMappingsBuilder;
 import org.opensearch.knn.KNNRestTestCase;
 import org.opensearch.knn.KNNResult;
 import org.opensearch.knn.TestUtils;
@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 
+import static org.opensearch.knn.common.KNNConstants.COMPRESSION_LEVEL_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.METHOD_HNSW;
 
 /**
@@ -50,6 +51,7 @@ public class ConcurrentSegmentSearchIT extends KNNRestTestCase {
         testData = new TestUtils.TestData(testIndexVectors.getPath(), testQueries.getPath());
     }
 
+    // Pinned to FP32: relies on uncompressed score precision
     @SneakyThrows
     @ExpectRemoteBuildValidation
     public void testConcurrentSegmentSearch_thenSucceed() {
@@ -103,19 +105,26 @@ public class ConcurrentSegmentSearchIT extends KNNRestTestCase {
      */
     @SneakyThrows
     private XContentBuilder createFaissHnswIndexMapping(String fieldName, int dimension) {
-        return KNNJsonIndexMappingsBuilder.builder()
-            .fieldName(fieldName)
-            .dimension(dimension)
-            .method(
-                KNNJsonIndexMappingsBuilder.Method.builder()
-                    .engine(KNNEngine.FAISS.getName())
-                    .methodName(METHOD_HNSW)
-                    .spaceType(SpaceType.L2.getValue())
-                    .parameters(KNNJsonIndexMappingsBuilder.Method.Parameters.builder().efConstruction(128).efSearch(128).m(16).build())
-                    .build()
-            )
-            .build()
-            .getIndexMappingBuilder();
+        return XContentFactory.jsonBuilder()
+            .startObject()
+            .startObject("properties")
+            .startObject(fieldName)
+            .field("type", "knn_vector")
+            .field("dimension", dimension)
+            .field(COMPRESSION_LEVEL_PARAMETER, "1x")
+            .startObject("method")
+            .field("name", METHOD_HNSW)
+            .field("engine", KNNEngine.FAISS.getName())
+            .field("space_type", SpaceType.L2.getValue())
+            .startObject("parameters")
+            .field("ef_construction", 128)
+            .field("ef_search", 128)
+            .field("m", 16)
+            .endObject()
+            .endObject()
+            .endObject()
+            .endObject()
+            .endObject();
     }
 
     @SneakyThrows

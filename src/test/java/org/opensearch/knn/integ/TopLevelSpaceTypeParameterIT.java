@@ -14,6 +14,7 @@ import org.opensearch.knn.index.SpaceType;
 
 import java.io.IOException;
 
+import static org.opensearch.knn.common.KNNConstants.COMPRESSION_LEVEL_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.FAISS_NAME;
 import static org.opensearch.knn.common.KNNConstants.KNN_ENGINE;
 import static org.opensearch.knn.common.KNNConstants.KNN_METHOD;
@@ -44,6 +45,7 @@ public class TopLevelSpaceTypeParameterIT extends KNNRestTestCase {
         deleteIndex(INDEX_NAME);
     }
 
+    // Pinned to FP32: relies on uncompressed score precision
     private void createTestIndexWithTopLevelSpaceTypeOnly() throws IOException {
         XContentBuilder builder = XContentFactory.jsonBuilder()
             .startObject()
@@ -51,6 +53,7 @@ public class TopLevelSpaceTypeParameterIT extends KNNRestTestCase {
             .startObject(FIELD_NAME)
             .field("type", "knn_vector")
             .field("dimension", DIMENSION)
+            .field(COMPRESSION_LEVEL_PARAMETER, "1x")
             .field(KNNConstants.TOP_LEVEL_PARAMETER_SPACE_TYPE, SpaceType.INNER_PRODUCT.getValue())
             .startObject(KNN_METHOD)
             .field(NAME, METHOD_HNSW)
@@ -64,6 +67,7 @@ public class TopLevelSpaceTypeParameterIT extends KNNRestTestCase {
         createKnnIndex(INDEX_NAME, mapping);
     }
 
+    // Pinned to FP32: relies on uncompressed score precision
     private void createTestIndexWithTopLevelSpaceTypeAndMethodSpaceType() throws IOException {
         XContentBuilder builder = XContentFactory.jsonBuilder()
             .startObject()
@@ -71,6 +75,7 @@ public class TopLevelSpaceTypeParameterIT extends KNNRestTestCase {
             .startObject(FIELD_NAME)
             .field("type", "knn_vector")
             .field("dimension", DIMENSION)
+            .field(COMPRESSION_LEVEL_PARAMETER, "1x")
             .field(KNNConstants.TOP_LEVEL_PARAMETER_SPACE_TYPE, SpaceType.INNER_PRODUCT.getValue())
             .startObject(KNN_METHOD)
             .field(NAME, METHOD_HNSW)
@@ -85,6 +90,7 @@ public class TopLevelSpaceTypeParameterIT extends KNNRestTestCase {
         createKnnIndex(INDEX_NAME, mapping);
     }
 
+    // Pinned to FP32: relies on uncompressed score precision
     private void createTestIndexWithNoSpaceType() throws IOException {
         XContentBuilder builder = XContentFactory.jsonBuilder()
             .startObject()
@@ -92,6 +98,7 @@ public class TopLevelSpaceTypeParameterIT extends KNNRestTestCase {
             .startObject(FIELD_NAME)
             .field("type", "knn_vector")
             .field("dimension", DIMENSION)
+            .field(COMPRESSION_LEVEL_PARAMETER, "1x")
             .startObject(KNN_METHOD)
             .field(NAME, METHOD_HNSW)
             .field(KNN_ENGINE, FAISS_NAME)
