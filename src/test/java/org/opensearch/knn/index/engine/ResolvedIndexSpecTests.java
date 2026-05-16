@@ -10,6 +10,7 @@ import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.mapper.CompressionLevel;
 import org.opensearch.knn.index.mapper.Mode;
+import org.opensearch.knn.index.query.rescore.RescoreContext;
 
 import static org.opensearch.knn.common.KNNConstants.METHOD_FLAT;
 import static org.opensearch.knn.common.KNNConstants.METHOD_HNSW;
@@ -148,6 +149,157 @@ public class ResolvedIndexSpecTests extends KNNTestCase {
             .compressionLevel(CompressionLevel.NOT_CONFIGURED)
             .build();
         assertTrue(spec.supportsRadialSearch());
+    }
+
+    // --- Rescore context ---
+
+    public void testRescoreContext_SQ1BitReturnsFixedOversample() {
+        ResolvedIndexSpec spec = baseFaissSQ1Bit().build();
+        RescoreContext ctx = spec.getRescoreContext();
+        assertNotNull(ctx);
+        assertEquals(RescoreContext.FAISS_SCALAR_QUANTIZED_INDEX_OVERSAMPLE_FACTOR, ctx.getOversampleFactor(), 0.001f);
+        assertFalse(ctx.isAllowOverrideOversampleFactor());
+        assertFalse(ctx.isUserProvided());
+    }
+
+    public void testRescoreContext_x1ReturnsNull() {
+        ResolvedIndexSpec spec = baseFaiss().encoderType(Encoder.EncoderType.FLAT)
+            .quantizationBits(Encoder.QuantizationBits.FULL_PRECISION)
+            .compressionLevel(CompressionLevel.x1)
+            .build();
+        assertNull(spec.getRescoreContext());
+        assertFalse(spec.requiresRescore());
+    }
+
+    public void testRescoreContext_x32OnDiskAboveThreshold() {
+        ResolvedIndexSpec spec = baseFaiss().encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.FOUR)
+            .compressionLevel(CompressionLevel.x32)
+            .mode(Mode.ON_DISK)
+            .dimension(1500)
+            .build();
+        RescoreContext ctx = spec.getRescoreContext();
+        assertNotNull(ctx);
+        assertEquals(3.0f, ctx.getOversampleFactor(), 0.001f);
+        assertFalse(ctx.isUserProvided());
+    }
+
+    public void testRescoreContext_x32OnDiskBelowThreshold() {
+        ResolvedIndexSpec spec = baseFaiss().encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.FOUR)
+            .compressionLevel(CompressionLevel.x32)
+            .mode(Mode.ON_DISK)
+            .dimension(500)
+            .build();
+        RescoreContext ctx = spec.getRescoreContext();
+        assertNotNull(ctx);
+        assertEquals(RescoreContext.OVERSAMPLE_FACTOR_BELOW_DIMENSION_THRESHOLD, ctx.getOversampleFactor(), 0.001f);
+    }
+
+    public void testRescoreContext_x4OnDiskAboveThreshold() {
+        ResolvedIndexSpec spec = baseFaiss().encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.SEVEN)
+            .compressionLevel(CompressionLevel.x4)
+            .mode(Mode.ON_DISK)
+            .dimension(1500)
+            .indexVersionCreated(Version.CURRENT)
+            .build();
+        RescoreContext ctx = spec.getRescoreContext();
+        assertNotNull(ctx);
+        assertEquals(1.0f, ctx.getOversampleFactor(), 0.001f);
+    }
+
+    public void testRescoreContext_x4BeforeV310ReturnsNull() {
+        ResolvedIndexSpec spec = baseFaiss().encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.SEVEN)
+            .compressionLevel(CompressionLevel.x4)
+            .mode(Mode.ON_DISK)
+            .dimension(1500)
+            .indexVersionCreated(Version.V_2_19_0)
+            .build();
+        assertNull(spec.getRescoreContext());
+    }
+
+    public void testRescoreContext_x32FlatMethodReturnsFixedOversample() {
+        ResolvedIndexSpec spec = baseFaiss().methodName(METHOD_FLAT)
+            .encoderType(Encoder.EncoderType.FLAT)
+            .quantizationBits(Encoder.QuantizationBits.FULL_PRECISION)
+            .compressionLevel(CompressionLevel.x32)
+            .mode(Mode.NOT_CONFIGURED)
+            .build();
+        RescoreContext ctx = spec.getRescoreContext();
+        assertNotNull(ctx);
+        assertEquals(2.0f, ctx.getOversampleFactor(), 0.001f);
+    }
+
+    public void testRescoreContext_x32LuceneAfterV360() {
+        ResolvedIndexSpec spec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.LUCENE)
+            .methodName(METHOD_HNSW)
+            .encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.ONE)
+            .compressionLevel(CompressionLevel.x32)
+            .mode(Mode.ON_DISK)
+            .vectorDataType(VectorDataType.FLOAT)
+            .dimension(768)
+            .indexVersionCreated(Version.V_3_6_0)
+            .build();
+        RescoreContext ctx = spec.getRescoreContext();
+        assertNotNull(ctx);
+        // SQ 1-bit takes priority over Lucene-specific path
+        assertEquals(RescoreContext.FAISS_SCALAR_QUANTIZED_INDEX_OVERSAMPLE_FACTOR, ctx.getOversampleFactor(), 0.001f);
+    }
+
+    public void testRescoreContext_x32LuceneAfterV360_NonSQ1Bit() {
+        ResolvedIndexSpec spec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.LUCENE)
+            .methodName(METHOD_HNSW)
+            .encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.FOUR)
+            .compressionLevel(CompressionLevel.x32)
+            .mode(Mode.ON_DISK)
+            .vectorDataType(VectorDataType.FLOAT)
+            .dimension(1500)
+            .indexVersionCreated(Version.V_3_6_0)
+            .build();
+        RescoreContext ctx = spec.getRescoreContext();
+        assertNotNull(ctx);
+        assertEquals(RescoreContext.OVERSAMPLE_FACTOR_DEFAULT_FOR_LUCENE_SCALAR_QUANTIZER_AFTER_V360, ctx.getOversampleFactor(), 0.001f);
+    }
+
+    public void testRescoreContext_NotOnDiskReturnsNull() {
+        ResolvedIndexSpec spec = baseFaiss().encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.FOUR)
+            .compressionLevel(CompressionLevel.x32)
+            .mode(Mode.NOT_CONFIGURED)
+            .dimension(500)
+            .build();
+        assertNull(spec.getRescoreContext());
+    }
+
+    // --- Memory optimized search for on-disk ---
+
+    public void testRequiresMemoryOptimizedSearchForOnDisk_OnDiskX1() {
+        ResolvedIndexSpec spec = baseFaiss().encoderType(Encoder.EncoderType.FLAT)
+            .quantizationBits(Encoder.QuantizationBits.FULL_PRECISION)
+            .compressionLevel(CompressionLevel.x1)
+            .mode(Mode.ON_DISK)
+            .build();
+        assertTrue(spec.requiresMemoryOptimizedSearchForOnDisk());
+    }
+
+    public void testRequiresMemoryOptimizedSearchForOnDisk_OnDiskX32() {
+        ResolvedIndexSpec spec = baseFaissSQ1Bit().mode(Mode.ON_DISK).build();
+        assertFalse(spec.requiresMemoryOptimizedSearchForOnDisk());
+    }
+
+    public void testRequiresMemoryOptimizedSearchForOnDisk_InMemoryX1() {
+        ResolvedIndexSpec spec = baseFaiss().encoderType(Encoder.EncoderType.FLAT)
+            .quantizationBits(Encoder.QuantizationBits.FULL_PRECISION)
+            .compressionLevel(CompressionLevel.x1)
+            .mode(Mode.NOT_CONFIGURED)
+            .build();
+        assertFalse(spec.requiresMemoryOptimizedSearchForOnDisk());
     }
 
     // --- Builder defaults ---

@@ -90,18 +90,58 @@ public final class ResolvedIndexSpec {
     }
 
     /**
+     * Whether this configuration requires memory-optimized search regardless of cluster setting.
+     * True for ON_DISK mode with x1 (no) compression — these indices store vectors on disk and
+     * need memory-optimized search for acceptable latency.
+     */
+    public boolean requiresMemoryOptimizedSearchForOnDisk() {
+        return mode == Mode.ON_DISK && compressionLevel == CompressionLevel.x1;
+    }
+
+    private static final float FLAT_OVERSAMPLE_FACTOR = 2.0f;
+
+    /**
      * Returns the appropriate rescore context for this configuration.
      * Recomputed each call since RescoreContext has mutable state in getFirstPassK().
      */
     public RescoreContext getRescoreContext() {
-        return compressionLevel.getDefaultRescoreContext(
-            mode,
-            dimension,
-            indexVersionCreated != null ? indexVersionCreated : Version.CURRENT,
-            isMethodFlat(),
-            isSQOneBit(),
-            engine
-        );
+        if (isSQOneBit()) {
+            return RescoreContext.builder()
+                .oversampleFactor(RescoreContext.FAISS_SCALAR_QUANTIZED_INDEX_OVERSAMPLE_FACTOR)
+                .allowOverrideOversampleFactor(false)
+                .userProvided(false)
+                .build();
+        }
+
+        if (compressionLevel == CompressionLevel.x32 && isMethodFlat()) {
+            return RescoreContext.builder().oversampleFactor(FLAT_OVERSAMPLE_FACTOR).userProvided(false).build();
+        }
+
+        if (compressionLevel.isModeValidForRescore(mode)) {
+            Version version = indexVersionCreated != null ? indexVersionCreated : Version.CURRENT;
+
+            if (compressionLevel == CompressionLevel.x32 && engine == KNNEngine.LUCENE && version.onOrAfter(Version.V_3_6_0)) {
+                return RescoreContext.builder()
+                    .oversampleFactor(RescoreContext.OVERSAMPLE_FACTOR_DEFAULT_FOR_LUCENE_SCALAR_QUANTIZER_AFTER_V360)
+                    .userProvided(false)
+                    .build();
+            }
+
+            if (compressionLevel == CompressionLevel.x4 && version.before(Version.V_3_1_0)) {
+                return null;
+            }
+
+            if (compressionLevel != CompressionLevel.x4 && dimension <= RescoreContext.DIMENSION_THRESHOLD) {
+                return RescoreContext.builder()
+                    .oversampleFactor(RescoreContext.OVERSAMPLE_FACTOR_BELOW_DIMENSION_THRESHOLD)
+                    .userProvided(false)
+                    .build();
+            }
+
+            return compressionLevel.getDefaultRescoreContextForLevel();
+        }
+
+        return null;
     }
 
     /**
