@@ -40,29 +40,6 @@ public class FaissCodecFormatResolver implements CodecFormatResolver {
         this.nativeIndexBuildStrategyFactory = nativeIndexBuildStrategyFactory;
     }
 
-    /**
-     * Resolves the format for a specific field. Returns {@link Faiss1040ScalarQuantizedKnnVectorsFormat} when
-     * the encoder is sq with bits=1, otherwise falls back to the default native format.
-     *
-     * @deprecated Use the overload accepting {@link ResolvedIndexSpec} instead. This overload is retained
-     *             for backward compatibility with indices that do not have a resolved spec (model/training paths).
-     */
-    @SuppressWarnings("removal")
-    @Deprecated(forRemoval = true)
-    @Override
-    public KnnVectorsFormat resolve(
-        String field,
-        KNNMethodContext methodContext,
-        Map<String, Object> params,
-        int defaultMaxConnections,
-        int defaultBeamWidth
-    ) {
-        if (FaissSQEncoder.isSQOneBit(params)) {
-            return new Faiss1040ScalarQuantizedKnnVectorsFormat(nativeIndexBuildStrategyFactory);
-        }
-        return resolve();
-    }
-
     @Override
     public KnnVectorsFormat resolve(
         String field,
@@ -72,7 +49,10 @@ public class FaissCodecFormatResolver implements CodecFormatResolver {
         int defaultBeamWidth,
         ResolvedIndexSpec resolvedSpec
     ) {
-        if (resolvedSpec.usesSQ1BitCodecFormat()) {
+        if (resolvedSpec != null && resolvedSpec.usesSQ1BitCodecFormat()) {
+            return new Faiss1040ScalarQuantizedKnnVectorsFormat(nativeIndexBuildStrategyFactory);
+        }
+        if (resolvedSpec == null && FaissSQEncoder.isSQOneBit(params)) {
             return new Faiss1040ScalarQuantizedKnnVectorsFormat(nativeIndexBuildStrategyFactory);
         }
         return resolve();

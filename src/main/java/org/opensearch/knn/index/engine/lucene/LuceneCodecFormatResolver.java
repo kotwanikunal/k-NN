@@ -48,27 +48,7 @@ public class LuceneCodecFormatResolver implements CodecFormatResolver {
         );
     }
 
-    @Deprecated(forRemoval = true)
     @Override
-    public KnnVectorsFormat resolve(
-        String field,
-        KNNMethodContext methodContext,
-        Map<String, Object> params,
-        int defaultMaxConnections,
-        int defaultBeamWidth
-    ) {
-        LuceneVectorsFormatType formatType = determineFormatType(field, methodContext, params, defaultMaxConnections, defaultBeamWidth);
-        Function<KnnVectorsFormatContext, KnnVectorsFormat> factory = formatResolvers.get(formatType);
-        if (factory == null) {
-            throw new IllegalStateException(String.format("No Lucene vectors format registered for type [%s]", formatType));
-        }
-        return factory.apply(new KnnVectorsFormatContext(field, methodContext, params, defaultMaxConnections, defaultBeamWidth));
-    }
-
-    /**
-     * Resolve with ResolvedIndexSpec available for future use.
-     * Currently delegates to the standard resolve method.
-     */
     public KnnVectorsFormat resolve(
         String field,
         KNNMethodContext methodContext,
@@ -77,7 +57,12 @@ public class LuceneCodecFormatResolver implements CodecFormatResolver {
         int defaultBeamWidth,
         ResolvedIndexSpec resolvedSpec
     ) {
-        return resolve(field, methodContext, params, defaultMaxConnections, defaultBeamWidth);
+        LuceneVectorsFormatType formatType = determineFormatType(field, methodContext, params, defaultMaxConnections, defaultBeamWidth);
+        Function<KnnVectorsFormatContext, KnnVectorsFormat> factory = formatResolvers.get(formatType);
+        if (factory == null) {
+            throw new IllegalStateException(String.format("No Lucene vectors format registered for type [%s]", formatType));
+        }
+        return factory.apply(new KnnVectorsFormatContext(field, methodContext, params, defaultMaxConnections, defaultBeamWidth));
     }
 
     /**

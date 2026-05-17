@@ -161,6 +161,40 @@ public final class ResolvedIndexSpec {
             && (quantizationBits == Encoder.QuantizationBits.SIXTEEN || quantizationBits == Encoder.QuantizationBits.FULL_PRECISION);
     }
 
+    /**
+     * Whether this configuration supports remote index build.
+     * Only HNSW method is supported for remote builds.
+     */
+    public boolean supportsRemoteIndexBuild() {
+        if (!METHOD_HNSW.equals(methodName)) {
+            return false;
+        }
+        if (isSQOneBit()) {
+            return true;
+        }
+        if (isFloat16Index()) {
+            return true;
+        }
+        if (vectorDataType == VectorDataType.FLOAT && encoderType == Encoder.EncoderType.FLAT) {
+            return true;
+        }
+        if (vectorDataType == VectorDataType.BINARY && encoderType == Encoder.EncoderType.FLAT) {
+            return true;
+        }
+        if (vectorDataType == VectorDataType.BYTE && encoderType == Encoder.EncoderType.FLAT) {
+            return true;
+        }
+        if (vectorDataType == VectorDataType.FLOAT
+            && encoderType == Encoder.EncoderType.SQ
+            && quantizationBits != null
+            && quantizationBits != Encoder.QuantizationBits.ONE
+            && quantizationBits != Encoder.QuantizationBits.SIXTEEN
+            && quantizationBits != Encoder.QuantizationBits.FULL_PRECISION) {
+            return true;
+        }
+        return false;
+    }
+
     private boolean isSQOneBit() {
         return encoderType == Encoder.EncoderType.SQ && quantizationBits == Encoder.QuantizationBits.ONE;
     }

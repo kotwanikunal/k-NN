@@ -16,6 +16,7 @@ import org.opensearch.knn.index.engine.KNNMethodConfigContext;
 import org.opensearch.knn.index.engine.KNNMethodContext;
 import org.opensearch.knn.index.engine.MethodResolver;
 import org.opensearch.knn.index.engine.NativeLibrary;
+import org.opensearch.knn.index.engine.ResolvedIndexSpec;
 import org.opensearch.knn.index.engine.ResolvedMethodContext;
 import org.opensearch.knn.memoryoptsearch.VectorSearcherFactory;
 import org.opensearch.knn.memoryoptsearch.faiss.FaissMemoryOptimizedSearcherFactory;
@@ -126,12 +127,13 @@ public class Faiss extends NativeLibrary {
         return methodResolver.resolveMethod(knnMethodContext, knnMethodConfigContext, shouldRequireTraining, spaceType);
     }
 
-    /**
-     * Use the method name to route the check to the specific method class
-     */
     @Override
     public boolean supportsRemoteIndexBuild(KNNLibraryIndexingContext knnLibraryIndexingContext) {
         if (knnLibraryIndexingContext != null) {
+            ResolvedIndexSpec resolvedSpec = knnLibraryIndexingContext.getResolvedSpec();
+            if (resolvedSpec != null) {
+                return resolvedSpec.supportsRemoteIndexBuild();
+            }
             Map<String, Object> parameters = knnLibraryIndexingContext.getLibraryParameters();
             if (METHOD_HNSW.equals(parameters.get(NAME))) {
                 return FaissHNSWMethod.supportsRemoteIndexBuild(parameters);

@@ -62,7 +62,6 @@ public abstract class KNN1040BasePerFieldKnnVectorsFormat extends PerFieldKnnVec
         this.nativeIndexBuildStrategyFactory = nativeIndexBuildStrategyFactory;
     }
 
-    @SuppressWarnings("removal")
     @Override
     public KnnVectorsFormat getKnnVectorsFormatForField(final String field) {
         if (isKnnVectorFieldType(field) == false) {
@@ -95,16 +94,10 @@ public abstract class KNN1040BasePerFieldKnnVectorsFormat extends PerFieldKnnVec
         final ResolvedIndexSpec resolvedSpec = mappedFieldType.getResolvedSpec();
 
         if (engine == KNNEngine.LUCENE) {
-            if (resolvedSpec != null) {
-                return luceneFormatResolver.resolve(field, knnMethodContext, params, defaultMaxConnections, defaultBeamWidth, resolvedSpec);
-            }
-            return luceneFormatResolver.resolve(field, knnMethodContext, params, defaultMaxConnections, defaultBeamWidth);
+            return luceneFormatResolver.resolve(field, knnMethodContext, params, defaultMaxConnections, defaultBeamWidth, resolvedSpec);
         }
 
-        if (resolvedSpec != null) {
-            return nativeFormatResolver.resolve(field, knnMethodContext, params, defaultMaxConnections, defaultBeamWidth, resolvedSpec);
-        }
-        return nativeFormatResolver.resolve(field, knnMethodContext, params, defaultMaxConnections, defaultBeamWidth);
+        return nativeFormatResolver.resolve(field, knnMethodContext, params, defaultMaxConnections, defaultBeamWidth, resolvedSpec);
     }
 
     @Override
