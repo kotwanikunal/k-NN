@@ -76,4 +76,17 @@ public class AbstractFaissPQEncoderTests extends KNNTestCase {
     private KNNMethodConfigContext generateKNNMethodConfigContext(int dimension) {
         return KNNMethodConfigContext.builder().dimension(dimension).build();
     }
+
+    public void testEncoderTypeAndBits() {
+        AbstractFaissPQEncoder encoder = new AbstractFaissPQEncoder() {
+            @Override
+            public MethodComponent getMethodComponent() {
+                return FaissIVFPQEncoder.METHOD_COMPONENT;
+            }
+        };
+        assertEquals(Encoder.EncoderType.PQ, encoder.getEncoderType());
+        assertEquals(Encoder.QuantizationBits.NOT_APPLICABLE, encoder.getQuantizationBits());
+        assertTrue(encoder.getSupportedBits().contains(Encoder.QuantizationBits.NOT_APPLICABLE));
+        assertEquals(1, encoder.getSupportedBits().size());
+    }
 }

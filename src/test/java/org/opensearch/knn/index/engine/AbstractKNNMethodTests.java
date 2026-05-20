@@ -188,4 +188,47 @@ public class AbstractKNNMethodTests extends KNNTestCase {
         );
         assertEquals(knnLibrarySearchContext, knnMethod.getKNNLibrarySearchContext());
     }
+
+    public void testEncoderEnums() {
+        // EncoderType fromName
+        assertEquals(Encoder.EncoderType.FLAT, Encoder.EncoderType.fromName("flat"));
+        assertEquals(Encoder.EncoderType.SQ, Encoder.EncoderType.fromName("sq"));
+        assertEquals(Encoder.EncoderType.PQ, Encoder.EncoderType.fromName("pq"));
+        assertEquals(Encoder.EncoderType.BQ, Encoder.EncoderType.fromName("binary"));
+        expectThrows(IllegalArgumentException.class, () -> Encoder.EncoderType.fromName("unknown"));
+
+        // QuantizationBits fromValue - known and unknown
+        assertEquals(Encoder.QuantizationBits.ONE, Encoder.QuantizationBits.fromValue(1));
+        assertEquals(Encoder.QuantizationBits.FOUR, Encoder.QuantizationBits.fromValue(4));
+        assertEquals(Encoder.QuantizationBits.FULL_PRECISION, Encoder.QuantizationBits.fromValue(99));
+    }
+
+    public void testBuildResolvedIndexSpec_DefaultsWithoutEncoder() {
+        String methodName = "test-method";
+        KNNMethodConfigContext configContext = KNNMethodConfigContext.builder()
+            .versionCreated(org.opensearch.Version.CURRENT)
+            .dimension(128)
+            .vectorDataType(VectorDataType.FLOAT)
+            .build();
+        KNNMethod knnMethod = new TestKNNMethod(
+            MethodComponent.Builder.builder(methodName).addSupportedDataTypes(Set.of(VectorDataType.FLOAT)).build(),
+            Set.of(SpaceType.L2),
+            EMPTY_ENGINE_SPECIFIC_CONTEXT
+        );
+
+        // No encoder param
+        KNNMethodContext methodContext = new KNNMethodContext(
+            KNNEngine.FAISS,
+            SpaceType.L2,
+            new MethodComponentContext(methodName, Map.of())
+        );
+        ResolvedIndexSpec spec = knnMethod.getKNNLibraryIndexingContext(methodContext, configContext).getResolvedSpec();
+        assertEquals(Encoder.EncoderType.FLAT, spec.getEncoderType());
+        assertEquals(Encoder.QuantizationBits.FULL_PRECISION, spec.getQuantizationBits());
+
+        // Null parameters
+        methodContext = new KNNMethodContext(KNNEngine.FAISS, SpaceType.L2, new MethodComponentContext(methodName, null));
+        spec = knnMethod.getKNNLibraryIndexingContext(methodContext, configContext).getResolvedSpec();
+        assertEquals(Encoder.EncoderType.FLAT, spec.getEncoderType());
+    }
 }

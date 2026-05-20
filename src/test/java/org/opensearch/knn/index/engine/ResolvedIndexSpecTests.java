@@ -341,6 +341,100 @@ public class ResolvedIndexSpecTests extends KNNTestCase {
         assertEquals(Version.V_3_6_0, spec.getIndexVersionCreated());
     }
 
+    // --- Float16 and remote index build ---
+
+    public void testIsFloat16Index() {
+        assertTrue(
+            baseFaiss().encoderType(Encoder.EncoderType.SQ).quantizationBits(Encoder.QuantizationBits.SIXTEEN).build().isFloat16Index()
+        );
+        assertTrue(
+            baseFaiss().encoderType(Encoder.EncoderType.SQ)
+                .quantizationBits(Encoder.QuantizationBits.FULL_PRECISION)
+                .build()
+                .isFloat16Index()
+        );
+        assertFalse(
+            baseFaiss().encoderType(Encoder.EncoderType.SQ)
+                .quantizationBits(Encoder.QuantizationBits.SIXTEEN)
+                .vectorDataType(VectorDataType.BYTE)
+                .build()
+                .isFloat16Index()
+        );
+        assertFalse(
+            baseFaiss().encoderType(Encoder.EncoderType.FLAT)
+                .quantizationBits(Encoder.QuantizationBits.FULL_PRECISION)
+                .build()
+                .isFloat16Index()
+        );
+        assertFalse(baseFaissSQ1Bit().build().isFloat16Index());
+    }
+
+    public void testSupportsRemoteIndexBuild() {
+        // Supported cases
+        assertTrue(baseFaissSQ1Bit().build().supportsRemoteIndexBuild());
+        assertTrue(
+            baseFaiss().encoderType(Encoder.EncoderType.SQ)
+                .quantizationBits(Encoder.QuantizationBits.SIXTEEN)
+                .build()
+                .supportsRemoteIndexBuild()
+        );
+        assertTrue(
+            baseFaiss().encoderType(Encoder.EncoderType.FLAT)
+                .quantizationBits(Encoder.QuantizationBits.FULL_PRECISION)
+                .compressionLevel(CompressionLevel.x1)
+                .build()
+                .supportsRemoteIndexBuild()
+        );
+        assertTrue(
+            baseFaiss().encoderType(Encoder.EncoderType.FLAT).vectorDataType(VectorDataType.BINARY).build().supportsRemoteIndexBuild()
+        );
+        assertTrue(
+            baseFaiss().encoderType(Encoder.EncoderType.FLAT).vectorDataType(VectorDataType.BYTE).build().supportsRemoteIndexBuild()
+        );
+        assertTrue(
+            baseFaiss().encoderType(Encoder.EncoderType.SQ)
+                .quantizationBits(Encoder.QuantizationBits.FOUR)
+                .build()
+                .supportsRemoteIndexBuild()
+        );
+
+        // Unsupported cases
+        assertFalse(
+            baseFaiss().encoderType(Encoder.EncoderType.PQ)
+                .quantizationBits(Encoder.QuantizationBits.NOT_APPLICABLE)
+                .build()
+                .supportsRemoteIndexBuild()
+        );
+        assertFalse(
+            baseFaiss().encoderType(Encoder.EncoderType.BQ)
+                .quantizationBits(Encoder.QuantizationBits.ONE)
+                .build()
+                .supportsRemoteIndexBuild()
+        );
+        assertFalse(
+            baseFaiss().methodName(METHOD_IVF)
+                .encoderType(Encoder.EncoderType.FLAT)
+                .quantizationBits(Encoder.QuantizationBits.FULL_PRECISION)
+                .build()
+                .supportsRemoteIndexBuild()
+        );
+    }
+
+    public void testRescoreContext_NullVersionFallback() {
+        ResolvedIndexSpec spec = ResolvedIndexSpec.builder()
+            .engine(KNNEngine.FAISS)
+            .methodName(METHOD_HNSW)
+            .encoderType(Encoder.EncoderType.SQ)
+            .quantizationBits(Encoder.QuantizationBits.FOUR)
+            .compressionLevel(CompressionLevel.x32)
+            .mode(Mode.ON_DISK)
+            .vectorDataType(VectorDataType.FLOAT)
+            .dimension(500)
+            .indexVersionCreated(null)
+            .build();
+        assertNotNull(spec.getRescoreContext());
+    }
+
     // --- Helpers ---
 
     private ResolvedIndexSpec.ResolvedIndexSpecBuilder baseFaiss() {
