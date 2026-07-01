@@ -359,7 +359,12 @@ public class RadialSearchIT extends KNNCompressionRestTestCase {
             );
         } else {
             assertTrue(
-                String.format("[%s] quantized radial returned %d results, expected at most %d", testName, results.size(), testVectors.length),
+                String.format(
+                    "[%s] quantized radial returned %d results, expected at most %d",
+                    testName,
+                    results.size(),
+                    testVectors.length
+                ),
                 results.size() <= testVectors.length
             );
             for (int i = 0; i < results.size(); i++) {

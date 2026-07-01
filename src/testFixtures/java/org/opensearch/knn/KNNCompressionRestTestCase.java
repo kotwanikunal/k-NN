@@ -11,9 +11,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.knn.index.SpaceType;
-import org.opensearch.knn.index.mapper.CompressionLevel;
 
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
@@ -22,7 +20,6 @@ import static org.opensearch.knn.common.KNNConstants.COMPRESSION_LEVEL_PARAMETER
 import static org.opensearch.knn.common.KNNConstants.FAISS_NAME;
 import static org.opensearch.knn.common.KNNConstants.KNN_ENGINE;
 import static org.opensearch.knn.common.KNNConstants.KNN_METHOD;
-import static org.opensearch.knn.common.KNNConstants.LUCENE_NAME;
 import static org.opensearch.knn.common.KNNConstants.METHOD_HNSW;
 import static org.opensearch.knn.common.KNNConstants.METHOD_PARAMETER_EF_CONSTRUCTION;
 import static org.opensearch.knn.common.KNNConstants.METHOD_PARAMETER_EF_SEARCH;
@@ -57,10 +54,7 @@ public abstract class KNNCompressionRestTestCase extends KNNRestTestCase {
      */
     @ParametersFactory(argumentFormatting = "compression:%1$s")
     public static Collection<Object[]> compressionParameters() {
-        return Arrays.asList(
-            new Object[] { CompressionTestConfig.FP32 },
-            new Object[] { CompressionTestConfig.SQ_1BIT }
-        );
+        return Arrays.asList(new Object[] { CompressionTestConfig.FP32 }, new Object[] { CompressionTestConfig.SQ_1BIT });
     }
 
     /**
@@ -102,7 +96,7 @@ public abstract class KNNCompressionRestTestCase extends KNNRestTestCase {
             .field("dimension", dimension)
             .field(MODE_PARAMETER, compressionConfig.getModeName())
             .field(COMPRESSION_LEVEL_PARAMETER, compressionConfig.getCompressionLevelName());
-        
+
         addMethodParams(builder, engine, spaceType, m, efConstruction);
         builder.endObject().endObject().endObject();
 
@@ -122,14 +116,9 @@ public abstract class KNNCompressionRestTestCase extends KNNRestTestCase {
             .field("dimension", dimension)
             .field(MODE_PARAMETER, compressionConfig.getModeName())
             .field(COMPRESSION_LEVEL_PARAMETER, compressionConfig.getCompressionLevelName());
-        
+
         addMethodParams(builder, engine, spaceType, DEFAULT_HNSW_M, DEFAULT_HNSW_EF_CONSTRUCTION);
-        builder.endObject()
-            .startObject("category")
-            .field("type", "keyword")
-            .endObject()
-            .endObject()
-            .endObject();
+        builder.endObject().startObject("category").field("type", "keyword").endObject().endObject().endObject();
 
         createKnnIndex(indexName, getDefaultCompressionIndexSettings(), builder.toString());
     }
@@ -155,10 +144,10 @@ public abstract class KNNCompressionRestTestCase extends KNNRestTestCase {
      */
     protected void assertScoreInRange(List<Float> scores, SpaceType spaceType) {
         assertFalse("Scores should not be empty", scores.isEmpty());
-        
+
         for (float score : scores) {
             assertTrue("Score should be positive", score > 0.0f);
-            
+
             // Space type specific bounds (compression affects precision but not valid range)
             switch (spaceType) {
                 case L2:
@@ -174,13 +163,10 @@ public abstract class KNNCompressionRestTestCase extends KNNRestTestCase {
                     break;
             }
         }
-        
+
         // Verify scores are in descending order (relevance ranking)
         for (int i = 0; i < scores.size() - 1; i++) {
-            assertTrue(
-                "Scores should be in descending order",
-                scores.get(i) >= scores.get(i + 1)
-            );
+            assertTrue("Scores should be in descending order", scores.get(i) >= scores.get(i + 1));
         }
     }
 
@@ -192,7 +178,7 @@ public abstract class KNNCompressionRestTestCase extends KNNRestTestCase {
         if (compressionConfig == CompressionTestConfig.FP32) {
             return 0.95f; // High precision expectation for uncompressed
         }
-        
+
         // Quantized thresholds vary by space type due to different approximation characteristics
         switch (spaceType) {
             case L2:
@@ -263,11 +249,11 @@ public abstract class KNNCompressionRestTestCase extends KNNRestTestCase {
             .startObject(PARAMETERS)
             .field(METHOD_PARAMETER_M, m)
             .field(METHOD_PARAMETER_EF_CONSTRUCTION, efConstruction);
-        
+
         if (FAISS_NAME.equals(engine)) {
             builder.field(METHOD_PARAMETER_EF_SEARCH, DEFAULT_HNSW_EF_SEARCH);
         }
-        
+
         builder.endObject().endObject();
     }
 }

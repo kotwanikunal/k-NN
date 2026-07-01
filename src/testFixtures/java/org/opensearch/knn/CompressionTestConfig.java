@@ -22,26 +22,8 @@ import java.util.Map;
 @Getter
 @AllArgsConstructor
 public enum CompressionTestConfig {
-    FP32(
-        CompressionLevel.x1, 
-        Mode.IN_MEMORY, 
-        null, 
-        createFP32Thresholds(),
-        true,
-        true,
-        true,
-        true
-    ),
-    SQ_1BIT(
-        CompressionLevel.x32, 
-        Mode.ON_DISK, 
-        ScalarQuantizationType.ONE_BIT, 
-        createSQ1BitThresholds(),
-        true,
-        true,
-        true,
-        true
-    );
+    FP32(CompressionLevel.x1, Mode.IN_MEMORY, null, createFP32Thresholds(), true, true, true, true),
+    SQ_1BIT(CompressionLevel.x32, Mode.ON_DISK, ScalarQuantizationType.ONE_BIT, createSQ1BitThresholds(), true, true, true, true);
 
     private final CompressionLevel compressionLevel;
     private final Mode mode;

@@ -103,6 +103,7 @@ public class FaissHNSWFlatE2EIT extends KNNRestTestCase {
             .startObject(fieldName)
             .field("type", "knn_vector")
             .field("dimension", dimension)
+            .field(KNNConstants.COMPRESSION_LEVEL_PARAMETER, "1x")
             .startObject(KNNConstants.KNN_METHOD)
             .field(NAME, METHOD_HNSW)
             .field(METHOD_PARAMETER_SPACE_TYPE, spaceType.getValue())

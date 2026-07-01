@@ -30,7 +30,8 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.index.query.RangeQueryBuilder;
 import org.opensearch.index.query.TermQueryBuilder;
-import org.opensearch.knn.KNNRestTestCase;
+import org.opensearch.knn.CompressionTestConfig;
+import org.opensearch.knn.KNNCompressionRestTestCase;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.knn.KNNResult;
 import org.opensearch.knn.TestUtils;
@@ -81,13 +82,17 @@ import static org.opensearch.knn.common.KNNConstants.MODEL_DESCRIPTION;
 import static org.opensearch.knn.common.KNNConstants.MODEL_ID;
 import static org.opensearch.knn.common.KNNConstants.NAME;
 import static org.opensearch.knn.common.KNNConstants.PARAMETERS;
-import static org.opensearch.knn.common.KNNConstants.COMPRESSION_LEVEL_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.TRAIN_FIELD_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.TRAIN_INDEX_PARAMETER;
 import static org.opensearch.knn.common.KNNConstants.VECTOR_DATA_TYPE_FIELD;
 
 @TimeoutSuite(millis = 40 * TimeUnits.MINUTE)
-public class FaissIT extends KNNRestTestCase {
+public class FaissIT extends KNNCompressionRestTestCase {
+
+    public FaissIT(CompressionTestConfig compressionConfig) {
+        super(compressionConfig);
+    }
+
     private static final String DOC_ID_1 = "doc1";
     private static final String DOC_ID_2 = "doc2";
     private static final String DOC_ID_3 = "doc3";
@@ -122,6 +127,7 @@ public class FaissIT extends KNNRestTestCase {
     @SneakyThrows
     @ExpectRemoteBuildValidation
     public void testEndToEnd_whenDoRadiusSearch_whenDistanceThreshold_whenMethodIsHNSWFlat_thenSucceed() {
+        assumeUncompressed();
         SpaceType spaceType = SpaceType.L2;
 
         List<Integer> mValues = ImmutableList.of(16, 32, 64, 128);
@@ -181,6 +187,7 @@ public class FaissIT extends KNNRestTestCase {
     @SneakyThrows
     @ExpectRemoteBuildValidation
     public void testEndToEnd_whenDoRadiusSearch_whenScoreThreshold_whenMethodIsHNSWFlat_thenSucceed() {
+        assumeUncompressed();
         SpaceType spaceType = SpaceType.L2;
 
         List<Integer> mValues = ImmutableList.of(16, 32, 64, 128);
@@ -238,9 +245,9 @@ public class FaissIT extends KNNRestTestCase {
         deleteKNNIndex(INDEX_NAME);
     }
 
-    // Pinned to FP32: relies on uncompressed score precision
     @SneakyThrows
     public void testRadialSearchWithCosineAndFilter_ensureThresholdEnforced_thenSucceed() {
+        assumeUncompressed();
         String indexName = "test-index-cosine-radial";
         String filterFieldName = "category";
         int dimension = 128;
@@ -252,7 +259,6 @@ public class FaissIT extends KNNRestTestCase {
             .startObject(FIELD_NAME)
             .field(TYPE_FIELD_NAME, KNN_VECTOR_TYPE)
             .field(DIMENSION_FIELD_NAME, dimension)
-            .field(COMPRESSION_LEVEL_PARAMETER, "1x")
             .startObject(KNN_METHOD)
             .field(NAME, METHOD_HNSW)
             .field(METHOD_PARAMETER_SPACE_TYPE, spaceType.getValue())
@@ -320,6 +326,7 @@ public class FaissIT extends KNNRestTestCase {
     @SneakyThrows
     @ExpectRemoteBuildValidation
     public void testEndToEnd_whenDoRadiusSearch_whenMoreThanOneScoreThreshold_whenMethodIsHNSWFlat_thenSucceed() {
+        assumeUncompressed();
         SpaceType spaceType = SpaceType.INNER_PRODUCT;
 
         List<Integer> mValues = ImmutableList.of(16, 32, 64, 128);
@@ -379,6 +386,7 @@ public class FaissIT extends KNNRestTestCase {
 
     @SneakyThrows
     public void testEndToEnd_whenDoRadiusSearch_whenDistanceThreshold_whenMethodIsHNSWPQ_thenSucceed() {
+        assumeUncompressed();
         String indexName = "test-index";
         String fieldName = "test-field";
         String trainingIndexName = "training-index";
@@ -471,6 +479,7 @@ public class FaissIT extends KNNRestTestCase {
 
     @SneakyThrows
     public void testRadialQuery_withFilter_thenSuccess() {
+        assumeUncompressed();
         setupKNNIndexForFilterQuery();
 
         final float[][] searchVector = new float[][] { { 3.3f, 3.0f, 5.0f } };
@@ -591,6 +600,7 @@ public class FaissIT extends KNNRestTestCase {
 
     @SneakyThrows
     public void testEndToEnd_whenMethodIsHNSWPQ_thenSucceed() {
+        assumeUncompressed();
         String indexName = "test-index";
         String fieldName = "test-field";
         String trainingIndexName = "training-index";
@@ -692,6 +702,7 @@ public class FaissIT extends KNNRestTestCase {
 
     @SneakyThrows
     public void testHNSWSQFP16_whenIndexedAndQueried_thenSucceed() {
+        assumeUncompressed();
         String indexName = "test-index-hnsw-sqfp16";
         String fieldName = "test-field-hnsw-sqfp16";
         SpaceType[] spaceTypes = { SpaceType.L2, SpaceType.INNER_PRODUCT };
@@ -746,6 +757,7 @@ public class FaissIT extends KNNRestTestCase {
 
     @SneakyThrows
     public void testHNSWSQFP16_whenGraphThresholdIsNegative_whenIndexed_thenSkipCreatingGraph() {
+        assumeUncompressed();
         final String indexName = "test-index-hnsw-sqfp16";
         final String fieldName = "test-field-hnsw-sqfp16";
         final SpaceType[] spaceTypes = { SpaceType.L2, SpaceType.INNER_PRODUCT };
@@ -804,6 +816,7 @@ public class FaissIT extends KNNRestTestCase {
 
     @SneakyThrows
     public void testHNSWSQFP16_whenGraphThresholdIsMetDuringMerge_thenCreateGraph() {
+        assumeUncompressed();
         final String indexName = "test-index-hnsw-sqfp16";
         final String fieldName = "test-field-hnsw-sqfp16";
         final SpaceType[] spaceTypes = { SpaceType.L2, SpaceType.INNER_PRODUCT };
@@ -867,7 +880,7 @@ public class FaissIT extends KNNRestTestCase {
 
     @SneakyThrows
     public void testIVFSQFP16_whenIndexedAndQueried_thenSucceed() {
-
+        assumeUncompressed();
         String modelId = "test-model-ivf-sqfp16";
         int dimension = 128;
         int numDocs = 100;
@@ -928,6 +941,7 @@ public class FaissIT extends KNNRestTestCase {
 
     @SneakyThrows
     public void testHNSWSQFP16_whenIndexedWithOutOfFP16Range_thenThrowException() {
+        assumeUncompressed();
         String indexName = "test-index-sqfp16";
         String fieldName = "test-field-sqfp16";
         SpaceType[] spaceTypes = { SpaceType.L2, SpaceType.INNER_PRODUCT };
@@ -1041,6 +1055,7 @@ public class FaissIT extends KNNRestTestCase {
 
     @SneakyThrows
     public void testHNSWSQFP16_whenClipToFp16isTrueAndIndexedWithOutOfFP16Range_thenSucceed() {
+        assumeUncompressed();
         String indexName = "test-index-sqfp16-clip-fp16";
         String fieldName = "test-field-sqfp16";
 
@@ -1127,6 +1142,7 @@ public class FaissIT extends KNNRestTestCase {
 
     @SneakyThrows
     public void testIVFSQFP16_whenIndexedWithOutOfFP16Range_thenThrowException() {
+        assumeUncompressed();
         String modelId = "test-model-ivf-sqfp16";
         int dimension = 128;
 
@@ -1232,6 +1248,7 @@ public class FaissIT extends KNNRestTestCase {
 
     @SneakyThrows
     public void testIVFSQFP16_whenClipToFp16isTrueAndIndexedWithOutOfFP16Range_thenSucceed() {
+        assumeUncompressed();
         String modelId = "test-model-ivf-sqfp16";
         int dimension = 2;
 
@@ -1308,6 +1325,7 @@ public class FaissIT extends KNNRestTestCase {
 
     @SneakyThrows
     public void testEndToEnd_whenMethodIsHNSWPQAndHyperParametersNotSet_thenSucceed() {
+        assumeUncompressed();
         String indexName = "test-index";
         String fieldName = "test-field";
         String trainingIndexName = "training-index";
@@ -1419,6 +1437,7 @@ public class FaissIT extends KNNRestTestCase {
      */
     @SneakyThrows
     public void testSharedIndexState_whenOneIndexDeleted_thenSecondIndexIsStillSearchable() {
+        assumeUncompressed();
         String firstIndexName = "test-index-1";
         String secondIndexName = "test-index-2";
         String trainingIndexName = "training-index";
@@ -1515,6 +1534,7 @@ public class FaissIT extends KNNRestTestCase {
     }
 
     public void testDocUpdate() throws IOException {
+        assumeUncompressed();
         String indexName = "test-index-1";
         String fieldName = "test-field-1";
         Integer dimension = 2;
@@ -1733,6 +1753,7 @@ public class FaissIT extends KNNRestTestCase {
 
     @SneakyThrows
     public void testByteVectorWithFilter_whenFilterCountGreaterThanK_thenSucceed() {
+        assumeUncompressed();
         String indexName = "test-byte-vector-filter";
         String fieldName = "test-byte-field";
         String categoryField = "category";
@@ -1793,6 +1814,7 @@ public class FaissIT extends KNNRestTestCase {
 
     @SneakyThrows
     public void testFiltering_whenUsingFaissExactSearchWithIP_thenMatchExpectedScore() {
+        assumeUncompressed();
         XContentBuilder builder = XContentFactory.jsonBuilder()
             .startObject()
             .startObject("properties")
@@ -1977,6 +1999,7 @@ public class FaissIT extends KNNRestTestCase {
 
     @SneakyThrows
     public void testIVF_whenBinaryFormat_whenIVF_thenSuccess() {
+        assumeUncompressed();
         String modelId = "test-model-ivf-binary";
         int dimension = 8;
 
@@ -2192,6 +2215,7 @@ public class FaissIT extends KNNRestTestCase {
 
     @SneakyThrows
     public void testEndToEnd_whenDoRadiusSearch_withByteVector_thenSucceed() {
+        assumeUncompressed();
         SpaceType spaceType = SpaceType.L2;
         String indexName = "test-index-byte-radial";
         String fieldName = "test-field-byte-radial";
@@ -2380,46 +2404,46 @@ public class FaissIT extends KNNRestTestCase {
         assertEquals(1, resultsQuery2.size());
     }
 
-    // Pinned to FP32: relies on uncompressed score precision
     public void testCosineSimilarity_withHNSW_withExactSearch_thenSucceed() throws Exception {
+        assumeUncompressed();
         testCosineSimilarityForApproximateSearch(NEVER_BUILD_VECTOR_DATA_STRUCTURE_THRESHOLD);
     }
 
-    // Pinned to FP32: relies on uncompressed score precision
     @ExpectRemoteBuildValidation
     public void testCosineSimilarity_withHNSW_withApproximate_thenSucceed() throws Exception {
+        assumeUncompressed();
         testCosineSimilarityForApproximateSearch(ALWAYS_BUILD_VECTOR_DATA_STRUCTURE_THRESHOLD);
         validateGraphEviction();
     }
 
-    // Pinned to FP32: relies on uncompressed score precision
     @ExpectRemoteBuildValidation
     public void testCosineSimilarity_withGraph_withRadialSearch_withDistanceThreshold_thenSucceed() throws Exception {
+        assumeUncompressed();
         testCosineSimilarityForRadialSearch(ALWAYS_BUILD_VECTOR_DATA_STRUCTURE_THRESHOLD, null, 0.1f);
         validateGraphEviction();
     }
 
-    // Pinned to FP32: relies on uncompressed score precision
     @ExpectRemoteBuildValidation
     public void testCosineSimilarity_withGraph_withRadialSearch_withScore_thenSucceed() throws Exception {
+        assumeUncompressed();
         testCosineSimilarityForRadialSearch(ALWAYS_BUILD_VECTOR_DATA_STRUCTURE_THRESHOLD, 0.9f, null);
         validateGraphEviction();
     }
 
-    // Pinned to FP32: relies on uncompressed score precision
     public void testCosineSimilarity_withNoGraphs_withRadialSearch_withDistanceThreshold_thenSucceed() throws Exception {
+        assumeUncompressed();
         testCosineSimilarityForRadialSearch(NEVER_BUILD_VECTOR_DATA_STRUCTURE_THRESHOLD, null, 0.1f);
         validateGraphEviction();
     }
 
-    // Pinned to FP32: relies on uncompressed score precision
     public void testCosineSimilarity_withNoGraphs_withRadialSearch_withScore_thenSucceed() throws Exception {
+        assumeUncompressed();
         testCosineSimilarityForRadialSearch(NEVER_BUILD_VECTOR_DATA_STRUCTURE_THRESHOLD, 0.9f, null);
         validateGraphEviction();
     }
 
-    // Pinned to FP32: relies on uncompressed score precision
     public void testEndToEnd_withApproxAndExactSearch_inSameIndex_ForCosineSpaceType() throws Exception {
+        assumeUncompressed();
         String indexName = randomLowerCaseString();
         String fieldName = randomLowerCaseString();
         SpaceType spaceType = SpaceType.COSINESIMIL;
@@ -2430,9 +2454,9 @@ public class FaissIT extends KNNRestTestCase {
             .startObject("properties")
             .startObject(fieldName)
             .field("type", "knn_vector")
-            .field("dimension", dimension)
-            .field(COMPRESSION_LEVEL_PARAMETER, "1x")
-            .field(KNNConstants.METHOD_PARAMETER_SPACE_TYPE, spaceType.getValue())
+            .field("dimension", dimension);
+        addCompressionMappingFields(builder);
+        builder.field(KNNConstants.METHOD_PARAMETER_SPACE_TYPE, spaceType.getValue())
             .startObject(KNNConstants.KNN_METHOD)
             .field(KNNConstants.NAME, KNNConstants.METHOD_HNSW)
             .field(KNNConstants.KNN_ENGINE, KNNEngine.FAISS.getName())
@@ -2650,9 +2674,9 @@ public class FaissIT extends KNNRestTestCase {
             .startObject("properties")
             .startObject(fieldName)
             .field("type", "knn_vector")
-            .field("dimension", dimension)
-            .field(COMPRESSION_LEVEL_PARAMETER, "1x")
-            .field(KNNConstants.METHOD_PARAMETER_SPACE_TYPE, spaceType.getValue())
+            .field("dimension", dimension);
+        addCompressionMappingFields(builder);
+        builder.field(KNNConstants.METHOD_PARAMETER_SPACE_TYPE, spaceType.getValue())
             .startObject(KNNConstants.KNN_METHOD)
             .field(KNNConstants.NAME, KNNConstants.METHOD_HNSW)
             .field(KNNConstants.KNN_ENGINE, KNNEngine.FAISS.getName())

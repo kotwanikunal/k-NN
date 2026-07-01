@@ -608,9 +608,7 @@ public class KNNScriptScoringIT extends KNNCompressionRestTestCase {
         List<String> docIds = hits.stream().map(hit -> ((String) ((Map<String, Object>) hit).get("_id"))).collect(Collectors.toList());
         assertEquals(Arrays.asList("2", "4", "3", "1"), docIds);
 
-        List<Double> scores = hits.stream()
-            .map(hit -> ((Double) ((Map<String, Object>) hit).get("_score")))
-            .collect(Collectors.toList());
+        List<Double> scores = hits.stream().map(hit -> ((Double) ((Map<String, Object>) hit).get("_score"))).collect(Collectors.toList());
         double[] expectedScores = { 1.0 / (1 + 2), 1.0 / (1 + 8), 1.0 / (1 + 18), 1.0 / (1 + 50) };
         for (int i = 0; i < expectedScores.length; i++) {
             assertEquals(expectedScores[i], scores.get(i), 0.001);

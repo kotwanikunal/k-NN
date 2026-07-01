@@ -185,7 +185,10 @@ public class Compression32XIT extends KNNCompressionRestTestCase {
         forceMergeKnnIndex(indexCosine, 1);
 
         double recallL2 = TestUtils.calculateRecallValue(bulkSearch(indexL2, FIELD_NAME, QUERY_VECTORS, K), GROUND_TRUTH_L2, K);
-        assertTrue(label() + " L2 recall should be >= " + minRecall(SpaceType.L2) + " but was " + recallL2, recallL2 >= minRecall(SpaceType.L2));
+        assertTrue(
+            label() + " L2 recall should be >= " + minRecall(SpaceType.L2) + " but was " + recallL2,
+            recallL2 >= minRecall(SpaceType.L2)
+        );
 
         double recallIP = TestUtils.calculateRecallValue(bulkSearch(indexIP, FIELD_NAME, QUERY_VECTORS, K), GROUND_TRUTH_IP, K);
         assertTrue(
@@ -247,7 +250,10 @@ public class Compression32XIT extends KNNCompressionRestTestCase {
         float threshold = minRecall(SpaceType.L2);
 
         double recallAfterMerge = TestUtils.calculateRecallValue(bulkSearch(indexName, FIELD_NAME, QUERY_VECTORS, K), GROUND_TRUTH_L2, K);
-        assertTrue(label() + " recall after merge should be >= " + threshold + " but was " + recallAfterMerge, recallAfterMerge >= threshold);
+        assertTrue(
+            label() + " recall after merge should be >= " + threshold + " but was " + recallAfterMerge,
+            recallAfterMerge >= threshold
+        );
 
         closeIndex(indexName);
         openIndex(indexName);
@@ -312,7 +318,10 @@ public class Compression32XIT extends KNNCompressionRestTestCase {
     // Builds both compression variants internally, so it runs once per engine under the compressed config.
     @SneakyThrows
     public void testScriptScoring() {
-        assumeTrue("Script scoring equivalence builds both variants internally; run once under the compressed config", compressionConfig.isCompressed());
+        assumeTrue(
+            "Script scoring equivalence builds both variants internally; run once under the compressed config",
+            compressionConfig.isCompressed()
+        );
         String x32IndexName = prefix() + "script_x32";
         String fp32IndexName = prefix() + "script_fp32";
         int docCount = 20;
@@ -674,7 +683,11 @@ public class Compression32XIT extends KNNCompressionRestTestCase {
         forceMergeKnnIndex(lowDimIndex, 1);
 
         List<Set<String>> groundTruthHighDim = TestUtils.computeGroundTruthValues(highDimVectors, highDimQueries, SpaceType.L2, K);
-        double recallHighDim = TestUtils.calculateRecallValue(bulkSearch(highDimIndex, FIELD_NAME, highDimQueries, K), groundTruthHighDim, K);
+        double recallHighDim = TestUtils.calculateRecallValue(
+            bulkSearch(highDimIndex, FIELD_NAME, highDimQueries, K),
+            groundTruthHighDim,
+            K
+        );
         assertTrue(label() + " high-dim recall should be >= " + threshold, recallHighDim >= threshold);
 
         List<Set<String>> groundTruthLowDim = TestUtils.computeGroundTruthValues(lowDimVectors, lowDimQueries, SpaceType.L2, K);

@@ -5,6 +5,7 @@
 
 package org.opensearch.knn.integ;
 
+import com.carrotsearch.randomizedtesting.annotations.ParametersFactory;
 import com.google.common.primitives.Floats;
 import lombok.SneakyThrows;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
@@ -13,8 +14,9 @@ import org.opensearch.client.Response;
 import org.opensearch.client.ResponseException;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.knn.CompressionTestConfig;
+import org.opensearch.knn.KNNCompressionRestTestCase;
 import org.opensearch.knn.KNNJsonIndexMappingsBuilder;
-import org.opensearch.knn.KNNRestTestCase;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.engine.KNNEngine;
@@ -28,7 +30,9 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 
@@ -39,7 +43,16 @@ import static org.opensearch.knn.common.KNNConstants.METHOD_HNSW;
  * Validates that vectors can be retrieved directly from doc values in search responses
  * across different engines, data types, query types, and field configurations.
  */
-public class DocValueFieldsIT extends KNNRestTestCase {
+public class DocValueFieldsIT extends KNNCompressionRestTestCase {
+
+    public DocValueFieldsIT(CompressionTestConfig compressionConfig) {
+        super(compressionConfig);
+    }
+
+    @ParametersFactory(argumentFormatting = "compression:%1$s")
+    public static Collection<Object[]> compressionParameters() {
+        return Arrays.asList(new Object[] { CompressionTestConfig.FP32 });
+    }
 
     private static final String TEST_INDEX = "docvalue_fields_test_index";
     private static final String VECTOR_FIELD = "test_vector";
@@ -241,6 +254,8 @@ public class DocValueFieldsIT extends KNNRestTestCase {
             .fieldName(VECTOR_FIELD)
             .dimension(highDimension)
             .vectorDataType(VectorDataType.FLOAT.getValue())
+            .compressionLevel(compressionConfig.getCompressionLevelName())
+            .mode(compressionMode())
             .method(method)
             .build()
             .getIndexMapping();
@@ -901,6 +916,8 @@ public class DocValueFieldsIT extends KNNRestTestCase {
             .fieldName(VECTOR_FIELD)
             .dimension(DIMENSION)
             .vectorDataType(VectorDataType.FLOAT.getValue())
+            .compressionLevel(compressionConfig.getCompressionLevelName())
+            .mode(compressionMode())
             .method(method)
             .build()
             .getIndexMapping();
@@ -990,6 +1007,8 @@ public class DocValueFieldsIT extends KNNRestTestCase {
             .fieldName(VECTOR_FIELD)
             .dimension(DIMENSION)
             .vectorDataType(VectorDataType.FLOAT.getValue())
+            .compressionLevel(compressionConfig.getCompressionLevelName())
+            .mode(compressionMode())
             .method(method)
             .build()
             .getIndexMapping();
@@ -1111,6 +1130,8 @@ public class DocValueFieldsIT extends KNNRestTestCase {
                 .fieldName(VECTOR_FIELD)
                 .dimension(DIMENSION)
                 .vectorDataType(VectorDataType.FLOAT.getValue())
+                .compressionLevel(compressionConfig.getCompressionLevelName())
+                .mode(compressionMode())
                 .method(method)
                 .build()
                 .getIndexMapping();
@@ -1189,6 +1210,8 @@ public class DocValueFieldsIT extends KNNRestTestCase {
                 .fieldName(VECTOR_FIELD)
                 .dimension(DIMENSION)
                 .vectorDataType(VectorDataType.FLOAT.getValue())
+                .compressionLevel(compressionConfig.getCompressionLevelName())
+                .mode(compressionMode())
                 .method(method)
                 .build()
                 .getIndexMapping();
@@ -1752,6 +1775,8 @@ public class DocValueFieldsIT extends KNNRestTestCase {
                 .fieldName(VECTOR_FIELD)
                 .dimension(DIMENSION)
                 .vectorDataType(VectorDataType.FLOAT.getValue())
+                .compressionLevel(compressionConfig.getCompressionLevelName())
+                .mode(compressionMode())
                 .method(
                     KNNJsonIndexMappingsBuilder.Method.builder()
                         .methodName(METHOD_HNSW)
@@ -1860,6 +1885,8 @@ public class DocValueFieldsIT extends KNNRestTestCase {
                 .fieldName(VECTOR_FIELD)
                 .dimension(DIMENSION)
                 .vectorDataType(VectorDataType.FLOAT.getValue())
+                .compressionLevel(compressionConfig.getCompressionLevelName())
+                .mode(compressionMode())
                 .method(
                     KNNJsonIndexMappingsBuilder.Method.builder()
                         .methodName(METHOD_HNSW)
@@ -1939,6 +1966,8 @@ public class DocValueFieldsIT extends KNNRestTestCase {
                 .fieldName(VECTOR_FIELD)
                 .dimension(DIMENSION)
                 .vectorDataType(VectorDataType.FLOAT.getValue())
+                .compressionLevel(compressionConfig.getCompressionLevelName())
+                .mode(compressionMode())
                 .method(
                     KNNJsonIndexMappingsBuilder.Method.builder()
                         .methodName(METHOD_HNSW)
@@ -2020,6 +2049,8 @@ public class DocValueFieldsIT extends KNNRestTestCase {
             .fieldName(VECTOR_FIELD)
             .dimension(DIMENSION)
             .vectorDataType(VectorDataType.FLOAT.getValue())
+            .compressionLevel(compressionConfig.getCompressionLevelName())
+            .mode(compressionMode())
             .method(
                 KNNJsonIndexMappingsBuilder.Method.builder()
                     .methodName(METHOD_HNSW)
@@ -2138,6 +2169,10 @@ public class DocValueFieldsIT extends KNNRestTestCase {
         }
     }
 
+    private String compressionMode() {
+        return compressionConfig.isCompressed() ? compressionConfig.getModeName() : null;
+    }
+
     private void createHnswIndex(KNNEngine engine) throws Exception {
         KNNJsonIndexMappingsBuilder.Method method = KNNJsonIndexMappingsBuilder.Method.builder()
             .methodName(METHOD_HNSW)
@@ -2149,6 +2184,8 @@ public class DocValueFieldsIT extends KNNRestTestCase {
             .fieldName(VECTOR_FIELD)
             .dimension(DIMENSION)
             .vectorDataType(VectorDataType.FLOAT.getValue())
+            .compressionLevel(compressionConfig.getCompressionLevelName())
+            .mode(compressionMode())
             .method(method)
             .build()
             .getIndexMapping();
@@ -2167,6 +2204,8 @@ public class DocValueFieldsIT extends KNNRestTestCase {
             .fieldName(VECTOR_FIELD)
             .dimension(DIMENSION)
             .vectorDataType(VectorDataType.FLOAT.getValue())
+            .compressionLevel(compressionConfig.getCompressionLevelName())
+            .mode(compressionMode())
             .method(method)
             .build()
             .getIndexMapping();

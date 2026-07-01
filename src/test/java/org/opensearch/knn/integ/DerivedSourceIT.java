@@ -5,6 +5,7 @@
 
 package org.opensearch.knn.integ;
 
+import com.carrotsearch.randomizedtesting.annotations.ParametersFactory;
 import lombok.SneakyThrows;
 import org.junit.Before;
 import org.opensearch.client.Request;
@@ -14,6 +15,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.knn.CompressionTestConfig;
 import org.opensearch.knn.DerivedSourceTestCase;
 import org.opensearch.knn.DerivedSourceUtils;
 import org.opensearch.knn.Pair;
@@ -23,6 +25,8 @@ import org.opensearch.knn.common.annotation.ExpectRemoteBuildValidation;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -39,6 +43,15 @@ import static org.opensearch.knn.common.KNNConstants.DIMENSION;
  * a few gaps in functionality. Ignoring tests for now as feature is experimental.
  */
 public class DerivedSourceIT extends DerivedSourceTestCase {
+
+    public DerivedSourceIT(CompressionTestConfig compressionConfig) {
+        super(compressionConfig);
+    }
+
+    @ParametersFactory(argumentFormatting = "compression:%1$s")
+    public static Collection<Object[]> compressionParameters() {
+        return Arrays.asList(new Object[] { CompressionTestConfig.FP32 });
+    }
 
     private final String snapshot = "snapshot-test";
     private final String repository = "repo";
@@ -280,6 +293,7 @@ public class DerivedSourceIT extends DerivedSourceTestCase {
             .startObject("mapping")
             .field("type", "knn_vector")
             .field("dimension", dimension)
+            .field(KNNConstants.COMPRESSION_LEVEL_PARAMETER, "1x")
             .startObject("method")
             .field("engine", "faiss")
             .field("space_type", "l2")
@@ -350,6 +364,7 @@ public class DerivedSourceIT extends DerivedSourceTestCase {
             .startObject("nameVector")
             .field(KNNConstants.TYPE, KNNConstants.TYPE_KNN_VECTOR)
             .field(DIMENSION, dimension)
+            .field(KNNConstants.COMPRESSION_LEVEL_PARAMETER, "1x")
             .startObject("method")
             .field("engine", "lucene")
             .field("space_type", "l2")
@@ -428,6 +443,7 @@ public class DerivedSourceIT extends DerivedSourceTestCase {
             .startObject(fieldName)
             .field("type", "knn_vector")
             .field("dimension", dimension)
+            .field(KNNConstants.COMPRESSION_LEVEL_PARAMETER, "1x")
             .endObject()
             .endObject()
             .endObject();
@@ -449,6 +465,7 @@ public class DerivedSourceIT extends DerivedSourceTestCase {
             .startObject(fieldName)
             .field("type", "knn_vector")
             .field("dimension", dimension)
+            .field(KNNConstants.COMPRESSION_LEVEL_PARAMETER, "1x")
             .endObject()
             .endObject()
             .endObject();
@@ -484,14 +501,17 @@ public class DerivedSourceIT extends DerivedSourceTestCase {
             .startObject(VECTOR_FIELD_1)
             .field(KNNConstants.TYPE, KNNConstants.TYPE_KNN_VECTOR)
             .field(KNNConstants.DIMENSION, DIMENSION)
+            .field(KNNConstants.COMPRESSION_LEVEL_PARAMETER, "1x")
             .endObject()
             .startObject(VECTOR_FIELD_2)
             .field(KNNConstants.TYPE, KNNConstants.TYPE_KNN_VECTOR)
             .field(KNNConstants.DIMENSION, DIMENSION)
+            .field(KNNConstants.COMPRESSION_LEVEL_PARAMETER, "1x")
             .endObject()
             .startObject(VECTOR_FIELD_3)
             .field(KNNConstants.TYPE, KNNConstants.TYPE_KNN_VECTOR)
             .field(KNNConstants.DIMENSION, DIMENSION)
+            .field(KNNConstants.COMPRESSION_LEVEL_PARAMETER, "1x")
             .endObject()
             .startObject(TEXT_FIELD)
             .field(KNNConstants.TYPE, "text")
@@ -638,10 +658,12 @@ public class DerivedSourceIT extends DerivedSourceTestCase {
             .startObject(VECTOR_FIELD_1)
             .field(KNNConstants.TYPE, KNNConstants.TYPE_KNN_VECTOR)
             .field(DIMENSION, dimension)
+            .field(KNNConstants.COMPRESSION_LEVEL_PARAMETER, "1x")
             .endObject()
             .startObject(VECTOR_FIELD_2)
             .field(KNNConstants.TYPE, KNNConstants.TYPE_KNN_VECTOR)
             .field(DIMENSION, dimension)
+            .field(KNNConstants.COMPRESSION_LEVEL_PARAMETER, "1x")
             .endObject()
             .startObject(TEXT_FIELD)
             .field(KNNConstants.TYPE, "text")
@@ -678,10 +700,12 @@ public class DerivedSourceIT extends DerivedSourceTestCase {
             .startObject(VECTOR_FIELD_1)
             .field(KNNConstants.TYPE, KNNConstants.TYPE_KNN_VECTOR)
             .field(DIMENSION, dimension)
+            .field(KNNConstants.COMPRESSION_LEVEL_PARAMETER, "1x")
             .endObject()
             .startObject(VECTOR_FIELD_2)
             .field(KNNConstants.TYPE, KNNConstants.TYPE_KNN_VECTOR)
             .field(DIMENSION, dimension)
+            .field(KNNConstants.COMPRESSION_LEVEL_PARAMETER, "1x")
             .endObject()
             .startObject(TEXT_FIELD)
             .field(KNNConstants.TYPE, "text")
@@ -719,10 +743,12 @@ public class DerivedSourceIT extends DerivedSourceTestCase {
             .startObject(VECTOR_FIELD_1)
             .field(KNNConstants.TYPE, KNNConstants.TYPE_KNN_VECTOR)
             .field(DIMENSION, dimension)
+            .field(KNNConstants.COMPRESSION_LEVEL_PARAMETER, "1x")
             .endObject()
             .startObject(VECTOR_FIELD_2)
             .field(KNNConstants.TYPE, KNNConstants.TYPE_KNN_VECTOR)
             .field(DIMENSION, dimension)
+            .field(KNNConstants.COMPRESSION_LEVEL_PARAMETER, "1x")
             .endObject()
             .startObject(TEXT_FIELD)
             .field(KNNConstants.TYPE, "text")
@@ -759,10 +785,12 @@ public class DerivedSourceIT extends DerivedSourceTestCase {
             .startObject(VECTOR_FIELD_1)
             .field(KNNConstants.TYPE, KNNConstants.TYPE_KNN_VECTOR)
             .field(DIMENSION, dimension)
+            .field(KNNConstants.COMPRESSION_LEVEL_PARAMETER, "1x")
             .endObject()
             .startObject(VECTOR_FIELD_2)
             .field(KNNConstants.TYPE, KNNConstants.TYPE_KNN_VECTOR)
             .field(DIMENSION, dimension)
+            .field(KNNConstants.COMPRESSION_LEVEL_PARAMETER, "1x")
             .endObject()
             .startObject(TEXT_FIELD)
             .field(KNNConstants.TYPE, "text")
@@ -803,10 +831,12 @@ public class DerivedSourceIT extends DerivedSourceTestCase {
             .startObject(VECTOR_FIELD_1)
             .field(KNNConstants.TYPE, KNNConstants.TYPE_KNN_VECTOR)
             .field(DIMENSION, dimension)
+            .field(KNNConstants.COMPRESSION_LEVEL_PARAMETER, "1x")
             .endObject()
             .startObject(VECTOR_FIELD_2)
             .field(KNNConstants.TYPE, KNNConstants.TYPE_KNN_VECTOR)
             .field(DIMENSION, dimension)
+            .field(KNNConstants.COMPRESSION_LEVEL_PARAMETER, "1x")
             .endObject()
             .startObject(TEXT_FIELD)
             .field(KNNConstants.TYPE, "text")

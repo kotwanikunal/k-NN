@@ -29,7 +29,11 @@ import java.util.function.Supplier;
 
 import static org.opensearch.knn.TestUtils.BWC_VERSION;
 
-public class DerivedSourceTestCase extends KNNRestTestCase {
+public class DerivedSourceTestCase extends KNNCompressionRestTestCase {
+
+    public DerivedSourceTestCase(CompressionTestConfig compressionConfig) {
+        super(compressionConfig);
+    }
 
     private static final List<Pair<String, Boolean>> INDEX_PREFIX_TO_ENABLED = List.of(
         new Pair<>("original-enable-", true),
