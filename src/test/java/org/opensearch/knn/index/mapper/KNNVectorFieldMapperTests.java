@@ -1229,7 +1229,7 @@ public class KNNVectorFieldMapperTests extends KNNTestCase {
 
     public void testKNNVectorFieldMapperMerge_whenCompressionNotSpecified_thenSuccess() throws IOException {
         // Exercises the getMergeBuilder path where the user never configured compression_level:
-        // userConfiguredCompressionLevel resolves to NOT_CONFIGURED instead of CompressionLevel.fromName(null)
+        // compressionLevel resolves to NOT_CONFIGURED instead of CompressionLevel.fromName(null)
         String fieldName = "test-field-name";
         String indexName = "test-index-name";
 
@@ -2665,7 +2665,7 @@ public class KNNVectorFieldMapperTests extends KNNTestCase {
             buildParserContext(TEST_INDEX_NAME, settings)
         );
         assertEquals(CompressionLevel.x1, CompressionLevel.fromName(builder.getOriginalParameters().getCompressionLevel()));
-        assertEquals(CompressionLevel.x1, builder.getKnnMethodConfigContext().getCompressionLevel());
+        assertEquals(CompressionLevel.x1, builder.getKnnMethodConfigContext().getResolvedCompressionLevel());
 
         XContentBuilder x1InMemoryBuilder = XContentFactory.jsonBuilder()
             .startObject()
@@ -2717,7 +2717,7 @@ public class KNNVectorFieldMapperTests extends KNNTestCase {
             xContentBuilderToMap(flatEncoderBuilder),
             buildParserContext(TEST_INDEX_NAME, settings)
         );
-        assertEquals(CompressionLevel.x1, builder.getKnnMethodConfigContext().getCompressionLevel());
+        assertEquals(CompressionLevel.x1, builder.getKnnMethodConfigContext().getResolvedCompressionLevel());
         assertFalse(builder.getOriginalParameters().isLegacyMapping());
     }
 
@@ -2807,7 +2807,7 @@ public class KNNVectorFieldMapperTests extends KNNTestCase {
         assertEquals(expectedSpaceType, builder.getOriginalParameters().getResolvedKnnMethodContext().getSpaceType());
         assertEquals(expectedVectorDataType, builder.getKnnMethodConfigContext().getVectorDataType());
 
-        assertEquals(expectedResolvedCompressionLevel, builder.getKnnMethodConfigContext().getCompressionLevel());
+        assertEquals(expectedResolvedCompressionLevel, builder.getKnnMethodConfigContext().getResolvedCompressionLevel());
         assertEquals(expectedOriginalCompressionLevel, CompressionLevel.fromName(builder.getOriginalParameters().getCompressionLevel()));
         assertEquals(expectedMode, Mode.fromName(builder.getOriginalParameters().getMode()));
         assertEquals(expectedMode, builder.getKnnMethodConfigContext().getMode());

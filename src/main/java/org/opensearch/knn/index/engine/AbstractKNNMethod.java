@@ -174,7 +174,7 @@ public abstract class AbstractKNNMethod implements KNNMethod {
             .methodName(knnMethodContext.getMethodComponentContext().getName())
             .encoderType(encoderType)
             .quantizationBits(quantizationBits)
-            .compressionLevel(knnMethodConfigContext.getCompressionLevel())
+            .compressionLevel(knnMethodConfigContext.getResolvedCompressionLevel())
             .mode(resolveEffectiveMode(knnMethodConfigContext))
             .vectorDataType(knnMethodConfigContext.getVectorDataType())
             .dimension(dimension != null ? dimension : 0)
@@ -194,7 +194,7 @@ public abstract class AbstractKNNMethod implements KNNMethod {
         // Only user-configured compression implies a mode. Compression derived from the encoder during
         // resolution (e.g. binary encoder bits=1 -> x32) must not silently opt the index into on_disk
         // behavior such as fp32 rescoring.
-        return KNNMethodConfigContext.deriveMode(ctx.getUserConfiguredCompressionLevel());
+        return KNNMethodConfigContext.deriveMode(ctx.getCompressionLevel());
     }
 
     /**

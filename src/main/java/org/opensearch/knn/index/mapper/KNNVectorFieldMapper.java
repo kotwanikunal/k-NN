@@ -603,7 +603,7 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
             // The original parameters stores both the resolveMethodContext as well as the original provided by the
             // user. Now that we have resolved, we need to update this in the original parameters.
             builder.originalParameters.setResolvedKnnMethodContext(resolvedMethodContext.getKnnMethodContext());
-            builder.knnMethodConfigContext.setCompressionLevel(resolvedMethodContext.getCompressionLevel());
+            builder.knnMethodConfigContext.setResolvedCompressionLevel(resolvedMethodContext.getCompressionLevel());
         }
 
         private boolean isKNNDisabled(Settings settings) {
@@ -942,10 +942,10 @@ public abstract class KNNVectorFieldMapper extends ParametrizedFieldMapper {
                 .vectorDataType(vectorDataType)
                 .versionCreated(indexCreatedVersion)
                 .dimension(fieldType().getKnnMappingConfig().getDimension())
-                .compressionLevel(fieldType().getKnnMappingConfig().getCompressionLevel())
-                // The mapping config carries the resolved compression, which may have been derived from the
-                // encoder. Preserve what the user originally configured so mode derivation stays correct on merge.
-                .userConfiguredCompressionLevel(CompressionLevel.fromName(originalMappingParameters.getCompressionLevel()))
+                // The user's originally configured compression drives mode derivation on merge; the mapping
+                // config carries the resolved compression (which may have been derived from the encoder).
+                .compressionLevel(CompressionLevel.fromName(originalMappingParameters.getCompressionLevel()))
+                .resolvedCompressionLevel(fieldType().getKnnMappingConfig().getCompressionLevel())
                 .mode(fieldType().getKnnMappingConfig().getMode())
                 .build();
         }

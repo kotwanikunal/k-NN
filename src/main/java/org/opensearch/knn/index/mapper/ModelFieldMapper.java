@@ -395,10 +395,10 @@ public class ModelFieldMapper extends KNNVectorFieldMapper {
             .dimension(modelMetadata.getDimension())
             .versionCreated(modelMetadata.getModelVersion())
             .mode(modelMetadata.getMode())
-            .compressionLevel(modelMetadata.getCompressionLevel())
             // Model metadata stores the compression resolved at training time (e.g. PQ-derived x32), not a
             // user-configured value, so it must not derive an on_disk mode; the metadata mode is authoritative.
-            .userConfiguredCompressionLevel(CompressionLevel.NOT_CONFIGURED)
+            .compressionLevel(CompressionLevel.NOT_CONFIGURED)
+            .resolvedCompressionLevel(modelMetadata.getCompressionLevel())
             .build();
     }
 

@@ -163,7 +163,7 @@ public class FaissMethodResolverTests extends KNNTestCase {
             false,
             SpaceType.L2
         );
-        assertEquals(knnMethodConfigContext.getCompressionLevel(), CompressionLevel.x8);
+        assertEquals(knnMethodConfigContext.getResolvedCompressionLevel(), CompressionLevel.x8);
         validateResolveMethodContext(resolvedMethodContext, CompressionLevel.x8, SpaceType.L2, QFrameBitEncoder.NAME, true);
     }
 

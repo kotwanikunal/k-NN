@@ -35,25 +35,26 @@ public class KNNMethodConfigContextTests extends KNNTestCase {
         assertEquals(Mode.ON_DISK, KNNMethodConfigContext.deriveMode(CompressionLevel.x32));
     }
 
-    public void testUserConfiguredCompressionLevel_whenNotResolved_thenMatchesCompressionLevel() {
+    public void testResolvedCompressionLevel_whenNotResolved_thenMatchesCompressionLevel() {
         KNNMethodConfigContext context = KNNMethodConfigContext.builder().compressionLevel(CompressionLevel.x32).build();
-        assertEquals(CompressionLevel.x32, context.getUserConfiguredCompressionLevel());
+        assertEquals(CompressionLevel.x32, context.getResolvedCompressionLevel());
     }
 
-    public void testUserConfiguredCompressionLevel_whenResolutionOverwrites_thenPreservesOriginal() {
+    public void testResolvedCompressionLevel_whenResolutionOverwrites_thenPreservesUserValue() {
         // Simulates encoder-derived compression: user did not configure compression, but method
-        // resolution derived x32 from the encoder (e.g. binary encoder with bits=1)
+        // resolution derived x32 from the encoder (e.g. binary encoder with bits=1). The user's
+        // configured compression must stay NOT_CONFIGURED so mode is not derived from the encoder value.
         KNNMethodConfigContext context = KNNMethodConfigContext.builder().build();
-        context.setCompressionLevel(CompressionLevel.x32);
-        assertEquals(CompressionLevel.x32, context.getCompressionLevel());
-        assertEquals(CompressionLevel.NOT_CONFIGURED, context.getUserConfiguredCompressionLevel());
+        context.setResolvedCompressionLevel(CompressionLevel.x32);
+        assertEquals(CompressionLevel.NOT_CONFIGURED, context.getCompressionLevel());
+        assertEquals(CompressionLevel.x32, context.getResolvedCompressionLevel());
     }
 
-    public void testUserConfiguredCompressionLevel_whenUserConfiguredAndResolved_thenPreservesUserValue() {
+    public void testResolvedCompressionLevel_whenUserConfiguredAndResolved_thenBothMatch() {
         // User configured x32; resolution re-sets the same value after validating the encoder
         KNNMethodConfigContext context = KNNMethodConfigContext.builder().compressionLevel(CompressionLevel.x32).build();
-        context.setCompressionLevel(CompressionLevel.x32);
+        context.setResolvedCompressionLevel(CompressionLevel.x32);
         assertEquals(CompressionLevel.x32, context.getCompressionLevel());
-        assertEquals(CompressionLevel.x32, context.getUserConfiguredCompressionLevel());
+        assertEquals(CompressionLevel.x32, context.getResolvedCompressionLevel());
     }
 }

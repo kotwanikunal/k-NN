@@ -73,7 +73,7 @@ public class EngineFieldMapper extends KNNVectorFieldMapper {
 
                 @Override
                 public CompressionLevel getCompressionLevel() {
-                    return knnMethodConfigContext.getCompressionLevel();
+                    return knnMethodConfigContext.getResolvedCompressionLevel();
                 }
 
                 @Override

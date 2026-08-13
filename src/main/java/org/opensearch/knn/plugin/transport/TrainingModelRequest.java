@@ -138,7 +138,7 @@ public class TrainingModelRequest extends ActionRequest {
         ResolvedMethodContext resolvedMethodContext = knnEngine.resolveMethod(knnMethodContext, knnMethodConfigContext, true, spaceType);
         this.knnMethodContext = resolvedMethodContext.getKnnMethodContext();
         this.compressionLevel = resolvedMethodContext.getCompressionLevel();
-        this.knnMethodConfigContext.setCompressionLevel(resolvedMethodContext.getCompressionLevel());
+        this.knnMethodConfigContext.setResolvedCompressionLevel(resolvedMethodContext.getCompressionLevel());
     }
 
     /**

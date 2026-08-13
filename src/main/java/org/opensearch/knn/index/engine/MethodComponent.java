@@ -331,7 +331,7 @@ public class MethodComponent {
         Map<String, Object> userProvidedParametersMap = methodComponentContext.getParameters();
         Version indexCreationVersion = knnMethodConfigContext.getVersionCreated();
         Mode mode = knnMethodConfigContext.getMode();
-        CompressionLevel compressionLevel = knnMethodConfigContext.getCompressionLevel();
+        CompressionLevel compressionLevel = knnMethodConfigContext.getResolvedCompressionLevel();
 
         // Check if the mode is ON_DISK and the compression level is one of the binary quantization levels (x32, x16, or x8).
         // This determines whether to use binary quantization-specific values for parameters like ef_search and ef_construction.

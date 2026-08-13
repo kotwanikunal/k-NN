@@ -129,7 +129,7 @@ public class RNNQueryFactoryTests extends KNNTestCase {
 
     // Validates that the Lucene radial search path is actually taken and that the shared decay factor
     // (DEFAULT_LUCENE_RADIAL_SEARCH_DECAY = 0.95) is wired into the produced Lucene similarity query.
-    // A mocked KNNVectorFieldType (non-quantized: isRescoringRequiredForRadial() == false) exercises the
+    // A mocked KNNVectorFieldType (non-quantized spec: no radial rescore) exercises the
     // real Lucene branch without the rescore wrapper. FloatVectorSimilarityQuery#equals compares the decay
     // field, so equality against a query constructed with the expected decay proves the value is wired.
     public void testCreate_whenLucene_thenDecayIsWiredIntoSimilarityQuery() {

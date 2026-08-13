@@ -30,17 +30,18 @@ public final class KNNMethodConfigContext {
     @Deprecated
     @Builder.Default
     private Mode mode = Mode.NOT_CONFIGURED;
+    /** Compression level as configured by the user. Never modified by resolution. */
     @Builder.Default
-    private CompressionLevel compressionLevel = CompressionLevel.NOT_CONFIGURED;
+    private final CompressionLevel compressionLevel = CompressionLevel.NOT_CONFIGURED;
     /**
-     * Snapshot of the compression level as it was configured by the user, captured at construction time
-     * before method resolution overwrites {@link #compressionLevel} with an encoder-derived value (e.g.
-     * binary encoder bits=1 resolves to x32). Mode derivation must be based on this value: a user asking
-     * for compression_level=32x implies on_disk behavior, but an encoder that internally maps to x32
-     * does not.
+     * Compression level after method resolution. Differs from {@link #compressionLevel} when the encoder
+     * implies a compression the user did not ask for (e.g. sq/binary bits=1 resolves to x32). Defaults to
+     * {@link #compressionLevel} until a resolver sets it. Mode must be derived from {@link #compressionLevel},
+     * not this value: a user asking for compression_level=32x implies on_disk behavior, but an encoder that
+     * internally maps to x32 does not.
      */
     @EqualsAndHashCode.Exclude
-    private final CompressionLevel userConfiguredCompressionLevel;
+    private CompressionLevel resolvedCompressionLevel;
 
     public static final KNNMethodConfigContext EMPTY = KNNMethodConfigContext.builder().build();
 
@@ -50,16 +51,15 @@ public final class KNNMethodConfigContext {
         Version versionCreated,
         Mode mode,
         CompressionLevel compressionLevel,
-        CompressionLevel userConfiguredCompressionLevel
+        CompressionLevel resolvedCompressionLevel
     ) {
         this.vectorDataType = vectorDataType;
         this.dimension = dimension;
         this.versionCreated = versionCreated;
         this.mode = mode;
         this.compressionLevel = compressionLevel;
-        // At build time, compressionLevel still holds the user's value since resolution has not run yet.
-        // Callers reconstructing a context post-resolution (e.g. mapper merge) pass the user value explicitly.
-        this.userConfiguredCompressionLevel = userConfiguredCompressionLevel == null ? compressionLevel : userConfiguredCompressionLevel;
+        // Until a resolver sets it, the resolved value mirrors the user's configured compression.
+        this.resolvedCompressionLevel = resolvedCompressionLevel == null ? compressionLevel : resolvedCompressionLevel;
     }
 
     /**

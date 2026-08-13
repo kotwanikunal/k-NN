@@ -45,6 +45,8 @@ String knn_bwc_version_no_qualifier = isSnapshot ? knn_bwc_version - "-SNAPSHOT"
 String os_platform = "linux"
 String artifact_type = "tar"
 String file_ext = "tar.gz"
+// Pull the BWC bundle matching the host architecture so native k-NN libraries can load
+String os_arch = System.getProperty("os.arch") in ["aarch64", "arm64"] ? "arm64" : "x64"
 
 if (Os.isFamily(Os.FAMILY_WINDOWS)) {
     os_platform = "windows"
@@ -83,9 +85,9 @@ task pullBwcPlugin {
     doLast {
         ext{
             if (isSnapshot) {
-                srcUrl = "https://ci.opensearch.org/ci/dbc/distribution-build-opensearch/${knn_bwc_version_no_qualifier}/latest/${os_platform}/x64/${artifact_type}/dist/opensearch/opensearch-${knn_bwc_version_no_qualifier}-${os_platform}-x64.${file_ext}"
+                srcUrl = "https://ci.opensearch.org/ci/dbc/distribution-build-opensearch/${knn_bwc_version_no_qualifier}/latest/${os_platform}/${os_arch}/${artifact_type}/dist/opensearch/opensearch-${knn_bwc_version_no_qualifier}-${os_platform}-${os_arch}.${file_ext}"
             } else {
-                srcUrl = "https://artifacts.opensearch.org/releases/bundle/opensearch/${knn_bwc_version}/opensearch-${knn_bwc_version}-${os_platform}-x64.${file_ext}"
+                srcUrl = "https://artifacts.opensearch.org/releases/bundle/opensearch/${knn_bwc_version}/opensearch-${knn_bwc_version}-${os_platform}-${os_arch}.${file_ext}"
             }
         }
         ant.get(
@@ -95,9 +97,9 @@ task pullBwcPlugin {
         )
         copy {
             if (Os.isFamily(Os.FAMILY_WINDOWS)) {
-                from zipTree(java.nio.file.Path.of(tmp_dir.absolutePath, "opensearch-${knn_bwc_version_no_qualifier}-${os_platform}-x64.${file_ext}"))
+                from zipTree(java.nio.file.Path.of(tmp_dir.absolutePath, "opensearch-${knn_bwc_version_no_qualifier}-${os_platform}-${os_arch}.${file_ext}"))
             } else {
-                from tarTree(java.nio.file.Path.of(tmp_dir.absolutePath, "opensearch-${knn_bwc_version_no_qualifier}-${os_platform}-x64.${file_ext}"))
+                from tarTree(java.nio.file.Path.of(tmp_dir.absolutePath, "opensearch-${knn_bwc_version_no_qualifier}-${os_platform}-${os_arch}.${file_ext}"))
             }
             into tmp_dir.absolutePath
         }
@@ -105,7 +107,7 @@ task pullBwcPlugin {
             from(java.nio.file.Path.of(tmp_dir.absolutePath, "opensearch-${knn_bwc_version_no_qualifier}", "plugins", "opensearch-knn"))
             into java.nio.file.Path.of(tmp_dir.absolutePath, "opensearch-knn")
         }
-        delete java.nio.file.Path.of(tmp_dir.absolutePath, "opensearch-${knn_bwc_version_no_qualifier}"), java.nio.file.Path.of(tmp_dir.absolutePath, "opensearch-${knn_bwc_version_no_qualifier}-${os_platform}-x64.${file_ext}")
+        delete java.nio.file.Path.of(tmp_dir.absolutePath, "opensearch-${knn_bwc_version_no_qualifier}"), java.nio.file.Path.of(tmp_dir.absolutePath, "opensearch-${knn_bwc_version_no_qualifier}-${os_platform}-${os_arch}.${file_ext}")
     }
 }
 

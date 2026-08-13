@@ -80,7 +80,7 @@ public class FaissMethodResolver extends AbstractMethodResolver {
 
         // Validate that resolved compression doesnt have any conflicts
         validateCompressionConflicts(knnMethodConfigContext.getCompressionLevel(), resolvedCompressionLevel);
-        knnMethodConfigContext.setCompressionLevel(resolvedCompressionLevel);
+        knnMethodConfigContext.setResolvedCompressionLevel(resolvedCompressionLevel);
         resolveMethodParams(resolvedKNNMethodContext.getMethodComponentContext(), knnMethodConfigContext, method);
 
         return ResolvedMethodContext.builder()
