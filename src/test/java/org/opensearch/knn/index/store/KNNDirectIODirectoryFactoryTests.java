@@ -13,10 +13,12 @@ import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.NIOFSDirectory;
 import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
+import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.store.FsDirectoryFactory;
 import org.opensearch.knn.KNNTestCase;
@@ -41,14 +43,25 @@ public class KNNDirectIODirectoryFactoryTests extends KNNTestCase {
     private static final String TEST_INDEX = "test-index";
 
     private static IndexSettings indexSettings(final Settings extraIndexSettings, final Settings nodeSettings) {
+        return indexSettings(extraIndexSettings, nodeSettings, null);
+    }
+
+    private static IndexSettings indexSettings(
+        final Settings extraIndexSettings,
+        final Settings nodeSettings,
+        final MappingMetadata mapping
+    ) {
         final Settings settings = Settings.builder()
             .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
             .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
             .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
             .put(extraIndexSettings)
             .build();
-        final IndexMetadata indexMetadata = IndexMetadata.builder(TEST_INDEX).settings(settings).build();
-        return new IndexSettings(indexMetadata, nodeSettings);
+        final IndexMetadata.Builder builder = IndexMetadata.builder(TEST_INDEX).settings(settings);
+        if (mapping != null) {
+            builder.putMapping(mapping);
+        }
+        return new IndexSettings(builder.build(), nodeSettings);
     }
 
     private static ShardPath shardPath(final Path root, final IndexSettings indexSettings) {
@@ -323,6 +336,67 @@ public class KNNDirectIODirectoryFactoryTests extends KNNTestCase {
         try (Directory ours = new KNNDirectIODirectoryFactory().newDirectory(ourSettings, path)) {
             assertNotNull(ours);
             assertTrue(java.nio.file.Files.isDirectory(path.resolveIndex()));
+        }
+    }
+
+    /**
+     * The buffer the factory hands the wrapper is derived from the index's mapping, taking the
+     * largest {@code knn_vector} field — not the fixed two blocks the earlier code used. Asserted
+     * against the real block size of the temp directory's filesystem so the test is portable.
+     */
+    public void testReadBufferSizeComesFromTheMapping() throws IOException {
+        final Path root = createTempDir();
+        final MappingMetadata mapping = new MappingMetadata(
+            MapperService.SINGLE_MAPPING_NAME,
+            Map.of(
+                "properties",
+                Map.of(
+                    "small",
+                    Map.of("type", "knn_vector", "dimension", 768),
+                    "large",
+                    Map.of("type", "knn_vector", "dimension", 1792),
+                    "text",
+                    Map.of("type", "text")
+                )
+            )
+        );
+        final IndexSettings ourSettings = indexSettings(
+            Settings.builder().put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), KNN_DIRECT_IO_STORE_TYPE).build(),
+            Settings.EMPTY,
+            mapping
+        );
+        final ShardPath path = shardPath(root, ourSettings);
+        java.nio.file.Files.createDirectories(path.resolveIndex());
+        final int blockSize = Math.toIntExact(java.nio.file.Files.getFileStore(path.resolveIndex()).getBlockSize());
+        final int expected = Math.min(
+            DirectIOBufferSizer.requiredBufferSize(1792 * Float.BYTES, blockSize),
+            Math.max(blockSize, (int) (KNNSettings.getDirectIOMaxBufferSize().getBytes() / blockSize) * blockSize)
+        );
+
+        try (Directory ours = new KNNDirectIODirectoryFactory().newDirectory(ourSettings, path)) {
+            assertTrue(ours instanceof KNNDirectIODirectory);
+            assertEquals(expected, ((KNNDirectIODirectory) ours).getReadBufferSize());
+            // and the 1792-dimension field, not the 768-dimension one, is what decided it
+            assertNotEquals(DirectIOBufferSizer.requiredBufferSize(768 * Float.BYTES, blockSize), expected);
+        }
+    }
+
+    /**
+     * An index with no mapping — and therefore no resolvable dimension — still gets a usable buffer:
+     * two filesystem blocks, which is what the code did before the sizer existed.
+     */
+    public void testReadBufferSizeFallsBackWithNoMapping() throws IOException {
+        final Path root = createTempDir();
+        final IndexSettings ourSettings = indexSettings(
+            Settings.builder().put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), KNN_DIRECT_IO_STORE_TYPE).build(),
+            Settings.EMPTY
+        );
+        final ShardPath path = shardPath(root, ourSettings);
+        java.nio.file.Files.createDirectories(path.resolveIndex());
+        final int blockSize = Math.toIntExact(java.nio.file.Files.getFileStore(path.resolveIndex()).getBlockSize());
+
+        try (Directory ours = new KNNDirectIODirectoryFactory().newDirectory(ourSettings, path)) {
+            assertEquals(2 * blockSize, ((KNNDirectIODirectory) ours).getReadBufferSize());
         }
     }
 

@@ -49,6 +49,12 @@ public final class KNNDirectIODirectory extends DirectIODirectory {
     private final long minBytesDirect;
 
     /**
+     * Also kept privately by {@link DirectIODirectory}, and held here only so that a test can assert
+     * the size {@link DirectIOBufferSizer} chose for this index.
+     */
+    private final int readBufferSize;
+
+    /**
      * @param delegate      the directory that serves every file this one does not route, and the
      *                      reference for the filesystem path. Must be an {@link FSDirectory}; the
      *                      superclass casts it.
@@ -65,6 +71,12 @@ public final class KNNDirectIODirectory extends DirectIODirectory {
     public KNNDirectIODirectory(final FSDirectory delegate, final int readBufferSize, final long minBytesDirect) throws IOException {
         super(delegate, readBufferSize, minBytesDirect);
         this.minBytesDirect = minBytesDirect;
+        this.readBufferSize = readBufferSize;
+    }
+
+    /** The read buffer size this directory was built with, in bytes. */
+    int getReadBufferSize() {
+        return readBufferSize;
     }
 
     /**

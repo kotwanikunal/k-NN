@@ -112,10 +112,10 @@ public class KNNDirectIODirectoryFactory implements IndexStorePlugin.DirectoryFa
         }
 
         final int blockSize = Math.toIntExact(Files.getFileStore(location).getBlockSize());
-        // A later change derives this per index from the mapping's vector dimensions. Two blocks is
-        // the smallest size that reads any vector shorter than a block in a single syscall no matter
-        // how it straddles a block boundary, which is why the floor is 2x and not 1x.
-        final int readBufferSize = 2 * blockSize;
+        // Derived per index from the vector dimensions the mapping declares; see DirectIOBufferSizer
+        // for why no flat constant works. The block size is read here rather than there so that the
+        // sizer does no filesystem I/O of its own.
+        final int readBufferSize = DirectIOBufferSizer.readBufferSize(indexSettings, blockSize);
         final long minBytesDirect = KNNSettings.getDirectIOMinFileSize().getBytes();
 
         log.info(
