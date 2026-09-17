@@ -127,6 +127,21 @@ public class KNNSettings {
     // heuristic is shape-based and can misclaim non-vector numeric arrays; operators must opt in.
     public static final String KNN_DYNAMIC_MAPPING_ENABLED = "knn.dynamic_mapping.enabled";
 
+    // Direct I/O settings. These are only consulted by the "knn_direct_io" store type, so on an index
+    // that does not select that store type none of them has any effect.
+    // Per-index kill switch. Deliberately plain IndexScope: it must NOT be Final, because a Final
+    // setting cannot be updated even on a closed index, which would defeat the close/reopen toggle.
+    public static final String KNN_INDEX_DIRECT_IO_ENABLED = "index.knn.direct_io.enabled";
+    public static final boolean KNN_INDEX_DIRECT_IO_ENABLED_DEFAULT_VALUE = true;
+    // Upper bound on the per-index Direct I/O read buffer. Above this size a vector costs an extra
+    // read rather than an ever larger aligned buffer.
+    public static final String KNN_DIRECT_IO_MAX_BUFFER_SIZE = "knn.direct_io.max_buffer_size";
+    public static final ByteSizeValue KNN_DIRECT_IO_MAX_BUFFER_SIZE_DEFAULT_VALUE = new ByteSizeValue(32, ByteSizeUnit.KB);
+    // Files smaller than this are left on the default path: they are likely fully page-cached already,
+    // so bypassing the cache for them buys nothing.
+    public static final String KNN_DIRECT_IO_MIN_FILE_SIZE = "knn.direct_io.min_file_size";
+    public static final ByteSizeValue KNN_DIRECT_IO_MIN_FILE_SIZE_DEFAULT_VALUE = new ByteSizeValue(1, ByteSizeUnit.MB);
+
     /**
      * For more details on supported engines, refer to {@link MemoryOptimizedSearchSupportSpec}
      */
@@ -320,6 +335,37 @@ public class KNNSettings {
         MEMORY_OPTIMIZED_KNN_SEARCH_MODE,
         false,
         IndexScope
+    );
+
+    /**
+     * Per-index Direct I/O kill switch, read when the shard's Directory is built. Plain IndexScope on
+     * purpose - neither Final nor UnmodifiableOnRestore - so that it can be flipped on a closed index
+     * and take effect when the index is reopened, without a node restart.
+     */
+    public static final Setting<Boolean> KNN_INDEX_DIRECT_IO_ENABLED_SETTING = Setting.boolSetting(
+        KNN_INDEX_DIRECT_IO_ENABLED,
+        KNN_INDEX_DIRECT_IO_ENABLED_DEFAULT_VALUE,
+        IndexScope
+    );
+
+    /**
+     * Node level upper bound on the Direct I/O read buffer computed per index from the mapping.
+     */
+    public static final Setting<ByteSizeValue> KNN_DIRECT_IO_MAX_BUFFER_SIZE_SETTING = Setting.byteSizeSetting(
+        KNN_DIRECT_IO_MAX_BUFFER_SIZE,
+        KNN_DIRECT_IO_MAX_BUFFER_SIZE_DEFAULT_VALUE,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
+     * Node level minimum file size below which Direct I/O is not used for a file.
+     */
+    public static final Setting<ByteSizeValue> KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING = Setting.byteSizeSetting(
+        KNN_DIRECT_IO_MIN_FILE_SIZE,
+        KNN_DIRECT_IO_MIN_FILE_SIZE_DEFAULT_VALUE,
+        NodeScope,
+        Dynamic
     );
 
     /**
@@ -758,6 +804,14 @@ public class KNNSettings {
             return KNN_DYNAMIC_MAPPING_ENABLED_SETTING;
         }
 
+        if (KNN_DIRECT_IO_MAX_BUFFER_SIZE.equals(key)) {
+            return KNN_DIRECT_IO_MAX_BUFFER_SIZE_SETTING;
+        }
+
+        if (KNN_DIRECT_IO_MIN_FILE_SIZE.equals(key)) {
+            return KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING;
+        }
+
         throw new IllegalArgumentException("Cannot find setting by key [" + key + "]");
     }
 
@@ -795,10 +849,50 @@ public class KNNSettings {
             KNN_REMOTE_BUILD_SERVER_USERNAME_SETTING,
             KNN_REMOTE_BUILD_SERVER_PASSWORD_SETTING,
             INDEX_KNN_FAISS_EFFICIENT_FILTER_DISABLE_EXACT_SEARCH_SETTING,
-            KNN_DYNAMIC_MAPPING_ENABLED_SETTING
+            KNN_DYNAMIC_MAPPING_ENABLED_SETTING,
+            // Direct I/O settings
+            KNN_INDEX_DIRECT_IO_ENABLED_SETTING,
+            KNN_DIRECT_IO_MAX_BUFFER_SIZE_SETTING,
+            KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
             .collect(Collectors.toList());
+    }
+
+    /**
+     * Reads a node level setting, falling back to the setting's own default when {@link KNNSettings} has
+     * not been initialized with a {@link ClusterService} yet. The Direct I/O settings are read while a
+     * shard's Directory is being built, which can also happen in harnesses that never initialize the
+     * singleton, and Direct I/O must never be the reason a shard fails to open.
+     *
+     * @param setting the node level setting to read
+     * @return the configured value, or the setting's default if it cannot be read
+     */
+    private static <T> T getNodeSettingValueOrDefault(final Setting<T> setting) {
+        try {
+            final ClusterService currentClusterService = state().clusterService;
+            if (currentClusterService == null) {
+                return setting.getDefault(Settings.EMPTY);
+            }
+            return currentClusterService.getClusterSettings().get(setting);
+        } catch (Exception e) {
+            logger.warn("Could not read setting [" + setting.getKey() + "]; falling back to its default", e);
+            return setting.getDefault(Settings.EMPTY);
+        }
+    }
+
+    /**
+     * @return the node level upper bound on the per-index Direct I/O read buffer
+     */
+    public static ByteSizeValue getDirectIOMaxBufferSize() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_MAX_BUFFER_SIZE_SETTING);
+    }
+
+    /**
+     * @return the node level minimum file size below which Direct I/O is not used
+     */
+    public static ByteSizeValue getDirectIOMinFileSize() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING);
     }
 
     public static boolean isCircuitBreakerTriggered() {

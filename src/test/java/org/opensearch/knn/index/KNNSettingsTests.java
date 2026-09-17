@@ -14,10 +14,13 @@ import org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.network.NetworkModule;
+import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.env.Environment;
 import org.opensearch.knn.KNNTestCase;
+import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
 import org.opensearch.knn.plugin.KNNPlugin;
 import org.opensearch.node.MockNode;
 import org.opensearch.node.Node;
@@ -34,6 +37,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Collection;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -313,5 +317,86 @@ public class KNNSettingsTests extends KNNTestCase {
         int availableProcessors = Runtime.getRuntime().availableProcessors();
         int expected = (availableProcessors >= 32) ? 4 : 1;
         assertEquals(expected, threadQtyWithEmpty);
+    }
+
+    /**
+     * Regression guard. index.knn.direct_io.enabled must NOT be Final: a Final setting cannot be
+     * updated even on a closed index, which would break the "toggle on close and reopen, no node
+     * restart" requirement this setting exists for.
+     */
+    public void testDirectIOIndexSetting_isNotFinal() {
+        final EnumSet<Setting.Property> properties = KNNSettings.KNN_INDEX_DIRECT_IO_ENABLED_SETTING.getProperties();
+        assertFalse(properties.contains(Setting.Property.Final));
+        assertFalse(properties.contains(Setting.Property.UnmodifiableOnRestore));
+    }
+
+    public void testDirectIOIndexSetting_properties() {
+        final EnumSet<Setting.Property> properties = KNNSettings.KNN_INDEX_DIRECT_IO_ENABLED_SETTING.getProperties();
+        assertTrue(properties.contains(Setting.Property.IndexScope));
+        assertFalse(properties.contains(Setting.Property.NodeScope));
+        assertFalse(properties.contains(Setting.Property.Dynamic));
+    }
+
+    public void testDirectIONodeSettings_properties() {
+        for (Setting<?> setting : List.of(
+            KNNFeatureFlags.KNN_DIRECT_IO_ENABLED_SETTING,
+            KNNSettings.KNN_DIRECT_IO_MAX_BUFFER_SIZE_SETTING,
+            KNNSettings.KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING
+        )) {
+            final EnumSet<Setting.Property> properties = setting.getProperties();
+            assertTrue(setting.getKey(), properties.contains(Setting.Property.NodeScope));
+            assertTrue(setting.getKey(), properties.contains(Setting.Property.Dynamic));
+            assertFalse(setting.getKey(), properties.contains(Setting.Property.IndexScope));
+            assertFalse(setting.getKey(), properties.contains(Setting.Property.Final));
+        }
+    }
+
+    public void testDirectIOSettings_defaults() {
+        assertTrue(KNNSettings.KNN_INDEX_DIRECT_IO_ENABLED_SETTING.getDefault(Settings.EMPTY));
+        assertTrue(KNNFeatureFlags.KNN_DIRECT_IO_ENABLED_SETTING.getDefault(Settings.EMPTY));
+        assertEquals(new ByteSizeValue(32, ByteSizeUnit.KB), KNNSettings.KNN_DIRECT_IO_MAX_BUFFER_SIZE_SETTING.getDefault(Settings.EMPTY));
+        assertEquals(new ByteSizeValue(1, ByteSizeUnit.MB), KNNSettings.KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING.getDefault(Settings.EMPTY));
+    }
+
+    /**
+     * All four Direct I/O settings must be returned by getSettings(), or KNNPlugin never registers them
+     * and any attempt to set one is rejected as an unknown setting.
+     */
+    public void testDirectIOSettings_areRegistered() {
+        final List<String> registeredKeys = KNNSettings.state().getSettings().stream().map(Setting::getKey).collect(Collectors.toList());
+        for (String key : List.of(
+            KNNSettings.KNN_INDEX_DIRECT_IO_ENABLED,
+            "knn.feature.direct_io.enabled",
+            KNNSettings.KNN_DIRECT_IO_MAX_BUFFER_SIZE,
+            KNNSettings.KNN_DIRECT_IO_MIN_FILE_SIZE
+        )) {
+            assertTrue(key + " is not registered", registeredKeys.contains(key));
+        }
+    }
+
+    public void testDirectIONodeSettingAccessors_returnDefaultsWhenUnset() {
+        assertEquals(new ByteSizeValue(32, ByteSizeUnit.KB), KNNSettings.getDirectIOMaxBufferSize());
+        assertEquals(new ByteSizeValue(1, ByteSizeUnit.MB), KNNSettings.getDirectIOMinFileSize());
+    }
+
+    /**
+     * The accessors are called while a shard's Directory is being built, which can happen before
+     * KNNSettings has a ClusterService. That must yield the defaults, not an exception.
+     */
+    public void testDirectIONodeSettingAccessors_whenClusterServiceIsNotSet_thenReturnDefaults() {
+        KNNSettings.state().setClusterService(null);
+        assertEquals(new ByteSizeValue(32, ByteSizeUnit.KB), KNNSettings.getDirectIOMaxBufferSize());
+        assertEquals(new ByteSizeValue(1, ByteSizeUnit.MB), KNNSettings.getDirectIOMinFileSize());
+    }
+
+    public void testDirectIONodeSettings_areReadableByKey() {
+        assertEquals(
+            new ByteSizeValue(32, ByteSizeUnit.KB),
+            (ByteSizeValue) KNNSettings.state().getSettingValue(KNNSettings.KNN_DIRECT_IO_MAX_BUFFER_SIZE)
+        );
+        assertEquals(
+            new ByteSizeValue(1, ByteSizeUnit.MB),
+            (ByteSizeValue) KNNSettings.state().getSettingValue(KNNSettings.KNN_DIRECT_IO_MIN_FILE_SIZE)
+        );
     }
 }

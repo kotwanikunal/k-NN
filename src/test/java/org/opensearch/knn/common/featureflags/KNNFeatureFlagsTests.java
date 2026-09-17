@@ -16,6 +16,8 @@ import java.util.List;
 
 import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.KNN_FORCE_EVICT_CACHE_ENABLED_SETTING;
 import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.KNN_PREFETCH_ENABLED_SETTING;
+import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.KNN_DIRECT_IO_ENABLED_SETTING;
+import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.isDirectIOEnabled;
 import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.isForceEvictCacheEnabled;
 import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.isPrefetchEnabled;
 import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.getFeatureFlags;
@@ -46,11 +48,28 @@ public class KNNFeatureFlagsTests extends KNNTestCase {
         assertFalse(isPrefetchEnabled());
     }
 
+    public void testIsDirectIOEnabled() {
+        when(clusterSettings.get(KNN_DIRECT_IO_ENABLED_SETTING)).thenReturn(true);
+        assertTrue(isDirectIOEnabled());
+        when(clusterSettings.get(KNN_DIRECT_IO_ENABLED_SETTING)).thenReturn(false);
+        assertFalse(isDirectIOEnabled());
+    }
+
+    /**
+     * The Direct I/O flag is read while a shard's Directory is being built, which can happen before
+     * KNNSettings has a ClusterService. That must yield the default, not an exception.
+     */
+    public void testIsDirectIOEnabled_whenClusterServiceIsNotSet_thenReturnsDefault() {
+        KNNSettings.state().setClusterService(null);
+        assertTrue(isDirectIOEnabled());
+    }
+
     public void testGetFeatureFlags() {
         List<Setting<?>> flags = getFeatureFlags();
-        assertEquals(2, flags.size());
+        assertEquals(3, flags.size());
         assertTrue(flags.contains(KNN_FORCE_EVICT_CACHE_ENABLED_SETTING));
         assertTrue(flags.contains(KNN_PREFETCH_ENABLED_SETTING));
+        assertTrue(flags.contains(KNN_DIRECT_IO_ENABLED_SETTING));
     }
 
     public void testGetFeatureFlagsWhichRebuildsCache() {
