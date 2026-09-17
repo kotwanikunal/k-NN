@@ -38,11 +38,10 @@ import java.util.Arrays;
  * existing prefetch kill switch still turns off everything, by
  * {@link KNNFeatureFlags#isPrefetchEnabled()}.
  * <p>
- * Known gap: a codec whose {@code getFloatVectorValues} returns a two-slice wrapper that deliberately
- * does not expose {@code HasIndexSlice} - the scalar-quantized wrapper fronting both {@code .veq} and
- * {@code .vec} is the one in this plugin - cannot be prefetched from here, and
- * {@link PrefetchableVectorValuesHelper#doPrefetch} logs that it declined. The in-scorer prefetch still
- * covers those fields, because it is handed the inner full-precision values rather than the wrapper.
+ * A codec whose {@code getFloatVectorValues} returns a wrapper over both {@code .veq} and {@code .vec}
+ * cannot expose {@code HasIndexSlice} - it has two slices - and is reached through
+ * {@link HasFullPrecisionVectorValues} instead, which names the {@code .vec} side. Anything that exposes
+ * neither is declined by {@link PrefetchableVectorValuesHelper#doPrefetch} with a warning.
  */
 @Log4j2
 @NoArgsConstructor(access = AccessLevel.PRIVATE)

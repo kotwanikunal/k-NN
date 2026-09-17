@@ -18,6 +18,7 @@ import org.opensearch.knn.KNNTestCase;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -105,7 +106,10 @@ public class Faiss1040ScalarQuantizedFlatVectorsReaderTests extends KNNTestCase 
             assertNull(wrapper.getQuantizedVectorValues());
             assertEquals(0, result.size());
             verify(delegate).getFloatVectorValues("field");
-            mockedUtils.verifyNoInteractions();
+            // The assertion is that the *quantized* extraction is skipped for an empty segment. The wrapper
+            // also unwraps the raw full-precision values, which is a different call on the same utility and
+            // does happen, so this cannot be verifyNoInteractions.
+            mockedUtils.verify(() -> KNN1040ScalarQuantizedUtils.extractQuantizedByteVectorValues(any()), never());
         }
     }
 

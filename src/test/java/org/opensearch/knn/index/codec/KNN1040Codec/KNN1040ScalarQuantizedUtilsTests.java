@@ -78,4 +78,60 @@ public class KNN1040ScalarQuantizedUtilsTests extends KNNTestCase {
         assertTrue(exception.getCause() instanceof NoSuchFieldException);
     }
 
+    /**
+     * A stub standing in for Lucene's {@code ScalarQuantizedVectorValues}, which holds the full-precision
+     * values in a private {@code rawVectorValues} field with no accessor.
+     */
+    static class StubWrapperWithRawValues extends KnnVectorValues {
+        private KnnVectorValues rawVectorValues;
+
+        @Override
+        public int dimension() {
+            return 0;
+        }
+
+        @Override
+        public int size() {
+            return 0;
+        }
+
+        @Override
+        public KnnVectorValues copy() throws IOException {
+            return this;
+        }
+
+        @Override
+        public VectorEncoding getEncoding() {
+            return VectorEncoding.FLOAT32;
+        }
+    }
+
+    @SneakyThrows
+    public void testExtractRawFloatVectorValues_whenFieldExists_thenReturnsValue() {
+        StubWrapperWithRawValues stub = new StubWrapperWithRawValues();
+        KnnVectorValues expected = mock(KnnVectorValues.class);
+
+        java.lang.reflect.Field field = StubWrapperWithRawValues.class.getDeclaredField("rawVectorValues");
+        field.setAccessible(true);
+        field.set(stub, expected);
+
+        assertSame(expected, KNN1040ScalarQuantizedUtils.extractRawFloatVectorValues(stub));
+    }
+
+    /**
+     * Losing the unwrap must never fail a read - its only caller is issuing an advisory prefetch hint - so
+     * this returns null where {@link KNN1040ScalarQuantizedUtils#extractQuantizedByteVectorValues} throws.
+     */
+    public void testExtractRawFloatVectorValues_whenFieldMissing_thenReturnsNull() {
+        assertNull(KNN1040ScalarQuantizedUtils.extractRawFloatVectorValues(mock(KnnVectorValues.class)));
+    }
+
+    public void testExtractRawFloatVectorValues_whenFieldIsUnset_thenReturnsNull() {
+        assertNull(KNN1040ScalarQuantizedUtils.extractRawFloatVectorValues(new StubWrapperWithRawValues()));
+    }
+
+    public void testExtractRawFloatVectorValues_whenArgumentIsNull_thenReturnsNull() {
+        assertNull(KNN1040ScalarQuantizedUtils.extractRawFloatVectorValues(null));
+    }
+
 }

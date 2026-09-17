@@ -6,11 +6,12 @@
 package org.opensearch.knn.index.codec.KNN1040Codec;
 
 import lombok.Getter;
-import lombok.RequiredArgsConstructor;
 import org.apache.lucene.util.quantization.QuantizedByteVectorValues;
 import org.apache.lucene.index.FloatVectorValues;
+import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.search.VectorScorer;
+import org.opensearch.knn.index.codec.scorer.HasFullPrecisionVectorValues;
 
 import java.io.IOException;
 
@@ -27,12 +28,13 @@ import java.io.IOException;
  * the delegating {@code vectorValue(ord)} reads full-precision floats from {@code .vec} while the
  * quantized values expose the {@code .veq} slice — a generic prefetch caller trusting
  * {@code HasIndexSlice} would warm the wrong file, defeating the fetch-phase prefetch entirely.
+ * A caller that specifically wants the {@code .vec} side asks for it by name instead, through
+ * {@link HasFullPrecisionVectorValues}.
  *
  * <p>For an empty vector segment, the quantized delegate may be {@code null}.
  */
 @Getter
-@RequiredArgsConstructor
-class ScalarQuantizedFloatVectorValues extends FloatVectorValues {
+class ScalarQuantizedFloatVectorValues extends FloatVectorValues implements HasFullPrecisionVectorValues {
     /**
      * The full-precision float delegate (reads the {@code .vec} file).
      */
@@ -42,6 +44,32 @@ class ScalarQuantizedFloatVectorValues extends FloatVectorValues {
      * segments where Lucene does not expose one.
      */
     private final QuantizedByteVectorValues quantizedVectorValues;
+    /**
+     * The values that own the {@code .vec} slice, resolved once at construction, or {@code null} when they
+     * cannot be reached. {@link #floatVectorValues} is itself a two-representation wrapper - Lucene's
+     * {@code ScalarQuantizedVectorValues} - so it exposes no slice either and one more unwrap is needed to
+     * reach the file.
+     */
+    private final KnnVectorValues fullPrecisionVectorValues;
+
+    ScalarQuantizedFloatVectorValues(final FloatVectorValues floatVectorValues, final QuantizedByteVectorValues quantizedVectorValues) {
+        this.floatVectorValues = floatVectorValues;
+        this.quantizedVectorValues = quantizedVectorValues;
+        this.fullPrecisionVectorValues = KNN1040ScalarQuantizedUtils.extractRawFloatVectorValues(floatVectorValues);
+    }
+
+    /**
+     * Returns the values backed by the {@code .vec} file, so an advisory prefetch caller can warm the
+     * full-precision vectors the rescore path reads rather than the quantized codes. They share this
+     * wrapper's ordinal space, because every iteration method here delegates to
+     * {@link #floatVectorValues}, which in turn delegates to them.
+     *
+     * @return the full-precision values, or {@code null} when they cannot be reached
+     */
+    @Override
+    public KnnVectorValues getFullPrecisionVectorValues() {
+        return fullPrecisionVectorValues;
+    }
 
     @Override
     public int dimension() {

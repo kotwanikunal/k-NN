@@ -12,6 +12,7 @@ import org.apache.lucene.document.StringField;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.DocIdSetIterator;
@@ -336,6 +337,76 @@ public class WholeLeafPrefetcherTests extends KNNTestCase {
                     assertArrayEquals(withoutPrefetch[i], withPrefetch[i], 0.0f);
                 }
             }
+        }
+    }
+
+    /**
+     * The whole point of unit 16b: a quantized field is fronted by a wrapper over {@code .veq} and
+     * {@code .vec} that exposes no slice of its own, and the whole-leaf prefetch used to decline on it -
+     * making the feature a silent no-op on exactly the codec the rescore path uses. It must now reach the
+     * full-precision values the wrapper names, and hint them with *their* per-vector byte size.
+     */
+    public void testPrefetchCandidates_whenValuesHideTheirSliceBehindAWrapper_thenStillPrefetches() throws Exception {
+        try (Directory directory = newDirectory()) {
+            buildIndex(directory, 20, 1, 0);
+            try (DirectoryReader reader = DirectoryReader.open(directory)) {
+                final FloatVectorValues realValues = reader.leaves().get(0).reader().getFloatVectorValues(FIELD);
+                final LeafReader leafReader = mock(LeafReader.class);
+                when(leafReader.getFloatVectorValues(FIELD)).thenReturn(new SliceHidingWrapper(realValues));
+
+                withPrefetchEnabled(() -> {
+                    try (MockedStatic<PrefetchHelper> prefetchHelper = mockStatic(PrefetchHelper.class)) {
+                        assertEquals(3, WholeLeafPrefetcher.prefetchCandidates(leafReader, FIELD, new int[] { 2, 5, 9 }));
+
+                        prefetchHelper.verify(
+                            () -> PrefetchHelper.prefetch(any(), eq(0L), eq((long) DIMENSION * Float.BYTES), any(), eq(3)),
+                            times(1)
+                        );
+                    }
+                });
+            }
+        }
+    }
+
+    /**
+     * The shape of the plugin's scalar-quantized wrapper: it delegates iteration to the full-precision
+     * values - so ordinals mean the same thing - but exposes no slice, because it fronts two files.
+     */
+    private static class SliceHidingWrapper extends FloatVectorValues implements HasFullPrecisionVectorValues {
+        private final FloatVectorValues fullPrecision;
+
+        SliceHidingWrapper(final FloatVectorValues fullPrecision) {
+            this.fullPrecision = fullPrecision;
+        }
+
+        @Override
+        public KnnVectorValues getFullPrecisionVectorValues() {
+            return fullPrecision;
+        }
+
+        @Override
+        public int dimension() {
+            return fullPrecision.dimension();
+        }
+
+        @Override
+        public int size() {
+            return fullPrecision.size();
+        }
+
+        @Override
+        public float[] vectorValue(int ord) throws IOException {
+            return fullPrecision.vectorValue(ord);
+        }
+
+        @Override
+        public DocIndexIterator iterator() {
+            return fullPrecision.iterator();
+        }
+
+        @Override
+        public FloatVectorValues copy() throws IOException {
+            return new SliceHidingWrapper(fullPrecision.copy());
         }
     }
 
