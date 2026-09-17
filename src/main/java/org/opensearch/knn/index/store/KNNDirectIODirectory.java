@@ -5,11 +5,15 @@
 
 package org.opensearch.knn.index.store;
 
+import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.misc.store.DirectIODirectory;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
 
 import java.io.IOException;
+import java.nio.file.OpenOption;
+import java.util.Arrays;
 import java.util.OptionalLong;
 
 /**
@@ -26,7 +30,28 @@ import java.util.OptionalLong;
  * <p>
  * The gate is an explicit include list rather than an exclude list, so any file type we have not
  * reasoned about keeps its current behaviour by default.
+ * <p>
+ * <b>Fallback.</b> Direct I/O can be refused at three different moments, and only the first two are
+ * recoverable:
+ * <ol>
+ *   <li>The JDK may not expose {@code com.sun.nio.file.ExtendedOpenOption.DIRECT} at all. That is a
+ *       property of the runtime, is knowable before any file is opened, and is what
+ *       {@link #isDirectIOOpenOptionAvailable()} reports so the factory can decline to wrap.</li>
+ *   <li>The filesystem may reject the open — tmpfs and several network filesystems answer
+ *       {@code O_DIRECT} with {@code EINVAL}. This surfaces per file at {@link #openInput}, so that
+ *       call falls back to the delegate, logs once, and latches Direct I/O off for the rest of this
+ *       directory's life rather than paying a failed open per file.</li>
+ *   <li>A misaligned read throws from Lucene's {@code refill} mid-stream, after the
+ *       {@link IndexInput} has been handed to the query. There is no way to resume from that, so
+ *       alignment is not defended at run time — it is correct by construction, because the buffer
+ *       {@link DirectIOBufferSizer} computes is always a whole number of filesystem blocks and
+ *       Lucene's own input does every seek and refill in block units. Do not add a per read guard
+ *       here expecting it to help.</li>
+ * </ol>
+ * The consequence of (1) and (2) together is that a query is never failed because Direct I/O is
+ * unavailable; the worst case is that it runs exactly as it does today.
  */
+@Log4j2
 public final class KNNDirectIODirectory extends DirectIODirectory {
 
     /**
@@ -55,6 +80,17 @@ public final class KNNDirectIODirectory extends DirectIODirectory {
     private final int readBufferSize;
 
     /**
+     * Latched to true by the first {@link #openInput} that could not open the file with Direct I/O.
+     * Once set, every later open goes straight to the delegate: the reason a Direct I/O open fails is
+     * almost always a property of the filesystem, so retrying it per file would cost a failed
+     * {@code open} syscall each time and produce the same answer.
+     * <p>
+     * Volatile rather than synchronized because a benign race — two concurrent opens both attempting
+     * Direct I/O once — is cheaper than serialising every open of every file in the shard.
+     */
+    private volatile boolean directIOUnavailable = false;
+
+    /**
      * @param delegate      the directory that serves every file this one does not route, and the
      *                      reference for the filesystem path. Must be an {@link FSDirectory}; the
      *                      superclass casts it.
@@ -79,6 +115,80 @@ public final class KNNDirectIODirectory extends DirectIODirectory {
         return readBufferSize;
     }
 
+    /** True once a Direct I/O open has failed and this directory has latched back to the delegate. */
+    boolean isDirectIOUnavailable() {
+        return directIOUnavailable;
+    }
+
+    /**
+     * Opens the file, falling back to the delegate if Direct I/O is refused for it.
+     * <p>
+     * The superclass already routes correctly; what it does not do is survive a refusal. A
+     * filesystem that does not implement {@code O_DIRECT} fails the {@code FileChannel.open} inside
+     * Lucene's {@code DirectIOIndexInput} constructor with {@code EINVAL}, and a JDK without
+     * {@code ExtendedOpenOption.DIRECT} throws {@link UnsupportedOperationException} from the same
+     * place. Either would otherwise propagate out of a query.
+     * <p>
+     * The gate is evaluated here rather than left to the superclass so that the {@code catch} only
+     * covers an open we actually attempted with Direct I/O. Catching around an unconditional
+     * {@code super.openInput} would also swallow the delegate's own failures — a missing file, say —
+     * and retry them, turning one clear exception into two confusing ones.
+     * <p>
+     * {@code Error} is deliberately not caught. A {@code MaxDirectMemorySize} exhaustion arrives as
+     * {@link OutOfMemoryError}, and continuing on the delegate while the JVM is out of direct memory
+     * would hide a misconfiguration that the operator has to fix.
+     *
+     * @param name    the file to open
+     * @param context the open context
+     * @return a Direct I/O input when the gate selects this file and the open succeeds, otherwise
+     *         exactly the input the delegate would have returned
+     * @throws IOException if the delegate cannot open the file either
+     */
+    @Override
+    public IndexInput openInput(final String name, final IOContext context) throws IOException {
+        ensureOpen();
+        if (directIOUnavailable == false && shouldUseDirectIO(name, context, OptionalLong.of(fileLength(name)), minBytesDirect)) {
+            try {
+                return super.openInput(name, context);
+            } catch (IOException | RuntimeException e) {
+                directIOUnavailable = true;
+                log.warn(
+                    "Direct I/O is not usable under [{}] and will not be attempted again for this shard; "
+                        + "falling back to [{}] for [{}] and every later file. Read buffer was {} bytes.",
+                    getDirectory(),
+                    getDelegate().getClass().getSimpleName(),
+                    name,
+                    readBufferSize,
+                    e
+                );
+            }
+        }
+        return getDelegate().openInput(name, context);
+    }
+
+    /**
+     * Whether this JDK exposes {@code com.sun.nio.file.ExtendedOpenOption.DIRECT}, which is what
+     * Lucene opens Direct I/O files with.
+     * <p>
+     * Looked up reflectively for the same two reasons Lucene's own
+     * {@code DirectIODirectory.ExtendedOpenOption_DIRECT} does — it is a proprietary OpenJDK API that
+     * emits an unsuppressible warning when referenced under {@code --release}, and it is absent on
+     * runtimes that do not implement it, so a direct reference would not link. Lucene's copy of this
+     * lookup is package private and has no accessor, hence the second one.
+     * <p>
+     * Called once per shard open, so the reflection cost is irrelevant.
+     *
+     * @return true if Direct I/O is at least theoretically available on this runtime
+     */
+    static boolean isDirectIOOpenOptionAvailable() {
+        try {
+            final Class<? extends OpenOption> clazz = Class.forName("com.sun.nio.file.ExtendedOpenOption").asSubclass(OpenOption.class);
+            return Arrays.stream(clazz.getEnumConstants()).anyMatch(option -> option.toString().equalsIgnoreCase("DIRECT"));
+        } catch (ClassNotFoundException | RuntimeException e) {
+            return false;
+        }
+    }
+
     /**
      * Routes only {@code .vec} reads above the size floor through Direct I/O.
      * <p>
@@ -100,6 +210,11 @@ public final class KNNDirectIODirectory extends DirectIODirectory {
      * </ol>
      * Unlike the superclass' implementation this never calls {@code context.mergeInfo()}, so it
      * cannot NPE on a non-merge context; do not "restore" that call.
+     * <p>
+     * This deliberately does <em>not</em> consult {@code directIOUnavailable}. {@link #openInput}
+     * checks the latch itself and bypasses the superclass entirely when it is set, and the
+     * superclass calls this method again on the way to building the input — so making it return false
+     * once the latch is set would mean the one open we do attempt can never succeed.
      *
      * @param name       the file name, without any directory component
      * @param context    the open context

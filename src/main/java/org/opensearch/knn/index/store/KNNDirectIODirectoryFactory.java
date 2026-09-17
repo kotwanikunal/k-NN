@@ -84,9 +84,15 @@ public class KNNDirectIODirectoryFactory implements IndexStorePlugin.DirectoryFa
      * resolves through the node's registered {@code IndexScopedSettings} and throws for a setting
      * that registry does not know about — which is every plugin setting in a plain unit test, and
      * would turn a missing registration into a shard-open failure rather than a fallback.
+     * <p>
+     * Nothing this method does can fail a shard open. Every step that can throw — reading the
+     * filesystem block size, and the {@link KNNDirectIODirectory} constructor, which reads it a
+     * second time inside {@code DirectIODirectory} — is inside one {@code try}, and any failure logs
+     * once at WARN and yields the stock directory. That is the whole point of the unit: on a
+     * filesystem that cannot report a block size, {@code knn_direct_io} must be a slow index, not an
+     * unopenable one.
      */
-    private static Directory maybeWrapWithDirectIO(final Directory directory, final Path location, final IndexSettings indexSettings)
-        throws IOException {
+    private Directory maybeWrapWithDirectIO(final Directory directory, final Path location, final IndexSettings indexSettings) {
         if (KNNSettings.KNN_INDEX_DIRECT_IO_ENABLED_SETTING.get(indexSettings.getSettings()) == false) {
             log.debug(
                 "Direct I/O is disabled for index [{}] by {}",
@@ -110,22 +116,71 @@ public class KNNDirectIODirectoryFactory implements IndexStorePlugin.DirectoryFa
             );
             return directory;
         }
+        if (KNNDirectIODirectory.isDirectIOOpenOptionAvailable() == false) {
+            // Knowable without touching the filesystem, so it is worth checking before the block size
+            // read below: on such a runtime every single openInput would fail and fall back anyway.
+            log.warn(
+                "Not using Direct I/O for index [{}]: this JDK does not expose "
+                    + "com.sun.nio.file.ExtendedOpenOption.DIRECT. Reads will use the store directory [{}].",
+                indexSettings.getIndex().getName(),
+                directory.getClass().getSimpleName()
+            );
+            return directory;
+        }
 
-        final int blockSize = Math.toIntExact(Files.getFileStore(location).getBlockSize());
-        // Derived per index from the vector dimensions the mapping declares; see DirectIOBufferSizer
-        // for why no flat constant works. The block size is read here rather than there so that the
-        // sizer does no filesystem I/O of its own.
-        final int readBufferSize = DirectIOBufferSizer.readBufferSize(indexSettings, blockSize);
-        final long minBytesDirect = KNNSettings.getDirectIOMinFileSize().getBytes();
+        try {
+            final int blockSize = blockSize(location);
+            // Derived per index from the vector dimensions the mapping declares; see DirectIOBufferSizer
+            // for why no flat constant works. The block size is read here rather than there so that the
+            // sizer does no filesystem I/O of its own.
+            final int readBufferSize = DirectIOBufferSizer.readBufferSize(indexSettings, blockSize);
+            final long minBytesDirect = KNNSettings.getDirectIOMinFileSize().getBytes();
 
-        log.info(
-            "Using Direct I/O for .vec reads on index [{}] with a {} byte read buffer (block size {}) above {} bytes",
-            indexSettings.getIndex().getName(),
-            readBufferSize,
-            blockSize,
-            minBytesDirect
-        );
-        return new KNNDirectIODirectory((FSDirectory) directory, readBufferSize, minBytesDirect);
+            final Directory wrapped = new KNNDirectIODirectory((FSDirectory) directory, readBufferSize, minBytesDirect);
+            // Phase 5 reads these three numbers back out of the log to confirm which arm actually ran,
+            // so keep the store type, the buffer size and the block size on one line.
+            log.info(
+                "Using store type [{}] for index [{}]: Direct I/O for {} reads above {} bytes, "
+                    + "with a {} byte read buffer over a {} byte filesystem block",
+                KNN_DIRECT_IO_STORE_TYPE,
+                indexSettings.getIndex().getName(),
+                KNNDirectIODirectory.VECTOR_DATA_SUFFIX,
+                minBytesDirect,
+                readBufferSize,
+                blockSize
+            );
+            return wrapped;
+        } catch (IOException | RuntimeException e) {
+            // UnsupportedOperationException (the block size attribute is optional and some filesystems
+            // do not implement it) and ArithmeticException (a block size that does not fit an int) both
+            // arrive as RuntimeException. Error is left to propagate.
+            log.warn(
+                "Not using Direct I/O for index [{}]: could not set it up over [{}]. Reads will use the store directory [{}].",
+                indexSettings.getIndex().getName(),
+                location,
+                directory.getClass().getSimpleName(),
+                e
+            );
+            return directory;
+        }
+    }
+
+    /**
+     * The filesystem block size at the given location, which is the alignment every Direct I/O read
+     * has to respect.
+     * <p>
+     * Package private and overridable purely so a test can make it throw: this is the one step of
+     * shard open that does filesystem I/O of its own, and its fallback is the behaviour unit 13
+     * exists to guarantee. There is no other way to inject a failing {@code getFileStore} without a
+     * filesystem that has one.
+     *
+     * @param location the shard's index directory
+     * @return the block size in bytes
+     * @throws IOException if the file store cannot be resolved
+     * @throws UnsupportedOperationException if the file store does not report a block size
+     */
+    int blockSize(final Path location) throws IOException {
+        return Math.toIntExact(Files.getFileStore(location).getBlockSize());
     }
 
     /**
