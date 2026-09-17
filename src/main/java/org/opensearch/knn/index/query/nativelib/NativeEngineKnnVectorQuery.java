@@ -28,6 +28,7 @@ import org.apache.lucene.util.IOSupplier;
 import org.opensearch.common.StopWatch;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.index.codec.scorer.WholeLeafPrefetcher;
 import org.opensearch.knn.index.query.KNNQuery;
 import org.opensearch.knn.index.query.KNNWeight;
 import org.opensearch.knn.index.query.PerLeafResult;
@@ -483,6 +484,14 @@ public class NativeEngineKnnVectorQuery extends Query {
                 if (perLeafeResult.getResult().scoreDocs.length == 0) {
                     return perLeafeResult;
                 }
+                // Hint the whole leaf's candidate set to the storage layer in one go. The scorer prefetches
+                // too, but only 64 ordinals at a time; this is the one point where every candidate for the
+                // leaf is known. Advisory and off by default - see WholeLeafPrefetcher.
+                WholeLeafPrefetcher.prefetchCandidates(
+                    leafReaderContext.reader(),
+                    knnQuery.getField(),
+                    perLeafeResult.getResult().scoreDocs
+                );
                 final Set<Integer> docIds = Arrays.stream(perLeafeResult.getResult().scoreDocs)
                     .map(scoreDoc -> scoreDoc.doc)
                     .collect(Collectors.toSet());

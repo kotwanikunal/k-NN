@@ -17,9 +17,11 @@ import java.util.List;
 import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.KNN_FORCE_EVICT_CACHE_ENABLED_SETTING;
 import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.KNN_PREFETCH_ENABLED_SETTING;
 import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.KNN_DIRECT_IO_ENABLED_SETTING;
+import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.KNN_WHOLE_LEAF_PREFETCH_ENABLED_SETTING;
 import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.isDirectIOEnabled;
 import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.isForceEvictCacheEnabled;
 import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.isPrefetchEnabled;
+import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.isWholeLeafPrefetchEnabled;
 import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.getFeatureFlags;
 import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.getFeatureFlagsWhichRebuildsCache;
 
@@ -64,12 +66,26 @@ public class KNNFeatureFlagsTests extends KNNTestCase {
         assertTrue(isDirectIOEnabled());
     }
 
+    public void testIsWholeLeafPrefetchEnabled() {
+        when(clusterSettings.get(KNN_WHOLE_LEAF_PREFETCH_ENABLED_SETTING)).thenReturn(true);
+        assertTrue(isWholeLeafPrefetchEnabled());
+        when(clusterSettings.get(KNN_WHOLE_LEAF_PREFETCH_ENABLED_SETTING)).thenReturn(false);
+        assertFalse(isWholeLeafPrefetchEnabled());
+    }
+
+    /** Off by default, so that every prior measurement of the rescore path stays the baseline. */
+    public void testIsWholeLeafPrefetchEnabled_whenClusterServiceIsNotSet_thenReturnsDefault() {
+        KNNSettings.state().setClusterService(null);
+        assertFalse(isWholeLeafPrefetchEnabled());
+    }
+
     public void testGetFeatureFlags() {
         List<Setting<?>> flags = getFeatureFlags();
-        assertEquals(3, flags.size());
+        assertEquals(4, flags.size());
         assertTrue(flags.contains(KNN_FORCE_EVICT_CACHE_ENABLED_SETTING));
         assertTrue(flags.contains(KNN_PREFETCH_ENABLED_SETTING));
         assertTrue(flags.contains(KNN_DIRECT_IO_ENABLED_SETTING));
+        assertTrue(flags.contains(KNN_WHOLE_LEAF_PREFETCH_ENABLED_SETTING));
     }
 
     public void testGetFeatureFlagsWhichRebuildsCache() {

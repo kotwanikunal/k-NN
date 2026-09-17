@@ -30,6 +30,8 @@ public class KNNFeatureFlags {
     private static final boolean KNN_PREFETCH_ENABLED_DEFAULT_VALUE = true;
     private static final String KNN_DIRECT_IO_ENABLED = "knn.feature.direct_io.enabled";
     private static final boolean KNN_DIRECT_IO_ENABLED_DEFAULT_VALUE = true;
+    private static final String KNN_WHOLE_LEAF_PREFETCH_ENABLED = "knn.feature.whole_leaf_prefetch.enabled";
+    private static final boolean KNN_WHOLE_LEAF_PREFETCH_ENABLED_DEFAULT_VALUE = false;
 
     @VisibleForTesting
     public static final Setting<Boolean> KNN_FORCE_EVICT_CACHE_ENABLED_SETTING = Setting.boolSetting(
@@ -59,11 +61,29 @@ public class KNNFeatureFlags {
     );
 
     /**
+     * Widens the rescore prefetch from the scorer's 64-ordinal bulk batch to the whole leaf's candidate
+     * set, which is {@code firstPassK} entries. Off by default: the narrower per-batch prefetch is the
+     * behaviour every existing measurement was taken against, so this has to be opted into to be
+     * measured on its own.
+     */
+    public static final Setting<Boolean> KNN_WHOLE_LEAF_PREFETCH_ENABLED_SETTING = Setting.boolSetting(
+        KNN_WHOLE_LEAF_PREFETCH_ENABLED,
+        KNN_WHOLE_LEAF_PREFETCH_ENABLED_DEFAULT_VALUE,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
      * All feature flags which needs to be provided as setting should be added here.
      * @return List of Feature flag settings
      */
     public static List<Setting<?>> getFeatureFlags() {
-        return ImmutableList.of(KNN_FORCE_EVICT_CACHE_ENABLED_SETTING, KNN_PREFETCH_ENABLED_SETTING, KNN_DIRECT_IO_ENABLED_SETTING);
+        return ImmutableList.of(
+            KNN_FORCE_EVICT_CACHE_ENABLED_SETTING,
+            KNN_PREFETCH_ENABLED_SETTING,
+            KNN_DIRECT_IO_ENABLED_SETTING,
+            KNN_WHOLE_LEAF_PREFETCH_ENABLED_SETTING
+        );
     }
 
     /**
@@ -105,6 +125,23 @@ public class KNNFeatureFlags {
             );
         } catch (Exception e) {
             return KNN_DIRECT_IO_ENABLED_DEFAULT_VALUE;
+        }
+    }
+
+    /**
+     * Checks the node level switch for whole-leaf rescore prefetch. Read once per leaf per rescore, so it
+     * takes effect on the next query with no index or node restart.
+     *
+     * @return true if the rescore path should prefetch the whole leaf's candidate set up front
+     */
+    public static boolean isWholeLeafPrefetchEnabled() {
+        try {
+            return Booleans.parseBoolean(
+                KNNSettings.state().getSettingValue(KNN_WHOLE_LEAF_PREFETCH_ENABLED).toString(),
+                KNN_WHOLE_LEAF_PREFETCH_ENABLED_DEFAULT_VALUE
+            );
+        } catch (Exception e) {
+            return KNN_WHOLE_LEAF_PREFETCH_ENABLED_DEFAULT_VALUE;
         }
     }
 }
