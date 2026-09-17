@@ -58,6 +58,7 @@ import org.opensearch.knn.index.query.RescoreRadialSearchQuery;
 import org.opensearch.knn.index.query.exactsearch.ExactSearcher;
 import org.opensearch.knn.index.query.nativelib.NativeEngineKnnVectorQuery;
 import org.opensearch.knn.index.query.parser.KNNQueryBuilderParser;
+import org.opensearch.knn.index.store.KNNDirectIODirectoryFactory;
 import org.opensearch.knn.index.util.KNNClusterUtil;
 import org.opensearch.knn.indices.ModelCache;
 import org.opensearch.knn.indices.ModelDao;
@@ -116,6 +117,7 @@ import org.opensearch.plugins.ClusterPlugin;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.ExtensiblePlugin;
+import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.plugins.MapperPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.ReloadablePlugin;
@@ -202,7 +204,8 @@ public class KNNPlugin extends Plugin
         ExtensiblePlugin,
         SystemIndexPlugin,
         ReloadablePlugin,
-        SearchPipelinePlugin {
+        SearchPipelinePlugin,
+        IndexStorePlugin {
 
     public static final String LEGACY_KNN_BASE_URI = "/_opendistro/_knn";
     public static final String KNN_BASE_URI = "/_plugins/_knn";
@@ -307,6 +310,17 @@ public class KNNPlugin extends Plugin
     @Override
     public List<Setting<?>> getSettings() {
         return KNNSettings.state().getSettings();
+    }
+
+    /**
+     * Registers the {@code knn_direct_io} store type. Registration is unconditional and inert: it only
+     * adds a key to a map, and none of the factory's code runs unless an index explicitly selects the
+     * store type. The operational kill switch is the node setting {@code knn.feature.direct_io.enabled},
+     * which is read when the directory is built, i.e. at shard open.
+     */
+    @Override
+    public Map<String, IndexStorePlugin.DirectoryFactory> getDirectoryFactories() {
+        return Map.of(KNNDirectIODirectoryFactory.KNN_DIRECT_IO_STORE_TYPE, new KNNDirectIODirectoryFactory());
     }
 
     @Override
