@@ -7,6 +7,7 @@ package org.opensearch.knn.index.store;
 
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.LockFactory;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
@@ -14,6 +15,8 @@ import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.store.FsDirectoryFactory;
+import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
+import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.plugins.IndexStorePlugin;
 
 import java.io.IOException;
@@ -26,10 +29,15 @@ import java.nio.file.Path;
  * {@code index.store.type: knn_direct_io}, which is a static index setting and therefore takes
  * effect when the index is closed and reopened, with no node restart.
  * <p>
- * This class deliberately contains no Direct I/O of its own. Its only job is to hand back the very
- * same {@link Directory} the node's default store type would have produced, so that the store type
- * is behaviour-neutral on every file. Direct I/O is layered on top of this in a later change; when
- * the feature is disabled this factory must remain indistinguishable from the default.
+ * The directory it hands back is the very same {@link Directory} the node's default store type
+ * would have produced, wrapped in {@link KNNDirectIODirectory} when Direct I/O is enabled. Only
+ * {@code .vec} reads are routed through Direct I/O; every other file is served by the stock
+ * directory exactly as it is today. When either gate is off the stock directory is returned
+ * unwrapped, so the store type is then indistinguishable from the node default on every file.
+ * <p>
+ * The two gates are the index setting {@code index.knn.direct_io.enabled} and the node setting
+ * {@code knn.feature.direct_io.enabled}. Both are read here, at shard open, so both take effect on
+ * a close and reopen of the index with no node restart.
  * <p>
  * It reproduces the four steps of {@link FsDirectoryFactory#newDirectory(IndexSettings, ShardPath)}
  * rather than calling it, because that method re-reads {@code index.store.type} out of the
@@ -63,7 +71,61 @@ public class KNNDirectIODirectoryFactory implements IndexStorePlugin.DirectoryFa
         final IndexSettings delegateSettings = withDefaultStoreType(indexSettings);
         final Directory directory = delegate.newFSDirectory(location, lockFactory, delegateSettings);
         assert assertMatchesDefaultStoreType(directory, delegateSettings);
-        return directory;
+        return maybeWrapWithDirectIO(directory, location, indexSettings);
+    }
+
+    /**
+     * Wraps the stock directory in {@link KNNDirectIODirectory} when both the index setting and the
+     * node feature flag allow it, and returns it untouched otherwise.
+     * <p>
+     * The index setting is read off the {@link IndexSettings} the caller handed us rather than out
+     * of cluster state, because that is the copy the shard was opened with. It is read through
+     * {@code Setting.get(Settings)} rather than {@link IndexSettings#getValue}, because the latter
+     * resolves through the node's registered {@code IndexScopedSettings} and throws for a setting
+     * that registry does not know about — which is every plugin setting in a plain unit test, and
+     * would turn a missing registration into a shard-open failure rather than a fallback.
+     */
+    private static Directory maybeWrapWithDirectIO(final Directory directory, final Path location, final IndexSettings indexSettings)
+        throws IOException {
+        if (KNNSettings.KNN_INDEX_DIRECT_IO_ENABLED_SETTING.get(indexSettings.getSettings()) == false) {
+            log.debug(
+                "Direct I/O is disabled for index [{}] by {}",
+                indexSettings.getIndex().getName(),
+                KNNSettings.KNN_INDEX_DIRECT_IO_ENABLED
+            );
+            return directory;
+        }
+        if (KNNFeatureFlags.isDirectIOEnabled() == false) {
+            log.debug("Direct I/O is disabled on this node by {}", KNNFeatureFlags.KNN_DIRECT_IO_ENABLED_SETTING.getKey());
+            return directory;
+        }
+        if (directory instanceof FSDirectory == false) {
+            // DirectIODirectory casts its delegate to FSDirectory and resolves paths through it, so a
+            // delegate that is not one cannot be wrapped. The node default store types all are, but
+            // this keeps a future default from failing shard open.
+            log.warn(
+                "Not using Direct I/O for index [{}]: the store directory [{}] is not an FSDirectory",
+                indexSettings.getIndex().getName(),
+                directory.getClass().getName()
+            );
+            return directory;
+        }
+
+        final int blockSize = Math.toIntExact(Files.getFileStore(location).getBlockSize());
+        // A later change derives this per index from the mapping's vector dimensions. Two blocks is
+        // the smallest size that reads any vector shorter than a block in a single syscall no matter
+        // how it straddles a block boundary, which is why the floor is 2x and not 1x.
+        final int readBufferSize = 2 * blockSize;
+        final long minBytesDirect = KNNSettings.getDirectIOMinFileSize().getBytes();
+
+        log.info(
+            "Using Direct I/O for .vec reads on index [{}] with a {} byte read buffer (block size {}) above {} bytes",
+            indexSettings.getIndex().getName(),
+            readBufferSize,
+            blockSize,
+            minBytesDirect
+        );
+        return new KNNDirectIODirectory((FSDirectory) directory, readBufferSize, minBytesDirect);
     }
 
     /**

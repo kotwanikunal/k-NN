@@ -6,6 +6,7 @@
 package org.opensearch.knn.index.store;
 
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FilterDirectory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
@@ -19,6 +20,7 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.store.FsDirectoryFactory;
 import org.opensearch.knn.KNNTestCase;
+import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.plugin.KNNPlugin;
 import org.opensearch.plugins.IndexStorePlugin;
 
@@ -77,6 +79,87 @@ public class KNNDirectIODirectoryFactoryTests extends KNNTestCase {
     }
 
     /**
+     * With Direct I/O enabled the factory wraps, and the wrapper delegates every non-{@code .vec}
+     * file to exactly the directory the node default would have produced.
+     */
+    public void testWrapsWhenDirectIOIsEnabled() throws IOException {
+        final Path root = createTempDir();
+        final IndexSettings ourSettings = indexSettings(
+            Settings.builder().put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), KNN_DIRECT_IO_STORE_TYPE).build(),
+            Settings.EMPTY
+        );
+        final IndexSettings stockSettings = indexSettings(Settings.EMPTY, Settings.EMPTY);
+
+        try (
+            Directory ours = new KNNDirectIODirectoryFactory().newDirectory(ourSettings, shardPath(root, ourSettings));
+            Directory stock = new FsDirectoryFactory().newDirectory(stockSettings, shardPath(root, stockSettings))
+        ) {
+            assertTrue("expected the Direct I/O wrapper, got " + ours.getClass().getName(), ours instanceof KNNDirectIODirectory);
+            assertEquals(stock.getClass(), ((FilterDirectory) ours).getDelegate().getClass());
+
+            // a non-.vec file is served by the unwrapped stock directory
+            writeFile(ours, "segments_3");
+            assertSameInputClass(ours, stock, "segments_3");
+        }
+    }
+
+    /**
+     * The index-level kill switch: {@code index.knn.direct_io.enabled: false} must return the stock
+     * directory unwrapped, so the store type is then indistinguishable from the node default. This is
+     * benchmark arm (d).
+     */
+    public void testDoesNotWrapWhenIndexSettingIsFalse() throws IOException {
+        final Path root = createTempDir();
+        final IndexSettings ourSettings = indexSettings(
+            Settings.builder()
+                .put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), KNN_DIRECT_IO_STORE_TYPE)
+                .put(KNNSettings.KNN_INDEX_DIRECT_IO_ENABLED, false)
+                .build(),
+            Settings.EMPTY
+        );
+        final IndexSettings stockSettings = indexSettings(Settings.EMPTY, Settings.EMPTY);
+
+        try (
+            Directory ours = new KNNDirectIODirectoryFactory().newDirectory(ourSettings, shardPath(root, ourSettings));
+            Directory stock = new FsDirectoryFactory().newDirectory(stockSettings, shardPath(root, stockSettings))
+        ) {
+            assertFalse(ours instanceof KNNDirectIODirectory);
+            assertEquals(stock.getClass(), ours.getClass());
+
+            // and a .vec file above the size floor is still served by the stock directory
+            writeFile(ours, "_0_NativeEngines990.vec", 2 * 1024 * 1024);
+            assertSameInputClass(ours, stock, "_0_NativeEngines990.vec");
+        }
+    }
+
+    /**
+     * Both entry points on {@link IndexStorePlugin.DirectoryFactory} must wrap. {@code newDirectory}
+     * happens to delegate to {@code newFSDirectory} today, but the interface declares both as
+     * abstract, so a caller may use either.
+     */
+    public void testBothEntryPointsWrap() throws IOException {
+        final Path root = createTempDir();
+        final IndexSettings ourSettings = indexSettings(
+            Settings.builder().put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), KNN_DIRECT_IO_STORE_TYPE).build(),
+            Settings.EMPTY
+        );
+        final ShardPath path = shardPath(root, ourSettings);
+        final KNNDirectIODirectoryFactory factory = new KNNDirectIODirectoryFactory();
+
+        try (
+            Directory viaNewDirectory = factory.newDirectory(ourSettings, path);
+            Directory viaNewFSDirectory = factory.newFSDirectory(
+                path.resolveIndex(),
+                ourSettings.getValue(FsDirectoryFactory.INDEX_LOCK_FACTOR_SETTING),
+                ourSettings
+            )
+        ) {
+            assertTrue(viaNewDirectory instanceof KNNDirectIODirectory);
+            assertTrue(viaNewFSDirectory instanceof KNNDirectIODirectory);
+        }
+    }
+
+    /**
      * Owed assertion 1: same class as the stock factory, and hybridfs for both.
      */
     public void testReturnsSameDirectoryClassAsStockFactory() throws IOException {
@@ -84,7 +167,10 @@ public class KNNDirectIODirectoryFactoryTests extends KNNTestCase {
         final Settings nodeSettings = Settings.EMPTY;
 
         final IndexSettings ourSettings = indexSettings(
-            Settings.builder().put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), KNN_DIRECT_IO_STORE_TYPE).build(),
+            Settings.builder()
+                .put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), KNN_DIRECT_IO_STORE_TYPE)
+                .put(KNNSettings.KNN_INDEX_DIRECT_IO_ENABLED, false)
+                .build(),
             nodeSettings
         );
         final IndexSettings hybridSettings = indexSettings(
@@ -183,8 +269,12 @@ public class KNNDirectIODirectoryFactoryTests extends KNNTestCase {
         final Path root = createTempDir();
         final Settings nodeSettings = Settings.builder().put(IndexModule.NODE_STORE_ALLOW_MMAP.getKey(), false).build();
 
+        // Direct I/O off, so the assertion is about store-type resolution and nothing else.
         final IndexSettings ourSettings = indexSettings(
-            Settings.builder().put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), KNN_DIRECT_IO_STORE_TYPE).build(),
+            Settings.builder()
+                .put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), KNN_DIRECT_IO_STORE_TYPE)
+                .put(KNNSettings.KNN_INDEX_DIRECT_IO_ENABLED, false)
+                .build(),
             nodeSettings
         );
         final IndexSettings stockSettings = indexSettings(Settings.EMPTY, nodeSettings);
@@ -196,6 +286,25 @@ public class KNNDirectIODirectoryFactoryTests extends KNNTestCase {
             assertEquals(stock.getClass(), ours.getClass());
             assertEquals(NIOFSDirectory.class, ours.getClass());
             assertFalse(FsDirectoryFactory.isHybridFs(ours));
+        }
+    }
+
+    /**
+     * With {@code node.store.allow_mmap: false} the delegate is a plain {@link NIOFSDirectory} rather
+     * than a hybrid one, and it must still be wrappable — {@link KNNDirectIODirectory} needs an
+     * {@code FSDirectory}, which both node defaults are.
+     */
+    public void testWrapsANonHybridDelegate() throws IOException {
+        final Path root = createTempDir();
+        final Settings nodeSettings = Settings.builder().put(IndexModule.NODE_STORE_ALLOW_MMAP.getKey(), false).build();
+        final IndexSettings ourSettings = indexSettings(
+            Settings.builder().put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), KNN_DIRECT_IO_STORE_TYPE).build(),
+            nodeSettings
+        );
+
+        try (Directory ours = new KNNDirectIODirectoryFactory().newDirectory(ourSettings, shardPath(root, ourSettings))) {
+            assertTrue(ours instanceof KNNDirectIODirectory);
+            assertEquals(NIOFSDirectory.class, ((FilterDirectory) ours).getDelegate().getClass());
         }
     }
 
@@ -218,8 +327,12 @@ public class KNNDirectIODirectoryFactoryTests extends KNNTestCase {
     }
 
     private static void writeFile(final Directory directory, final String name) throws IOException {
+        writeFile(directory, name, 64);
+    }
+
+    private static void writeFile(final Directory directory, final String name, final int length) throws IOException {
         try (IndexOutput out = directory.createOutput(name, IOContext.DEFAULT)) {
-            out.writeBytes(new byte[64], 64);
+            out.writeBytes(new byte[length], length);
         }
     }
 
