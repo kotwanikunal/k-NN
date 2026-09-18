@@ -10,6 +10,7 @@ import org.apache.lucene.codecs.lucene95.HasIndexSlice;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.search.DocAndFloatFeatureBuffer;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.util.Bits;
@@ -181,6 +182,48 @@ public class DirectIOFloatVectorValuesTests extends KNNTestCase {
         assertNotNull(rescorer);
         assertEquals(0, rescorer.iterator().nextDoc());
         assertEquals(VectorSimilarityFunction.EUCLIDEAN.compare(target, SOURCE_VECTORS[0]), rescorer.score(), 1e-6f);
+    }
+
+    /**
+     * The scorer must stage each batch before scoring it, because {@code bulkScore} is the only point on the
+     * rescore path where more than one upcoming ordinal is known. If this wiring were dropped, every number
+     * would still be right and the path would silently cost one blocking read per candidate again — which is
+     * the 123 ms Phase 2 measured.
+     */
+    @SneakyThrows
+    public void testBulkScoringStagesTheBatchOnTheReaderItScoresThrough() {
+        final List<DirectIOVectorSource.Reader> readers = new java.util.ArrayList<>();
+        final DirectIOVectorSource source = mock(DirectIOVectorSource.class);
+        when(source.size()).thenReturn(DELEGATE_VECTORS.size());
+        when(source.dimension()).thenReturn(DIMENSION);
+        when(source.vectorByteLength()).thenReturn(DIMENSION * Float.BYTES);
+        when(source.newReader()).thenAnswer(invocation -> {
+            final DirectIOVectorSource.Reader reader = mock(DirectIOVectorSource.Reader.class);
+            when(reader.read(org.mockito.ArgumentMatchers.anyInt())).thenAnswer(read -> SOURCE_VECTORS[(int) read.getArgument(0)]);
+            readers.add(reader);
+            return reader;
+        });
+
+        final float[] target = { 1.0f, 2.0f, 3.0f, 4.0f };
+        final DirectIOFloatVectorValues values = new DirectIOFloatVectorValues(delegate(), source, VectorSimilarityFunction.EUCLIDEAN);
+        final VectorScorer scorer = values.scorer(target);
+
+        final DocAndFloatFeatureBuffer buffer = new DocAndFloatFeatureBuffer();
+        final float max = scorer.bulk(null).nextDocsAndScores(DocIdSetIterator.NO_MORE_DOCS, null, buffer);
+
+        assertEquals(SOURCE_VECTORS.length, buffer.size);
+        float expectedMax = Float.NEGATIVE_INFINITY;
+        for (int ord = 0; ord < SOURCE_VECTORS.length; ord++) {
+            final float expected = VectorSimilarityFunction.EUCLIDEAN.compare(target, SOURCE_VECTORS[ord]);
+            assertEquals("ordinal " + ord, expected, buffer.features[ord], 1e-6f);
+            expectedMax = Math.max(expectedMax, expected);
+        }
+        assertEquals(expectedMax, max, 1e-6f);
+
+        // The scoring copy's reader is the second one, since the values object itself took the first.
+        assertEquals(2, readers.size());
+        verify(readers.get(1)).stage(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.eq(SOURCE_VECTORS.length));
+        verify(readers.get(0), never()).stage(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyInt());
     }
 
     @SneakyThrows

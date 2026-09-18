@@ -20,6 +20,12 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.Locale;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * A Direct I/O byte source for one field's full-precision vectors in a {@code .vec} file: given an
@@ -28,9 +34,14 @@ import java.util.Locale;
  *
  * <p>This is the loader half of the rescore seam. It is deliberately <em>not</em> an
  * {@link org.apache.lucene.store.IndexInput}: Lucene's own {@code DirectIOIndexInput} is a sequential
- * stream with a single internal buffer, and this path wants one independent aligned buffer per query
- * thread over a shared file handle. The handle is opened once per segment and shared; the buffer is
- * owned by a {@link Reader}, one per scorer.
+ * stream with a single internal buffer, and this path wants independent aligned buffers per query thread
+ * over a shared file handle. The handle is opened once per segment and shared; the buffers are owned by a
+ * {@link Reader}, one reader per scorer.
+ *
+ * <p>A {@link Reader} can also be told what it is about to be asked for, via {@link Reader#stage}, and
+ * will then keep a rolling window of those reads in flight on {@link DirectIOReadPool}. That read-ahead is
+ * what replaces the {@code madvise} prefetch the mmap path got for free and {@code O_DIRECT} necessarily
+ * removes; without it a rescore query pays one serial device round trip per candidate.
  *
  * <h2>Why the file region has to be discovered rather than asked for</h2>
  * The seam holds Lucene's mmap-backed slice of the vector region, and neither {@code IndexInput} nor
@@ -226,28 +237,112 @@ public final class DirectIOVectorSource implements Closeable {
     }
 
     /**
-     * A single-threaded view over the shared file handle, owning the one aligned buffer its reads go
-     * through and the one {@code float[]} they decode into.
+     * A single-threaded view over the shared file handle, owning the aligned buffers its reads go through
+     * and the one {@code float[]} they decode into.
      *
      * <p>One per scorer: Lucene hands every per-leaf scoring task its own copy of the vector values, and
-     * those tasks run concurrently, so a shared buffer would be a data race. The buffer is allocated on
-     * the first read rather than in the constructor, because the seam creates a reader for the values it
+     * those tasks run concurrently, so a shared buffer would be a data race. Buffers are allocated on
+     * first use rather than in the constructor, because the seam creates a reader for the values it
      * returns and then a second one for the private copy the scorer actually reads through — allocating
-     * eagerly would pay for a buffer that is never used.
+     * eagerly would pay for buffers that are never used.
      *
-     * <p>The buffer is released when the reader becomes unreachable, by the same {@code Cleaner} that
-     * releases any direct buffer. Nothing is retained after a read: {@link #read} overwrites the buffer
-     * every time, so this is a staging area and not a cache.
+     * <h2>The staging ring</h2>
+     * Read ahead exists because the mmap path this replaces got its speed from {@code madvise}, which has
+     * no meaning without a mapping: with one blocking read per candidate, a rescore query costs 200 serial
+     * device round trips. So {@link #stage} takes the batch of ordinals the scorer is about to ask for and
+     * puts a rolling window of them in flight on {@link DirectIOReadPool}, and {@link #read} then waits
+     * only for the one it needs while the rest are already travelling.
+     *
+     * <p>Each ring entry is written by exactly one background read, decoded by exactly one {@link #read},
+     * and then immediately reused for the next ordinal in the batch. <b>That makes this a staging area and
+     * not a cache</b>: there is no eviction policy because there is nothing to evict, and no entry
+     * survives its single consume. A future cache belongs at the loader seam, above this class, not here.
+     *
+     * <p>Staging is an optimisation and never a correctness requirement. Any reason not to stage — the
+     * setting off, no pool, a rejected submission, a window of one, a batch shorter than two, or a
+     * consumer that asks for an ordinal the batch did not predict — falls back to a single blocking read,
+     * which is the path {@link #read} takes when no batch is active. The vector returned is the same
+     * either way.
+     *
+     * <p>Buffers are released when the reader becomes unreachable, by the same {@code Cleaner} that
+     * releases any direct buffer.
      */
     public final class Reader {
 
-        private ByteBuffer buffer;
+        /** Buffer for reads that are not served from the ring. Allocated on the first such read. */
+        private ByteBuffer syncBuffer;
         private final float[] value = new float[dimension];
+
+        /**
+         * Ring slots, or null before the first staged batch. Slices of one aligned allocation, which they
+         * keep reachable, so this is one direct buffer and one {@code Cleaner} registration however many
+         * slots there are.
+         */
+        private ByteBuffer[] slots;
+        private Future<?>[] pending;
+        private StagedRead[] staged;
+        private int[] slotOrd;
+        private int ringSize;
+        private ExecutorService pool;
+
+        /** The ordinals of the batch being staged, and how far submission and consumption have got. */
+        private int[] batch = new int[0];
+        private int batchSize;
+        private int nextSubmit;
+        private int nextConsume;
 
         private Reader() {}
 
         /**
-         * The vector at {@code ord}, read with one {@code pread} of a block-aligned range.
+         * Declares that {@code ords[0..count)} are about to be read, in that order, and puts a window of
+         * them in flight.
+         *
+         * <p>Advisory in both directions: this may stage none of them, and a caller that then reads
+         * something else, or reads them out of order, gets correct vectors from blocking reads. It must be
+         * called from the thread that will do the reading.
+         *
+         * @param ords  ordinals in the order they will be read; only the first {@code count} are looked at
+         * @param count how many of {@code ords} are meaningful
+         */
+        public void stage(final int[] ords, final int count) {
+            // Any previous batch has to be fully quiesced before its slots can be handed to new reads:
+            // cancel(false) does not stop a read that has already started writing into a slot.
+            abandonBatch();
+            if (ords == null || count <= 1) {
+                return;
+            }
+            final int window = prefetchWindow();
+            if (window <= 1) {
+                return;
+            }
+            for (int i = 0; i < count; i++) {
+                if (ords[i] < 0 || ords[i] >= size) {
+                    // Not this class' error to report: read(ord) will reject it with the ordinal in hand.
+                    return;
+                }
+            }
+            if (ensureRing(Math.min(window, count)) == false) {
+                return;
+            }
+            if (batch.length < count) {
+                batch = new int[count];
+            }
+            System.arraycopy(ords, 0, batch, 0, count);
+            batchSize = count;
+            nextSubmit = 0;
+            nextConsume = 0;
+            final int inFlight = Math.min(ringSize, count);
+            for (int i = 0; i < inFlight; i++) {
+                if (submitNext() == false) {
+                    abandonBatch();
+                    return;
+                }
+            }
+        }
+
+        /**
+         * The vector at {@code ord}: taken from the staging ring when it is the next ordinal the current
+         * batch predicted, and otherwise read with one {@code pread} of a block-aligned range.
          *
          * <p>The returned array is owned by this reader and is overwritten by the next call, which is the
          * same contract {@code FloatVectorValues#vectorValue(int)} has.
@@ -262,43 +357,239 @@ public final class DirectIOVectorSource implements Closeable {
                     String.format(Locale.ROOT, "Ordinal %d is out of range for %d vectors in %s", ord, size, path)
                 );
             }
-            final long absolute = baseOffset + (long) ord * vectorByteLength;
-            final int delta = (int) (absolute % blockSize);
-            final long alignedStart = absolute - delta;
-
-            final ByteBuffer target = buffer();
-            target.clear();
-            final int read = channel.read(target, alignedStart);
-            // A short read is only possible at end of file, and the bytes wanted here always end at least
-            // FOOTER_LENGTH bytes before it, so this cannot fire for a source that verified. It is checked
-            // rather than asserted because the alternative is decoding whatever the buffer last held.
-            if (read < delta + vectorByteLength) {
-                throw new IOException(
-                    String.format(
-                        Locale.ROOT,
-                        "Direct I/O read of %s at %d returned %d bytes, need %d for ordinal %d",
-                        path,
-                        alignedStart,
-                        read,
-                        delta + vectorByteLength,
-                        ord
-                    )
-                );
+            if (batchSize > 0) {
+                if (nextConsume < batchSize && batch[nextConsume] == ord) {
+                    return consumeStaged();
+                }
+                // The consumer did not follow the order it declared. Correct, but every remaining staged
+                // read is now speculative, so drop the batch rather than serve from it.
+                abandonBatch();
             }
-            for (int i = 0; i < value.length; i++) {
-                value[i] = target.getFloat(delta + (i << 2));
+            return readBlocking(ord);
+        }
+
+        /** Waits for the head of the ring, decodes it, and refills the slot it frees. */
+        private float[] consumeStaged() throws IOException {
+            final int slot = nextConsume % ringSize;
+            final Future<?> future = pending[slot];
+            pending[slot] = null;
+            staged[slot] = null;
+            try {
+                future.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                abandonBatch();
+                throw new IOException("Interrupted waiting for a Direct I/O read of " + path, e);
+            } catch (ExecutionException e) {
+                abandonBatch();
+                final Throwable cause = e.getCause();
+                // Error propagates for the reason open() does not catch it: a direct-buffer OutOfMemoryError
+                // is a misconfiguration to fix, not a condition to read around.
+                if (cause instanceof Error) {
+                    throw (Error) cause;
+                }
+                if (cause instanceof IOException) {
+                    throw (IOException) cause;
+                }
+                throw new IOException("Direct I/O read of " + path + " failed", cause);
+            }
+            decode(slots[slot], slotOrd[slot]);
+            nextConsume++;
+            if (submitNext() == false) {
+                // value already holds this ordinal, so the batch can be dropped without losing this read.
+                abandonBatch();
             }
             return value;
         }
 
-        private ByteBuffer buffer() {
-            if (buffer == null) {
+        /**
+         * Puts the next unsubmitted ordinal of the batch in flight, in the slot the ring has just freed.
+         *
+         * @return false if the pool refused the read, which means the batch cannot continue
+         */
+        private boolean submitNext() {
+            if (nextSubmit >= batchSize) {
+                return true;
+            }
+            final int ord = batch[nextSubmit];
+            final int slot = nextSubmit % ringSize;
+            final StagedRead read = new StagedRead(slots[slot], ord);
+            try {
+                pending[slot] = pool.submit(read);
+            } catch (RejectedExecutionException e) {
+                pending[slot] = null;
+                staged[slot] = null;
+                log.debug("Direct I/O rescore read pool refused a read of {}; falling back to blocking reads", path);
+                return false;
+            }
+            staged[slot] = read;
+            slotOrd[slot] = ord;
+            nextSubmit++;
+            return true;
+        }
+
+        /**
+         * Quiesces everything the current batch still has in flight and forgets the batch.
+         *
+         * <p>A slot is safe to reuse only once no read can still write into it, and {@code Future#cancel} is
+         * not enough for that: cancelling a task that has already started completes the future immediately
+         * while the read runs on. So each read is claimed instead — a read that has not begun is skipped by
+         * the claim and one that has is waited for.
+         */
+        private void abandonBatch() {
+            if (pending != null) {
+                for (int slot = 0; slot < ringSize; slot++) {
+                    final Future<?> future = pending[slot];
+                    if (future == null) {
+                        continue;
+                    }
+                    final StagedRead read = staged[slot];
+                    pending[slot] = null;
+                    staged[slot] = null;
+                    if (read.skipIfNotStarted()) {
+                        continue;
+                    }
+                    try {
+                        future.get();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (ExecutionException e) {
+                        log.debug("Abandoned a staged Direct I/O read of {}", path);
+                    }
+                }
+            }
+            batchSize = 0;
+            nextSubmit = 0;
+            nextConsume = 0;
+        }
+
+        /**
+         * Allocates the ring, once, at {@code desired} slots, and takes a reference to the shared pool.
+         *
+         * @return false when read ahead is not available, so the caller should read blocking
+         */
+        private boolean ensureRing(final int desired) {
+            if (slots != null) {
+                return true;
+            }
+            final ExecutorService acquired = DirectIOReadPool.executor();
+            if (acquired == null) {
+                return false;
+            }
+            // One allocation for the whole ring, over-allocated by a block so a block-aligned start exists
+            // inside it. Every slot boundary is then also block aligned, because bufferSize is a multiple
+            // of blockSize by construction in DirectIOBufferSizer.
+            final ByteBuffer arena = ByteBuffer.allocateDirect(desired * bufferSize + blockSize - 1).alignedSlice(blockSize);
+            final ByteBuffer[] allocated = new ByteBuffer[desired];
+            for (int i = 0; i < desired; i++) {
+                allocated[i] = arena.slice(i * bufferSize, bufferSize).order(ByteOrder.LITTLE_ENDIAN);
+            }
+            slotOrd = new int[desired];
+            pending = new Future<?>[desired];
+            staged = new StagedRead[desired];
+            ringSize = desired;
+            pool = acquired;
+            slots = allocated;
+            return true;
+        }
+
+        /** One blocking {@code pread}, the whole of the Phase 2 path and the fallback for every other. */
+        private float[] readBlocking(final int ord) throws IOException {
+            if (syncBuffer == null) {
                 // Mirrors Lucene's DirectIOIndexInput#allocateBuffer: over-allocate by a block so that a
                 // block-aligned slice exists inside the allocation, since O_DIRECT requires the buffer
                 // address, the file offset and the length to all be block aligned.
-                buffer = ByteBuffer.allocateDirect(bufferSize + blockSize - 1).alignedSlice(blockSize).order(ByteOrder.LITTLE_ENDIAN);
+                syncBuffer = ByteBuffer.allocateDirect(bufferSize + blockSize - 1).alignedSlice(blockSize).order(ByteOrder.LITTLE_ENDIAN);
             }
-            return buffer;
+            readInto(syncBuffer, ord);
+            decode(syncBuffer, ord);
+            return value;
+        }
+
+        /** Decodes the vector at {@code ord} out of a buffer that already holds its block-aligned range. */
+        private void decode(final ByteBuffer target, final int ord) {
+            final int delta = (int) ((baseOffset + (long) ord * vectorByteLength) % blockSize);
+            for (int i = 0; i < value.length; i++) {
+                value[i] = target.getFloat(delta + (i << 2));
+            }
+        }
+    }
+
+    /**
+     * One staged read of one ordinal into one ring slot.
+     *
+     * <p>The claim is what makes a slot reusable: whoever wins {@code started} owns the buffer, so a read
+     * abandoned before it began never touches a slot the next batch is already reading into, and one that
+     * has begun can be waited out. {@code Future#cancel} cannot express this, since it completes the future
+     * while a started task runs on.
+     */
+    private final class StagedRead implements Callable<Void> {
+
+        private final ByteBuffer target;
+        private final int ord;
+        private final AtomicBoolean started = new AtomicBoolean();
+
+        private StagedRead(final ByteBuffer target, final int ord) {
+            this.target = target;
+            this.ord = ord;
+        }
+
+        @Override
+        public Void call() throws IOException {
+            if (started.compareAndSet(false, true) == false) {
+                return null;
+            }
+            readInto(target, ord);
+            return null;
+        }
+
+        /** @return true if this read will now never run, false if it is running or has already run */
+        private boolean skipIfNotStarted() {
+            return started.compareAndSet(false, true);
+        }
+    }
+
+    /**
+     * Reads the block-aligned range holding {@code ord} into {@code target}.
+     *
+     * <p>Runs on the calling thread for a blocking read and on a {@link DirectIOReadPool} thread for a
+     * staged one. Safe in both cases because a {@code FileChannel} is thread safe for positional reads and
+     * each buffer is written by one read at a time, with the {@code Future} publishing it to the consumer.
+     */
+    private void readInto(final ByteBuffer target, final int ord) throws IOException {
+        final long absolute = baseOffset + (long) ord * vectorByteLength;
+        final int delta = (int) (absolute % blockSize);
+        final long alignedStart = absolute - delta;
+        target.clear();
+        final int read = channel.read(target, alignedStart);
+        // A short read is only possible at end of file, and the bytes wanted here always end at least
+        // FOOTER_LENGTH bytes before it, so this cannot fire for a source that verified. It is checked
+        // rather than asserted because the alternative is decoding whatever the buffer last held.
+        if (read < delta + vectorByteLength) {
+            throw new IOException(
+                String.format(
+                    Locale.ROOT,
+                    "Direct I/O read of %s at %d returned %d bytes, need %d for ordinal %d",
+                    path,
+                    alignedStart,
+                    read,
+                    delta + vectorByteLength,
+                    ord
+                )
+            );
+        }
+    }
+
+    /**
+     * The configured read-ahead window, or 1 to mean "do not read ahead". Read defensively for the reason
+     * {@link #maxBufferSize()} is: an unreadable setting must leave the query working.
+     */
+    private static int prefetchWindow() {
+        try {
+            return KNNSettings.isDirectIORescorePrefetchEnabled() ? KNNSettings.getDirectIORescorePrefetchWindow() : 1;
+        } catch (Exception e) {
+            log.debug("Could not read the Direct I/O rescore prefetch settings; reading without prefetch", e);
+            return 1;
         }
     }
 
@@ -327,7 +618,7 @@ public final class DirectIOVectorSource implements Closeable {
         return baseOffset;
     }
 
-    /** Size of each {@link Reader}'s aligned buffer, in bytes. */
+    /** Size of one aligned read buffer, in bytes; a {@link Reader} holds one per staging ring slot. */
     public int bufferSize() {
         return bufferSize;
     }

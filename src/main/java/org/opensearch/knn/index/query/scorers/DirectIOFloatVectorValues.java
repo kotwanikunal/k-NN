@@ -42,9 +42,13 @@ import java.io.IOException;
  * Everything except {@code vectorValue} delegates, so ordinals, {@code ordToDoc} and iteration are the
  * codec's and cannot drift from them. {@link #copy()} pairs a fresh delegate copy with a fresh
  * {@link DirectIOVectorSource.Reader}, because Lucene gives each per-leaf scoring task its own copy and
- * those tasks run concurrently - one buffer shared between them would be a data race. The buffer is
- * allocated on the reader's first read and dropped when it becomes unreachable; nothing is retained
- * between reads, so this is a staging area and not a cache.
+ * those tasks run concurrently - one buffer shared between them would be a data race. Buffers are
+ * allocated on first use and dropped when the reader becomes unreachable; no buffer survives the single
+ * score that consumes it, so this is a staging area and not a cache.
+ *
+ * <p>{@link #scorer(float[])} additionally wraps Lucene's scorer so that each batch of ordinals is staged
+ * before it is scored - see {@link PrefetchingRandomVectorScorer}. That read-ahead is what makes this path
+ * competitive with mmap, whose speed came from a {@code madvise} prefetch that cannot exist here.
  */
 final class DirectIOFloatVectorValues extends FloatVectorValues {
 
@@ -86,8 +90,12 @@ final class DirectIOFloatVectorValues extends FloatVectorValues {
         return reader.read(ord);
     }
 
+    /**
+     * Covariant on purpose: {@link #scorer} needs the copy's {@link DirectIOVectorSource.Reader} to stage
+     * read-ahead into, and the {@link FloatVectorValues} this overrides cannot express that.
+     */
     @Override
-    public FloatVectorValues copy() throws IOException {
+    public DirectIOFloatVectorValues copy() throws IOException {
         return new DirectIOFloatVectorValues(delegate.copy(), source, similarityFunction);
     }
 
@@ -133,13 +141,20 @@ final class DirectIOFloatVectorValues extends FloatVectorValues {
      *
      * <p>{@code rescorer(float[])} inherits this, because {@link FloatVectorValues#rescorer(float[])}
      * delegates to {@code scorer}. The rescore path is the only caller that reaches here.
+     *
+     * <p>The scorer Lucene builds is then wrapped in a {@link PrefetchingRandomVectorScorer} over the
+     * copy's own reader, which is what turns the per-vector blocking reads into a pipeline. The wrapper
+     * cannot change a score — see its javadoc — so this is a latency change and not a results change.
      */
     @Override
     public VectorScorer scorer(final float[] target) throws IOException {
-        final FloatVectorValues scoringCopy = copy();
+        final DirectIOFloatVectorValues scoringCopy = copy();
         final DocIndexIterator iterator = scoringCopy.iterator();
-        final RandomVectorScorer randomVectorScorer = FlatVectorScorerUtil.getLucene99FlatVectorsScorer()
-            .getRandomVectorScorer(similarityFunction, scoringCopy, target);
+        final RandomVectorScorer randomVectorScorer = new PrefetchingRandomVectorScorer(
+            FlatVectorScorerUtil.getLucene99FlatVectorsScorer().getRandomVectorScorer(similarityFunction, scoringCopy, target),
+            scoringCopy.reader,
+            scoringCopy
+        );
         return new VectorScorer() {
             @Override
             public float score() throws IOException {

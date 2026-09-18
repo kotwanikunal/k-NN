@@ -5,6 +5,7 @@
 
 package org.opensearch.knn.index.store;
 
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 import lombok.SneakyThrows;
 import org.apache.lucene.index.FloatVectorValues;
 import org.opensearch.knn.KNNTestCase;
@@ -20,6 +21,10 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 /**
  * The Direct I/O byte source, tested against real files on the test filesystem.
@@ -33,7 +38,11 @@ import java.util.Random;
  * {@code O_DIRECT} (tmpfs and several network filesystems answer {@code EINVAL}), since that says nothing
  * about this code. {@link #testOpenDeclinesWhenTheRegionIsNotWhereItWasDerivedToBe} and the argument
  * checks run everywhere.
+ * <p>
+ * Staging runs on {@link DirectIOReadPool}, whose daemon threads outlive a suite by design, so this suite
+ * carries the same thread filter {@link DirectIOReadPoolTests} does.
  */
+@ThreadLeakFilters(defaultFilters = true, filters = { DirectIOReadPoolTests.ReadPoolThreadFilter.class })
 public class DirectIOVectorSourceTests extends KNNTestCase {
 
     private static final int DIMENSION = 8;
@@ -228,5 +237,220 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
         final DirectIOVectorSource.Reader reader = source.newReader();
         source.close();
         expectThrows(Exception.class, () -> reader.read(0));
+    }
+
+    // ----------------------------------------------------------------------------------------------
+    // Staging. Every test here asserts the same thing from a different angle: read ahead changes when
+    // bytes arrive and never which bytes. A ring with an off-by-one returns a neighbouring vector, which
+    // is why these compare against the written contents rather than against a second read.
+    // ----------------------------------------------------------------------------------------------
+
+    /** The ordinals one batch of a rescore looks like: sparse, ascending, wider than one block. */
+    private static int[] sparseOrdinals(final int count, final int stride, final int limit) {
+        final int[] ords = new int[count];
+        for (int i = 0; i < count; i++) {
+            ords[i] = (i * stride) % limit;
+        }
+        return ords;
+    }
+
+    private void assertReadsInOrder(final DirectIOVectorSource.Reader reader, final int[] ords, final List<float[]> vectors)
+        throws IOException {
+        for (final int ord : ords) {
+            assertArrayEquals("ordinal " + ord, vectors.get(ord), reader.read(ord), 0.0f);
+        }
+    }
+
+    /**
+     * A staged batch several times the default window, so the ring has to roll: slots are reused as reads
+     * are consumed, and a slot handed to a new read before the old one finished writing it would show up
+     * here as a vector from the wrong ordinal.
+     */
+    @SneakyThrows
+    public void testAStagedBatchWiderThanTheRingReadsBackEveryVector() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(600);
+        final Path path = writeVectorFile(vectors, 0);
+
+        try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
+            assertNotNull(source);
+            final DirectIOVectorSource.Reader reader = source.newReader();
+            // 200 is firstPassK on the benchmark index, i.e. a whole rescore candidate set.
+            final int[] ords = sparseOrdinals(200, 7, vectors.size());
+            reader.stage(ords, ords.length);
+            assertReadsInOrder(reader, ords, vectors);
+        }
+    }
+
+    /** A batch shorter than the window: every read is already in flight before the first is consumed. */
+    @SneakyThrows
+    public void testAStagedBatchNarrowerThanTheRingReadsBackEveryVector() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(64);
+        final Path path = writeVectorFile(vectors, 0);
+
+        try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
+            assertNotNull(source);
+            final DirectIOVectorSource.Reader reader = source.newReader();
+            final int[] ords = { 61, 0, 33, 7, 12 };
+            reader.stage(ords, ords.length);
+            assertReadsInOrder(reader, ords, vectors);
+        }
+    }
+
+    /**
+     * Only the first {@code count} entries are staged, and the tail of the array must not be read — a
+     * caller reusing one oversized array across batches is exactly what Lucene's bulk scorer does.
+     */
+    @SneakyThrows
+    public void testStageLooksAtOnlyTheFirstCountOrdinals() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(64);
+        final Path path = writeVectorFile(vectors, 0);
+
+        try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
+            assertNotNull(source);
+            final DirectIOVectorSource.Reader reader = source.newReader();
+            // The tail is out of range on purpose: staging it would decline the batch, and reading it would
+            // throw. Neither may happen, because count says it is not part of this batch.
+            final int[] ords = { 5, 9, 40, 12345, -3 };
+            reader.stage(ords, 3);
+            assertReadsInOrder(reader, new int[] { 5, 9, 40 }, vectors);
+        }
+    }
+
+    /**
+     * Staging is a prediction, and a wrong prediction has to cost latency rather than correctness. Here the
+     * consumer reads an ordinal the batch did not put next, which drops the batch; the remaining reads then
+     * come from blocking reads and must still be right.
+     */
+    @SneakyThrows
+    public void testReadFallsBackToBlockingWhenTheConsumerLeavesTheStagedOrder() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(600);
+        final Path path = writeVectorFile(vectors, 0);
+
+        try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
+            assertNotNull(source);
+            final DirectIOVectorSource.Reader reader = source.newReader();
+            final int[] ords = sparseOrdinals(64, 9, vectors.size());
+            reader.stage(ords, ords.length);
+
+            // Consume a little of the batch, then deviate, then read the whole batch anyway.
+            assertArrayEquals(vectors.get(ords[0]), reader.read(ords[0]), 0.0f);
+            assertArrayEquals(vectors.get(ords[1]), reader.read(ords[1]), 0.0f);
+            assertArrayEquals(vectors.get(511), reader.read(511), 0.0f);
+            assertReadsInOrder(reader, ords, vectors);
+        }
+    }
+
+    /**
+     * One reader serves many batches, and a batch that was abandoned part-read leaves reads in flight over
+     * slots the next batch reuses. Quiescing them is the reason {@code stage} cancels and drains first; if
+     * it did not, this test would intermittently read a vector from the previous batch.
+     */
+    @SneakyThrows
+    public void testConsecutiveBatchesOnOneReaderAfterPartialConsumption() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(600);
+        final Path path = writeVectorFile(vectors, 0);
+
+        try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
+            assertNotNull(source);
+            final DirectIOVectorSource.Reader reader = source.newReader();
+            for (int batch = 0; batch < 8; batch++) {
+                final int[] ords = sparseOrdinals(64, 7 + batch, vectors.size());
+                reader.stage(ords, ords.length);
+                // Consume only part of it, so the next stage() has to clean up after this one.
+                for (int i = 0; i < 3 + batch; i++) {
+                    assertArrayEquals("batch " + batch + " ordinal " + ords[i], vectors.get(ords[i]), reader.read(ords[i]), 0.0f);
+                }
+            }
+            // And after all that, the reader is still a correct reader.
+            assertReadsInOrder(reader, sparseOrdinals(64, 13, vectors.size()), vectors);
+        }
+    }
+
+    /**
+     * A batch containing an ordinal outside the region is not staged at all, so the out-of-range ordinal is
+     * still rejected by {@code read} with the ordinal in hand rather than swallowed by a background read.
+     */
+    @SneakyThrows
+    public void testStageDeclinesABatchThatContainsAnOrdinalOutsideTheRegion() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(64);
+        final Path path = writeVectorFile(vectors, 0);
+
+        try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
+            assertNotNull(source);
+            final DirectIOVectorSource.Reader reader = source.newReader();
+            reader.stage(new int[] { 1, 2, 64 }, 3);
+            assertArrayEquals(vectors.get(1), reader.read(1), 0.0f);
+            expectThrows(IllegalArgumentException.class, () -> reader.read(64));
+
+            reader.stage(new int[] { 1, -1 }, 2);
+            expectThrows(IllegalArgumentException.class, () -> reader.read(-1));
+        }
+    }
+
+    @SneakyThrows
+    public void testStageIsHarmlessForDegenerateBatches() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(64);
+        final Path path = writeVectorFile(vectors, 0);
+
+        try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
+            assertNotNull(source);
+            final DirectIOVectorSource.Reader reader = source.newReader();
+            reader.stage(null, 8);
+            reader.stage(new int[] { 3 }, 1);
+            reader.stage(new int[] { 3, 4 }, 0);
+            reader.stage(new int[0], 0);
+            assertArrayEquals(vectors.get(3), reader.read(3), 0.0f);
+        }
+    }
+
+    /**
+     * The shared read pool means one file handle is read by many threads at once, and each reader's slots
+     * are written by pool threads and decoded by the query thread. This is the test that would fail if
+     * slots were shared between readers or if a slot were published without the {@code Future}'s
+     * happens-before.
+     */
+    @SneakyThrows
+    public void testManyReadersStageConcurrentlyWithoutCrossTalk() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(600);
+        final Path path = writeVectorFile(vectors, 0);
+        final int threads = 8;
+
+        try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
+            assertNotNull(source);
+            final ExecutorService drivers = Executors.newFixedThreadPool(threads);
+            try {
+                final CountDownLatch start = new CountDownLatch(1);
+                final List<Future<?>> running = new ArrayList<>(threads);
+                for (int t = 0; t < threads; t++) {
+                    final int stride = 3 + t;
+                    running.add(drivers.submit(() -> {
+                        start.await();
+                        final DirectIOVectorSource.Reader reader = source.newReader();
+                        for (int round = 0; round < 20; round++) {
+                            final int[] ords = sparseOrdinals(64, stride, vectors.size());
+                            reader.stage(ords, ords.length);
+                            for (final int ord : ords) {
+                                assertArrayEquals("stride " + stride + " ordinal " + ord, vectors.get(ord), reader.read(ord), 0.0f);
+                            }
+                        }
+                        return null;
+                    }));
+                }
+                start.countDown();
+                for (final Future<?> future : running) {
+                    future.get();
+                }
+            } finally {
+                drivers.shutdownNow();
+            }
+        }
     }
 }

@@ -142,6 +142,25 @@ public class KNNSettings {
     public static final String KNN_DIRECT_IO_MIN_FILE_SIZE = "knn.direct_io.min_file_size";
     public static final ByteSizeValue KNN_DIRECT_IO_MIN_FILE_SIZE_DEFAULT_VALUE = new ByteSizeValue(1, ByteSizeUnit.MB);
 
+    // Rescore-seam prefetch settings. These are only consulted once the rescore seam is already engaged,
+    // i.e. knn.feature.direct_io.rescore.enabled is on and the query is a non-radial RESCORE, so on a
+    // node with that flag off none of them has any effect.
+    // Kill switch for the prefetch pipeline alone: with it off the seam still reads with Direct I/O, but
+    // one blocking read at a time. That is the arm every Phase-2 correctness number was taken against,
+    // so it is the thing to switch to when a prefetch regression has to be isolated from the loader.
+    public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED = "knn.direct_io.rescore.prefetch.enabled";
+    public static final boolean KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED_DEFAULT_VALUE = true;
+    // How many reads one scorer keeps in flight. Deliberately a rolling window and not a fan-out over the
+    // whole candidate set: a 200-wide fan-out measured p90 2.2x and p99 2.0x worse than a 64-wide one,
+    // because the device queue (nr_requests=63) caps how much in-flight I/O is useful.
+    public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW = "knn.direct_io.rescore.prefetch_window";
+    public static final int KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_DEFAULT_VALUE = 16;
+    // Upper bound on in-flight reads across the whole node, not per segment: per-leaf scoring tasks run
+    // concurrently, so total in-flight is segments x window, and a per-segment bound oversaturates the
+    // device. Sized to the device queue rather than to the core count for that reason.
+    public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS = "knn.direct_io.rescore.prefetch_threads";
+    public static final int KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_DEFAULT_VALUE = 64;
+
     /**
      * For more details on supported engines, refer to {@link MemoryOptimizedSearchSupportSpec}
      */
@@ -364,6 +383,52 @@ public class KNNSettings {
     public static final Setting<ByteSizeValue> KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING = Setting.byteSizeSetting(
         KNN_DIRECT_IO_MIN_FILE_SIZE,
         KNN_DIRECT_IO_MIN_FILE_SIZE_DEFAULT_VALUE,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
+     * Node level kill switch for the rescore seam's read-ahead pipeline. Read when a scorer stages its
+     * first batch, so flipping it takes effect on the next query with no restart. Turning it off leaves
+     * the seam reading with Direct I/O one blocking read at a time - the Phase 2 behaviour - rather than
+     * turning Direct I/O off, which is what {@code knn.feature.direct_io.rescore.enabled} does.
+     */
+    public static final Setting<Boolean> KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED_SETTING = Setting.boolSetting(
+        KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED,
+        KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED_DEFAULT_VALUE,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
+     * Node level number of reads one rescore scorer keeps in flight. Also the number of staging buffers
+     * that scorer allocates, so raising it costs direct memory proportionally: one window is
+     * {@code window x} the per-read buffer, which is 8192 bytes for a 768-dimension float field.
+     * <p>
+     * Read when a scorer allocates its ring, which is once per query per segment, so a change takes
+     * effect on the next query. The upper bound is deliberately well above the device queue depth this
+     * was tuned for, so that the setting can be swept, but a window far above {@code nr_requests} is
+     * measured-worse rather than merely unhelpful.
+     */
+    public static final Setting<Integer> KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_SETTING = Setting.intSetting(
+        KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW,
+        KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_DEFAULT_VALUE,
+        1,
+        1024,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
+     * Node level size of the shared pool that performs the rescore seam's reads, and so the bound on
+     * in-flight Direct I/O reads for the whole node. Threads are created on demand and reaped when idle,
+     * so on a node whose rescore traffic never engages the seam the pool costs nothing.
+     */
+    public static final Setting<Integer> KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING = Setting.intSetting(
+        KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS,
+        KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_DEFAULT_VALUE,
+        1,
+        1024,
         NodeScope,
         Dynamic
     );
@@ -812,6 +877,18 @@ public class KNNSettings {
             return KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING;
         }
 
+        if (KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED.equals(key)) {
+            return KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED_SETTING;
+        }
+
+        if (KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW.equals(key)) {
+            return KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_SETTING;
+        }
+
+        if (KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS.equals(key)) {
+            return KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING;
+        }
+
         throw new IllegalArgumentException("Cannot find setting by key [" + key + "]");
     }
 
@@ -853,7 +930,11 @@ public class KNNSettings {
             // Direct I/O settings
             KNN_INDEX_DIRECT_IO_ENABLED_SETTING,
             KNN_DIRECT_IO_MAX_BUFFER_SIZE_SETTING,
-            KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING
+            KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING,
+            // Rescore-seam prefetch settings
+            KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED_SETTING,
+            KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_SETTING,
+            KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
             .collect(Collectors.toList());
@@ -893,6 +974,27 @@ public class KNNSettings {
      */
     public static ByteSizeValue getDirectIOMinFileSize() {
         return getNodeSettingValueOrDefault(KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING);
+    }
+
+    /**
+     * @return whether the rescore seam may read ahead, as opposed to reading one vector at a time
+     */
+    public static boolean isDirectIORescorePrefetchEnabled() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED_SETTING);
+    }
+
+    /**
+     * @return the number of reads one rescore scorer keeps in flight
+     */
+    public static int getDirectIORescorePrefetchWindow() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_SETTING);
+    }
+
+    /**
+     * @return the node wide bound on threads performing rescore seam reads
+     */
+    public static int getDirectIORescorePrefetchThreads() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING);
     }
 
     public static boolean isCircuitBreakerTriggered() {
