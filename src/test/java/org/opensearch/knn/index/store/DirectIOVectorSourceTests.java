@@ -20,6 +20,7 @@ import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
@@ -241,11 +242,10 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
     }
 
     /**
-     * The reuse hint is carried, not obeyed: this implementation retains nothing past the single consuming
-     * score, so every mode reads identically, and what it owes the seam is only to report the hint it was
-     * built with. A future cache at this seam is the caller of {@code reuseHint()} that matters - it is the
-     * thing that must not cache {@code RESCORE} reads - so the hint has to survive the trip here, where it
-     * is easy to drop as an unused constructor argument.
+     * The reuse hint has to survive the trip to the loader, where it is easy to drop as an unused
+     * constructor argument, because it is what decides whether that loader caches. The hint changes when a
+     * read costs a device round trip and never which bytes it produces, which is why both modes are asserted
+     * against the written contents here rather than against each other.
      */
     @SneakyThrows
     public void testEachLoaderReportsTheReuseHintItWasBuiltWith() {
@@ -260,7 +260,6 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
 
             assertSame(VectorScorerMode.RESCORE, rescore.reuseHint());
             assertSame(VectorScorerMode.SCORE, score.reuseHint());
-            // and the hint changes nothing about the bytes, because nothing is retained either way
             assertArrayEquals(vectors.get(3), rescore.read(3), 0.0f);
             assertArrayEquals(vectors.get(3), score.read(3), 0.0f);
         }
@@ -551,6 +550,416 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
             } finally {
                 drivers.shutdownNow();
             }
+        }
+    }
+
+    // ----------------------------------------------------------------------------------------------
+    // The cache behind the loader seam. Staging and retention meet here, and the thing that breaks is
+    // ordering: with a cache, a batch is a mix of positions that took a ring slot and positions that did
+    // not, so batch position and slot index stop advancing together. Every test below therefore asserts
+    // the vectors against the written contents, because an off-by-one in that arithmetic returns a
+    // neighbouring candidate's vector and scores it as this one's.
+    // ----------------------------------------------------------------------------------------------
+
+    /** Bytes one cache entry costs at {@link #DIMENSION}, so a budget can be written in whole entries. */
+    private static final long ENTRY_BYTES = LruVectorCache.ENTRY_OVERHEAD_BYTES + DIMENSION * (long) Float.BYTES;
+
+    /** A source whose cache holds exactly {@code entries} vectors, bypassing the node setting. */
+    private DirectIOVectorSource openWithCacheFor(final List<float[]> vectors, final Path path, final int entries) {
+        final DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors), entries * ENTRY_BYTES);
+        assertNotNull(source);
+        return source;
+    }
+
+    /** Reads {@code ords} through {@code reader} without staging, which is what warms the cache. */
+    private void warm(final DirectIOVectorSource.Reader reader, final int[] ords, final List<float[]> vectors) throws IOException {
+        for (final int ord : ords) {
+            assertArrayEquals(vectors.get(ord), reader.read(ord), 0.0f);
+        }
+    }
+
+    /**
+     * A budget of zero is no cache object at all, which is what makes "cache off" a control arm rather than a
+     * cache that always misses: there is no lookup, no accounting and no counter on the read path. Asserted
+     * through {@code cacheStats()} because that is the only way the absence is visible from outside.
+     */
+    @SneakyThrows
+    public void testAZeroBudgetSourceHasNoCacheAndStillReadsEveryVector() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(600);
+        final Path path = writeVectorFile(vectors, 0, ALIGNED_HEADER_LENGTH);
+
+        try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors), 0L)) {
+            assertNotNull(source);
+            assertNull("a zero budget must leave no cache to report on", source.cacheStats());
+
+            final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
+            final int[] ords = sparseOrdinals(200, 7, vectors.size());
+            // Twice, so anything that only shows up on the second pass over the same ordinals would show up.
+            reader.stage(ords, ords.length);
+            assertReadsInOrder(reader, ords, vectors);
+            reader.stage(ords, ords.length);
+            assertReadsInOrder(reader, ords, vectors);
+            assertNull(source.cacheStats());
+        }
+    }
+
+    /**
+     * Verification reads through a loader with no cache, whatever the budget, so a source arrives with its
+     * counters at zero. That matters for the benchmark rather than for correctness: the measured hit rate is
+     * read against a prediction, and two startup misses charged to every segment is noise in it.
+     */
+    @SneakyThrows
+    public void testANewSourceStartsWithAnEmptyCache() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(64);
+        final Path path = writeVectorFile(vectors, 0);
+
+        try (DirectIOVectorSource source = openWithCacheFor(vectors, path, 32)) {
+            final LruVectorCache.Stats stats = source.cacheStats();
+            assertNotNull(stats);
+            assertEquals(0, stats.hits());
+            assertEquals(0, stats.misses());
+            assertEquals(0, stats.entries());
+        }
+    }
+
+    /** Only a RESCORE loader caches. A SCORE loader over the same source must neither read nor fill it. */
+    @SneakyThrows
+    public void testOnlyRescoreLoadersCache() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(64);
+        final Path path = writeVectorFile(vectors, 0);
+
+        try (DirectIOVectorSource source = openWithCacheFor(vectors, path, 32)) {
+            final DirectIOVectorSource.Reader score = source.newLoader(VectorScorerMode.SCORE);
+            warm(score, new int[] { 1, 2, 3 }, vectors);
+            assertEquals("a SCORE loader must not populate", 0, source.cacheStats().entries());
+            assertEquals(0, source.cacheStats().misses());
+
+            final DirectIOVectorSource.Reader rescore = source.newLoader(VectorScorerMode.RESCORE);
+            warm(rescore, new int[] { 1, 2, 3 }, vectors);
+            assertEquals(3, source.cacheStats().entries());
+            assertEquals(3, source.cacheStats().misses());
+        }
+    }
+
+    /**
+     * The cache is shared by every reader over one source, which is the whole point: the reuse it recovers is
+     * across queries, and a per-reader cache would recover none of it. So a second reader must find what the
+     * first one read.
+     */
+    @SneakyThrows
+    public void testTheCacheIsSharedBetweenReadersOverOneSource() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(64);
+        final Path path = writeVectorFile(vectors, 0);
+
+        try (DirectIOVectorSource source = openWithCacheFor(vectors, path, 32)) {
+            warm(source.newLoader(VectorScorerMode.RESCORE), new int[] { 9, 10, 11 }, vectors);
+            assertEquals(0, source.cacheStats().hits());
+
+            warm(source.newLoader(VectorScorerMode.RESCORE), new int[] { 9, 10, 11 }, vectors);
+            assertEquals("the second reader must have been served by the first reader's reads", 3, source.cacheStats().hits());
+        }
+    }
+
+    /**
+     * The headline of the wiring: a staged batch whose ordinals are all already held issues no device read at
+     * all and still delivers every vector in declared order. Every position is cache-served, so the ring is
+     * never touched - the case where slot arithmetic driven by batch position would read slot 0 repeatedly.
+     */
+    @SneakyThrows
+    public void testAFullyCachedBatchIsServedWithoutTheRing() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(600);
+        final Path path = writeVectorFile(vectors, 0, ALIGNED_HEADER_LENGTH);
+        final int[] ords = sparseOrdinals(64, 9, vectors.size());
+
+        try (DirectIOVectorSource source = openWithCacheFor(vectors, path, 600)) {
+            final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
+            reader.stage(ords, ords.length);
+            assertReadsInOrder(reader, ords, vectors);
+            final long missesAfterWarming = source.cacheStats().misses();
+
+            reader.stage(ords, ords.length);
+            assertReadsInOrder(reader, ords, vectors);
+
+            assertEquals("a fully cached batch must read nothing from the device", missesAfterWarming, source.cacheStats().misses());
+            assertEquals(ords.length, source.cacheStats().hits());
+        }
+    }
+
+    /**
+     * The fiddly case, in every shape that breaks it differently. A batch where only some positions were
+     * already held has to interleave cache-served and device-served positions: hits at the head leave the
+     * first device read in slot 0 rather than in the slot its batch position implies, hits at the tail leave
+     * the ring draining early, and alternating hits shift slot from position by a growing offset. All three
+     * return a neighbouring candidate's vector if the arithmetic is wrong, so all three are read back against
+     * what was written.
+     */
+    @SneakyThrows
+    public void testPartiallyCachedBatchesPreserveOrderAndValues() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(600);
+        final Path path = writeVectorFile(vectors, 0, ALIGNED_HEADER_LENGTH);
+        final int[] ords = sparseOrdinals(120, 7, vectors.size());
+
+        // Which positions of the batch to warm first: head, tail, every other one, one, and all but one.
+        final List<int[]> patterns = List.of(
+            new int[] { 0, 1, 2, 3, 4, 5 },
+            new int[] { 114, 115, 116, 117, 118, 119 },
+            new int[] { 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22 },
+            new int[] { 63 },
+            new int[] { 0, 60, 119 }
+        );
+        for (final int[] warmPositions : patterns) {
+            try (DirectIOVectorSource source = openWithCacheFor(vectors, path, 600)) {
+                final DirectIOVectorSource.Reader warmer = source.newLoader(VectorScorerMode.RESCORE);
+                for (final int position : warmPositions) {
+                    assertArrayEquals(vectors.get(ords[position]), warmer.read(ords[position]), 0.0f);
+                }
+                final long hitsBefore = source.cacheStats().hits();
+
+                final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
+                reader.stage(ords, ords.length);
+                assertReadsInOrder(reader, ords, vectors);
+
+                assertEquals(
+                    "positions " + Arrays.toString(warmPositions) + " should have been served from the cache",
+                    hitsBefore + warmPositions.length,
+                    source.cacheStats().hits()
+                );
+            }
+        }
+    }
+
+    /**
+     * A batch wider than the ring <em>and</em> partly cached, so slots are reused while the offset between
+     * batch position and slot index keeps growing. This is the shape the benchmark actually runs: 200
+     * candidates, a window of 48, and a hit rate around 40%.
+     */
+    @SneakyThrows
+    public void testAPartiallyCachedBatchWiderThanTheRingRollsCorrectly() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(600);
+        final Path path = writeVectorFile(vectors, 0, ALIGNED_HEADER_LENGTH);
+        final int[] ords = sparseOrdinals(200, 7, vectors.size());
+
+        try (DirectIOVectorSource source = openWithCacheFor(vectors, path, 600)) {
+            // Warm a scattered 40% of the batch, which is roughly the measured steady-state hit rate.
+            final DirectIOVectorSource.Reader warmer = source.newLoader(VectorScorerMode.RESCORE);
+            int warmed = 0;
+            for (int position = 0; position < ords.length; position++) {
+                if (position % 5 == 1 || position % 5 == 3) {
+                    assertArrayEquals(vectors.get(ords[position]), warmer.read(ords[position]), 0.0f);
+                    warmed++;
+                }
+            }
+            final long hitsBefore = source.cacheStats().hits();
+
+            final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
+            reader.stage(ords, ords.length);
+            assertReadsInOrder(reader, ords, vectors);
+            assertEquals(hitsBefore + warmed, source.cacheStats().hits());
+        }
+    }
+
+    /**
+     * A cache-served position whose entry is evicted between the stage-time lookup and the consume falls back
+     * to a device read for its own ordinal - not to the ring, whose slots belong to other positions. Forced
+     * here by a cache far smaller than the batch, so this batch's own misses evict the entries its own
+     * stage-time lookup found; in production the stage-time touch makes that take a whole budget of other
+     * traffic, which is why it needs forcing to be tested at all.
+     */
+    @SneakyThrows
+    public void testAnEntryEvictedBetweenStageAndConsumeStillDeliversTheRightVector() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(64);
+        final Path path = writeVectorFile(vectors, 0);
+
+        try (DirectIOVectorSource source = openWithCacheFor(vectors, path, 2)) {
+            final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
+            warm(reader, new int[] { 5, 6 }, vectors);
+            assertEquals(2, source.cacheStats().entries());
+
+            // 5 and 6 are both resident when this is staged. Consuming 10 and 11 evicts them both, so the
+            // last position is marked cache-served and then finds nothing there.
+            final int[] ords = { 5, 10, 11, 6 };
+            reader.stage(ords, ords.length);
+            assertReadsInOrder(reader, ords, vectors);
+
+            // And the reader is still a correct reader afterwards, with the batch intact for a later one.
+            assertReadsInOrder(reader, new int[] { 11, 6, 5 }, vectors);
+        }
+    }
+
+    /**
+     * A batch that repeats an ordinal marks both positions cache-served or neither, and must still deliver
+     * one vector per call in declared order. Rescore candidate sets do not repeat, but the ring must not be
+     * the thing that assumes it.
+     */
+    @SneakyThrows
+    public void testABatchThatRepeatsAnOrdinalIsServedPositionByPosition() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(64);
+        final Path path = writeVectorFile(vectors, 0);
+
+        try (DirectIOVectorSource source = openWithCacheFor(vectors, path, 32)) {
+            final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
+            warm(reader, new int[] { 3 }, vectors);
+
+            final int[] ords = { 3, 8, 3, 9, 8, 3 };
+            reader.stage(ords, ords.length);
+            assertReadsInOrder(reader, ords, vectors);
+        }
+    }
+
+    /**
+     * Staging is a prediction and a wrong one must cost latency rather than correctness, cache or no cache.
+     * Here the consumer deviates from the declared order in the middle of a partly cached batch, which drops
+     * the batch and leaves every remaining read on the blocking path - where the cache still has to be
+     * consulted, or an abandoned batch would silently turn every hit into a device read.
+     */
+    @SneakyThrows
+    public void testACacheServedBatchStillFallsBackWhenTheConsumerLeavesTheStagedOrder() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(600);
+        final Path path = writeVectorFile(vectors, 0, ALIGNED_HEADER_LENGTH);
+        final int[] ords = sparseOrdinals(64, 9, vectors.size());
+
+        try (DirectIOVectorSource source = openWithCacheFor(vectors, path, 600)) {
+            final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
+            // First pass fills the cache with the whole batch.
+            reader.stage(ords, ords.length);
+            assertReadsInOrder(reader, ords, vectors);
+            final long missesAfterWarming = source.cacheStats().misses();
+
+            // Second pass deviates after two positions, abandoning a batch every position of which was
+            // marked cache-served.
+            reader.stage(ords, ords.length);
+            assertArrayEquals(vectors.get(ords[0]), reader.read(ords[0]), 0.0f);
+            assertArrayEquals(vectors.get(ords[1]), reader.read(ords[1]), 0.0f);
+            assertArrayEquals(vectors.get(511), reader.read(511), 0.0f);
+            assertReadsInOrder(reader, ords, vectors);
+
+            // 511 was the only ordinal not already held, so it is the only device read the second pass owed.
+            assertEquals(missesAfterWarming + 1, source.cacheStats().misses());
+        }
+    }
+
+    /**
+     * One reader, many partly cached batches, each abandoned part-read by the next {@code stage}. This is the
+     * shape that leaves reads in flight over slots the next batch reuses, and the shape where the cache keeps
+     * changing which positions take a slot at all, so the offset between batch position and slot index is
+     * different in every batch.
+     */
+    @SneakyThrows
+    public void testConsecutiveMixedBatchesOnOneReaderAfterPartialConsumption() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(600);
+        final Path path = writeVectorFile(vectors, 0, ALIGNED_HEADER_LENGTH);
+
+        try (DirectIOVectorSource source = openWithCacheFor(vectors, path, 100)) {
+            final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
+            for (int batch = 0; batch < 12; batch++) {
+                final int[] ords = sparseOrdinals(64, 7 + batch, vectors.size());
+                reader.stage(ords, ords.length);
+                for (int i = 0; i < 3 + batch; i++) {
+                    assertArrayEquals("batch " + batch + " ordinal " + ords[i], vectors.get(ords[i]), reader.read(ords[i]), 0.0f);
+                }
+            }
+            assertReadsInOrder(reader, sparseOrdinals(64, 13, vectors.size()), vectors);
+            // A budget of 100 against 64-ordinal batches over 600 vectors must have been evicting.
+            assertTrue("the budget should have been exercised", source.cacheStats().evictions() > 0);
+        }
+    }
+
+    /**
+     * The unit-level form of this phase's correctness oracle: a cached source and an uncached one, driven
+     * through the same long sequence of staged batches, must produce identical vectors for every read. On the
+     * bench node the same question is asked as "is recall still 0.8106 with identical top-100 identifier
+     * sets"; here it is asked directly, against a cache small enough to be evicting throughout.
+     */
+    @SneakyThrows
+    public void testACachedSourceReadsIdenticallyToAnUncachedOne() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(600);
+        final Path path = writeVectorFile(vectors, 0, ALIGNED_HEADER_LENGTH);
+
+        try (
+            DirectIOVectorSource cached = openWithCacheFor(vectors, path, 40);
+            DirectIOVectorSource uncached = DirectIOVectorSource.open(path, reference(vectors), 0L)
+        ) {
+            assertNotNull(uncached);
+            final DirectIOVectorSource.Reader withCache = cached.newLoader(VectorScorerMode.RESCORE);
+            final DirectIOVectorSource.Reader withoutCache = uncached.newLoader(VectorScorerMode.RESCORE);
+
+            final Random random = new Random(7);
+            for (int round = 0; round < 40; round++) {
+                final int[] ords = new int[1 + random.nextInt(120)];
+                for (int i = 0; i < ords.length; i++) {
+                    ords[i] = random.nextInt(vectors.size());
+                }
+                withCache.stage(ords, ords.length);
+                withoutCache.stage(ords, ords.length);
+                for (final int ord : ords) {
+                    final float[] fromCached = withCache.read(ord).clone();
+                    final float[] fromUncached = withoutCache.read(ord);
+                    assertArrayEquals("round " + round + " ordinal " + ord, fromUncached, fromCached, 0.0f);
+                    assertArrayEquals(vectors.get(ord), fromCached, 0.0f);
+                }
+            }
+            assertTrue("the run should have produced hits", cached.cacheStats().hits() > 0);
+            assertTrue("and evictions, at 40 slots over 600 vectors", cached.cacheStats().evictions() > 0);
+            assertNull(uncached.cacheStats());
+        }
+    }
+
+    /**
+     * Concurrent readers over one shared cache small enough to be evicting throughout, which is the
+     * production shape: per-leaf scorers run in parallel, each with its own loader, all populating and
+     * evicting the same LRU. A cache that published a half-written entry, or a stage-time lookup that raced
+     * an eviction into serving the wrong slot, shows up here as a vector from another ordinal.
+     */
+    @SneakyThrows
+    public void testManyReadersShareOneCacheWithoutCrossTalk() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(600);
+        final Path path = writeVectorFile(vectors, 0, ALIGNED_HEADER_LENGTH);
+        final int threads = 8;
+
+        try (DirectIOVectorSource source = openWithCacheFor(vectors, path, 48)) {
+            final ExecutorService drivers = Executors.newFixedThreadPool(threads);
+            try {
+                final CountDownLatch start = new CountDownLatch(1);
+                final List<Future<?>> running = new ArrayList<>(threads);
+                for (int t = 0; t < threads; t++) {
+                    final int stride = 3 + t;
+                    running.add(drivers.submit(() -> {
+                        start.await();
+                        final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
+                        for (int round = 0; round < 20; round++) {
+                            final int[] ords = sparseOrdinals(64, stride, vectors.size());
+                            reader.stage(ords, ords.length);
+                            for (final int ord : ords) {
+                                assertArrayEquals("stride " + stride + " ordinal " + ord, vectors.get(ord), reader.read(ord), 0.0f);
+                            }
+                        }
+                        return null;
+                    }));
+                }
+                start.countDown();
+                for (final Future<?> future : running) {
+                    future.get();
+                }
+            } finally {
+                drivers.shutdownNow();
+            }
+            final LruVectorCache.Stats stats = source.cacheStats();
+            assertTrue("48 slots over 600 vectors and 8 threads must have evicted", stats.evictions() > 0);
+            assertTrue("and must have hit", stats.hits() > 0);
+            assertTrue("held bytes must never exceed the budget", stats.bytes() <= stats.budgetBytes());
         }
     }
 }

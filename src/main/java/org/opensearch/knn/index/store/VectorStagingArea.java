@@ -44,6 +44,14 @@ package org.opensearch.knn.index.store;
  * <p>Fused into one interface, those two sets of concerns would share an implementation, and adding a cache
  * would mean rewriting read ahead rather than implementing an interface next to it. Kept separate, a cache
  * implements {@link VectorLoaderSource} and either offers staging or does not.
+ *
+ * <p>The cache that arrived — {@link LruVectorCache}, behind {@link DirectIOVectorSource} — bears this out
+ * with one honest qualification worth recording. It changed no <em>semantics</em> here: the ring is still
+ * consume-once, {@link #stage} still promises nothing, and the retention lives entirely at the loader seam.
+ * But it did have to reach into the implementation of {@link #stage}, because the whole value of a hit is
+ * that the device read is never issued, and only the stager knows which reads are about to be issued. So the
+ * separation bought what it was for — the ring's contract and the eviction policy stayed independent of each
+ * other — and not an untouched staging implementation, which was never on offer.
  */
 public interface VectorStagingArea {
 

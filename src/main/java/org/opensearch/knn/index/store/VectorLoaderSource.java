@@ -14,12 +14,11 @@ import java.io.IOException;
  * <b>The loader seam.</b> A pluggable byte source for one field's full-precision vectors in one segment:
  * given an ordinal, it yields that vector's floats, by whatever means it likes.
  *
- * <p>This is the extension point a future full-precision vector cache belongs at. Everything above it —
- * the rescore gate, the values wrapper, Lucene's scorer — is written against this interface and
- * {@link Loader}, so a cache can be introduced by implementing them and choosing a different
- * implementation at {@link org.opensearch.knn.index.codec.scorer.HasVectorLoaderSource}, without touching
- * the query path. {@link DirectIOVectorSource} is the only implementation today and it holds no bytes
- * between reads.
+ * <p>This is the extension point the full-precision vector cache sits at. Everything above it — the rescore
+ * gate, the values wrapper, Lucene's scorer — is written against this interface and {@link Loader}, so
+ * retention was introduced without touching the query path: {@link DirectIOVectorSource}, the only
+ * implementation, holds an {@link LruVectorCache} of decoded vectors behind this interface, and nothing
+ * above it knows.
  *
  * <h2>Two levels, because they have different lifetimes</h2>
  * <ul>
@@ -34,19 +33,26 @@ import java.io.IOException;
  *
  * <h2>Why {@link #newLoader} takes a {@link VectorScorerMode}</h2>
  * The mode is a <b>reuse hint</b>, and it is the one piece of query context this seam carries, because it
- * is the piece a caching implementation cannot do its job without:
- * <ul>
- *   <li>{@link VectorScorerMode#RESCORE} reads have approximately no reuse. A rescore pass reads each
- *       candidate's full-precision vector once and never asks again, so caching those bytes is worse than
- *       not caching them: it re-retains exactly the single-use data whose eviction pressure on the graph
- *       and the quantized vectors motivates reading them with {@code O_DIRECT} in the first place.</li>
- *   <li>{@link VectorScorerMode#SCORE} reads — traversal and the exact-search fallback — were measured at
- *       6.6x reuse, which is the profile a cache is for.</li>
- * </ul>
- * A hint is not a gate. An implementation may ignore it entirely, as {@link DirectIOVectorSource} does
- * because it retains nothing either way; what it may not do is decide caching policy without it. Note that
- * whether a given read <em>reaches</em> this seam at all is a separate decision made above it, by
- * {@code DirectIORescoreSeam}, and this hint neither widens nor narrows that gate.
+ * is the piece a caching implementation cannot do its job without. {@link DirectIOVectorSource} caches
+ * {@link VectorScorerMode#RESCORE} loaders and only those.
+ *
+ * <p><b>This is the reverse of what this javadoc said through Phase 5</b>, and the correction is worth
+ * keeping rather than quietly overwriting, because the mistake is an easy one to make again. The old
+ * argument was that a rescore pass reads each candidate's vector once and never asks again, so retaining it
+ * re-retains exactly the single-use data whose page-cache pressure motivated {@code O_DIRECT}; traversal
+ * reads, measured at 6.6x reuse, were "the profile a cache is for". The first half is a true statement about
+ * reuse <em>within</em> one query and it says nothing about reuse <em>across</em> queries, which is where
+ * the reuse actually is: Phase 6 measured the Direct I/O arm issuing 200 device reads per query where the
+ * mmap arm issues 103.4, i.e. mmap's page cache was serving about 48% of candidate reads from what earlier
+ * queries had brought in, and an exact LRU stack-distance analysis of a 2,000-query candidate trace puts
+ * 44.2% of that within reach of an 8 MB per-source budget. Traversal is the higher-reuse profile and remains
+ * out of scope for a different reason — Lucene traversal measured 5.2x worse under {@code O_DIRECT} and so
+ * never reaches this seam.
+ *
+ * <p>A hint is still not a gate. An implementation may ignore it entirely; what it may not do is decide
+ * caching policy without it. Note that whether a given read <em>reaches</em> this seam at all is a separate
+ * decision made above it, by {@code DirectIORescoreSeam}, and this hint neither widens nor narrows that
+ * gate.
  *
  * <h2>Separate from the staging seam, deliberately</h2>
  * Read ahead is {@link VectorStagingArea}, a different interface that a {@link Loader} may also implement.
@@ -78,9 +84,10 @@ public interface VectorLoaderSource extends Closeable {
         float[] read(int ord) throws IOException;
 
         /**
-         * The reuse hint this loader was created with, as given to {@link #newLoader}. Reported rather than
-         * consumed so that the hint reaching the loader is observable — a seam whose one piece of context is
-         * silently dropped somewhere in the middle is a seam a future cache cannot rely on.
+         * The reuse hint this loader was created with, as given to {@link #newLoader}. Reported as well as
+         * acted on, so that what a loader decided to do with the hint is observable from outside it: in
+         * {@link DirectIOVectorSource} this is the difference between a loader that caches and one that does
+         * not, and nothing else about the loader shows which it is.
          */
         VectorScorerMode reuseHint();
     }

@@ -36,7 +36,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>This is the only implementation of the {@link VectorLoaderSource} loader seam, and its {@link Reader}
  * implements both that seam's {@link VectorLoaderSource.Loader} and the {@link VectorStagingArea} staging
  * seam. Those two interfaces, not this class, are what the query path is written against; read their javadoc
- * for the contracts and for why a future cache belongs at the former and never at the latter.
+ * for the contracts and for why retention belongs at the former and never at the latter.
  *
  * <p>It is deliberately <em>not</em> an {@link org.apache.lucene.store.IndexInput}: Lucene's own
  * {@code DirectIOIndexInput} is a sequential stream with a single internal buffer, and this path wants
@@ -48,10 +48,23 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * what replaces the {@code madvise} prefetch the mmap path got for free and {@code O_DIRECT} necessarily
  * removes; without it a rescore query pays one serial device round trip per candidate.
  *
- * <p>The {@link VectorScorerMode} reuse hint {@link #newLoader} carries is <b>ignored here</b>, and that is
- * the correct behaviour for this implementation rather than an omission: no read is retained past the single
- * score that consumes it, so there is no retention decision for the hint to inform. It is recorded on the
- * {@link Reader} and reported by {@link Reader#reuseHint()} so that the hint arriving remains observable.
+ * <h2>Retention: a bounded LRU of decoded vectors</h2>
+ * A source holds one {@link LruVectorCache}, and a {@link Reader} built with the
+ * {@link VectorScorerMode#RESCORE} reuse hint looks in it before it reads the device. That is what the hint
+ * is for, and it is the opposite of what this class did through Phase 5, when it retained nothing and the
+ * hint was carried but unused - see the seam's javadoc for the measurement that changed the answer. Nothing
+ * about the <em>bytes</em> changes: a segment is immutable, so a hit is the same vector the device would
+ * have produced, which is why the correctness oracle for the cache is that recall and the top-100 identifier
+ * sets are unchanged.
+ *
+ * <p>The lookup happens at {@link Reader#stage} time rather than in {@link Reader#read}, because a lookup in
+ * {@code read} would find the device read for that ordinal already in flight: it would save the decode and
+ * pay the I/O anyway, and the I/O is the whole cost. So a staged batch is filtered first and only its misses
+ * are dispatched, which makes a batch a mix of cache-served and device-served positions. The staging ring is
+ * untouched by this and stays consume-once; it is the LRU, above it, that retains.
+ *
+ * <p>A budget of zero means no cache object is built at all, so this class is then byte-for-byte the Phase
+ * 2-5 loader with no lookup, no accounting and no counters on the read path.
  *
  * <h2>Why the file region has to be discovered rather than asked for</h2>
  * The seam holds Lucene's mmap-backed slice of the vector region, and neither {@code IndexInput} nor
@@ -112,6 +125,13 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
      */
     private final boolean bulkDecodable;
 
+    /**
+     * The retention behind the loader seam, or {@code null} when the node's budget is zero and there is to
+     * be no cache. Shared by every {@link Reader} over this source, which is the point: the reuse this
+     * recovers is across queries, so a per-reader cache would recover none of it.
+     */
+    private final LruVectorCache cache;
+
     private DirectIOVectorSource(
         final Path path,
         final FileChannel channel,
@@ -120,8 +140,10 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
         final int dimension,
         final int vectorByteLength,
         final int blockSize,
-        final int bufferSize
+        final int bufferSize,
+        final long cacheBudgetBytes
     ) {
+        this.cache = LruVectorCache.forSource(dimension, cacheBudgetBytes);
         this.path = path;
         this.channel = channel;
         this.baseOffset = baseOffset;
@@ -146,6 +168,19 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
      * @return a verified source, or {@code null} to mean "fall back to the default path"
      */
     public static DirectIOVectorSource open(final Path path, final FloatVectorValues reference) {
+        // Read once per source, so a change in the budget reaches segments opened after it rather than
+        // moving the budget of a live cache under the queries reading it.
+        return open(path, reference, LruVectorCache.budgetBytesFromSettings());
+    }
+
+    /**
+     * As {@link #open(Path, FloatVectorValues)}, at an explicit cache budget rather than the node's. The
+     * package-private twin exists for the same reason {@link LruVectorCache#forSource(int, long)} does:
+     * tests need to drive the budget, including to zero, without reaching for cluster settings.
+     *
+     * @param cacheBudgetBytes bytes of decoded vectors this source may retain, zero for no cache
+     */
+    static DirectIOVectorSource open(final Path path, final FloatVectorValues reference, final long cacheBudgetBytes) {
         if (path == null || reference == null) {
             return null;
         }
@@ -209,20 +244,22 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
                 dimension,
                 vectorByteLength,
                 blockSize,
-                bufferSize
+                bufferSize,
+                cacheBudgetBytes
             );
             if (source.verifyAgainst(reference) == false) {
                 channel.close();
                 return null;
             }
             log.info(
-                "Direct I/O rescore is serving [{}]: {} vectors of {} bytes at offset {}, {} byte reads on a {} byte block",
+                "Direct I/O rescore is serving [{}]: {} vectors of {} bytes at offset {}, {} byte reads on a {} byte block, {}",
                 path,
                 size,
                 vectorByteLength,
                 baseOffset,
                 bufferSize,
-                blockSize
+                blockSize,
+                source.cache == null ? "no vector cache" : source.cache
             );
             return source;
         } catch (IOException | RuntimeException e) {
@@ -239,9 +276,15 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
      * number of vectors — which is what a second region in the same file looks like — still lines up
      * somewhere. A file whose region is shifted at all fails the first ordinal; a file whose region is
      * the wrong length fails the last.
+     *
+     * <p>Reads through a loader with <b>no cache</b>, whatever the budget. What is being verified is that
+     * the device returns the same bytes the mmap values do, so a read that could be served from this
+     * source's own cache would be verifying the cache against itself. Nothing is in the cache yet at this
+     * point, so today the distinction only keeps two startup misses out of the statistics; it is written
+     * this way so that it stays a device read if that ever stops being true.
      */
     private boolean verifyAgainst(final FloatVectorValues reference) throws IOException {
-        final Reader reader = newLoader(VectorScorerMode.RESCORE);
+        final Reader reader = new Reader(VectorScorerMode.RESCORE, null);
         for (final int ord : size == 1 ? new int[] { 0 } : new int[] { 0, size - 1 }) {
             final float[] expected = reference.vectorValue(ord).clone();
             final float[] actual = reader.read(ord);
@@ -279,13 +322,22 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
      * <p>Each ring entry is written by exactly one background read, decoded by exactly one {@link #read},
      * and then immediately reused for the next ordinal in the batch. <b>That makes this a staging area and
      * not a cache</b>: there is no eviction policy because there is nothing to evict, and no entry
-     * survives its single consume. A future cache belongs at the loader seam, above this class, not here.
+     * survives its single consume. The retention is the {@link LruVectorCache} at the loader seam, above
+     * this ring, not in it.
      *
      * <p>Staging is an optimisation and never a correctness requirement. Any reason not to stage — the
      * setting off, no pool, a rejected submission, a window of one, a batch shorter than two, or a
      * consumer that asks for an ordinal the batch did not predict — falls back to a single blocking read,
      * which is the path {@link #read} takes when no batch is active. The vector returned is the same
      * either way.
+     *
+     * <h2>Mixed batches</h2>
+     * When this reader caches, {@link #stage} asks the cache about every ordinal in the batch and dispatches
+     * device reads only for the ones it does not hold, so a batch is a mix of <em>cache-served</em> and
+     * <em>device-served</em> positions. The consumer cannot tell: {@link #read} still requires the declared
+     * order and still delivers one vector per call, out of the cache or out of the ring as that position
+     * demands. Only device-served positions take a ring slot, which is why slot assignment counts device
+     * reads ({@link #submittedReads}, {@link #consumedReads}) rather than batch positions.
      *
      * <p>Buffers are released when the reader becomes unreachable, by the same {@code Cleaner} that
      * releases any direct buffer.
@@ -302,8 +354,14 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
         private FloatBuffer syncFloats;
         private final float[] value = new float[dimension];
 
-        /** Recorded, reported, and otherwise unused; see the class javadoc for why that is correct here. */
         private final VectorScorerMode reuseHint;
+
+        /**
+         * The source's cache, or null when this reader does not cache — a budget of zero, or a reuse hint
+         * that is not {@link VectorScorerMode#RESCORE}. Resolved once, at construction, so that "does not
+         * cache" costs one field that is null rather than a policy decision per read.
+         */
+        private final LruVectorCache cache;
 
         /**
          * Ring slots, or null before the first staged batch. Slices of one aligned allocation, which they
@@ -329,8 +387,27 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
         private int nextSubmit;
         private int nextConsume;
 
-        private Reader(final VectorScorerMode reuseHint) {
+        /**
+         * Per batch position, whether {@link #stage} found the cache already holding that ordinal and so
+         * dispatched no device read for it. Allocated with {@link #batch} and to the same length; only
+         * {@code [0, batchSize)} is meaningful, and {@link #stage} writes every one of those entries before
+         * the batch opens, so a position can never inherit the previous batch's answer.
+         */
+        private boolean[] cacheServed = new boolean[0];
+
+        /**
+         * Device reads submitted and consumed within the current batch. Slot assignment is
+         * {@code submittedReads % ringSize} rather than {@code nextSubmit % ringSize} because a cache-served
+         * position takes no slot, so batch position and slot index no longer advance together: with one
+         * cache hit in the batch they would differ by one from then on, and the consumer would decode a slot
+         * one read ahead of the one it is waiting for.
+         */
+        private int submittedReads;
+        private int consumedReads;
+
+        private Reader(final VectorScorerMode reuseHint, final LruVectorCache cache) {
             this.reuseHint = reuseHint;
+            this.cache = cache;
         }
 
         @Override
@@ -372,11 +449,27 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
             }
             if (batch.length < count) {
                 batch = new int[count];
+                cacheServed = new boolean[count];
             }
             System.arraycopy(ords, 0, batch, 0, count);
+            // The cache is consulted here, before a single read is dispatched, and deliberately not in
+            // read(): by the time read() is reached the device read for that ordinal is already in flight,
+            // so a hit there would save the decode and pay the I/O anyway, and the I/O is the entire cost
+            // this cache exists to remove.
+            if (cache == null) {
+                Arrays.fill(cacheServed, 0, count, false);
+            } else {
+                for (int i = 0; i < count; i++) {
+                    cacheServed[i] = cache.touchIfResident(batch[i]);
+                }
+            }
             batchSize = count;
             nextSubmit = 0;
             nextConsume = 0;
+            submittedReads = 0;
+            consumedReads = 0;
+            // Up to ringSize reads in flight, counted in device reads: submitNext skips over cache-served
+            // positions, so a batch that is mostly hits puts its few misses in flight and no more.
             final int inFlight = Math.min(ringSize, count);
             for (int i = 0; i < inFlight; i++) {
                 if (submitNext() == false) {
@@ -387,8 +480,9 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
         }
 
         /**
-         * The vector at {@code ord}: taken from the staging ring when it is the next ordinal the current
-         * batch predicted, and otherwise read with one {@code pread} of a block-aligned range.
+         * The vector at {@code ord}: from the cache or the staging ring when it is the next ordinal the
+         * current batch predicted, and otherwise from the cache or one {@code pread} of a block-aligned
+         * range.
          *
          * <p>The returned array is owned by this reader and is overwritten by the next call, which is the
          * same contract {@code FloatVectorValues#vectorValue(int)} has.
@@ -406,7 +500,7 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
             }
             if (batchSize > 0) {
                 if (nextConsume < batchSize && batch[nextConsume] == ord) {
-                    return consumeStaged();
+                    return cacheServed[nextConsume] ? consumeCached() : consumeStaged();
                 }
                 // The consumer did not follow the order it declared. Correct, but every remaining staged
                 // read is now speculative, so drop the batch rather than serve from it.
@@ -415,9 +509,29 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
             return readBlocking(ord);
         }
 
+        /**
+         * Delivers a position {@link #stage} found in the cache. No slot was taken for it and no read was
+         * dispatched, so there is nothing to wait for and nothing to refill.
+         *
+         * <p>The entry can nevertheless be gone: another reader's misses evict, and nothing pins an entry
+         * between the stage-time lookup and this one. In practice it is vanishingly rare — the stage-time
+         * lookup made every ordinal in this batch most-recently-used, so evicting one takes a whole
+         * budget's worth of other ordinals arriving in between — but it is possible, so the position falls
+         * back to a device read for its own ordinal rather than to the ring, whose slots belong to other
+         * positions. The batch survives: the ring's order is untouched by this.
+         */
+        private float[] consumeCached() throws IOException {
+            final int ord = batch[nextConsume];
+            nextConsume++;
+            if (cache.load(ord, value)) {
+                return value;
+            }
+            return readFromDevice(ord);
+        }
+
         /** Waits for the head of the ring, decodes it, and refills the slot it frees. */
         private float[] consumeStaged() throws IOException {
-            final int slot = nextConsume % ringSize;
+            final int slot = consumedReads % ringSize;
             final Future<?> future = pending[slot];
             pending[slot] = null;
             staged[slot] = null;
@@ -440,8 +554,13 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
                 }
                 throw new IOException("Direct I/O read of " + path + " failed", cause);
             }
-            decode(slots[slot], slotFloats[slot], slotOrd[slot]);
+            final int ord = slotOrd[slot];
+            decode(slots[slot], slotFloats[slot], ord);
             nextConsume++;
+            consumedReads++;
+            if (cache != null) {
+                cache.put(ord, value);
+            }
             if (submitNext() == false) {
                 // value already holds this ordinal, so the batch can be dropped without losing this read.
                 abandonBatch();
@@ -450,16 +569,20 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
         }
 
         /**
-         * Puts the next unsubmitted ordinal of the batch in flight, in the slot the ring has just freed.
+         * Puts the next ordinal of the batch that needs a device read in flight, in the slot the ring has
+         * just freed, skipping over any cache-served positions on the way.
          *
          * @return false if the pool refused the read, which means the batch cannot continue
          */
         private boolean submitNext() {
+            while (nextSubmit < batchSize && cacheServed[nextSubmit]) {
+                nextSubmit++;
+            }
             if (nextSubmit >= batchSize) {
                 return true;
             }
             final int ord = batch[nextSubmit];
-            final int slot = nextSubmit % ringSize;
+            final int slot = submittedReads % ringSize;
             final StagedRead read = new StagedRead(slots[slot], ord);
             try {
                 pending[slot] = pool.submit(read);
@@ -472,6 +595,7 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
             staged[slot] = read;
             slotOrd[slot] = ord;
             nextSubmit++;
+            submittedReads++;
             return true;
         }
 
@@ -508,6 +632,8 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
             batchSize = 0;
             nextSubmit = 0;
             nextConsume = 0;
+            submittedReads = 0;
+            consumedReads = 0;
         }
 
         /**
@@ -543,8 +669,29 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
             return true;
         }
 
-        /** One blocking {@code pread}, the whole of the Phase 2 path and the fallback for every other. */
+        /**
+         * The cache, then one blocking {@code pread}: the whole of the Phase 2 path and the fallback for
+         * every other.
+         *
+         * <p>This is the unstaged path, so the lookup is worth doing here — unlike in {@link #read}, no
+         * device read for this ordinal is in flight yet, so a hit really does save the I/O. It is also the
+         * path an abandoned batch leaves the consumer on, which is why the cache has to be consulted here
+         * and not only in {@link #stage}.
+         */
         private float[] readBlocking(final int ord) throws IOException {
+            if (cache != null && cache.load(ord, value)) {
+                return value;
+            }
+            return readFromDevice(ord);
+        }
+
+        /**
+         * One blocking {@code pread} and decode, with no cache lookup, populating the cache with what it
+         * produced. Separate from {@link #readBlocking} so that a caller that has already missed — a
+         * cache-served position whose entry was evicted before it was consumed — does not look twice and
+         * count the lookup twice.
+         */
+        private float[] readFromDevice(final int ord) throws IOException {
             if (syncBuffer == null) {
                 // Mirrors Lucene's DirectIOIndexInput#allocateBuffer: over-allocate by a block so that a
                 // block-aligned slice exists inside the allocation, since O_DIRECT requires the buffer
@@ -554,6 +701,9 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
             }
             readInto(syncBuffer, ord);
             decode(syncBuffer, syncFloats, ord);
+            if (cache != null) {
+                cache.put(ord, value);
+            }
             return value;
         }
 
@@ -667,11 +817,28 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
      * staging tests, and {@link #verifyAgainst} — keep the {@link Reader} type without a cast. The query
      * path deliberately does not: it holds the seam types.
      *
-     * @param reuseHint recorded and reported, not acted on; see the class javadoc
+     * @param reuseHint which reads this loader will serve; decides whether it caches, and nothing else
      */
     @Override
     public Reader newLoader(final VectorScorerMode reuseHint) {
-        return new Reader(reuseHint);
+        // The reuse hint's one job, and the only gate the cache has of its own. Anyone reading the Phase 5
+        // seam javadoc will expect the opposite polarity: it argued RESCORE reads were the ones not to
+        // cache, on the strength of a rescore pass reading each candidate once. That is true within a
+        // query and wrong across queries, which is where the reuse Phase 6 measured actually lives. This
+        // narrows nothing: whether a read reaches this source at all is DirectIORescoreSeam's decision,
+        // untouched here, and a SCORE-mode loader simply does not cache.
+        return new Reader(reuseHint, reuseHint == VectorScorerMode.RESCORE ? cache : null);
+    }
+
+    /**
+     * What this source's cache has done and is holding, or {@code null} when it has no cache.
+     *
+     * <p>A permanent surface rather than temporary instrumentation: the hit rate is the number that says
+     * whether the budget is doing anything, and an operator who has just changed the budget has no other
+     * way to find out.
+     */
+    public LruVectorCache.Stats cacheStats() {
+        return cache == null ? null : cache.stats();
     }
 
     @Override

@@ -71,6 +71,19 @@ import java.util.concurrent.atomic.AtomicLong;
  * is held for nanoseconds and contention is measured rather than assumed. Access-order
  * {@link LinkedHashMap} is not thread safe even for reads, since a read reorders the list, so the lock is
  * required and not merely prudent.
+ *
+ * <h2>What the counters count</h2>
+ * A lookup is counted <b>once per vector the loader delivers</b>, at the point the lookup is resolved:
+ * {@link #load} counts the hit it serves, and {@link #put} counts the miss, because on this path a
+ * {@code put} happens exactly once per device read. That is why {@link #load} does <em>not</em> count its
+ * own misses and why {@link #touchIfResident} counts nothing at all - the staged path splits one lookup
+ * across {@link #touchIfResident} at stage time and {@link #load} at consume time, and counting at both
+ * would double the denominator.
+ *
+ * <p>So {@link Stats#hitRate()} is the fraction of delivered vectors that did not cost a device read,
+ * which is the quantity the reuse analysis predicts. It deliberately says nothing about staged reads that
+ * were dispatched and then abandoned unconsumed: those cost device I/O without delivering a vector, and
+ * the right instrument for them is the device read count, not this ratio.
  */
 @Log4j2
 public final class LruVectorCache {
@@ -113,24 +126,29 @@ public final class LruVectorCache {
      * <p>Returning {@code null} rather than a zero-capacity cache is the contract that makes a budget of
      * zero a real control arm: the caller holds no cache object, so there is no lookup, no accounting and
      * no counter on the read path, and the loader is the Phase 2-5 loader exactly.
-     *
-     * <p>The setting is read defensively, for the reason every setting on this path is: a setting that
-     * cannot be read must leave the query working, and the safe direction here is no cache.
      */
     public static LruVectorCache forSource(final int dimension) {
-        final long budgetBytes;
+        return forSource(dimension, budgetBytesFromSettings());
+    }
+
+    /**
+     * The node's configured per-source budget in bytes, or zero - meaning no cache - if it cannot be read.
+     *
+     * <p>Read defensively, for the reason every setting on this path is: a setting that cannot be read must
+     * leave the query working, and the safe direction here is no cache.
+     */
+    static long budgetBytesFromSettings() {
         try {
             final ByteSizeValue configured = KNNSettings.getDirectIORescoreCacheBytesPerSource();
-            budgetBytes = configured == null ? 0L : configured.getBytes();
+            return configured == null ? 0L : configured.getBytes();
         } catch (Exception e) {
             log.debug(
                 "Could not read {}; serving the rescore seam without a cache",
                 KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE,
                 e
             );
-            return null;
+            return 0L;
         }
-        return forSource(dimension, budgetBytes);
     }
 
     /**
@@ -159,6 +177,10 @@ public final class LruVectorCache {
     /**
      * Copies the cached vector at {@code ord} into {@code dst} and marks it most recently used.
      *
+     * <p>Counts a hit on success and <b>nothing</b> on failure: a failure here means the caller is about
+     * to read the device, and that read counts its own miss when it calls {@link #put}. See the class
+     * javadoc on what the counters count.
+     *
      * @param dst where to copy the vector on a hit; untouched on a miss
      * @return true if {@code ord} was cached, false if it was not
      */
@@ -166,13 +188,34 @@ public final class LruVectorCache {
         synchronized (this) {
             final float[] cached = entries.get(ord);
             if (cached == null) {
-                misses.incrementAndGet();
                 return false;
             }
             System.arraycopy(cached, 0, dst, 0, dimension);
         }
         hits.incrementAndGet();
         return true;
+    }
+
+    /**
+     * Marks {@code ord} most recently used if it is held, and reports whether it was, without copying
+     * anything out and without counting.
+     *
+     * <p>This is the stage-time half of a staged lookup. A loader that is about to dispatch a batch of
+     * device reads asks this of every ordinal in the batch so that the resident ones are never read from
+     * the device at all; the bytes are fetched later, one at a time, by {@link #load} as the consumer
+     * reaches each position. Splitting it that way is what keeps the loader from having to retain a
+     * decoded vector per staged position.
+     *
+     * <p>Touching here rather than at {@link #load} is deliberate and is what makes the LRU order right:
+     * every ordinal a query is about to want becomes most-recently-used before that same query's misses
+     * start evicting, so a query cannot evict its own working set.
+     *
+     * @return true if {@code ord} is held, so no device read is needed for it
+     */
+    public boolean touchIfResident(final int ord) {
+        synchronized (this) {
+            return entries.get(ord) != null;
+        }
     }
 
     /**
@@ -184,10 +227,16 @@ public final class LruVectorCache {
      * length is rejected rather than retained, because a short entry would be a wrong score later, far
      * from here.
      *
+     * <p><b>This is where a miss is counted</b>, before any of those decisions, because the loader calls it
+     * exactly once per vector it read from the device and the count is of the read rather than of the
+     * retention. An ordinal that turns out to be held, or a vector too big for the budget, still cost a
+     * device read. See the class javadoc on what the counters count.
+     *
      * @param ord    the ordinal this vector belongs to
      * @param vector the decoded vector, copied rather than retained
      */
     public void put(final int ord, final float[] vector) {
+        misses.incrementAndGet();
         if (ord < 0 || vector == null || vector.length != dimension) {
             return;
         }

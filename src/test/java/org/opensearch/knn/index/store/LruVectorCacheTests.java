@@ -194,21 +194,68 @@ public class LruVectorCacheTests extends KNNTestCase {
         assertEquals(5, cache.stats().entries());
     }
 
-    /** Hit and miss counters, and the hit rate derived from them. */
-    public void testHitAndMissCounters() {
+    /**
+     * The counting contract: one lookup per vector the loader delivers, counted at the point it resolves.
+     * A hit is counted by {@link LruVectorCache#load}, a miss by {@link LruVectorCache#put} - because a put
+     * happens exactly once per device read - and a failed {@code load} counts nothing, because the caller is
+     * about to call {@code put} and would otherwise be charged twice for one vector.
+     */
+    public void testOneLookupIsCountedPerDeliveredVector() {
         final LruVectorCache cache = cacheHolding(4);
         assertEquals(0.0d, cache.stats().hitRate(), 0.0d);
 
-        cache.put(1, vectorFor(1));
         final float[] dst = new float[DIM];
+        // Miss, then the device read that follows it. One vector delivered, one lookup, one miss.
+        assertFalse(cache.load(1, dst));
+        cache.put(1, vectorFor(1));
+        assertEquals(0, cache.stats().hits());
+        assertEquals(1, cache.stats().misses());
+
+        // Three hits on the entry that put left behind.
         assertTrue(cache.load(1, dst));
         assertTrue(cache.load(1, dst));
         assertTrue(cache.load(1, dst));
-        assertFalse(cache.load(2, dst));
 
         assertEquals(3, cache.stats().hits());
         assertEquals(1, cache.stats().misses());
-        assertEquals(0.75d, cache.stats().hitRate(), 1e-9);
+        assertEquals("four vectors delivered, four lookups counted", 0.75d, cache.stats().hitRate(), 1e-9);
+    }
+
+    /**
+     * The stage-time half of a staged lookup counts nothing at all, or every hit would be counted twice -
+     * once here and once when the consumer reaches that position and calls {@code load}.
+     */
+    public void testTouchIfResidentReportsResidencyWithoutCounting() {
+        final LruVectorCache cache = cacheHolding(4);
+        cache.put(1, vectorFor(1));
+        final long missesAfterThePut = cache.stats().misses();
+
+        assertTrue(cache.touchIfResident(1));
+        assertFalse(cache.touchIfResident(2));
+        assertFalse(cache.touchIfResident(-1));
+
+        assertEquals(0, cache.stats().hits());
+        assertEquals(missesAfterThePut, cache.stats().misses());
+    }
+
+    /**
+     * Touching at stage time rather than at consume time is what stops a query evicting its own working
+     * set: every ordinal the query is about to want becomes most-recently-used before any of that query's
+     * misses start making room. Here ordinal 1 is the least recently used until it is touched, after which
+     * the insert has to take 2 instead.
+     */
+    public void testTouchIfResidentMakesAnEntryMostRecentlyUsed() {
+        final LruVectorCache cache = cacheHolding(3);
+        cache.put(1, vectorFor(1));
+        cache.put(2, vectorFor(2));
+        cache.put(3, vectorFor(3));
+
+        assertTrue(cache.touchIfResident(1));
+        cache.put(4, vectorFor(4));
+
+        final float[] dst = new float[DIM];
+        assertTrue("1 was touched and must have survived", cache.load(1, dst));
+        assertFalse("2 became least recently used and must have been evicted", cache.load(2, dst));
     }
 
     /** A budget of zero is not a cache that always misses; it is no cache object at all. */
