@@ -153,8 +153,16 @@ public class KNNSettings {
     // How many reads one scorer keeps in flight. Deliberately a rolling window and not a fan-out over the
     // whole candidate set: a 200-wide fan-out measured p90 2.2x and p99 2.0x worse than a 64-wide one,
     // because the device queue (nr_requests=63) caps how much in-flight I/O is useful.
+    //
+    // 48 rather than 16 on measurement: swept at 200 queries per point on a volume with I/O budget to
+    // spare, median went 23.97 ms at 8, 17.36 at 16, 12.27 at 32, 11.43 at 48, 10.55 at 64 -- but 64,
+    // which is the whole batch Lucene's bulk scorer hands over, took p99/median from 1.15 to 1.45. So 48
+    // is the widest window that still leaves the ring rolling rather than fanning out, which is the
+    // property the flat tail comes from. An earlier sweep found this curve flat from 8 to 64 and
+    // concluded the window did not matter; that sweep was run against a volume already throttled to its
+    // sustained IOPS allowance, where every window is equally throughput-bound. See output/impl/task-05.md.
     public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW = "knn.direct_io.rescore.prefetch_window";
-    public static final int KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_DEFAULT_VALUE = 16;
+    public static final int KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_DEFAULT_VALUE = 48;
     // Upper bound on in-flight reads across the whole node, not per segment: per-leaf scoring tasks run
     // concurrently, so total in-flight is segments x window, and a per-segment bound oversaturates the
     // device. Sized to the device queue rather than to the core count for that reason.

@@ -49,6 +49,12 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
     private static final int VECTOR_BYTES = DIMENSION * Float.BYTES;
     /** Deliberately odd, so the vector region starts unaligned to any block or gcd boundary. */
     private static final int HEADER_LENGTH = 41;
+    /**
+     * Block- and gcd-unaligned like {@link #HEADER_LENGTH}, but a multiple of four, which is the case
+     * every real {@code .vec} presents and the only one that takes the bulk decode. 41 is not, so a test
+     * that wants the bulk path has to ask for this explicitly.
+     */
+    private static final int ALIGNED_HEADER_LENGTH = 44;
 
     /**
      * Skips the calling test when this filesystem will not open a file with {@code O_DIRECT}, which is a
@@ -68,12 +74,17 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
     }
 
     /** Writes header, {@code vectors}, footer — the layout {@link DirectIOVectorSource} derives against. */
-    @SneakyThrows
     private Path writeVectorFile(final List<float[]> vectors, final int trailingPadding) {
+        return writeVectorFile(vectors, trailingPadding, HEADER_LENGTH);
+    }
+
+    /** As {@link #writeVectorFile(List, int)}, with the header length chosen by the caller. */
+    @SneakyThrows
+    private Path writeVectorFile(final List<float[]> vectors, final int trailingPadding, final int headerLength) {
         final Path path = createTempDir().resolve("_0_Test_0.vec");
-        final ByteBuffer buffer = ByteBuffer.allocate(HEADER_LENGTH + vectors.size() * VECTOR_BYTES + trailingPadding + 16)
+        final ByteBuffer buffer = ByteBuffer.allocate(headerLength + vectors.size() * VECTOR_BYTES + trailingPadding + 16)
             .order(ByteOrder.LITTLE_ENDIAN);
-        for (int i = 0; i < HEADER_LENGTH; i++) {
+        for (int i = 0; i < headerLength; i++) {
             buffer.put((byte) (0xC0 + i));
         }
         for (final float[] vector : vectors) {
@@ -127,6 +138,51 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
             assertArrayEquals(vectors.get(599), reader.read(599), 0.0f);
             assertArrayEquals(vectors.get(3), reader.read(3), 0.0f);
             assertArrayEquals(vectors.get(412), reader.read(412), 0.0f);
+        }
+    }
+
+    /**
+     * The same read-back over a region that starts on a four-byte boundary, which is what every real
+     * {@code .vec} does and what every other test in this suite deliberately does not: with a header of 41
+     * the decode falls back to reading a float at a time, and only a header like this one takes the bulk
+     * copy. Both paths have to produce the same floats, so this is the guard on the one that ships.
+     */
+    @SneakyThrows
+    public void testEveryOrdinalReadsBackTheBytesThatWereWrittenWhenTheRegionIsFourAligned() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(600);
+        final Path path = writeVectorFile(vectors, 0, ALIGNED_HEADER_LENGTH);
+
+        try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
+            assertNotNull("open should have succeeded on a well-formed file", source);
+            assertEquals(ALIGNED_HEADER_LENGTH, source.baseOffset());
+
+            final DirectIOVectorSource.Reader reader = source.newReader();
+            for (int ord = 0; ord < vectors.size(); ord++) {
+                assertArrayEquals("ordinal " + ord, vectors.get(ord), reader.read(ord), 0.0f);
+            }
+            assertArrayEquals(vectors.get(599), reader.read(599), 0.0f);
+            assertArrayEquals(vectors.get(3), reader.read(3), 0.0f);
+        }
+    }
+
+    /**
+     * Staged reads over a four-aligned region: the bulk decode runs against a ring slot's own
+     * {@code float} view rather than the blocking buffer's, and a view built over the wrong slot would
+     * return another ordinal's vector.
+     */
+    @SneakyThrows
+    public void testAStagedBatchReadsBackEveryVectorWhenTheRegionIsFourAligned() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(600);
+        final Path path = writeVectorFile(vectors, 0, ALIGNED_HEADER_LENGTH);
+
+        try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
+            assertNotNull(source);
+            final DirectIOVectorSource.Reader reader = source.newReader();
+            final int[] ords = sparseOrdinals(200, 7, vectors.size());
+            reader.stage(ords, ords.length);
+            assertReadsInOrder(reader, ords, vectors);
         }
     }
 

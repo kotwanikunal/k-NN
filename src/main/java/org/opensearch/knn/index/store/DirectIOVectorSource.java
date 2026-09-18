@@ -13,6 +13,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.OpenOption;
@@ -90,6 +91,18 @@ public final class DirectIOVectorSource implements Closeable {
     private final int blockSize;
     private final int bufferSize;
 
+    /**
+     * Whether a vector always starts on a four-byte boundary inside its read buffer, which is what lets
+     * {@link Reader#decode} copy the whole vector at once instead of a float at a time.
+     *
+     * <p>True for every layout this seam actually meets — {@code vectorByteLength} is {@code dimension}
+     * floats and a block size is a power of two, so the only way the offset within the block can be
+     * unaligned is a base offset that is not a multiple of four, which no {@code CodecUtil} header
+     * produces. It is still computed rather than assumed, because the base offset is derived (see the
+     * class javadoc) and a misaligned one must cost a slower decode, not a wrong read.
+     */
+    private final boolean bulkDecodable;
+
     private DirectIOVectorSource(
         final Path path,
         final FileChannel channel,
@@ -108,6 +121,7 @@ public final class DirectIOVectorSource implements Closeable {
         this.vectorByteLength = vectorByteLength;
         this.blockSize = blockSize;
         this.bufferSize = bufferSize;
+        this.bulkDecodable = baseOffset % Float.BYTES == 0 && vectorByteLength % Float.BYTES == 0;
     }
 
     /**
@@ -271,6 +285,7 @@ public final class DirectIOVectorSource implements Closeable {
 
         /** Buffer for reads that are not served from the ring. Allocated on the first such read. */
         private ByteBuffer syncBuffer;
+        private FloatBuffer syncFloats;
         private final float[] value = new float[dimension];
 
         /**
@@ -279,6 +294,12 @@ public final class DirectIOVectorSource implements Closeable {
          * slots there are.
          */
         private ByteBuffer[] slots;
+        /**
+         * A {@code float} view per slot, created with the slot and never reassigned. A view addresses the
+         * byte range the buffer had when the view was made, so it is unaffected by the {@code clear()} and
+         * position changes each read does, and making it once keeps {@link #decode} allocation free.
+         */
+        private FloatBuffer[] slotFloats;
         private Future<?>[] pending;
         private StagedRead[] staged;
         private int[] slotOrd;
@@ -393,7 +414,7 @@ public final class DirectIOVectorSource implements Closeable {
                 }
                 throw new IOException("Direct I/O read of " + path + " failed", cause);
             }
-            decode(slots[slot], slotOrd[slot]);
+            decode(slots[slot], slotFloats[slot], slotOrd[slot]);
             nextConsume++;
             if (submitNext() == false) {
                 // value already holds this ordinal, so the batch can be dropped without losing this read.
@@ -481,9 +502,12 @@ public final class DirectIOVectorSource implements Closeable {
             // of blockSize by construction in DirectIOBufferSizer.
             final ByteBuffer arena = ByteBuffer.allocateDirect(desired * bufferSize + blockSize - 1).alignedSlice(blockSize);
             final ByteBuffer[] allocated = new ByteBuffer[desired];
+            final FloatBuffer[] views = new FloatBuffer[desired];
             for (int i = 0; i < desired; i++) {
                 allocated[i] = arena.slice(i * bufferSize, bufferSize).order(ByteOrder.LITTLE_ENDIAN);
+                views[i] = allocated[i].asFloatBuffer();
             }
+            slotFloats = views;
             slotOrd = new int[desired];
             pending = new Future<?>[desired];
             staged = new StagedRead[desired];
@@ -500,15 +524,32 @@ public final class DirectIOVectorSource implements Closeable {
                 // block-aligned slice exists inside the allocation, since O_DIRECT requires the buffer
                 // address, the file offset and the length to all be block aligned.
                 syncBuffer = ByteBuffer.allocateDirect(bufferSize + blockSize - 1).alignedSlice(blockSize).order(ByteOrder.LITTLE_ENDIAN);
+                syncFloats = syncBuffer.asFloatBuffer();
             }
             readInto(syncBuffer, ord);
-            decode(syncBuffer, ord);
+            decode(syncBuffer, syncFloats, ord);
             return value;
         }
 
-        /** Decodes the vector at {@code ord} out of a buffer that already holds its block-aligned range. */
-        private void decode(final ByteBuffer target, final int ord) {
+        /**
+         * Decodes the vector at {@code ord} out of a buffer that already holds its block-aligned range.
+         *
+         * <p>The bulk path is one copy of {@code dimension} floats rather than {@code dimension} separate
+         * reads, which matters because this runs once per rescore candidate: a query decodes
+         * {@code firstPassK x dimension} floats, 153,600 of them at the shape this seam was measured on.
+         * A {@code FloatBuffer} view of a direct buffer in the platform's byte order implements its
+         * absolute bulk get as a memory copy, so there is no per-element cost and no intermediate object.
+         *
+         * @param target the buffer holding the block-aligned range, used by the unaligned fallback
+         * @param view   {@code target}'s {@code float} view, created once with the buffer
+         * @param ord    the ordinal whose bytes {@code target} holds
+         */
+        private void decode(final ByteBuffer target, final FloatBuffer view, final int ord) {
             final int delta = (int) ((baseOffset + (long) ord * vectorByteLength) % blockSize);
+            if (bulkDecodable) {
+                view.get(delta / Float.BYTES, value, 0, value.length);
+                return;
+            }
             for (int i = 0; i < value.length; i++) {
                 value[i] = target.getFloat(delta + (i << 2));
             }
