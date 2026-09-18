@@ -17,7 +17,10 @@ import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.mockito.MockedStatic;
+import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.knn.KNNTestCase;
+import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
+import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.engine.qframe.QuantizationConfig;
 import org.opensearch.knn.index.engine.qframe.QuantizationConfigParser;
@@ -561,6 +564,96 @@ public class VectorScorersTests extends KNNTestCase {
             float expected = MemoryOptimizedSearchScoreConverter.convertInnerProductScoreToCosineScore(ipScore);
             assertScores(Map.of(0, expected), scorer);
         }
+    }
+
+    // ──────────────────────────────────────────────
+    // Direct I/O rescore seam
+    // ──────────────────────────────────────────────
+
+    /**
+     * Records the values instance the mode was handed. The seam sits between {@code getBaseScorer} and
+     * {@code VectorScorerMode.RESCORE}, and RESCORE calls {@code rescorer(target)} on whatever it is
+     * given, so a pass-through seam shows up as {@code this} being the receiver.
+     */
+    private static final class RescorerRecordingFloatVectorValues extends TestVectorValues.PreDefinedFloatVectorValues {
+        private final VectorScorer rescorerResult = mock(VectorScorer.class);
+        private FloatVectorValues rescoredThrough;
+
+        private RescorerRecordingFloatVectorValues(final List<float[]> vectors) {
+            super(vectors, VectorSimilarityFunction.EUCLIDEAN);
+        }
+
+        @Override
+        public VectorScorer rescorer(final float[] target) {
+            rescoredThrough = this;
+            return rescorerResult;
+        }
+    }
+
+    @SneakyThrows
+    private VectorScorer createRescoreScorer(final RescorerRecordingFloatVectorValues values, final boolean radialSearch) {
+        final KNNVectorValuesIterator.DocIdsIteratorValues iteratorValues = mock(KNNVectorValuesIterator.DocIdsIteratorValues.class);
+        when(iteratorValues.getDocIdSetIterator()).thenReturn(values.iterator());
+        when(iteratorValues.getKnnVectorValues()).thenReturn(values);
+        when(fieldInfo.getVectorSimilarityFunction()).thenReturn(VectorSimilarityFunction.EUCLIDEAN);
+        return VectorScorers.createScorer(
+            iteratorValues,
+            new float[] { 1.0f, 2.0f },
+            VectorScorerMode.RESCORE,
+            SpaceType.L2,
+            fieldInfo,
+            null,
+            null,
+            radialSearch
+        );
+    }
+
+    /** Flag off is the default, and then the seam is not in the path at all. */
+    @SneakyThrows
+    public void testFloatTarget_rescoreSeam_whenFlagIsOff_thenScoresThroughTheCodecValues() {
+        RescorerRecordingFloatVectorValues values = new RescorerRecordingFloatVectorValues(List.of(new float[] { 1.0f, 2.0f }));
+
+        VectorScorer scorer = createRescoreScorer(values, false);
+
+        assertSame(values, values.rescoredThrough);
+        assertSame(values.rescorerResult, scorer);
+    }
+
+    /**
+     * With the flag on the seam is engaged, and while it is a pass-through the scorer must still be built
+     * over the very same values instance - the Phase 1 claim that switching the flag on changes nothing.
+     */
+    @SneakyThrows
+    public void testFloatTarget_rescoreSeam_whenFlagIsOn_thenStillScoresThroughTheCodecValues() {
+        ClusterSettings clusterSettings = mock(ClusterSettings.class);
+        when(clusterService.getClusterSettings()).thenReturn(clusterSettings);
+        when(clusterSettings.get(KNNFeatureFlags.KNN_DIRECT_IO_RESCORE_ENABLED_SETTING)).thenReturn(true);
+        KNNSettings.state().setClusterService(clusterService);
+
+        RescorerRecordingFloatVectorValues values = new RescorerRecordingFloatVectorValues(List.of(new float[] { 1.0f, 2.0f }));
+
+        VectorScorer scorer = createRescoreScorer(values, false);
+
+        assertSame(values, values.rescoredThrough);
+        assertSame(values.rescorerResult, scorer);
+    }
+
+    /** Radial stays on the default path even with the flag on and mode RESCORE. */
+    @SneakyThrows
+    public void testFloatTarget_rescoreSeam_whenRadial_thenNotEngaged() {
+        ClusterSettings clusterSettings = mock(ClusterSettings.class);
+        when(clusterService.getClusterSettings()).thenReturn(clusterSettings);
+        when(clusterSettings.get(KNNFeatureFlags.KNN_DIRECT_IO_RESCORE_ENABLED_SETTING)).thenReturn(true);
+        KNNSettings.state().setClusterService(clusterService);
+
+        RescorerRecordingFloatVectorValues values = new RescorerRecordingFloatVectorValues(List.of(new float[] { 1.0f, 2.0f }));
+
+        assertFalse(DirectIORescoreSeam.isEngaged(VectorScorerMode.RESCORE, true));
+
+        VectorScorer scorer = createRescoreScorer(values, true);
+
+        assertSame(values, values.rescoredThrough);
+        assertSame(values.rescorerResult, scorer);
     }
 
     // ──────────────────────────────────────────────

@@ -353,6 +353,10 @@ public class ExactSearcher {
         final SegmentLevelQuantizationInfo quantizationInfo = SegmentLevelQuantizationInfo.build(reader, fieldInfo, context.getField());
 
         if (quantizationInfo == null || scorerMode == VectorScorerMode.RESCORE) {
+            // This is the only call site that can reach fp32 .vec values in RESCORE mode, so it is the one
+            // that has to tell the rescore seam whether the query is radial - the mode alone does not,
+            // since a radial rescore also arrives here as RESCORE.
+            final boolean radialSearch = context.getRadius() != null;
             return VectorScorers.createScorer(
                 iteratorValues,
                 context.getFloatQueryVector(),
@@ -360,7 +364,8 @@ public class ExactSearcher {
                 spaceType,
                 fieldInfo,
                 context.getMatchedDocsIterator(),
-                parentBitSet
+                parentBitSet,
+                radialSearch
             );
         }
 

@@ -93,7 +93,43 @@ public final class VectorScorers {
         @Nullable final DocIdSetIterator filteredIdsIterator,
         @Nullable final BitSet parentBitSet
     ) throws IOException {
-        final VectorScorer scorer = getBaseScorer(docIdsIteratorValues, target, vectorScorerMode, spaceType, fieldInfo);
+        // No radial flag was supplied, so this caller cannot rule out a radial query: stay on the default
+        // path. See DirectIORescoreSeam for why radial needs an exclusion the mode gate does not give.
+        return createScorer(docIdsIteratorValues, target, vectorScorerMode, spaceType, fieldInfo, filteredIdsIterator, parentBitSet, true);
+    }
+
+    /**
+     * Creates a {@link VectorScorer} for the given float query vector, telling the
+     * {@link DirectIORescoreSeam} whether this scorer serves a radial query.
+     *
+     * <p>Radial search cannot be recognised from the arguments the other overloads take, and the
+     * {@link VectorScorerMode#RESCORE} gate does not exclude it, so the caller has to say. Callers that
+     * do not know pass {@code radialSearch = true} through the shorter overloads, which keeps them on
+     * the default path.
+     *
+     * @param docIdsIteratorValues wraps the {@link DocIdSetIterator} and {@link KnnVectorValues}
+     *                             for the segment being scored
+     * @param target    the float query vector
+     * @param vectorScorerMode determines whether to use scoring or rescoring
+     * @param spaceType the space type defining the similarity function
+     * @param fieldInfo the field info for the vector field
+     * @param filteredIdsIterator iterator over accepted child documents, or null if not nested
+     * @param parentBitSet bit set identifying parent documents, or null if not nested
+     * @param radialSearch true if this scorer serves a radial (min-score) query
+     * @return a {@link VectorScorer} appropriate for the underlying vector storage format
+     * @throws IOException if an I/O error occurs
+     */
+    public static VectorScorer createScorer(
+        final KNNVectorValuesIterator.DocIdsIteratorValues docIdsIteratorValues,
+        final float[] target,
+        final VectorScorerMode vectorScorerMode,
+        final SpaceType spaceType,
+        final FieldInfo fieldInfo,
+        @Nullable final DocIdSetIterator filteredIdsIterator,
+        @Nullable final BitSet parentBitSet,
+        final boolean radialSearch
+    ) throws IOException {
+        final VectorScorer scorer = getBaseScorer(docIdsIteratorValues, target, vectorScorerMode, spaceType, fieldInfo, radialSearch);
         return maybeWrapWithNestedScorer(scorer, filteredIdsIterator, parentBitSet);
     }
 
@@ -152,7 +188,8 @@ public final class VectorScorers {
         final float[] target,
         final VectorScorerMode vectorScorerMode,
         final SpaceType spaceType,
-        final FieldInfo fieldInfo
+        final FieldInfo fieldInfo,
+        final boolean radialSearch
     ) throws IOException {
         final DocIdSetIterator docIdSetIterator = docIdsIteratorValues.getDocIdSetIterator();
 
@@ -165,12 +202,15 @@ public final class VectorScorers {
         if (knnVectorValues instanceof FloatVectorValues floatVectorValues) {
             final VectorSimilarityFunction configuredFunction = resolveSimilarityFunction(spaceType);
             if (configuredFunction == null || configuredFunction == fieldInfo.getVectorSimilarityFunction()) {
-                // TEMPORARY Phase-0 gate instrumentation; a no-op unless -Dknn.probe.rescore_seam is set.
-                // Removed in Phase 1, where the real feature-flagged hook takes this position.
-                return vectorScorerMode.createScorer(
-                    RescoreSeamProbe.intercept(floatVectorValues, target, vectorScorerMode, fieldInfo),
-                    target
+                // The rescore seam. Returns floatVectorValues unchanged unless the Direct I/O rescore flag
+                // is on and this is a non-radial RESCORE scorer, so the default path is untouched.
+                final FloatVectorValues valuesToScore = DirectIORescoreSeam.vectorValuesForRescore(
+                    floatVectorValues,
+                    vectorScorerMode,
+                    radialSearch,
+                    fieldInfo
                 );
+                return vectorScorerMode.createScorer(valuesToScore, target);
             }
             return createSimilarityOverrideScorer(floatVectorValues, target, configuredFunction);
         }

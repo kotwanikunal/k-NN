@@ -32,6 +32,8 @@ public class KNNFeatureFlags {
     private static final boolean KNN_DIRECT_IO_ENABLED_DEFAULT_VALUE = true;
     private static final String KNN_WHOLE_LEAF_PREFETCH_ENABLED = "knn.feature.whole_leaf_prefetch.enabled";
     private static final boolean KNN_WHOLE_LEAF_PREFETCH_ENABLED_DEFAULT_VALUE = false;
+    private static final String KNN_DIRECT_IO_RESCORE_ENABLED = "knn.feature.direct_io.rescore.enabled";
+    private static final boolean KNN_DIRECT_IO_RESCORE_ENABLED_DEFAULT_VALUE = false;
 
     @VisibleForTesting
     public static final Setting<Boolean> KNN_FORCE_EVICT_CACHE_ENABLED_SETTING = Setting.boolSetting(
@@ -74,6 +76,22 @@ public class KNNFeatureFlags {
     );
 
     /**
+     * Node level switch for reading full-precision vectors with Direct I/O on the rescore path, at the
+     * query seam in {@code VectorScorers}. Independent of {@link #KNN_DIRECT_IO_ENABLED_SETTING}, which
+     * gates the file level {@code knn_direct_io} store type: this one is a per-query decision and needs
+     * no index close and reopen, so flipping it takes effect on the next query.
+     * <p>
+     * Off by default. With it off the rescore path is the one every existing measurement was taken
+     * against, byte for byte.
+     */
+    public static final Setting<Boolean> KNN_DIRECT_IO_RESCORE_ENABLED_SETTING = Setting.boolSetting(
+        KNN_DIRECT_IO_RESCORE_ENABLED,
+        KNN_DIRECT_IO_RESCORE_ENABLED_DEFAULT_VALUE,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
      * All feature flags which needs to be provided as setting should be added here.
      * @return List of Feature flag settings
      */
@@ -82,7 +100,8 @@ public class KNNFeatureFlags {
             KNN_FORCE_EVICT_CACHE_ENABLED_SETTING,
             KNN_PREFETCH_ENABLED_SETTING,
             KNN_DIRECT_IO_ENABLED_SETTING,
-            KNN_WHOLE_LEAF_PREFETCH_ENABLED_SETTING
+            KNN_WHOLE_LEAF_PREFETCH_ENABLED_SETTING,
+            KNN_DIRECT_IO_RESCORE_ENABLED_SETTING
         );
     }
 
@@ -142,6 +161,24 @@ public class KNNFeatureFlags {
             );
         } catch (Exception e) {
             return KNN_WHOLE_LEAF_PREFETCH_ENABLED_DEFAULT_VALUE;
+        }
+    }
+
+    /**
+     * Checks the node level switch for Direct I/O reads on the rescore path. Read once per scorer built
+     * at the rescore seam, so it takes effect on the next query with no index or node restart. An
+     * unreadable setting falls back to the default rather than failing the query.
+     *
+     * @return true if the rescore path may read full-precision vectors with Direct I/O
+     */
+    public static boolean isDirectIORescoreEnabled() {
+        try {
+            return Booleans.parseBoolean(
+                KNNSettings.state().getSettingValue(KNN_DIRECT_IO_RESCORE_ENABLED).toString(),
+                KNN_DIRECT_IO_RESCORE_ENABLED_DEFAULT_VALUE
+            );
+        } catch (Exception e) {
+            return KNN_DIRECT_IO_RESCORE_ENABLED_DEFAULT_VALUE;
         }
     }
 }
