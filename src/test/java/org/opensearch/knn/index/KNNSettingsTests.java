@@ -344,7 +344,8 @@ public class KNNSettingsTests extends KNNTestCase {
             KNNSettings.KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING,
             KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED_SETTING,
             KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_SETTING,
-            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING
+            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING,
+            KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_SETTING
         )) {
             final EnumSet<Setting.Property> properties = setting.getProperties();
             assertTrue(setting.getKey(), properties.contains(Setting.Property.NodeScope));
@@ -375,10 +376,47 @@ public class KNNSettingsTests extends KNNTestCase {
             KNNSettings.KNN_DIRECT_IO_MIN_FILE_SIZE,
             KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED,
             KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW,
-            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS
+            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS,
+            KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE
         )) {
             assertTrue(key + " is not registered", registeredKeys.contains(key));
         }
+    }
+
+    /**
+     * The cache budget's default is 8 MB on measurement: an exact LRU stack-distance analysis of a
+     * 2,000-query candidate trace put the steady-state hit rate at 41.4% for 4 MB, 44.2% for 8 MB, 45.3%
+     * for 16 MB and 50.3% for 128 MB, so 8 MB is where the curve flattens. A change to the default should
+     * be a change to this assertion too.
+     */
+    public void testDirectIORescoreCacheSetting_default() {
+        assertEquals(
+            new ByteSizeValue(8, ByteSizeUnit.MB),
+            KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_SETTING.getDefault(Settings.EMPTY)
+        );
+        assertEquals(new ByteSizeValue(8, ByteSizeUnit.MB), KNNSettings.getDirectIORescoreCacheBytesPerSource());
+    }
+
+    /**
+     * Zero has to be an accepted value, not a rejected one: it is how the cache is turned off, and the
+     * off arm is what every cache measurement is read against.
+     */
+    public void testDirectIORescoreCacheSetting_acceptsZero() {
+        final Settings zero = Settings.builder().put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE, "0b").build();
+        assertEquals(ByteSizeValue.ZERO, KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_SETTING.get(zero));
+    }
+
+    public void testDirectIORescoreCacheSetting_isReadableByKey() {
+        assertEquals(
+            new ByteSizeValue(8, ByteSizeUnit.MB),
+            KNNSettings.state().getSettingValue(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE)
+        );
+    }
+
+    /** Read from a query path that must never fail, so an uninitialized singleton yields the default. */
+    public void testDirectIORescoreCacheAccessor_whenClusterServiceIsNotSet_thenReturnsDefault() {
+        KNNSettings.state().setClusterService(null);
+        assertEquals(new ByteSizeValue(8, ByteSizeUnit.MB), KNNSettings.getDirectIORescoreCacheBytesPerSource());
     }
 
     /**

@@ -169,6 +169,20 @@ public class KNNSettings {
     public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS = "knn.direct_io.rescore.prefetch_threads";
     public static final int KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_DEFAULT_VALUE = 64;
 
+    // Memory budget for the rescore seam's full-precision vector cache, per loader source, i.e. per field
+    // per segment. Zero means the cache is not built at all, which is the arm to compare against: with it
+    // the seam is byte-for-byte the Phase 2-5 path.
+    //
+    // 8 MB on measurement, not on intuition. O_DIRECT deletes the cross-query page-cache reuse mmap gets
+    // for free -- the ON arm issues 200 device reads per query where mmap issues 103.4 -- and an exact LRU
+    // stack-distance analysis of a 2,000-query candidate trace says how much of that is recoverable at a
+    // given budget: 41.4% hit at 4 MB, 44.2% at 8 MB, 45.3% at 16 MB, 50.3% at 128 MB. The curve is steep
+    // to 8 MB and nearly flat after it, because the reuse is head weighted -- 41% of it falls within 1 MB
+    // of stack depth -- so 8 MB buys most of a 128 MB cache for a sixteenth of the footprint. The budget is
+    // per source rather than node wide so that it cannot be starved by whichever segment asks first.
+    public static final String KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE = "knn.direct_io.rescore.cache.bytes_per_source";
+    public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_DEFAULT_VALUE = new ByteSizeValue(8, ByteSizeUnit.MB);
+
     /**
      * For more details on supported engines, refer to {@link MemoryOptimizedSearchSupportSpec}
      */
@@ -437,6 +451,28 @@ public class KNNSettings {
         KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_DEFAULT_VALUE,
         1,
         1024,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
+     * Node level memory budget for the rescore seam's full-precision vector cache, charged per loader
+     * source - one field in one segment - and accounted by the bytes actually retained rather than by an
+     * entry count.
+     * <p>
+     * Read once, when a source decides whether to build a cache at all, so a change takes effect on
+     * segments opened after it; the budget of a live cache does not move under the queries reading it.
+     * <b>Zero disables the cache entirely</b>: no cache object is built, so the loader path is the Phase
+     * 2-5 one with no lookup, no accounting and no counters, which is what makes "cache off" a meaningful
+     * control arm rather than a cache that merely always misses.
+     * <p>
+     * There is no upper bound beyond the operator's own: the footprint is bounded by this setting times the
+     * number of open rescore-served segments, and a node that wants to spend a gigabyte on it should be
+     * allowed to.
+     */
+    public static final Setting<ByteSizeValue> KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_SETTING = Setting.byteSizeSetting(
+        KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE,
+        KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_DEFAULT_VALUE,
         NodeScope,
         Dynamic
     );
@@ -897,6 +933,10 @@ public class KNNSettings {
             return KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING;
         }
 
+        if (KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE.equals(key)) {
+            return KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_SETTING;
+        }
+
         throw new IllegalArgumentException("Cannot find setting by key [" + key + "]");
     }
 
@@ -942,7 +982,9 @@ public class KNNSettings {
             // Rescore-seam prefetch settings
             KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED_SETTING,
             KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_SETTING,
-            KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING
+            KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING,
+            // Rescore-seam vector cache
+            KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
             .collect(Collectors.toList());
@@ -1003,6 +1045,13 @@ public class KNNSettings {
      */
     public static int getDirectIORescorePrefetchThreads() {
         return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING);
+    }
+
+    /**
+     * @return the per-source memory budget for the rescore seam's vector cache, zero meaning "no cache"
+     */
+    public static ByteSizeValue getDirectIORescoreCacheBytesPerSource() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_SETTING);
     }
 
     public static boolean isCircuitBreakerTriggered() {
