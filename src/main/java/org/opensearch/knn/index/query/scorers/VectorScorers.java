@@ -165,7 +165,12 @@ public final class VectorScorers {
         if (knnVectorValues instanceof FloatVectorValues floatVectorValues) {
             final VectorSimilarityFunction configuredFunction = resolveSimilarityFunction(spaceType);
             if (configuredFunction == null || configuredFunction == fieldInfo.getVectorSimilarityFunction()) {
-                return vectorScorerMode.createScorer(floatVectorValues, target);
+                // TEMPORARY Phase-0 gate instrumentation; a no-op unless -Dknn.probe.rescore_seam is set.
+                // Removed in Phase 1, where the real feature-flagged hook takes this position.
+                return vectorScorerMode.createScorer(
+                    RescoreSeamProbe.intercept(floatVectorValues, target, vectorScorerMode, fieldInfo),
+                    target
+                );
             }
             return createSimilarityOverrideScorer(floatVectorValues, target, configuredFunction);
         }
