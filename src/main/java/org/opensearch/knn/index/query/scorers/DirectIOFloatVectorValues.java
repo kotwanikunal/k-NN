@@ -14,14 +14,15 @@ import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
-import org.opensearch.knn.index.store.DirectIOVectorSource;
+import org.opensearch.knn.index.store.VectorLoaderSource;
+import org.opensearch.knn.index.store.VectorStagingArea;
 
 import java.io.IOException;
 
 /**
- * The {@link FloatVectorValues} the rescore path scores through when Direct I/O is engaged: identical to
- * the codec's values in every respect except that {@link #vectorValue(int)} reads the vector from a
- * {@link DirectIOVectorSource} instead of from Lucene's memory mapping.
+ * The {@link FloatVectorValues} the rescore path scores through when the seam is engaged: identical to
+ * the codec's values in every respect except that {@link #vectorValue(int)} reads the vector through a
+ * {@link VectorLoaderSource.Loader} instead of from Lucene's memory mapping.
  *
  * <h2>Why not implementing {@link HasIndexSlice} is the mechanism</h2>
  * Lucene binds {@code Lucene99MemorySegmentFloatVectorScorer} - which reads fp32 vectors straight out of
@@ -38,40 +39,45 @@ import java.io.IOException;
  * budget the design allows. Do not "fix" this by re-exposing the slice: doing so silently restores the
  * mmap reads this path exists to remove, and the only symptom is that the Direct I/O counters stay flat.
  *
- * <h2>Ordinals, copies and buffers</h2>
+ * <h2>Ordinals, copies and loaders</h2>
  * Everything except {@code vectorValue} delegates, so ordinals, {@code ordToDoc} and iteration are the
  * codec's and cannot drift from them. {@link #copy()} pairs a fresh delegate copy with a fresh
- * {@link DirectIOVectorSource.Reader}, because Lucene gives each per-leaf scoring task its own copy and
- * those tasks run concurrently - one buffer shared between them would be a data race. Buffers are
- * allocated on first use and dropped when the reader becomes unreachable; no buffer survives the single
- * score that consumes it, so this is a staging area and not a cache.
+ * {@link VectorLoaderSource.Loader}, because Lucene gives each per-leaf scoring task its own copy and
+ * those tasks run concurrently - per-read state shared between them would be a data race.
  *
  * <p>{@link #scorer(float[])} additionally wraps Lucene's scorer so that each batch of ordinals is staged
  * before it is scored - see {@link PrefetchingRandomVectorScorer}. That read-ahead is what makes this path
- * competitive with mmap, whose speed came from a {@code madvise} prefetch that cannot exist here.
+ * competitive with mmap, whose speed came from a {@code madvise} prefetch that cannot exist here. It happens
+ * only when the loader also implements {@link VectorStagingArea}: the two are separate seams, and a loader
+ * that offers no staging is scored without it rather than refused.
  */
 final class DirectIOFloatVectorValues extends FloatVectorValues {
 
     private final FloatVectorValues delegate;
-    private final DirectIOVectorSource source;
-    private final DirectIOVectorSource.Reader reader;
+    private final VectorLoaderSource source;
+    private final VectorLoaderSource.Loader loader;
     private final VectorSimilarityFunction similarityFunction;
+    private final VectorScorerMode reuseHint;
 
     /**
      * @param delegate           the codec's values, which own iteration and the ordinal-to-doc mapping
-     * @param source             the Direct I/O source for the same vectors, sharing {@code delegate}'s
-     *                           ordinal space
+     * @param source             the loader seam for the same vectors, sharing {@code delegate}'s ordinal
+     *                           space
      * @param similarityFunction the function to score with, taken from the field
+     * @param reuseHint          the mode these reads were built in, passed to the loader seam as its reuse
+     *                           hint and carried so {@link #copy()} can pass the same one
      */
     DirectIOFloatVectorValues(
         final FloatVectorValues delegate,
-        final DirectIOVectorSource source,
-        final VectorSimilarityFunction similarityFunction
+        final VectorLoaderSource source,
+        final VectorSimilarityFunction similarityFunction,
+        final VectorScorerMode reuseHint
     ) {
         this.delegate = delegate;
         this.source = source;
-        this.reader = source.newReader();
+        this.loader = source.newLoader(reuseHint);
         this.similarityFunction = similarityFunction;
+        this.reuseHint = reuseHint;
     }
 
     /**
@@ -79,7 +85,7 @@ final class DirectIOFloatVectorValues extends FloatVectorValues {
      * same on-disk vector size. A mismatch means the source was verified against a different field or a
      * different segment generation and must not be used, so the seam falls back.
      */
-    static boolean isCompatible(final FloatVectorValues values, final DirectIOVectorSource source) {
+    static boolean isCompatible(final FloatVectorValues values, final VectorLoaderSource source) {
         return source.size() == values.size()
             && source.dimension() == values.dimension()
             && source.vectorByteLength() == values.getVectorByteLength();
@@ -87,16 +93,16 @@ final class DirectIOFloatVectorValues extends FloatVectorValues {
 
     @Override
     public float[] vectorValue(final int ord) throws IOException {
-        return reader.read(ord);
+        return loader.read(ord);
     }
 
     /**
-     * Covariant on purpose: {@link #scorer} needs the copy's {@link DirectIOVectorSource.Reader} to stage
+     * Covariant on purpose: {@link #scorer} needs the copy's {@link VectorLoaderSource.Loader} to stage
      * read-ahead into, and the {@link FloatVectorValues} this overrides cannot express that.
      */
     @Override
     public DirectIOFloatVectorValues copy() throws IOException {
-        return new DirectIOFloatVectorValues(delegate.copy(), source, similarityFunction);
+        return new DirectIOFloatVectorValues(delegate.copy(), source, similarityFunction, reuseHint);
     }
 
     @Override
@@ -142,19 +148,20 @@ final class DirectIOFloatVectorValues extends FloatVectorValues {
      * <p>{@code rescorer(float[])} inherits this, because {@link FloatVectorValues#rescorer(float[])}
      * delegates to {@code scorer}. The rescore path is the only caller that reaches here.
      *
-     * <p>The scorer Lucene builds is then wrapped in a {@link PrefetchingRandomVectorScorer} over the
-     * copy's own reader, which is what turns the per-vector blocking reads into a pipeline. The wrapper
-     * cannot change a score — see its javadoc — so this is a latency change and not a results change.
+     * <p>When the copy's loader also implements the staging seam, the scorer Lucene builds is wrapped in a
+     * {@link PrefetchingRandomVectorScorer} over it, which is what turns the per-vector blocking reads into a
+     * pipeline. The wrapper cannot change a score — see its javadoc — so this is a latency change and not a
+     * results change, and a loader that offers no staging simply is not wrapped.
      */
     @Override
     public VectorScorer scorer(final float[] target) throws IOException {
         final DirectIOFloatVectorValues scoringCopy = copy();
         final DocIndexIterator iterator = scoringCopy.iterator();
-        final RandomVectorScorer randomVectorScorer = new PrefetchingRandomVectorScorer(
-            FlatVectorScorerUtil.getLucene99FlatVectorsScorer().getRandomVectorScorer(similarityFunction, scoringCopy, target),
-            scoringCopy.reader,
-            scoringCopy
-        );
+        final RandomVectorScorer luceneScorer = FlatVectorScorerUtil.getLucene99FlatVectorsScorer()
+            .getRandomVectorScorer(similarityFunction, scoringCopy, target);
+        final RandomVectorScorer randomVectorScorer = scoringCopy.loader instanceof VectorStagingArea stagingArea
+            ? new PrefetchingRandomVectorScorer(luceneScorer, stagingArea, scoringCopy)
+            : luceneScorer;
         return new VectorScorer() {
             @Override
             public float score() throws IOException {

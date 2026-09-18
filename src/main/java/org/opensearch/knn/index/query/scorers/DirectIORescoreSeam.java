@@ -9,8 +9,8 @@ import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FloatVectorValues;
 import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
-import org.opensearch.knn.index.codec.scorer.HasDirectIOVectorSource;
-import org.opensearch.knn.index.store.DirectIOVectorSource;
+import org.opensearch.knn.index.codec.scorer.HasVectorLoaderSource;
+import org.opensearch.knn.index.store.VectorLoaderSource;
 
 /**
  * The query side seam where the rescore path may swap Lucene's mmap backed full-precision vector
@@ -46,15 +46,16 @@ import org.opensearch.knn.index.store.DirectIOVectorSource;
  * </ol>
  *
  * <h2>What the engaged branch does</h2>
- * It asks the values for a {@link org.opensearch.knn.index.store.DirectIOVectorSource} through
- * {@link HasDirectIOVectorSource} and, if it gets one, wraps them in {@link DirectIOFloatVectorValues} so
- * every vector the rescorer reads comes off the device rather than out of the page cache. Three further
- * things send a query back to the default path, and none of them is an error: values that name no source
- * (any other vector format), a source that could not be opened or verified (a compound segment, a
- * filesystem that refuses {@code O_DIRECT}), and a source whose shape does not match the values.
+ * It asks the values for a {@link VectorLoaderSource} through {@link HasVectorLoaderSource} and, if it gets
+ * one, wraps them in {@link DirectIOFloatVectorValues} so every vector the rescorer reads comes through that
+ * seam rather than out of the page cache. Three further things send a query back to the default path, and
+ * none of them is an error: values that name no source (any other vector format), a source that could not be
+ * established or verified (a compound segment, a filesystem that refuses {@code O_DIRECT}), and a source
+ * whose shape does not match the values.
  *
- * <p>Reads are still one synchronous {@code pread} per vector here. The parallel fetch that makes that
- * competitive is the next phase; the bar for this one is that the ranking is unchanged.
+ * <p>This class knows nothing about {@code O_DIRECT}. It decides <em>whether</em> a read is a rescore read
+ * and hands the mode down as a reuse hint; <em>how</em> the bytes arrive is the loader seam's business, and
+ * the seam's one implementation today happens to use {@code O_DIRECT}.
  */
 @Log4j2
 public final class DirectIORescoreSeam {
@@ -98,19 +99,19 @@ public final class DirectIORescoreSeam {
         if (isEngaged(vectorScorerMode, radialSearch) == false) {
             return values;
         }
-        if ((values instanceof HasDirectIOVectorSource) == false) {
+        if ((values instanceof HasVectorLoaderSource) == false) {
             // Every other vector format keeps the default path. This is not a gap to close later: the fp32
             // .vec rescore chain the project measures resolves to values that do implement it, and a format
             // that does not is one whose file layout has not been verified.
             log.debug(
-                "[KNN] Direct I/O rescore seam declined field [{}]: values [{}] name no Direct I/O source",
+                "[KNN] Direct I/O rescore seam declined field [{}]: values [{}] name no vector loader source",
                 fieldInfo.name,
                 values.getClass().getName()
             );
             return values;
         }
 
-        final DirectIOVectorSource source = ((HasDirectIOVectorSource) values).directIOVectorSource();
+        final VectorLoaderSource source = ((HasVectorLoaderSource) values).vectorLoaderSource();
         if (source == null) {
             // The source logs its own reason once per segment; a compound segment or a filesystem that
             // refuses O_DIRECT lands here on every query and must stay cheap and quiet.
@@ -132,11 +133,13 @@ public final class DirectIORescoreSeam {
         }
 
         log.debug(
-            "[KNN] Direct I/O rescore seam engaged for field [{}], values [{}], reading [{}]",
+            "[KNN] Direct I/O rescore seam engaged for field [{}], values [{}], reading through [{}]",
             fieldInfo.name,
             values.getClass().getName(),
-            source.path()
+            source
         );
-        return new DirectIOFloatVectorValues(values, source, fieldInfo.getVectorSimilarityFunction());
+        // The mode goes down as well as gating on it: it is the loader seam's reuse hint, and RESCORE is the
+        // only value the gate above lets through.
+        return new DirectIOFloatVectorValues(values, source, fieldInfo.getVectorSimilarityFunction(), vectorScorerMode);
     }
 }

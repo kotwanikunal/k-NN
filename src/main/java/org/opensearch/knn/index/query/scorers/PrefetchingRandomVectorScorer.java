@@ -9,14 +9,14 @@ import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.hnsw.HasKnnVectorValues;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
-import org.opensearch.knn.index.store.DirectIOVectorSource;
+import org.opensearch.knn.index.store.VectorStagingArea;
 
 import java.io.IOException;
 
 /**
- * The staging half of the rescore seam: a {@link RandomVectorScorer} that, before scoring a batch, hands
- * the batch's ordinals to the {@link DirectIOVectorSource.Reader} the scores will be read through, so those
- * reads can be in flight by the time they are needed.
+ * The query side of the staging seam: a {@link RandomVectorScorer} that, before scoring a batch, hands the
+ * batch's ordinals to the {@link VectorStagingArea} the scores will be read through, so those reads can be in
+ * flight by the time they are needed.
  *
  * <h2>Why {@code bulkScore} is the right place, and the only one</h2>
  * Read ahead needs to know what is coming, and on the rescore path exactly one call knows. Scoring is
@@ -35,41 +35,37 @@ import java.io.IOException;
  * call in front of it.
  *
  * <h2>Why the window is not the batch</h2>
- * {@link #bulkScore} declares all {@code numOrds} ordinals, but {@link DirectIOVectorSource.Reader#stage}
- * only puts a window of them in flight and refills as they are consumed. Offering the whole batch at once
+ * {@link #bulkScore} declares all {@code numOrds} ordinals, but {@link VectorStagingArea#stage} is free to
+ * put only a window of them in flight and refill as they are consumed, and the one implementation does. Offering the whole batch at once
  * is measured-worse, not merely wasteful: a 200-wide fan-out measured p90 2.2x and p99 2.0x worse than a
  * 64-wide one, because the device queue holds 63 requests and everything past that queues in software while
  * still competing for the same completion order.
  *
- * <p>Staging is advisory. If it does not happen, for any of the reasons {@code stage} lists, the delegate
- * still scores the same ordinals from the same file and gets the same floats — just one blocking read at a
- * time. So this class cannot change a score, only when the bytes for it arrive.
+ * <p>Staging is advisory, which {@link VectorStagingArea} states as its contract: if it does not happen, the
+ * delegate still scores the same ordinals through the same loader and gets the same floats — just one
+ * blocking read at a time. So this class cannot change a score, only when the bytes for it arrive.
  */
 final class PrefetchingRandomVectorScorer implements RandomVectorScorer, HasKnnVectorValues {
 
     private final RandomVectorScorer delegate;
-    private final DirectIOVectorSource.Reader reader;
+    private final VectorStagingArea stagingArea;
     private final KnnVectorValues values;
 
     /**
-     * @param delegate the scorer that does the arithmetic, over {@code values}
-     * @param reader   the reader {@code values} reads through, whose ring is being staged
-     * @param values   the values {@code delegate} scores over, re-exposed because
-     *                 {@code AbstractRandomVectorScorer} exposes it and wrapping must not take that away
+     * @param delegate    the scorer that does the arithmetic, over {@code values}
+     * @param stagingArea the staging seam of the loader {@code values} reads through
+     * @param values      the values {@code delegate} scores over, re-exposed because
+     *                    {@code AbstractRandomVectorScorer} exposes it and wrapping must not take that away
      */
-    PrefetchingRandomVectorScorer(
-        final RandomVectorScorer delegate,
-        final DirectIOVectorSource.Reader reader,
-        final KnnVectorValues values
-    ) {
+    PrefetchingRandomVectorScorer(final RandomVectorScorer delegate, final VectorStagingArea stagingArea, final KnnVectorValues values) {
         this.delegate = delegate;
-        this.reader = reader;
+        this.stagingArea = stagingArea;
         this.values = values;
     }
 
     @Override
     public float bulkScore(final int[] ords, final float[] scores, final int numOrds) throws IOException {
-        reader.stage(ords, numOrds);
+        stagingArea.stage(ords, numOrds);
         return delegate.bulkScore(ords, scores, numOrds);
     }
 

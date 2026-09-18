@@ -16,6 +16,8 @@ import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.util.Bits;
 import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.index.store.DirectIOVectorSource;
+import org.opensearch.knn.index.store.VectorLoaderSource;
+import org.opensearch.knn.index.store.VectorStagingArea;
 import org.opensearch.knn.index.vectorvalues.TestVectorValues;
 
 import java.util.List;
@@ -54,33 +56,46 @@ public class DirectIOFloatVectorValuesTests extends KNNTestCase {
     }
 
     /**
-     * A source of the same shape as {@link #delegate()} whose reader answers {@link #SOURCE_VECTORS}. Each
-     * {@code newReader()} call yields a distinct reader, matching the real source's contract that every
-     * reader owns its own buffer.
+     * A source of the same shape as {@link #delegate()} whose loaders answer {@link #SOURCE_VECTORS}. Each
+     * {@code newLoader} call yields a distinct loader, matching the seam's contract that every loader owns
+     * its own per-read state. The loaders are {@link DirectIOVectorSource.Reader} mocks, so they implement
+     * the staging seam as well as the loader seam.
      */
     @SneakyThrows
-    private DirectIOVectorSource stubSource() {
-        final DirectIOVectorSource source = mock(DirectIOVectorSource.class);
+    private VectorLoaderSource stubSource() {
+        return stubSource(new java.util.ArrayList<>());
+    }
+
+    /** As {@link #stubSource()}, collecting each loader it hands out in {@code loaders}. */
+    @SneakyThrows
+    private VectorLoaderSource stubSource(final List<DirectIOVectorSource.Reader> loaders) {
+        final VectorLoaderSource source = mock(VectorLoaderSource.class);
         when(source.size()).thenReturn(DELEGATE_VECTORS.size());
         when(source.dimension()).thenReturn(DIMENSION);
         when(source.vectorByteLength()).thenReturn(DIMENSION * Float.BYTES);
-        when(source.newReader()).thenAnswer(invocation -> {
+        when(source.newLoader(org.mockito.ArgumentMatchers.any())).thenAnswer(invocation -> {
             final DirectIOVectorSource.Reader reader = mock(DirectIOVectorSource.Reader.class);
             when(reader.read(org.mockito.ArgumentMatchers.anyInt())).thenAnswer(read -> SOURCE_VECTORS[(int) read.getArgument(0)]);
+            loaders.add(reader);
             return reader;
         });
         return source;
     }
 
     private DirectIOFloatVectorValues values() {
-        return new DirectIOFloatVectorValues(delegate(), stubSource(), VectorSimilarityFunction.EUCLIDEAN);
+        return new DirectIOFloatVectorValues(delegate(), stubSource(), VectorSimilarityFunction.EUCLIDEAN, VectorScorerMode.RESCORE);
     }
 
     @SneakyThrows
     public void testVectorValueComesFromTheSourceAndNotFromTheDelegate() {
         final FloatVectorValues delegate = mock(FloatVectorValues.class);
-        final DirectIOVectorSource source = stubSource();
-        final DirectIOFloatVectorValues values = new DirectIOFloatVectorValues(delegate, source, VectorSimilarityFunction.EUCLIDEAN);
+        final VectorLoaderSource source = stubSource();
+        final DirectIOFloatVectorValues values = new DirectIOFloatVectorValues(
+            delegate,
+            source,
+            VectorSimilarityFunction.EUCLIDEAN,
+            VectorScorerMode.RESCORE
+        );
 
         for (int ord = 0; ord < SOURCE_VECTORS.length; ord++) {
             assertArrayEquals("ordinal " + ord, SOURCE_VECTORS[ord], values.vectorValue(ord), 0.0f);
@@ -103,7 +118,12 @@ public class DirectIOFloatVectorValuesTests extends KNNTestCase {
         when(delegate.getAcceptOrds(acceptDocs)).thenReturn(acceptOrds);
         when(delegate.iterator()).thenReturn(iterator);
 
-        final DirectIOFloatVectorValues values = new DirectIOFloatVectorValues(delegate, stubSource(), VectorSimilarityFunction.EUCLIDEAN);
+        final DirectIOFloatVectorValues values = new DirectIOFloatVectorValues(
+            delegate,
+            stubSource(),
+            VectorSimilarityFunction.EUCLIDEAN,
+            VectorScorerMode.RESCORE
+        );
 
         assertEquals(768, values.dimension());
         assertEquals(1_000_000, values.size());
@@ -119,20 +139,25 @@ public class DirectIOFloatVectorValuesTests extends KNNTestCase {
      * that shared a reader would share the reader's buffer. Every copy must take a fresh reader.
      */
     @SneakyThrows
-    public void testCopyTakesAFreshReaderAndAFreshDelegateCopy() {
+    public void testCopyTakesAFreshLoaderAndAFreshDelegateCopy() {
         final FloatVectorValues delegate = mock(FloatVectorValues.class);
         final FloatVectorValues delegateCopy = mock(FloatVectorValues.class);
         when(delegate.copy()).thenReturn(delegateCopy);
-        final DirectIOVectorSource source = stubSource();
+        final VectorLoaderSource source = stubSource();
 
-        final DirectIOFloatVectorValues values = new DirectIOFloatVectorValues(delegate, source, VectorSimilarityFunction.EUCLIDEAN);
+        final DirectIOFloatVectorValues values = new DirectIOFloatVectorValues(
+            delegate,
+            source,
+            VectorSimilarityFunction.EUCLIDEAN,
+            VectorScorerMode.RESCORE
+        );
         final FloatVectorValues copy = values.copy();
 
         assertNotSame(values, copy);
         assertTrue(copy instanceof DirectIOFloatVectorValues);
         verify(delegate).copy();
-        // one reader for the original, one for the copy
-        verify(source, times(2)).newReader();
+        // one loader for the original, one for the copy, both carrying the reuse hint the values were built with
+        verify(source, times(2)).newLoader(VectorScorerMode.RESCORE);
         // and the copy still reads through the source
         assertArrayEquals(SOURCE_VECTORS[1], copy.vectorValue(1), 0.0f);
     }
@@ -193,19 +218,15 @@ public class DirectIOFloatVectorValuesTests extends KNNTestCase {
     @SneakyThrows
     public void testBulkScoringStagesTheBatchOnTheReaderItScoresThrough() {
         final List<DirectIOVectorSource.Reader> readers = new java.util.ArrayList<>();
-        final DirectIOVectorSource source = mock(DirectIOVectorSource.class);
-        when(source.size()).thenReturn(DELEGATE_VECTORS.size());
-        when(source.dimension()).thenReturn(DIMENSION);
-        when(source.vectorByteLength()).thenReturn(DIMENSION * Float.BYTES);
-        when(source.newReader()).thenAnswer(invocation -> {
-            final DirectIOVectorSource.Reader reader = mock(DirectIOVectorSource.Reader.class);
-            when(reader.read(org.mockito.ArgumentMatchers.anyInt())).thenAnswer(read -> SOURCE_VECTORS[(int) read.getArgument(0)]);
-            readers.add(reader);
-            return reader;
-        });
+        final VectorLoaderSource source = stubSource(readers);
 
         final float[] target = { 1.0f, 2.0f, 3.0f, 4.0f };
-        final DirectIOFloatVectorValues values = new DirectIOFloatVectorValues(delegate(), source, VectorSimilarityFunction.EUCLIDEAN);
+        final DirectIOFloatVectorValues values = new DirectIOFloatVectorValues(
+            delegate(),
+            source,
+            VectorSimilarityFunction.EUCLIDEAN,
+            VectorScorerMode.RESCORE
+        );
         final VectorScorer scorer = values.scorer(target);
 
         final DocAndFloatFeatureBuffer buffer = new DocAndFloatFeatureBuffer();
@@ -226,6 +247,48 @@ public class DirectIOFloatVectorValuesTests extends KNNTestCase {
         verify(readers.get(0), never()).stage(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyInt());
     }
 
+    /**
+     * The loader seam and the staging seam are separate interfaces, and this is what that separation buys: a
+     * loader that offers no read ahead - which is what a cache at the loader seam would most likely be - is
+     * scored without it rather than refused. If {@code scorer} ever required the staging seam, introducing
+     * such a loader would mean rewriting read ahead instead of implementing an interface beside it.
+     */
+    @SneakyThrows
+    public void testAStagelessLoaderIsScoredWithoutStagingRatherThanRefused() {
+        final VectorLoaderSource source = mock(VectorLoaderSource.class);
+        when(source.size()).thenReturn(DELEGATE_VECTORS.size());
+        when(source.dimension()).thenReturn(DIMENSION);
+        when(source.vectorByteLength()).thenReturn(DIMENSION * Float.BYTES);
+        // mock of the seam interface alone, so it is NOT a VectorStagingArea
+        when(source.newLoader(org.mockito.ArgumentMatchers.any())).thenAnswer(invocation -> {
+            final VectorLoaderSource.Loader loader = mock(VectorLoaderSource.Loader.class);
+            when(loader.read(org.mockito.ArgumentMatchers.anyInt())).thenAnswer(read -> SOURCE_VECTORS[(int) read.getArgument(0)]);
+            return loader;
+        });
+        assertFalse(VectorStagingArea.class.isAssignableFrom(VectorLoaderSource.Loader.class));
+
+        final float[] target = { 1.0f, 2.0f, 3.0f, 4.0f };
+        final DirectIOFloatVectorValues values = new DirectIOFloatVectorValues(
+            delegate(),
+            source,
+            VectorSimilarityFunction.EUCLIDEAN,
+            VectorScorerMode.RESCORE
+        );
+
+        final DocAndFloatFeatureBuffer buffer = new DocAndFloatFeatureBuffer();
+        values.scorer(target).bulk(null).nextDocsAndScores(DocIdSetIterator.NO_MORE_DOCS, null, buffer);
+
+        assertEquals(SOURCE_VECTORS.length, buffer.size);
+        for (int ord = 0; ord < SOURCE_VECTORS.length; ord++) {
+            assertEquals(
+                "ordinal " + ord,
+                VectorSimilarityFunction.EUCLIDEAN.compare(target, SOURCE_VECTORS[ord]),
+                buffer.features[ord],
+                1e-6f
+            );
+        }
+    }
+
     @SneakyThrows
     public void testIsCompatibleWhenShapesAgree() {
         assertTrue(DirectIOFloatVectorValues.isCompatible(delegate(), stubSource()));
@@ -237,15 +300,15 @@ public class DirectIOFloatVectorValuesTests extends KNNTestCase {
      */
     @SneakyThrows
     public void testIsIncompatibleOnEveryShapeMismatch() {
-        final DirectIOVectorSource wrongSize = stubSource();
+        final VectorLoaderSource wrongSize = stubSource();
         when(wrongSize.size()).thenReturn(DELEGATE_VECTORS.size() + 1);
         assertFalse("size", DirectIOFloatVectorValues.isCompatible(delegate(), wrongSize));
 
-        final DirectIOVectorSource wrongDimension = stubSource();
+        final VectorLoaderSource wrongDimension = stubSource();
         when(wrongDimension.dimension()).thenReturn(DIMENSION + 1);
         assertFalse("dimension", DirectIOFloatVectorValues.isCompatible(delegate(), wrongDimension));
 
-        final DirectIOVectorSource wrongByteLength = stubSource();
+        final VectorLoaderSource wrongByteLength = stubSource();
         when(wrongByteLength.vectorByteLength()).thenReturn(DIMENSION * Float.BYTES + 4);
         assertFalse("vectorByteLength", DirectIOFloatVectorValues.isCompatible(delegate(), wrongByteLength));
     }

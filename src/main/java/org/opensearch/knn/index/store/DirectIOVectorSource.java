@@ -8,8 +8,8 @@ package org.opensearch.knn.index.store;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.index.FloatVectorValues;
 import org.opensearch.knn.index.KNNSettings;
+import org.opensearch.knn.index.query.scorers.VectorScorerMode;
 
-import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -33,16 +33,25 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * ordinal, it returns that vector's floats, read with {@code O_DIRECT} so the bytes never enter the
  * page cache.
  *
- * <p>This is the loader half of the rescore seam. It is deliberately <em>not</em> an
- * {@link org.apache.lucene.store.IndexInput}: Lucene's own {@code DirectIOIndexInput} is a sequential
- * stream with a single internal buffer, and this path wants independent aligned buffers per query thread
- * over a shared file handle. The handle is opened once per segment and shared; the buffers are owned by a
- * {@link Reader}, one reader per scorer.
+ * <p>This is the only implementation of the {@link VectorLoaderSource} loader seam, and its {@link Reader}
+ * implements both that seam's {@link VectorLoaderSource.Loader} and the {@link VectorStagingArea} staging
+ * seam. Those two interfaces, not this class, are what the query path is written against; read their javadoc
+ * for the contracts and for why a future cache belongs at the former and never at the latter.
+ *
+ * <p>It is deliberately <em>not</em> an {@link org.apache.lucene.store.IndexInput}: Lucene's own
+ * {@code DirectIOIndexInput} is a sequential stream with a single internal buffer, and this path wants
+ * independent aligned buffers per query thread over a shared file handle. The handle is opened once per
+ * segment and shared; the buffers are owned by a {@link Reader}, one reader per scorer.
  *
  * <p>A {@link Reader} can also be told what it is about to be asked for, via {@link Reader#stage}, and
  * will then keep a rolling window of those reads in flight on {@link DirectIOReadPool}. That read-ahead is
  * what replaces the {@code madvise} prefetch the mmap path got for free and {@code O_DIRECT} necessarily
  * removes; without it a rescore query pays one serial device round trip per candidate.
+ *
+ * <p>The {@link VectorScorerMode} reuse hint {@link #newLoader} carries is <b>ignored here</b>, and that is
+ * the correct behaviour for this implementation rather than an omission: no read is retained past the single
+ * score that consumes it, so there is no retention decision for the hint to inform. It is recorded on the
+ * {@link Reader} and reported by {@link Reader#reuseHint()} so that the hint arriving remains observable.
  *
  * <h2>Why the file region has to be discovered rather than asked for</h2>
  * The seam holds Lucene's mmap-backed slice of the vector region, and neither {@code IndexInput} nor
@@ -77,7 +86,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * mmap path while the JVM is out of direct memory hides a misconfiguration the operator has to fix.
  */
 @Log4j2
-public final class DirectIOVectorSource implements Closeable {
+public final class DirectIOVectorSource implements VectorLoaderSource {
 
     /** Length of a {@code CodecUtil} footer: magic, algorithm id and a long checksum. */
     static final int FOOTER_LENGTH = 16;
@@ -232,7 +241,7 @@ public final class DirectIOVectorSource implements Closeable {
      * the wrong length fails the last.
      */
     private boolean verifyAgainst(final FloatVectorValues reference) throws IOException {
-        final Reader reader = newReader();
+        final Reader reader = newLoader(VectorScorerMode.RESCORE);
         for (final int ord : size == 1 ? new int[] { 0 } : new int[] { 0, size - 1 }) {
             final float[] expected = reference.vectorValue(ord).clone();
             final float[] actual = reader.read(ord);
@@ -280,13 +289,21 @@ public final class DirectIOVectorSource implements Closeable {
      *
      * <p>Buffers are released when the reader becomes unreachable, by the same {@code Cleaner} that
      * releases any direct buffer.
+     *
+     * <p>This class is where the loader seam and the staging seam meet in this implementation: it is both a
+     * {@link VectorLoaderSource.Loader} and a {@link VectorStagingArea}. That they are two interfaces on one
+     * object here is an implementation detail and not a licence to merge them — see
+     * {@link VectorStagingArea}.
      */
-    public final class Reader {
+    public final class Reader implements VectorLoaderSource.Loader, VectorStagingArea {
 
         /** Buffer for reads that are not served from the ring. Allocated on the first such read. */
         private ByteBuffer syncBuffer;
         private FloatBuffer syncFloats;
         private final float[] value = new float[dimension];
+
+        /** Recorded, reported, and otherwise unused; see the class javadoc for why that is correct here. */
+        private final VectorScorerMode reuseHint;
 
         /**
          * Ring slots, or null before the first staged batch. Slices of one aligned allocation, which they
@@ -312,7 +329,14 @@ public final class DirectIOVectorSource implements Closeable {
         private int nextSubmit;
         private int nextConsume;
 
-        private Reader() {}
+        private Reader(final VectorScorerMode reuseHint) {
+            this.reuseHint = reuseHint;
+        }
+
+        @Override
+        public VectorScorerMode reuseHint() {
+            return reuseHint;
+        }
 
         /**
          * Declares that {@code ords[0..count)} are about to be read, in that order, and puts a window of
@@ -325,6 +349,7 @@ public final class DirectIOVectorSource implements Closeable {
          * @param ords  ordinals in the order they will be read; only the first {@code count} are looked at
          * @param count how many of {@code ords} are meaningful
          */
+        @Override
         public void stage(final int[] ords, final int count) {
             // Any previous batch has to be fully quiesced before its slots can be handed to new reads:
             // cancel(false) does not stop a read that has already started writing into a slot.
@@ -372,6 +397,7 @@ public final class DirectIOVectorSource implements Closeable {
          * @return the vector's floats
          * @throws IOException if the read fails or returns too few bytes
          */
+        @Override
         public float[] read(final int ord) throws IOException {
             if (ord < 0 || ord >= size) {
                 throw new IllegalArgumentException(
@@ -634,22 +660,31 @@ public final class DirectIOVectorSource implements Closeable {
         }
     }
 
-    /** A new single-threaded reader over this source. Cheap: the buffer is allocated on first use. */
-    public Reader newReader() {
-        return new Reader();
+    /**
+     * A new single-threaded reader over this source. Cheap: the buffer is allocated on first use.
+     *
+     * <p>Covariant on {@link VectorLoaderSource#newLoader} so that callers holding a concrete source — the
+     * staging tests, and {@link #verifyAgainst} — keep the {@link Reader} type without a cast. The query
+     * path deliberately does not: it holds the seam types.
+     *
+     * @param reuseHint recorded and reported, not acted on; see the class javadoc
+     */
+    @Override
+    public Reader newLoader(final VectorScorerMode reuseHint) {
+        return new Reader(reuseHint);
     }
 
-    /** Number of vectors in the region this source serves. */
+    @Override
     public int size() {
         return size;
     }
 
-    /** Dimension of the vectors this source serves. */
+    @Override
     public int dimension() {
         return dimension;
     }
 
-    /** On-disk size of one vector, in bytes. */
+    @Override
     public int vectorByteLength() {
         return vectorByteLength;
     }
@@ -669,7 +704,7 @@ public final class DirectIOVectorSource implements Closeable {
         return blockSize;
     }
 
-    /** The file this source reads. */
+    /** The file this source reads. Not part of the loader seam — only this implementation has a file. */
     public Path path() {
         return path;
     }
@@ -677,6 +712,12 @@ public final class DirectIOVectorSource implements Closeable {
     @Override
     public void close() throws IOException {
         channel.close();
+    }
+
+    /** Names the file, so a log line about a source identifies which one without reaching for {@link #path}. */
+    @Override
+    public String toString() {
+        return "DirectIOVectorSource[" + path + "]";
     }
 
     /**

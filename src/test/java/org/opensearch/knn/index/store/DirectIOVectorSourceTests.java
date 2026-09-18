@@ -9,6 +9,7 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 import lombok.SneakyThrows;
 import org.apache.lucene.index.FloatVectorValues;
 import org.opensearch.knn.KNNTestCase;
+import org.opensearch.knn.index.query.scorers.VectorScorerMode;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -130,7 +131,7 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
             assertEquals(DIMENSION, source.dimension());
             assertEquals(VECTOR_BYTES, source.vectorByteLength());
 
-            final DirectIOVectorSource.Reader reader = source.newReader();
+            final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
             for (int ord = 0; ord < vectors.size(); ord++) {
                 assertArrayEquals("ordinal " + ord, vectors.get(ord), reader.read(ord), 0.0f);
             }
@@ -157,7 +158,7 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
             assertNotNull("open should have succeeded on a well-formed file", source);
             assertEquals(ALIGNED_HEADER_LENGTH, source.baseOffset());
 
-            final DirectIOVectorSource.Reader reader = source.newReader();
+            final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
             for (int ord = 0; ord < vectors.size(); ord++) {
                 assertArrayEquals("ordinal " + ord, vectors.get(ord), reader.read(ord), 0.0f);
             }
@@ -179,7 +180,7 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
 
         try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
             assertNotNull(source);
-            final DirectIOVectorSource.Reader reader = source.newReader();
+            final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
             final int[] ords = sparseOrdinals(200, 7, vectors.size());
             reader.stage(ords, ords.length);
             assertReadsInOrder(reader, ords, vectors);
@@ -212,13 +213,56 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
 
         try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
             assertNotNull(source);
-            final DirectIOVectorSource.Reader first = source.newReader();
-            final DirectIOVectorSource.Reader second = source.newReader();
+            final DirectIOVectorSource.Reader first = source.newLoader(VectorScorerMode.RESCORE);
+            final DirectIOVectorSource.Reader second = source.newLoader(VectorScorerMode.RESCORE);
             final float[] fromFirst = first.read(7);
             final float[] fromSecond = second.read(31);
             assertNotSame(fromFirst, fromSecond);
             assertArrayEquals(vectors.get(7), fromFirst, 0.0f);
             assertArrayEquals(vectors.get(31), fromSecond, 0.0f);
+        }
+    }
+
+    /**
+     * This is the one implementation that fills both seams at once, and that is a property of the
+     * implementation rather than of the seams: the loader seam says how bytes for an ordinal arrive and the
+     * staging seam says which ordinals are coming, and a cache introduced at the loader seam would implement
+     * only the first. Asserted structurally so that splitting {@code Reader} into two objects later - or
+     * fusing the two interfaces into one, which is what the design forbids - is a test failure rather than a
+     * silent change of shape.
+     */
+    public void testTheReaderFillsBothSeamsWhileTheSeamsThemselvesStaySeparate() {
+        assertTrue(VectorLoaderSource.Loader.class.isAssignableFrom(DirectIOVectorSource.Reader.class));
+        assertTrue(VectorStagingArea.class.isAssignableFrom(DirectIOVectorSource.Reader.class));
+        assertTrue(VectorLoaderSource.class.isAssignableFrom(DirectIOVectorSource.class));
+        // Neither seam may require the other, or a loader without read-ahead could not exist.
+        assertFalse(VectorStagingArea.class.isAssignableFrom(VectorLoaderSource.Loader.class));
+        assertFalse(VectorLoaderSource.Loader.class.isAssignableFrom(VectorStagingArea.class));
+    }
+
+    /**
+     * The reuse hint is carried, not obeyed: this implementation retains nothing past the single consuming
+     * score, so every mode reads identically, and what it owes the seam is only to report the hint it was
+     * built with. A future cache at this seam is the caller of {@code reuseHint()} that matters - it is the
+     * thing that must not cache {@code RESCORE} reads - so the hint has to survive the trip here, where it
+     * is easy to drop as an unused constructor argument.
+     */
+    @SneakyThrows
+    public void testEachLoaderReportsTheReuseHintItWasBuiltWith() {
+        assumeDirectIOWorksHere();
+        final List<float[]> vectors = randomVectors(8);
+        final Path path = writeVectorFile(vectors, 0);
+
+        try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
+            assertNotNull(source);
+            final DirectIOVectorSource.Reader rescore = source.newLoader(VectorScorerMode.RESCORE);
+            final DirectIOVectorSource.Reader score = source.newLoader(VectorScorerMode.SCORE);
+
+            assertSame(VectorScorerMode.RESCORE, rescore.reuseHint());
+            assertSame(VectorScorerMode.SCORE, score.reuseHint());
+            // and the hint changes nothing about the bytes, because nothing is retained either way
+            assertArrayEquals(vectors.get(3), rescore.read(3), 0.0f);
+            assertArrayEquals(vectors.get(3), score.read(3), 0.0f);
         }
     }
 
@@ -266,7 +310,7 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
         final Path path = writeVectorFile(vectors, 0);
         try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
             assertNotNull(source);
-            assertArrayEquals(vectors.get(0), source.newReader().read(0), 0.0f);
+            assertArrayEquals(vectors.get(0), source.newLoader(VectorScorerMode.RESCORE).read(0), 0.0f);
         }
     }
 
@@ -277,7 +321,7 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
         final Path path = writeVectorFile(vectors, 0);
         try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
             assertNotNull(source);
-            final DirectIOVectorSource.Reader reader = source.newReader();
+            final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
             expectThrows(IllegalArgumentException.class, () -> reader.read(-1));
             expectThrows(IllegalArgumentException.class, () -> reader.read(16));
         }
@@ -290,7 +334,7 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
         final Path path = writeVectorFile(vectors, 0);
         final DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors));
         assertNotNull(source);
-        final DirectIOVectorSource.Reader reader = source.newReader();
+        final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
         source.close();
         expectThrows(Exception.class, () -> reader.read(0));
     }
@@ -330,7 +374,7 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
 
         try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
             assertNotNull(source);
-            final DirectIOVectorSource.Reader reader = source.newReader();
+            final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
             // 200 is firstPassK on the benchmark index, i.e. a whole rescore candidate set.
             final int[] ords = sparseOrdinals(200, 7, vectors.size());
             reader.stage(ords, ords.length);
@@ -347,7 +391,7 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
 
         try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
             assertNotNull(source);
-            final DirectIOVectorSource.Reader reader = source.newReader();
+            final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
             final int[] ords = { 61, 0, 33, 7, 12 };
             reader.stage(ords, ords.length);
             assertReadsInOrder(reader, ords, vectors);
@@ -366,7 +410,7 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
 
         try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
             assertNotNull(source);
-            final DirectIOVectorSource.Reader reader = source.newReader();
+            final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
             // The tail is out of range on purpose: staging it would decline the batch, and reading it would
             // throw. Neither may happen, because count says it is not part of this batch.
             final int[] ords = { 5, 9, 40, 12345, -3 };
@@ -388,7 +432,7 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
 
         try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
             assertNotNull(source);
-            final DirectIOVectorSource.Reader reader = source.newReader();
+            final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
             final int[] ords = sparseOrdinals(64, 9, vectors.size());
             reader.stage(ords, ords.length);
 
@@ -413,7 +457,7 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
 
         try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
             assertNotNull(source);
-            final DirectIOVectorSource.Reader reader = source.newReader();
+            final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
             for (int batch = 0; batch < 8; batch++) {
                 final int[] ords = sparseOrdinals(64, 7 + batch, vectors.size());
                 reader.stage(ords, ords.length);
@@ -439,7 +483,7 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
 
         try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
             assertNotNull(source);
-            final DirectIOVectorSource.Reader reader = source.newReader();
+            final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
             reader.stage(new int[] { 1, 2, 64 }, 3);
             assertArrayEquals(vectors.get(1), reader.read(1), 0.0f);
             expectThrows(IllegalArgumentException.class, () -> reader.read(64));
@@ -457,7 +501,7 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
 
         try (DirectIOVectorSource source = DirectIOVectorSource.open(path, reference(vectors))) {
             assertNotNull(source);
-            final DirectIOVectorSource.Reader reader = source.newReader();
+            final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
             reader.stage(null, 8);
             reader.stage(new int[] { 3 }, 1);
             reader.stage(new int[] { 3, 4 }, 0);
@@ -489,7 +533,7 @@ public class DirectIOVectorSourceTests extends KNNTestCase {
                     final int stride = 3 + t;
                     running.add(drivers.submit(() -> {
                         start.await();
-                        final DirectIOVectorSource.Reader reader = source.newReader();
+                        final DirectIOVectorSource.Reader reader = source.newLoader(VectorScorerMode.RESCORE);
                         for (int round = 0; round < 20; round++) {
                             final int[] ords = sparseOrdinals(64, stride, vectors.size());
                             reader.stage(ords, ords.length);

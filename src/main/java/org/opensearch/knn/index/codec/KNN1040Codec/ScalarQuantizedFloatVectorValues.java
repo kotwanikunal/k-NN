@@ -12,9 +12,9 @@ import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.search.VectorScorer;
 import org.opensearch.common.Nullable;
-import org.opensearch.knn.index.codec.scorer.HasDirectIOVectorSource;
+import org.opensearch.knn.index.codec.scorer.HasVectorLoaderSource;
 import org.opensearch.knn.index.codec.scorer.HasFullPrecisionVectorValues;
-import org.opensearch.knn.index.store.DirectIOVectorSource;
+import org.opensearch.knn.index.store.VectorLoaderSource;
 
 import java.io.IOException;
 import java.util.function.Supplier;
@@ -38,7 +38,7 @@ import java.util.function.Supplier;
  * <p>For an empty vector segment, the quantized delegate may be {@code null}.
  */
 @Getter
-class ScalarQuantizedFloatVectorValues extends FloatVectorValues implements HasFullPrecisionVectorValues, HasDirectIOVectorSource {
+class ScalarQuantizedFloatVectorValues extends FloatVectorValues implements HasFullPrecisionVectorValues, HasVectorLoaderSource {
     /**
      * The full-precision float delegate (reads the {@code .vec} file).
      */
@@ -56,15 +56,15 @@ class ScalarQuantizedFloatVectorValues extends FloatVectorValues implements HasF
      */
     private final KnnVectorValues fullPrecisionVectorValues;
     /**
-     * Supplies the segment-scoped Direct I/O source for the {@code .vec} file, or {@code null} when this
-     * values object was built without one. Held as a supplier rather than a source so that nothing is
-     * opened until a Direct I/O rescore query asks: these values are constructed on every search, the
-     * source is owned by the reader, and the reader must not open a file handle on a node whose Direct I/O
-     * rescore flag is off.
+     * Supplies the segment-scoped loader seam for the {@code .vec} file, or {@code null} when this values
+     * object was built without one. Held as a supplier rather than a source so that nothing is established
+     * until a query that knows its reads have no reuse asks: these values are constructed on every search,
+     * the source is owned by the reader, and the reader must not open a file handle on a node whose Direct
+     * I/O rescore flag is off.
      */
     @Getter(lombok.AccessLevel.NONE)
     @Nullable
-    private final Supplier<DirectIOVectorSource> directIOVectorSourceSupplier;
+    private final Supplier<VectorLoaderSource> vectorLoaderSourceSupplier;
 
     ScalarQuantizedFloatVectorValues(final FloatVectorValues floatVectorValues, final QuantizedByteVectorValues quantizedVectorValues) {
         this(floatVectorValues, quantizedVectorValues, null);
@@ -73,22 +73,22 @@ class ScalarQuantizedFloatVectorValues extends FloatVectorValues implements HasF
     ScalarQuantizedFloatVectorValues(
         final FloatVectorValues floatVectorValues,
         final QuantizedByteVectorValues quantizedVectorValues,
-        @Nullable final Supplier<DirectIOVectorSource> directIOVectorSourceSupplier
+        @Nullable final Supplier<VectorLoaderSource> vectorLoaderSourceSupplier
     ) {
         this.floatVectorValues = floatVectorValues;
         this.quantizedVectorValues = quantizedVectorValues;
         this.fullPrecisionVectorValues = KNN1040ScalarQuantizedUtils.extractRawFloatVectorValues(floatVectorValues);
-        this.directIOVectorSourceSupplier = directIOVectorSourceSupplier;
+        this.vectorLoaderSourceSupplier = vectorLoaderSourceSupplier;
     }
 
     /**
-     * The Direct I/O source for the {@code .vec} vectors this wrapper serves through
-     * {@link #vectorValue(int)}, or {@code null} when there is none. Shares this wrapper's ordinal space,
-     * for the same reason {@link #getFullPrecisionVectorValues()} does.
+     * The loader seam for the {@code .vec} vectors this wrapper serves through {@link #vectorValue(int)}, or
+     * {@code null} when there is none. Shares this wrapper's ordinal space, for the same reason
+     * {@link #getFullPrecisionVectorValues()} does.
      */
     @Override
-    public DirectIOVectorSource directIOVectorSource() {
-        return directIOVectorSourceSupplier == null ? null : directIOVectorSourceSupplier.get();
+    public VectorLoaderSource vectorLoaderSource() {
+        return vectorLoaderSourceSupplier == null ? null : vectorLoaderSourceSupplier.get();
     }
 
     /**
@@ -124,7 +124,7 @@ class ScalarQuantizedFloatVectorValues extends FloatVectorValues implements HasF
         return new ScalarQuantizedFloatVectorValues(
             floatVectorValues.copy(),
             quantizedVectorValues == null ? null : quantizedVectorValues.copy(),
-            directIOVectorSourceSupplier
+            vectorLoaderSourceSupplier
         );
     }
 

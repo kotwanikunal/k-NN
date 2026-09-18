@@ -13,14 +13,16 @@ import org.mockito.Mock;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.index.KNNSettings;
-import org.opensearch.knn.index.codec.scorer.HasDirectIOVectorSource;
-import org.opensearch.knn.index.store.DirectIOVectorSource;
+import org.opensearch.knn.index.codec.scorer.HasVectorLoaderSource;
+import org.opensearch.knn.index.store.VectorLoaderSource;
 import org.opensearch.knn.index.vectorvalues.TestVectorValues;
 
 import java.util.List;
 
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.KNN_DIRECT_IO_RESCORE_ENABLED_SETTING;
 
@@ -138,7 +140,7 @@ public class DirectIORescoreSeamTests extends KNNTestCase {
      */
     public void testVectorValuesForRescore_whenSourceShapeDisagrees_thenReturnsSameInstance() {
         setFlag(true);
-        final DirectIOVectorSource source = source(SIZE + 1, DIMENSION, DIMENSION * Float.BYTES);
+        final VectorLoaderSource source = source(SIZE + 1, DIMENSION, DIMENSION * Float.BYTES);
         final FloatVectorValues values = new SourceNamingValues(source);
         assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, false, fieldInfo));
     }
@@ -164,6 +166,22 @@ public class DirectIORescoreSeamTests extends KNNTestCase {
     }
 
     /**
+     * The mode is both the gate and the loader seam's reuse hint, and the hint half is easy to drop: nothing
+     * in this plugin reads it, so only this assertion notices if it stops arriving. A future cache at the
+     * loader seam needs it to know that rescore reads have no reuse and must not be retained.
+     */
+    @SneakyThrows
+    public void testVectorValuesForRescore_whenEngaged_thenPassesTheModeDownAsTheReuseHint() {
+        setFlag(true);
+        when(fieldInfo.getVectorSimilarityFunction()).thenReturn(VectorSimilarityFunction.EUCLIDEAN);
+        final VectorLoaderSource source = source(SIZE, DIMENSION, DIMENSION * Float.BYTES);
+
+        DirectIORescoreSeam.vectorValuesForRescore(new SourceNamingValues(source), VectorScorerMode.RESCORE, false, fieldInfo);
+
+        verify(source).newLoader(VectorScorerMode.RESCORE);
+    }
+
+    /**
      * The same values that would be swapped with the flag on are handed straight back with it off. This is
      * the "flag off is identical to no seam at all" guarantee, asserted where it can actually fail.
      */
@@ -174,17 +192,24 @@ public class DirectIORescoreSeamTests extends KNNTestCase {
         assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, false, fieldInfo));
     }
 
-    /** A stub source of a given shape whose reader answers {@link #SOURCE_VECTOR} for every ordinal. */
+    /**
+     * A stub source of a given shape whose loaders answer {@link #SOURCE_VECTOR} for every ordinal.
+     * <p>
+     * Mocked as the {@link VectorLoaderSource} seam rather than as the Direct I/O implementation, which is
+     * itself an assertion: if the seam ever needed something only the implementation offers, this would stop
+     * compiling.
+     */
     @SneakyThrows
-    private static DirectIOVectorSource source(final int size, final int dimension, final int vectorByteLength) {
-        final DirectIOVectorSource source = mock(DirectIOVectorSource.class);
+    private static VectorLoaderSource source(final int size, final int dimension, final int vectorByteLength) {
+        final VectorLoaderSource source = mock(VectorLoaderSource.class);
         when(source.size()).thenReturn(size);
         when(source.dimension()).thenReturn(dimension);
         when(source.vectorByteLength()).thenReturn(vectorByteLength);
-        when(source.newReader()).thenAnswer(invocation -> {
-            final DirectIOVectorSource.Reader reader = mock(DirectIOVectorSource.Reader.class);
-            when(reader.read(anyInt())).thenReturn(SOURCE_VECTOR);
-            return reader;
+        when(source.newLoader(any())).thenAnswer(invocation -> {
+            final VectorLoaderSource.Loader loader = mock(VectorLoaderSource.Loader.class);
+            when(loader.read(anyInt())).thenReturn(SOURCE_VECTOR);
+            when(loader.reuseHint()).thenReturn(invocation.getArgument(0));
+            return loader;
         });
         return source;
     }
@@ -193,17 +218,17 @@ public class DirectIORescoreSeamTests extends KNNTestCase {
      * Stands in for {@code ScalarQuantizedFloatVectorValues}: the shape of {@link #values()} plus the one
      * interface the seam looks for.
      */
-    private static final class SourceNamingValues extends TestVectorValues.PreDefinedFloatVectorValues implements HasDirectIOVectorSource {
+    private static final class SourceNamingValues extends TestVectorValues.PreDefinedFloatVectorValues implements HasVectorLoaderSource {
 
-        private final DirectIOVectorSource source;
+        private final VectorLoaderSource source;
 
-        private SourceNamingValues(final DirectIOVectorSource source) {
+        private SourceNamingValues(final VectorLoaderSource source) {
             super(VECTORS);
             this.source = source;
         }
 
         @Override
-        public DirectIOVectorSource directIOVectorSource() {
+        public VectorLoaderSource vectorLoaderSource() {
             return source;
         }
     }

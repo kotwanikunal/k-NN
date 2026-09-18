@@ -18,6 +18,7 @@ import org.apache.lucene.store.FilterDirectory;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.opensearch.common.Nullable;
 import org.opensearch.knn.index.store.DirectIOVectorSource;
+import org.opensearch.knn.index.store.VectorLoaderSource;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -62,12 +63,17 @@ public class Faiss1040ScalarQuantizedFlatVectorsReader extends FlatVectorsReader
     private final Path vectorDataPath;
 
     /**
-     * Direct I/O sources by field, opened on first use and shared for this reader's life. Empty until a
+     * Loader seams by field, established on first use and shared for this reader's life. Empty until a
      * Direct I/O rescore query asks for one, so a node with the flag off never opens a second handle.
      * {@link Optional#empty()} caches "there is none", so a field that cannot be served is not retried
      * once per query.
+     *
+     * <p>Typed as {@link VectorLoaderSource} rather than the Direct I/O implementation because this is the
+     * one place the implementation behind the seam is chosen: a future full-precision vector cache would be
+     * introduced by constructing a different one in {@link #vectorLoaderSource(String)}, with nothing on the
+     * query path changing.
      */
-    private final Map<String, Optional<DirectIOVectorSource>> directIOVectorSources = new ConcurrentHashMap<>();
+    private final Map<String, Optional<VectorLoaderSource>> vectorLoaderSources = new ConcurrentHashMap<>();
 
     /**
      * @param lucene104ScalarQuantizedVectorsReader the delegate reader whose {@link FloatVectorValues}
@@ -130,20 +136,20 @@ public class Faiss1040ScalarQuantizedFlatVectorsReader extends FlatVectorsReader
     }
 
     /**
-     * The Direct I/O source for {@code field}, opening and verifying it on the first call and returning
-     * the same instance afterwards. {@code null} means this field's vectors cannot be served that way and
-     * the caller should read them through mmap as usual.
+     * The loader seam for {@code field}, establishing and verifying it on the first call and returning the
+     * same instance afterwards. {@code null} means this field's vectors cannot be served that way and the
+     * caller should read them through mmap as usual.
      * <p>
      * Verification needs full-precision values to compare against, and this method makes its own rather
      * than borrowing the caller's: the caller's are about to be read by a scorer, and
      * {@code vectorValue(int)} mutates the values it is called on.
      */
     @Nullable
-    DirectIOVectorSource directIOVectorSource(final String field) {
+    VectorLoaderSource vectorLoaderSource(final String field) {
         if (vectorDataPath == null) {
             return null;
         }
-        return directIOVectorSources.computeIfAbsent(field, name -> {
+        return vectorLoaderSources.computeIfAbsent(field, name -> {
             try {
                 final FloatVectorValues reference = delegateFlatVectorsReader.getFloatVectorValues(name);
                 return Optional.ofNullable(DirectIOVectorSource.open(vectorDataPath, reference));
@@ -189,7 +195,7 @@ public class Faiss1040ScalarQuantizedFlatVectorsReader extends FlatVectorsReader
         return new ScalarQuantizedFloatVectorValues(
             floatVectorValues,
             KNN1040ScalarQuantizedUtils.extractQuantizedByteVectorValues(floatVectorValues),
-            () -> directIOVectorSource(field)
+            () -> vectorLoaderSource(field)
         );
     }
 
@@ -199,22 +205,23 @@ public class Faiss1040ScalarQuantizedFlatVectorsReader extends FlatVectorsReader
     }
 
     /**
-     * Closes the delegate and any Direct I/O handles this reader opened. The delegate is closed even if a
-     * Direct I/O handle fails to close, since it owns every file the default path reads.
+     * Closes the delegate and any loader seams this reader established. The delegate is closed even if a
+     * seam fails to close, since it owns every file the default path reads.
      */
     @Override
     public void close() throws IOException {
         try {
-            for (final Optional<DirectIOVectorSource> source : directIOVectorSources.values()) {
+            for (final Map.Entry<String, Optional<VectorLoaderSource>> entry : vectorLoaderSources.entrySet()) {
+                final Optional<VectorLoaderSource> source = entry.getValue();
                 if (source.isPresent()) {
                     try {
                         source.get().close();
                     } catch (IOException e) {
-                        log.warn("Failed to close the Direct I/O handle for [{}]", source.get().path(), e);
+                        log.warn("Failed to close the vector loader source for field [{}]: {}", entry.getKey(), source.get(), e);
                     }
                 }
             }
-            directIOVectorSources.clear();
+            vectorLoaderSources.clear();
         } finally {
             delegateFlatVectorsReader.close();
         }

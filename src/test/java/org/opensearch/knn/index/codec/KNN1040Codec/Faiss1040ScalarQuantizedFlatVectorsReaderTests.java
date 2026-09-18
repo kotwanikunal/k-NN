@@ -174,11 +174,11 @@ public class Faiss1040ScalarQuantizedFlatVectorsReaderTests extends KNNTestCase 
      * no Direct I/O source, so it behaves exactly as it did before that path existed.
      */
     @SneakyThrows
-    public void testDirectIOVectorSource_whenNoReadState_thenNullAndNothingIsOpened() {
+    public void testVectorLoaderSource_whenNoReadState_thenNullAndNothingIsOpened() {
         FlatVectorsReader delegate = mock(FlatVectorsReader.class);
         Faiss1040ScalarQuantizedFlatVectorsReader reader = new Faiss1040ScalarQuantizedFlatVectorsReader(delegate);
 
-        assertNull(reader.directIOVectorSource("field"));
+        assertNull(reader.vectorLoaderSource("field"));
         // Not even the reference values the source would verify against are requested.
         verify(delegate, never()).getFloatVectorValues(any());
     }
@@ -217,7 +217,7 @@ public class Faiss1040ScalarQuantizedFlatVectorsReaderTests extends KNNTestCase 
      * cannot be served is not retried once per query.
      */
     @SneakyThrows
-    public void testDirectIOVectorSource_whenTheFileIsAbsent_thenNullAndNotRetried() {
+    public void testVectorLoaderSource_whenTheFileIsAbsent_thenNullAndNotRetried() {
         FlatVectorsReader delegate = mock(FlatVectorsReader.class);
         FloatVectorValues mockFvv = mock(FloatVectorValues.class);
         when(delegate.getFloatVectorValues("field")).thenReturn(mockFvv);
@@ -228,21 +228,21 @@ public class Faiss1040ScalarQuantizedFlatVectorsReaderTests extends KNNTestCase 
         try (Directory dir = newFSDirectory(createTempDir())) {
             Faiss1040ScalarQuantizedFlatVectorsReader reader = new Faiss1040ScalarQuantizedFlatVectorsReader(delegate, readState(dir, "0"));
 
-            assertNull(reader.directIOVectorSource("field"));
-            assertNull(reader.directIOVectorSource("field"));
+            assertNull(reader.vectorLoaderSource("field"));
+            assertNull(reader.vectorLoaderSource("field"));
             verify(delegate, times(1)).getFloatVectorValues("field");
         }
     }
 
     /** A failure while looking for a source is a fallback, not a query failure. */
     @SneakyThrows
-    public void testDirectIOVectorSource_whenTheReferenceValuesThrow_thenNull() {
+    public void testVectorLoaderSource_whenTheReferenceValuesThrow_thenNull() {
         FlatVectorsReader delegate = mock(FlatVectorsReader.class);
         when(delegate.getFloatVectorValues("field")).thenThrow(new IOException("corrupt"));
 
         try (Directory dir = newFSDirectory(createTempDir())) {
             Faiss1040ScalarQuantizedFlatVectorsReader reader = new Faiss1040ScalarQuantizedFlatVectorsReader(delegate, readState(dir, "0"));
-            assertNull(reader.directIOVectorSource("field"));
+            assertNull(reader.vectorLoaderSource("field"));
         }
     }
 
