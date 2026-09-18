@@ -88,10 +88,40 @@ final class DirectIOBufferSizer {
 
     /**
      * The smallest multiple of {@code blockSize} that serves any single vector of
-     * {@code vectorBytes} bytes in one read, whatever its alignment within the file.
+     * {@code vectorBytes} bytes in one read, whatever its alignment within the file, for a vector
+     * region that starts at file offset 0.
      */
     static int requiredBufferSize(final int vectorBytes, final int blockSize) {
-        final long maxDelta = blockSize - gcd(vectorBytes, blockSize);
+        return requiredBufferSize(vectorBytes, blockSize, 0L);
+    }
+
+    /**
+     * The smallest multiple of {@code blockSize} that serves any single vector of {@code vectorBytes}
+     * bytes in one read, for a vector region beginning at {@code baseOffset} in the file.
+     * <p>
+     * The {@code baseOffset} term matters because the {@code gcd} bound in this class' javadoc is
+     * derived for a region starting at 0: there
+     * {@code delta = (n * vectorBytes) % blockSize} only takes multiples of
+     * {@code g = gcd(vectorBytes, blockSize)}, so {@code delta_max = blockSize - g}. A region that
+     * starts partway into the file shifts every one of those values by {@code baseOffset % g}, so
+     * {@code delta_max} rises to {@code blockSize - g + (baseOffset % g)}. Lucene's flat vector file
+     * puts a codec header before the first vector, and that header is not a multiple of {@code g}, so
+     * the shift is the normal case rather than a corner one — ignoring it can leave a vector one byte
+     * short of the buffer and turn a one-read-per-vector path into a broken one.
+     * <p>
+     * When {@code baseOffset % g == 0} this reduces exactly to
+     * {@link #requiredBufferSize(int, int)}, so the sizes approach A validated in production are
+     * unchanged. For the 3072-byte vectors and 4096-byte blocks measured there, {@code g} is 1024 and
+     * any header shorter than 1024 bytes still lands on 8192.
+     *
+     * @param vectorBytes the on-disk size of one vector
+     * @param blockSize   the filesystem block size
+     * @param baseOffset  file offset of the first vector in the region
+     * @return a positive multiple of {@code blockSize}
+     */
+    static int requiredBufferSize(final int vectorBytes, final int blockSize, final long baseOffset) {
+        final int g = gcd(vectorBytes, blockSize);
+        final long maxDelta = blockSize - g + Math.floorMod(baseOffset, g);
         return Math.max(blockSize, alignUp(maxDelta + vectorBytes, blockSize));
     }
 

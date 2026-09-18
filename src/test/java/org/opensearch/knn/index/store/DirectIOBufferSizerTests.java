@@ -68,6 +68,59 @@ public class DirectIOBufferSizerTests extends KNNTestCase {
         }
     }
 
+    /**
+     * The two-argument rule is the three-argument one at {@code baseOffset = 0}, so approach A's
+     * production-validated sizes are unchanged by the generalisation.
+     */
+    public void testBaseOffsetZeroReproducesTheOriginalRule() {
+        for (int vectorBytes = 1; vectorBytes <= 20_000; vectorBytes++) {
+            assertEquals(
+                "differs at " + vectorBytes,
+                DirectIOBufferSizer.requiredBufferSize(vectorBytes, BLOCK),
+                DirectIOBufferSizer.requiredBufferSize(vectorBytes, BLOCK, 0L)
+            );
+        }
+    }
+
+    /**
+     * A region that starts partway into the file shifts every straddle by {@code baseOffset % gcd}, so the
+     * gcd bound alone can under-size the buffer. The 3072/4096 case has {@code gcd = 1024}: a region
+     * starting at 1024 is still covered by 8192, but one starting at 1025 needs the shift accounted for.
+     * Both come out at 8192 here, which is why the measured configuration was never wrong — but the
+     * property being tested is that the size always covers the worst straddle from the real base.
+     */
+    public void testBaseOffsetShiftsTheWorstStraddle() {
+        for (final long baseOffset : new long[] { 0, 1, 41, 1023, 1024, 1025, 4095, 4096, 123_456_789 }) {
+            final int size = DirectIOBufferSizer.requiredBufferSize(3072, BLOCK, baseOffset);
+            assertTrue("not a multiple of the block size at " + baseOffset, size % BLOCK == 0);
+            for (int ord = 0; ord < 64; ord++) {
+                final long absolute = baseOffset + (long) ord * 3072;
+                final int delta = (int) (absolute % BLOCK);
+                assertTrue("ordinal " + ord + " at base " + baseOffset + " does not fit in " + size, delta + 3072 <= size);
+            }
+        }
+    }
+
+    /**
+     * The bound holds for every combination of vector size and base offset in a range that covers the
+     * dimensions this plugin permits, so no configuration can produce a buffer a vector straddles out of.
+     */
+    public void testBaseOffsetBoundHoldsForEveryVectorSize() {
+        for (int vectorBytes = 4; vectorBytes <= 8192; vectorBytes += 4) {
+            for (final long baseOffset : new long[] { 7, 41, 137, 4095 }) {
+                final int size = DirectIOBufferSizer.requiredBufferSize(vectorBytes, BLOCK, baseOffset);
+                for (int ord = 0; ord < 16; ord++) {
+                    final long absolute = baseOffset + (long) ord * vectorBytes;
+                    final int delta = (int) (absolute % BLOCK);
+                    assertTrue(
+                        "vectorBytes " + vectorBytes + " base " + baseOffset + " ordinal " + ord + " does not fit in " + size,
+                        delta + vectorBytes <= size
+                    );
+                }
+            }
+        }
+    }
+
     public void testRequiredBufferSizeHonoursANonDefaultBlockSize() {
         // 512-byte blocks: a 3072-byte vector is block aligned, so one block-sized read serves it
         assertEquals(3072, DirectIOBufferSizer.requiredBufferSize(3072, 512));

@@ -9,6 +9,8 @@ import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FloatVectorValues;
 import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
+import org.opensearch.knn.index.codec.scorer.HasDirectIOVectorSource;
+import org.opensearch.knn.index.store.DirectIOVectorSource;
 
 /**
  * The query side seam where the rescore path may swap Lucene's mmap backed full-precision vector
@@ -43,12 +45,16 @@ import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
  *       default path.</li>
  * </ol>
  *
- * <h2>Current state</h2>
- * A pass-through. {@link #vectorValuesForRescore} returns the values it was handed in every case,
- * including when all three conditions hold, so switching the flag on cannot change a score today. The
- * Direct I/O loader that fills in the engaged branch arrives in the next phase; the gate is separated
- * out into {@link #isEngaged} so the conditions can be pinned by tests before there is anything behind
- * them.
+ * <h2>What the engaged branch does</h2>
+ * It asks the values for a {@link org.opensearch.knn.index.store.DirectIOVectorSource} through
+ * {@link HasDirectIOVectorSource} and, if it gets one, wraps them in {@link DirectIOFloatVectorValues} so
+ * every vector the rescorer reads comes off the device rather than out of the page cache. Three further
+ * things send a query back to the default path, and none of them is an error: values that name no source
+ * (any other vector format), a source that could not be opened or verified (a compound segment, a
+ * filesystem that refuses {@code O_DIRECT}), and a source whose shape does not match the values.
+ *
+ * <p>Reads are still one synchronous {@code pread} per vector here. The parallel fetch that makes that
+ * competitive is the next phase; the bar for this one is that the ranking is unchanged.
  */
 @Log4j2
 public final class DirectIORescoreSeam {
@@ -92,12 +98,45 @@ public final class DirectIORescoreSeam {
         if (isEngaged(vectorScorerMode, radialSearch) == false) {
             return values;
         }
-        if (log.isDebugEnabled()) {
-            log.debug("[KNN] Direct I/O rescore seam engaged for field [{}], values [{}]", fieldInfo.name, values.getClass().getName());
+        if ((values instanceof HasDirectIOVectorSource) == false) {
+            // Every other vector format keeps the default path. This is not a gap to close later: the fp32
+            // .vec rescore chain the project measures resolves to values that do implement it, and a format
+            // that does not is one whose file layout has not been verified.
+            log.debug(
+                "[KNN] Direct I/O rescore seam declined field [{}]: values [{}] name no Direct I/O source",
+                fieldInfo.name,
+                values.getClass().getName()
+            );
+            return values;
         }
-        // TODO: return a Direct I/O backed FloatVectorValues here. Until then the engaged branch is a
-        // pass-through, which is what makes "flag on changes no score" a property of the code rather
-        // than of a measurement.
-        return values;
+
+        final DirectIOVectorSource source = ((HasDirectIOVectorSource) values).directIOVectorSource();
+        if (source == null) {
+            // The source logs its own reason once per segment; a compound segment or a filesystem that
+            // refuses O_DIRECT lands here on every query and must stay cheap and quiet.
+            return values;
+        }
+        if (DirectIOFloatVectorValues.isCompatible(values, source) == false) {
+            log.warn(
+                "[KNN] Direct I/O rescore seam declined field [{}]: source has {} vectors of {} bytes at dimension {}, "
+                    + "values have {} of {} at {}",
+                fieldInfo.name,
+                source.size(),
+                source.vectorByteLength(),
+                source.dimension(),
+                values.size(),
+                values.getVectorByteLength(),
+                values.dimension()
+            );
+            return values;
+        }
+
+        log.debug(
+            "[KNN] Direct I/O rescore seam engaged for field [{}], values [{}], reading [{}]",
+            fieldInfo.name,
+            values.getClass().getName(),
+            source.path()
+        );
+        return new DirectIOFloatVectorValues(values, source, fieldInfo.getVectorSimilarityFunction());
     }
 }

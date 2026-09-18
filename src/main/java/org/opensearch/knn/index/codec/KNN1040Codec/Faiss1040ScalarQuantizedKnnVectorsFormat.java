@@ -157,7 +157,9 @@ public class Faiss1040ScalarQuantizedKnnVectorsFormat extends KnnVectorsFormat {
     public KnnVectorsReader fieldsReader(SegmentReadState state) throws IOException {
         return new Faiss1040ScalarQuantizedKnnVectorsReader(
             state,
-            new Faiss1040ScalarQuantizedFlatVectorsReader(flatFormatFor().fieldsReader(state))
+            // The state is handed down only so the flat reader can name this segment's .vec file for
+            // Direct I/O rescoring; it opens nothing until a Direct I/O rescore query asks it to.
+            new Faiss1040ScalarQuantizedFlatVectorsReader(flatFormatFor().fieldsReader(state), state)
         );
     }
 
