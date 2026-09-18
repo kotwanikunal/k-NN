@@ -46,7 +46,7 @@ public class LruVectorCacheTests extends KNNTestCase {
     }
 
     private static LruVectorCache cacheHolding(final int entries) {
-        final LruVectorCache cache = LruVectorCache.forSource(DIM, entries * ENTRY);
+        final LruVectorCache cache = LruVectorCache.forSource("test", DIM, entries * ENTRY);
         assertNotNull(cache);
         assertEquals(entries, cache.capacity());
         return cache;
@@ -115,7 +115,7 @@ public class LruVectorCacheTests extends KNNTestCase {
      */
     public void testHeldBytesNeverExceedTheBudget() {
         final long budget = 10 * ENTRY;
-        final LruVectorCache cache = LruVectorCache.forSource(DIM, budget);
+        final LruVectorCache cache = LruVectorCache.forSource("test", DIM, budget);
         assertNotNull(cache);
 
         for (int ord = 0; ord < 500; ord++) {
@@ -131,7 +131,7 @@ public class LruVectorCacheTests extends KNNTestCase {
      * what fits and leaves the remainder unspent.
      */
     public void testBudgetIsFlooredToWholeEntries() {
-        final LruVectorCache cache = LruVectorCache.forSource(DIM, 3 * ENTRY + ENTRY / 2);
+        final LruVectorCache cache = LruVectorCache.forSource("test", DIM, 3 * ENTRY + ENTRY / 2);
         assertNotNull(cache);
         assertEquals(3, cache.capacity());
 
@@ -260,19 +260,19 @@ public class LruVectorCacheTests extends KNNTestCase {
 
     /** A budget of zero is not a cache that always misses; it is no cache object at all. */
     public void testZeroBudgetYieldsNoCache() {
-        assertNull(LruVectorCache.forSource(DIM, 0));
-        assertNull(LruVectorCache.forSource(DIM, -1));
+        assertNull(LruVectorCache.forSource("test", DIM, 0));
+        assertNull(LruVectorCache.forSource("test", DIM, -1));
     }
 
     /** A budget too small for a single vector is the same thing: no cache rather than a useless one. */
     public void testBudgetBelowOneEntryYieldsNoCache() {
-        assertNull(LruVectorCache.forSource(DIM, ENTRY - 1));
-        assertNotNull(LruVectorCache.forSource(DIM, ENTRY));
+        assertNull(LruVectorCache.forSource("test", DIM, ENTRY - 1));
+        assertNotNull(LruVectorCache.forSource("test", DIM, ENTRY));
     }
 
     public void testNonPositiveDimensionYieldsNoCache() {
-        assertNull(LruVectorCache.forSource(0, 1 << 20));
-        assertNull(LruVectorCache.forSource(-8, 1 << 20));
+        assertNull(LruVectorCache.forSource("test", 0, 1 << 20));
+        assertNull(LruVectorCache.forSource("test", -8, 1 << 20));
     }
 
     /** A vector of the wrong length is a bug upstream; retaining it would turn it into a wrong score. */
@@ -288,7 +288,7 @@ public class LruVectorCacheTests extends KNNTestCase {
 
     /** The settings-driven factory: the 8 MB default, and zero meaning no cache. */
     public void testForSourceReadsTheNodeSetting() {
-        final LruVectorCache atDefault = LruVectorCache.forSource(768);
+        final LruVectorCache atDefault = LruVectorCache.forSource("test", 768);
         assertNotNull(atDefault);
         assertEquals(new ByteSizeValue(8, ByteSizeUnit.MB).getBytes(), atDefault.budgetBytes());
         // 8 MB / (3072 + 80) bytes per entry. Worth pinning: it is the number to read the measured
@@ -296,10 +296,10 @@ public class LruVectorCacheTests extends KNNTestCase {
         assertEquals(2661, atDefault.capacity());
 
         setNodeSettings(Settings.builder().put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE, "0b").build());
-        assertNull(LruVectorCache.forSource(768));
+        assertNull(LruVectorCache.forSource("test", 768));
 
         setNodeSettings(Settings.builder().put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE, "4mb").build());
-        final LruVectorCache atFourMegabytes = LruVectorCache.forSource(768);
+        final LruVectorCache atFourMegabytes = LruVectorCache.forSource("test", 768);
         assertNotNull(atFourMegabytes);
         assertEquals(new ByteSizeValue(4, ByteSizeUnit.MB).getBytes(), atFourMegabytes.budgetBytes());
     }
@@ -307,7 +307,7 @@ public class LruVectorCacheTests extends KNNTestCase {
     /** A source opened in a harness that never gave KNNSettings a ClusterService still gets the default. */
     public void testForSourceWithoutAClusterServiceUsesTheDefault() {
         KNNSettings.state().setClusterService(null);
-        final LruVectorCache cache = LruVectorCache.forSource(768);
+        final LruVectorCache cache = LruVectorCache.forSource("test", 768);
         assertNotNull(cache);
         assertEquals(new ByteSizeValue(8, ByteSizeUnit.MB).getBytes(), cache.budgetBytes());
     }
@@ -336,7 +336,7 @@ public class LruVectorCacheTests extends KNNTestCase {
         final int threads = 8;
         final int ordinals = 64;
         final long budget = 16 * ENTRY;
-        final LruVectorCache cache = LruVectorCache.forSource(DIM, budget);
+        final LruVectorCache cache = LruVectorCache.forSource("test", DIM, budget);
         assertNotNull(cache);
 
         final CountDownLatch start = new CountDownLatch(1);
@@ -396,5 +396,43 @@ public class LruVectorCacheTests extends KNNTestCase {
             }
         }
         assertFalse(present.isEmpty());
+    }
+
+    /**
+     * The stats-line cadence. Pinned because it is the only way the counters leave the JVM - the benchmark
+     * and the operator both read the hit rate off these lines - and because both ways it can break are
+     * silent: "every lookup" floods a live node's log, "never" leaves a run with no numbers, and no other
+     * assertion in this suite touches either.
+     */
+    public void testStatsLinesAreDueOncePerInterval() {
+        final LruVectorCache cache = LruVectorCache.forSource("test", DIM, 4 * ENTRY);
+        assertNotNull(cache);
+
+        for (int i = 1; i < LruVectorCache.STATS_LOG_INTERVAL; i++) {
+            assertFalse("lookup " + i + " is not the interval", cache.statsLineDue());
+        }
+        assertTrue("lookup " + LruVectorCache.STATS_LOG_INTERVAL + " is", cache.statsLineDue());
+
+        // And the counter resets rather than latching, so the second interval behaves like the first.
+        for (int i = 1; i < LruVectorCache.STATS_LOG_INTERVAL; i++) {
+            assertFalse(cache.statsLineDue());
+        }
+        assertTrue(cache.statsLineDue());
+    }
+
+    /**
+     * Lookups are what drive the lines, so a cache nobody asks about never writes one. The reason to assert
+     * it: the interval counter is advanced from inside the lookup methods, and moving it to {@code stats()}
+     * - a plausible refactor, since that is what builds the line - would make an operator's own polling the
+     * thing that triggers the logging.
+     */
+    public void testStatsAreNotADueLookup() {
+        final LruVectorCache cache = cacheHolding(4);
+        for (int i = 0; i < LruVectorCache.STATS_LOG_INTERVAL * 2; i++) {
+            cache.stats();
+            cache.budgetBytes();
+            cache.capacity();
+        }
+        assertFalse("reading the stats is not a lookup", cache.statsLineDue());
     }
 }

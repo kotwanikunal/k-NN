@@ -143,7 +143,8 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
         final int bufferSize,
         final long cacheBudgetBytes
     ) {
-        this.cache = LruVectorCache.forSource(dimension, cacheBudgetBytes);
+        // Named by its file, so that the stats lines of a node serving several segments can be told apart.
+        this.cache = LruVectorCache.forSource(String.valueOf(path), dimension, cacheBudgetBytes);
         this.path = path;
         this.channel = channel;
         this.baseOffset = baseOffset;
@@ -878,6 +879,12 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
 
     @Override
     public void close() throws IOException {
+        // The final total for this source, which the periodic lines cannot give: the last one is up to
+        // LruVectorCache.STATS_LOG_INTERVAL lookups short of the end. Logged by the cache rather than here
+        // so that it is under the one DEBUG switch the class javadoc documents, not two.
+        if (cache != null) {
+            cache.logFinalStats();
+        }
         channel.close();
     }
 

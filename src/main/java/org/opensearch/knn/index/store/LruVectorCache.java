@@ -84,6 +84,24 @@ import java.util.concurrent.atomic.AtomicLong;
  * which is the quantity the reuse analysis predicts. It deliberately says nothing about staged reads that
  * were dispatched and then abandoned unconsumed: those cost device I/O without delivering a vector, and
  * the right instrument for them is the device read count, not this ratio.
+ *
+ * <h2>Reading the counters on a running node</h2>
+ * {@link #stats()} is the in-process surface, and {@link DirectIOVectorSource#cacheStats()} reaches it from
+ * a held source. Neither is reachable from outside the JVM, so this class also logs one cumulative
+ * {@link Stats} line per {@link #STATS_LOG_INTERVAL} lookups at {@code DEBUG}, which an operator turns on
+ * without a restart:
+ *
+ * <pre>
+ * PUT /_cluster/settings
+ * {"transient": {"logger.org.opensearch.knn.index.store.LruVectorCache": "DEBUG"}}
+ * </pre>
+ *
+ * <p>The lines are cumulative for the life of the source, not per interval, which is what makes them
+ * differenceable: subtract the line before a block of queries from the line after it to get that block's
+ * hit rate. That matters because this cache outlives the page cache — a benchmark that evicts the page
+ * cache between repeats does not reset this, so the first repeat measures a warming LRU and a later one
+ * measures a warm one, and only the difference between the lines separates them. Each line names its
+ * source, because a node serving two indices has two caches writing to one log.
  */
 @Log4j2
 public final class LruVectorCache {
@@ -95,6 +113,17 @@ public final class LruVectorCache {
      * payload, so an operator who sets 8 MB is not surprised by 8.3.
      */
     static final int ENTRY_OVERHEAD_BYTES = 80;
+
+    /**
+     * How many lookups between cumulative stats lines, when this class is logging at {@code DEBUG}. A
+     * thousand is about five queries' worth of candidates on the shape this was measured on, so a 200-query
+     * benchmark block gets enough lines to see the LRU warm up, and the cumulative total a reader picks off
+     * the log is never more than five queries stale.
+     */
+    static final long STATS_LOG_INTERVAL = 1000L;
+
+    /** What this cache calls itself in its log lines; the file its source reads. */
+    private final String name;
 
     private final long budgetBytes;
     private final int dimension;
@@ -112,7 +141,15 @@ public final class LruVectorCache {
     private final AtomicLong misses = new AtomicLong();
     private final AtomicLong evictions = new AtomicLong();
 
-    private LruVectorCache(final int dimension, final long budgetBytes) {
+    /**
+     * Lookups since the last stats line. Only advanced while this class is logging at {@code DEBUG}, so it
+     * counts lookups an operator was watching rather than lookups that happened, which is the right cadence
+     * for a switch that can be thrown mid-query.
+     */
+    private final AtomicLong lookupsSinceStatsLine = new AtomicLong();
+
+    private LruVectorCache(final String name, final int dimension, final long budgetBytes) {
+        this.name = name;
         this.dimension = dimension;
         this.budgetBytes = budgetBytes;
         this.entryBytes = ENTRY_OVERHEAD_BYTES + (long) dimension * Float.BYTES;
@@ -127,8 +164,8 @@ public final class LruVectorCache {
      * zero a real control arm: the caller holds no cache object, so there is no lookup, no accounting and
      * no counter on the read path, and the loader is the Phase 2-5 loader exactly.
      */
-    public static LruVectorCache forSource(final int dimension) {
-        return forSource(dimension, budgetBytesFromSettings());
+    public static LruVectorCache forSource(final String name, final int dimension) {
+        return forSource(name, dimension, budgetBytesFromSettings());
     }
 
     /**
@@ -153,21 +190,22 @@ public final class LruVectorCache {
 
     /**
      * A cache for a source of {@code dimension}-wide vectors at an explicit budget, or {@code null} for a
-     * budget of zero or less. Package private twin of {@link #forSource(int)} for callers that have the
-     * budget in hand, which in practice means tests.
+     * budget of zero or less. Package private twin of {@link #forSource(String, int)} for callers that have
+     * the budget in hand, which in practice means tests.
      */
-    static LruVectorCache forSource(final int dimension, final long budgetBytes) {
+    static LruVectorCache forSource(final String name, final int dimension, final long budgetBytes) {
         if (dimension <= 0 || budgetBytes <= 0) {
             return null;
         }
-        final LruVectorCache cache = new LruVectorCache(dimension, budgetBytes);
+        final LruVectorCache cache = new LruVectorCache(name, dimension, budgetBytes);
         if (cache.capacity() == 0) {
             log.warn(
                 "The rescore vector cache budget of {} bytes cannot hold even one {}-dimension vector ({} bytes with overhead); "
-                    + "serving the rescore seam without a cache",
+                    + "serving the rescore seam without a cache for [{}]",
                 budgetBytes,
                 dimension,
-                cache.entryBytes
+                cache.entryBytes,
+                name
             );
             return null;
         }
@@ -193,6 +231,7 @@ public final class LruVectorCache {
             System.arraycopy(cached, 0, dst, 0, dimension);
         }
         hits.incrementAndGet();
+        maybeLogStats();
         return true;
     }
 
@@ -237,6 +276,14 @@ public final class LruVectorCache {
      */
     public void put(final int ord, final float[] vector) {
         misses.incrementAndGet();
+        retain(ord, vector);
+        // After retaining rather than before, so the occupancy on the line is the occupancy that includes
+        // this entry. The counters are already right either way; the bytes would be one entry behind.
+        maybeLogStats();
+    }
+
+    /** {@link #put} without the accounting: evict as needed, then insert. */
+    private void retain(final int ord, final float[] vector) {
         if (ord < 0 || vector == null || vector.length != dimension) {
             return;
         }
@@ -264,6 +311,50 @@ public final class LruVectorCache {
             entries.put(ord, vector.clone());
             heldBytes += entryBytes;
         }
+    }
+
+    /**
+     * Logs the cumulative counters once every {@link #STATS_LOG_INTERVAL} lookups, and does as close to
+     * nothing as a call can when this class is not logging at {@code DEBUG}.
+     *
+     * <p>The level check comes first and is the whole reason this is affordable on a path that runs per
+     * delivered vector: with the level off it is a field read and a comparison, and the interval counter is
+     * never touched. See the class javadoc for how an operator turns it on and what to do with the lines.
+     */
+    private void maybeLogStats() {
+        if (log.isDebugEnabled() && statsLineDue()) {
+            log.debug("Rescore vector cache [{}]: {}", name, stats());
+        }
+    }
+
+    /**
+     * Whether this lookup is the one that should write a stats line, counting the lookup either way.
+     *
+     * <p>Package private only so a test can pin the cadence: a dump interval that silently became "every
+     * lookup" would be a log flood on a live node, and one that became "never" would leave a benchmark with
+     * no numbers, and neither shows up in any other assertion.
+     */
+    /**
+     * Writes one last cumulative stats line, under the same {@code DEBUG} switch as the periodic ones.
+     *
+     * <p>Called when the source closes. It exists because the periodic lines stop up to
+     * {@link #STATS_LOG_INTERVAL} lookups before the cache does, so a reader adding up a run's totals off
+     * the log would otherwise be missing the tail.
+     */
+    public void logFinalStats() {
+        if (log.isDebugEnabled()) {
+            log.debug("Rescore vector cache [{}] closing: {}", name, stats());
+        }
+    }
+
+    boolean statsLineDue() {
+        if (lookupsSinceStatsLine.incrementAndGet() < STATS_LOG_INTERVAL) {
+            return false;
+        }
+        // Subtract rather than set to zero: two threads can both pass the test above, and subtracting keeps
+        // the long-run cadence at one line per interval instead of dropping the concurrent lookups.
+        lookupsSinceStatsLine.addAndGet(-STATS_LOG_INTERVAL);
+        return true;
     }
 
     /**
@@ -334,6 +425,14 @@ public final class LruVectorCache {
 
     @Override
     public String toString() {
-        return "LruVectorCache[dimension=" + dimension + ", budget=" + budgetBytes + " bytes, capacity=" + capacity() + " vectors]";
+        return "LruVectorCache[dimension="
+            + dimension
+            + ", budget="
+            + budgetBytes
+            + " bytes, capacity="
+            + capacity()
+            + " vectors, statsLogInterval="
+            + STATS_LOG_INTERVAL
+            + " lookups at DEBUG]";
     }
 }
