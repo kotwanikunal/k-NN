@@ -95,8 +95,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * {@code EINVAL}, a path that does not exist, a derived offset that is negative or does not verify, or
  * a vector large enough that a single-read buffer would exceed
  * {@code knn.direct_io.max_buffer_size}. {@link Error} — notably direct-buffer {@link OutOfMemoryError}
- * — is not caught, for the same reason {@link KNNDirectIODirectory} does not catch it: continuing on the
- * mmap path while the JVM is out of direct memory hides a misconfiguration the operator has to fix.
+ * — is deliberately not caught: continuing on the mmap path while the JVM is out of direct memory hides
+ * a misconfiguration the operator has to fix.
  */
 @Log4j2
 public final class DirectIOVectorSource implements VectorLoaderSource {

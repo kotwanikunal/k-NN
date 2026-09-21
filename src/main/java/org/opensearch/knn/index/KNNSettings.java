@@ -127,20 +127,10 @@ public class KNNSettings {
     // heuristic is shape-based and can misclaim non-vector numeric arrays; operators must opt in.
     public static final String KNN_DYNAMIC_MAPPING_ENABLED = "knn.dynamic_mapping.enabled";
 
-    // Direct I/O settings. These are only consulted by the "knn_direct_io" store type, so on an index
-    // that does not select that store type none of them has any effect.
-    // Per-index kill switch. Deliberately plain IndexScope: it must NOT be Final, because a Final
-    // setting cannot be updated even on a closed index, which would defeat the close/reopen toggle.
-    public static final String KNN_INDEX_DIRECT_IO_ENABLED = "index.knn.direct_io.enabled";
-    public static final boolean KNN_INDEX_DIRECT_IO_ENABLED_DEFAULT_VALUE = true;
-    // Upper bound on the per-index Direct I/O read buffer. Above this size a vector costs an extra
-    // read rather than an ever larger aligned buffer.
+    // Upper bound on the per-index Direct I/O read buffer used by the rescore seam's DirectIOBufferSizer.
+    // Above this size a vector costs an extra read rather than an ever larger aligned buffer.
     public static final String KNN_DIRECT_IO_MAX_BUFFER_SIZE = "knn.direct_io.max_buffer_size";
     public static final ByteSizeValue KNN_DIRECT_IO_MAX_BUFFER_SIZE_DEFAULT_VALUE = new ByteSizeValue(32, ByteSizeUnit.KB);
-    // Files smaller than this are left on the default path: they are likely fully page-cached already,
-    // so bypassing the cache for them buys nothing.
-    public static final String KNN_DIRECT_IO_MIN_FILE_SIZE = "knn.direct_io.min_file_size";
-    public static final ByteSizeValue KNN_DIRECT_IO_MIN_FILE_SIZE_DEFAULT_VALUE = new ByteSizeValue(1, ByteSizeUnit.MB);
 
     // Rescore-seam prefetch settings. These are only consulted once the rescore seam is already engaged,
     // i.e. knn.feature.direct_io.rescore.enabled is on and the query is a non-radial RESCORE, so on a
@@ -379,32 +369,11 @@ public class KNNSettings {
     );
 
     /**
-     * Per-index Direct I/O kill switch, read when the shard's Directory is built. Plain IndexScope on
-     * purpose - neither Final nor UnmodifiableOnRestore - so that it can be flipped on a closed index
-     * and take effect when the index is reopened, without a node restart.
-     */
-    public static final Setting<Boolean> KNN_INDEX_DIRECT_IO_ENABLED_SETTING = Setting.boolSetting(
-        KNN_INDEX_DIRECT_IO_ENABLED,
-        KNN_INDEX_DIRECT_IO_ENABLED_DEFAULT_VALUE,
-        IndexScope
-    );
-
-    /**
      * Node level upper bound on the Direct I/O read buffer computed per index from the mapping.
      */
     public static final Setting<ByteSizeValue> KNN_DIRECT_IO_MAX_BUFFER_SIZE_SETTING = Setting.byteSizeSetting(
         KNN_DIRECT_IO_MAX_BUFFER_SIZE,
         KNN_DIRECT_IO_MAX_BUFFER_SIZE_DEFAULT_VALUE,
-        NodeScope,
-        Dynamic
-    );
-
-    /**
-     * Node level minimum file size below which Direct I/O is not used for a file.
-     */
-    public static final Setting<ByteSizeValue> KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING = Setting.byteSizeSetting(
-        KNN_DIRECT_IO_MIN_FILE_SIZE,
-        KNN_DIRECT_IO_MIN_FILE_SIZE_DEFAULT_VALUE,
         NodeScope,
         Dynamic
     );
@@ -917,10 +886,6 @@ public class KNNSettings {
             return KNN_DIRECT_IO_MAX_BUFFER_SIZE_SETTING;
         }
 
-        if (KNN_DIRECT_IO_MIN_FILE_SIZE.equals(key)) {
-            return KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING;
-        }
-
         if (KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED.equals(key)) {
             return KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED_SETTING;
         }
@@ -976,9 +941,7 @@ public class KNNSettings {
             INDEX_KNN_FAISS_EFFICIENT_FILTER_DISABLE_EXACT_SEARCH_SETTING,
             KNN_DYNAMIC_MAPPING_ENABLED_SETTING,
             // Direct I/O settings
-            KNN_INDEX_DIRECT_IO_ENABLED_SETTING,
             KNN_DIRECT_IO_MAX_BUFFER_SIZE_SETTING,
-            KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING,
             // Rescore-seam prefetch settings
             KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED_SETTING,
             KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_SETTING,
@@ -1017,13 +980,6 @@ public class KNNSettings {
      */
     public static ByteSizeValue getDirectIOMaxBufferSize() {
         return getNodeSettingValueOrDefault(KNN_DIRECT_IO_MAX_BUFFER_SIZE_SETTING);
-    }
-
-    /**
-     * @return the node level minimum file size below which Direct I/O is not used
-     */
-    public static ByteSizeValue getDirectIOMinFileSize() {
-        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING);
     }
 
     /**

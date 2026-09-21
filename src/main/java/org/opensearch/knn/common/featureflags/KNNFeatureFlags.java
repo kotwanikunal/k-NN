@@ -28,8 +28,6 @@ public class KNNFeatureFlags {
     private static final String KNN_FORCE_EVICT_CACHE_ENABLED = "knn.feature.cache.force_evict.enabled";
     private static final String KNN_PREFETCH_ENABLED = "knn.feature.prefetch.enabled";
     private static final boolean KNN_PREFETCH_ENABLED_DEFAULT_VALUE = true;
-    private static final String KNN_DIRECT_IO_ENABLED = "knn.feature.direct_io.enabled";
-    private static final boolean KNN_DIRECT_IO_ENABLED_DEFAULT_VALUE = true;
     private static final String KNN_WHOLE_LEAF_PREFETCH_ENABLED = "knn.feature.whole_leaf_prefetch.enabled";
     private static final boolean KNN_WHOLE_LEAF_PREFETCH_ENABLED_DEFAULT_VALUE = false;
     private static final String KNN_DIRECT_IO_RESCORE_ENABLED = "knn.feature.direct_io.rescore.enabled";
@@ -51,18 +49,6 @@ public class KNNFeatureFlags {
     );
 
     /**
-     * Node level kill switch for the "knn_direct_io" store type. Because the Directory is built when a
-     * shard opens, flipping this flag takes effect on the next close and reopen of an index, with no
-     * node restart.
-     */
-    public static final Setting<Boolean> KNN_DIRECT_IO_ENABLED_SETTING = Setting.boolSetting(
-        KNN_DIRECT_IO_ENABLED,
-        KNN_DIRECT_IO_ENABLED_DEFAULT_VALUE,
-        NodeScope,
-        Dynamic
-    );
-
-    /**
      * Widens the rescore prefetch from the scorer's 64-ordinal bulk batch to the whole leaf's candidate
      * set, which is {@code firstPassK} entries. Off by default: the narrower per-batch prefetch is the
      * behaviour every existing measurement was taken against, so this has to be opted into to be
@@ -77,9 +63,8 @@ public class KNNFeatureFlags {
 
     /**
      * Node level switch for reading full-precision vectors with Direct I/O on the rescore path, at the
-     * query seam in {@code VectorScorers}. Independent of {@link #KNN_DIRECT_IO_ENABLED_SETTING}, which
-     * gates the file level {@code knn_direct_io} store type: this one is a per-query decision and needs
-     * no index close and reopen, so flipping it takes effect on the next query.
+     * query seam in {@code VectorScorers}. A per-query decision that needs no index close and reopen, so
+     * flipping it takes effect on the next query.
      * <p>
      * Off by default. With it off the rescore path is the one every existing measurement was taken
      * against, byte for byte.
@@ -99,7 +84,6 @@ public class KNNFeatureFlags {
         return ImmutableList.of(
             KNN_FORCE_EVICT_CACHE_ENABLED_SETTING,
             KNN_PREFETCH_ENABLED_SETTING,
-            KNN_DIRECT_IO_ENABLED_SETTING,
             KNN_WHOLE_LEAF_PREFETCH_ENABLED_SETTING,
             KNN_DIRECT_IO_RESCORE_ENABLED_SETTING
         );
@@ -126,25 +110,6 @@ public class KNNFeatureFlags {
             KNNSettings.state().getSettingValue(KNN_PREFETCH_ENABLED).toString(),
             KNN_PREFETCH_ENABLED_DEFAULT_VALUE
         );
-    }
-
-    /**
-     * Checks the node level Direct I/O kill switch. Unlike the other flags this one is read while a
-     * shard's Directory is being built, which can happen before {@link KNNSettings} has a
-     * {@code ClusterService} - so an unreadable setting falls back to the default rather than
-     * propagating and failing shard open.
-     *
-     * @return true if Direct I/O may be used on this node
-     */
-    public static boolean isDirectIOEnabled() {
-        try {
-            return Booleans.parseBoolean(
-                KNNSettings.state().getSettingValue(KNN_DIRECT_IO_ENABLED).toString(),
-                KNN_DIRECT_IO_ENABLED_DEFAULT_VALUE
-            );
-        } catch (Exception e) {
-            return KNN_DIRECT_IO_ENABLED_DEFAULT_VALUE;
-        }
     }
 
     /**
