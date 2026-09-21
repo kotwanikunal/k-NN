@@ -19,7 +19,6 @@ import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.mockito.MockedStatic;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.knn.KNNTestCase;
-import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.engine.qframe.QuantizationConfig;
@@ -627,7 +626,7 @@ public class VectorScorersTests extends KNNTestCase {
     public void testFloatTarget_rescoreSeam_whenFlagIsOn_thenStillScoresThroughTheCodecValues() {
         ClusterSettings clusterSettings = mock(ClusterSettings.class);
         when(clusterService.getClusterSettings()).thenReturn(clusterSettings);
-        when(clusterSettings.get(KNNFeatureFlags.KNN_DIRECT_IO_RESCORE_ENABLED_SETTING)).thenReturn(true);
+        when(clusterSettings.get(KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED_SETTING)).thenReturn(true);
         KNNSettings.state().setClusterService(clusterService);
 
         RescorerRecordingFloatVectorValues values = new RescorerRecordingFloatVectorValues(List.of(new float[] { 1.0f, 2.0f }));
@@ -643,7 +642,7 @@ public class VectorScorersTests extends KNNTestCase {
     public void testFloatTarget_rescoreSeam_whenRadial_thenNotEngaged() {
         ClusterSettings clusterSettings = mock(ClusterSettings.class);
         when(clusterService.getClusterSettings()).thenReturn(clusterSettings);
-        when(clusterSettings.get(KNNFeatureFlags.KNN_DIRECT_IO_RESCORE_ENABLED_SETTING)).thenReturn(true);
+        when(clusterSettings.get(KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED_SETTING)).thenReturn(true);
         KNNSettings.state().setClusterService(clusterService);
 
         RescorerRecordingFloatVectorValues values = new RescorerRecordingFloatVectorValues(List.of(new float[] { 1.0f, 2.0f }));

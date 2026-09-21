@@ -132,9 +132,16 @@ public class KNNSettings {
     public static final String KNN_DIRECT_IO_MAX_BUFFER_SIZE = "knn.direct_io.max_buffer_size";
     public static final ByteSizeValue KNN_DIRECT_IO_MAX_BUFFER_SIZE_DEFAULT_VALUE = new ByteSizeValue(32, ByteSizeUnit.KB);
 
+    // Node level gate for the Direct I/O rescore seam. Off by default: with it off DirectIORescoreSeam
+    // returns its input unchanged, so the rescore path is byte for byte what it is without this code. A
+    // per-query decision read once per scorer built at the seam, so flipping it takes effect on the next
+    // query with no index or node restart.
+    public static final String KNN_DIRECT_IO_RESCORE_ENABLED = "knn.direct_io.rescore.enabled";
+    public static final boolean KNN_DIRECT_IO_RESCORE_ENABLED_DEFAULT_VALUE = false;
+
     // Rescore-seam prefetch settings. These are only consulted once the rescore seam is already engaged,
-    // i.e. knn.feature.direct_io.rescore.enabled is on and the query is a non-radial RESCORE, so on a
-    // node with that flag off none of them has any effect.
+    // i.e. knn.direct_io.rescore.enabled is on and the query is a non-radial RESCORE, so on a
+    // node with that setting off none of them has any effect.
     // Kill switch for the prefetch pipeline alone: with it off the seam still reads with Direct I/O, but
     // one blocking read at a time. That is the arm every Phase-2 correctness number was taken against,
     // so it is the thing to switch to when a prefetch regression has to be isolated from the loader.
@@ -379,10 +386,25 @@ public class KNNSettings {
     );
 
     /**
+     * Node level switch for reading full-precision vectors with Direct I/O on the rescore path, at the
+     * query seam in {@link org.opensearch.knn.index.query.scorers.DirectIORescoreSeam}. A per-query
+     * decision that needs no index close and reopen, so flipping it takes effect on the next query.
+     * <p>
+     * Off by default. With it off the rescore path is the one every existing measurement was taken
+     * against, byte for byte.
+     */
+    public static final Setting<Boolean> KNN_DIRECT_IO_RESCORE_ENABLED_SETTING = Setting.boolSetting(
+        KNN_DIRECT_IO_RESCORE_ENABLED,
+        KNN_DIRECT_IO_RESCORE_ENABLED_DEFAULT_VALUE,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
      * Node level kill switch for the rescore seam's read-ahead pipeline. Read when a scorer stages its
      * first batch, so flipping it takes effect on the next query with no restart. Turning it off leaves
      * the seam reading with Direct I/O one blocking read at a time - the Phase 2 behaviour - rather than
-     * turning Direct I/O off, which is what {@code knn.feature.direct_io.rescore.enabled} does.
+     * turning Direct I/O off, which is what {@code knn.direct_io.rescore.enabled} does.
      */
     public static final Setting<Boolean> KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED_SETTING = Setting.boolSetting(
         KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED,
@@ -886,6 +908,10 @@ public class KNNSettings {
             return KNN_DIRECT_IO_MAX_BUFFER_SIZE_SETTING;
         }
 
+        if (KNN_DIRECT_IO_RESCORE_ENABLED.equals(key)) {
+            return KNN_DIRECT_IO_RESCORE_ENABLED_SETTING;
+        }
+
         if (KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED.equals(key)) {
             return KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED_SETTING;
         }
@@ -942,6 +968,8 @@ public class KNNSettings {
             KNN_DYNAMIC_MAPPING_ENABLED_SETTING,
             // Direct I/O settings
             KNN_DIRECT_IO_MAX_BUFFER_SIZE_SETTING,
+            // Rescore-seam gate
+            KNN_DIRECT_IO_RESCORE_ENABLED_SETTING,
             // Rescore-seam prefetch settings
             KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED_SETTING,
             KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_SETTING,
@@ -980,6 +1008,17 @@ public class KNNSettings {
      */
     public static ByteSizeValue getDirectIOMaxBufferSize() {
         return getNodeSettingValueOrDefault(KNN_DIRECT_IO_MAX_BUFFER_SIZE_SETTING);
+    }
+
+    /**
+     * Checks the node level switch for Direct I/O reads on the rescore path. Read once per scorer built
+     * at the rescore seam, so it takes effect on the next query with no index or node restart. An
+     * unreadable setting falls back to the default rather than failing the query.
+     *
+     * @return true if the rescore path may read full-precision vectors with Direct I/O
+     */
+    public static boolean isDirectIORescoreEnabled() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_ENABLED_SETTING);
     }
 
     /**

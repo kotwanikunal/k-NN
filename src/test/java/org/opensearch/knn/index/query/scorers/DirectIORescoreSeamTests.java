@@ -24,7 +24,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
-import static org.opensearch.knn.common.featureflags.KNNFeatureFlags.KNN_DIRECT_IO_RESCORE_ENABLED_SETTING;
+import static org.opensearch.knn.index.KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED_SETTING;
 
 /**
  * Pins the three conditions of the Direct I/O rescore gate, that the seam is a pass-through in every case

@@ -321,6 +321,7 @@ public class KNNSettingsTests extends KNNTestCase {
     public void testDirectIONodeSettings_properties() {
         for (Setting<?> setting : List.of(
             KNNSettings.KNN_DIRECT_IO_MAX_BUFFER_SIZE_SETTING,
+            KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED_SETTING,
             KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED_SETTING,
             KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_SETTING,
             KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING,
@@ -345,7 +346,7 @@ public class KNNSettingsTests extends KNNTestCase {
     public void testDirectIOSettings_areRegistered() {
         final List<String> registeredKeys = KNNSettings.state().getSettings().stream().map(Setting::getKey).collect(Collectors.toList());
         for (String key : List.of(
-            "knn.feature.direct_io.rescore.enabled",
+            KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED,
             KNNSettings.KNN_DIRECT_IO_MAX_BUFFER_SIZE,
             KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED,
             KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW,
@@ -439,6 +440,22 @@ public class KNNSettingsTests extends KNNTestCase {
 
     public void testDirectIONodeSettingAccessors_returnDefaultsWhenUnset() {
         assertEquals(new ByteSizeValue(32, ByteSizeUnit.KB), KNNSettings.getDirectIOMaxBufferSize());
+    }
+
+    /** Off by default: with it off the rescore path is byte for byte what it is without the seam. */
+    public void testDirectIORescoreEnabledSetting_default() {
+        assertFalse(KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED_SETTING.getDefault(Settings.EMPTY));
+        assertFalse(KNNSettings.isDirectIORescoreEnabled());
+    }
+
+    /** Read from the query seam, which must never fail a query, so an uninitialized singleton is the default. */
+    public void testDirectIORescoreEnabledAccessor_whenClusterServiceIsNotSet_thenReturnsDefault() {
+        KNNSettings.state().setClusterService(null);
+        assertFalse(KNNSettings.isDirectIORescoreEnabled());
+    }
+
+    public void testDirectIORescoreEnabledSetting_isReadableByKey() {
+        assertEquals(Boolean.FALSE, KNNSettings.state().getSettingValue(KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED));
     }
 
     /**

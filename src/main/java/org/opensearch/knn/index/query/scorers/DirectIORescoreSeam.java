@@ -8,7 +8,7 @@ package org.opensearch.knn.index.query.scorers;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FloatVectorValues;
-import org.opensearch.knn.common.featureflags.KNNFeatureFlags;
+import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.codec.scorer.HasVectorLoaderSource;
 import org.opensearch.knn.index.store.VectorLoaderSource;
 
@@ -30,7 +30,7 @@ import org.opensearch.knn.index.store.VectorLoaderSource;
  *
  * <h2>Three conditions, all required</h2>
  * <ol>
- *   <li><b>Flag on.</b> {@link KNNFeatureFlags#isDirectIORescoreEnabled()}, a dynamic node setting that
+ *   <li><b>Flag on.</b> {@link KNNSettings#isDirectIORescoreEnabled()}, a dynamic node setting that
  *       is off by default. With it off this class returns its input unchanged, so the default path is
  *       byte for byte what it is without this code.</li>
  *   <li><b>Mode is {@link VectorScorerMode#RESCORE}.</b> This is the whole safety argument, and it must
@@ -75,7 +75,7 @@ public final class DirectIORescoreSeam {
         if (vectorScorerMode != VectorScorerMode.RESCORE || radialSearch) {
             return false;
         }
-        return KNNFeatureFlags.isDirectIORescoreEnabled();
+        return KNNSettings.isDirectIORescoreEnabled();
     }
 
     /**
