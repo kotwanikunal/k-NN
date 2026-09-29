@@ -79,6 +79,18 @@ public class KNN1040ScalarQuantizedVectorsFormat extends Lucene104ScalarQuantize
         );
     }
 
+    /**
+     * The format that reads and writes the full-precision {@code .vec} nested inside this quantized one.
+     *
+     * <p>Exposed because the rescore path wants the fp32 vectors and nothing else: a second view built on
+     * this format reads only {@code .vec} and its {@code .vemf} sidecar, where one built on the quantized
+     * format would open the {@code .veq} codes as well for a caller that will never look at them. Safe to
+     * share — a {@link Lucene99FlatVectorsFormat} holds nothing but its scorer.
+     */
+    public Lucene99FlatVectorsFormat rawVectorsFormat() {
+        return RAW_VECTOR_FORMAT;
+    }
+
     @Override
     public int getMaxDimensions(String fieldName) {
         return KNNEngine.getMaxDimensionByEngine(KNNEngine.LUCENE);
