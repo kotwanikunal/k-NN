@@ -15,6 +15,8 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 
 /**
  * The dispatch point <em>inside</em> a compound file: an {@link IndexInput} over a {@code .cfs} whose
@@ -116,8 +118,26 @@ public final class KNNVectorCompoundSliceInput extends FilterIndexInput {
     /** Shared with the {@link KNNVectorIntentProbeDirectory} that created this input, and with clones. */
     private final List<SliceObservation> observations;
 
-    /** Whether an intent-bearing {@code .vec} slice should be served with {@code O_DIRECT}. */
-    private final boolean routeRescoreToDirectIO;
+    /**
+     * Whether every slice is recorded in {@link #observations} and logged.
+     *
+     * <p>Off for the production {@link KNNVectorStorageDirectory}, and that is not a detail: the list is
+     * unbounded and appending to a {@link CopyOnWriteArrayList} copies it, so a spike's
+     * record-everything behaviour on a shard's real slice traffic would be a leak and an O(n²). The
+     * counters below are kept either way, which is all a node needs to tell dispatch from silence.
+     */
+    private final boolean observing;
+
+    /**
+     * Whether an intent-bearing {@code .vec} slice should be served with {@code O_DIRECT} — condition 3
+     * of {@link KNNVectorStorageDirectory}'s dispatch rule. A supplier rather than a boolean because the
+     * setting behind it is dynamic and a container outlives the query that opened it.
+     */
+    private final BooleanSupplier routeRescoreToDirectIO;
+
+    /** Shared with clones, so a caller counts the container's traffic and not one clone's. */
+    private final AtomicLong routedSlices;
+    private final AtomicLong declinedSlices;
 
     /** Whether this instance owns {@link #directIO} and must close it. Clones do not. */
     private final boolean owner;
@@ -128,21 +148,55 @@ public final class KNNVectorCompoundSliceInput extends FilterIndexInput {
     /** Set once {@link DirectIOVectorIndexInput#open} has answered {@code null}, so it is asked once. */
     private boolean directIOUnavailable;
 
+    /** The observing form, for the probe and its tests: a fixed answer to condition 3, every slice recorded. */
     KNNVectorCompoundSliceInput(
         final IndexInput delegate,
         final String containerName,
         final Path containerPath,
         final boolean routeRescoreToDirectIO
     ) {
-        this(delegate, containerName, containerPath, routeRescoreToDirectIO, new CopyOnWriteArrayList<>(), true);
+        this(
+            delegate,
+            containerName,
+            containerPath,
+            () -> routeRescoreToDirectIO,
+            new CopyOnWriteArrayList<>(),
+            true,
+            new AtomicLong(),
+            new AtomicLong(),
+            true
+        );
+    }
+
+    /** The production form: condition 3 is asked live, and nothing is recorded per slice. */
+    KNNVectorCompoundSliceInput(
+        final IndexInput delegate,
+        final String containerName,
+        final Path containerPath,
+        final BooleanSupplier routeRescoreToDirectIO
+    ) {
+        this(
+            delegate,
+            containerName,
+            containerPath,
+            routeRescoreToDirectIO,
+            new CopyOnWriteArrayList<>(),
+            false,
+            new AtomicLong(),
+            new AtomicLong(),
+            true
+        );
     }
 
     private KNNVectorCompoundSliceInput(
         final IndexInput delegate,
         final String containerName,
         final Path containerPath,
-        final boolean routeRescoreToDirectIO,
+        final BooleanSupplier routeRescoreToDirectIO,
         final List<SliceObservation> observations,
+        final boolean observing,
+        final AtomicLong routedSlices,
+        final AtomicLong declinedSlices,
         final boolean owner
     ) {
         super("KNNVectorCompoundSliceInput(" + containerName + ")", delegate);
@@ -150,7 +204,20 @@ public final class KNNVectorCompoundSliceInput extends FilterIndexInput {
         this.containerPath = containerPath;
         this.routeRescoreToDirectIO = routeRescoreToDirectIO;
         this.observations = observations;
+        this.observing = observing;
+        this.routedSlices = routedSlices;
+        this.declinedSlices = declinedSlices;
         this.owner = owner;
+    }
+
+    /** Entries of this container served with {@code O_DIRECT}. Shared with clones. */
+    public long routedSlices() {
+        return routedSlices.get();
+    }
+
+    /** Entries that satisfied the intent rule but could not be served with {@code O_DIRECT}. */
+    public long declinedSlices() {
+        return declinedSlices.get();
     }
 
     /** Every {@code slice} of this container seen so far, in call order. Shared with clones. */
@@ -175,10 +242,13 @@ public final class KNNVectorCompoundSliceInput extends FilterIndexInput {
     public IndexInput slice(final String sliceDescription, final long offset, final long length, final IOContext context)
         throws IOException {
         final KNNVectorReadIntent intent = KNNVectorReadIntent.of(context);
-        final boolean route = routeRescoreToDirectIO
-            && intent == KNNVectorReadIntent.RESCORE
-            && isFullPrecisionVectorData(sliceDescription);
+        final boolean route = intent == KNNVectorReadIntent.RESCORE
+            && isFullPrecisionVectorData(sliceDescription)
+            && routeRescoreToDirectIO.getAsBoolean();
         final IndexInput routed = route ? directIOSlice(sliceDescription, offset, length) : null;
+        if (route) {
+            (routed != null ? routedSlices : declinedSlices).incrementAndGet();
+        }
         record(sliceDescription, offset, length, context.hints(), intent, true, routed != null);
         return routed != null ? routed : in.slice(sliceDescription, offset, length, context);
     }
@@ -204,6 +274,9 @@ public final class KNNVectorCompoundSliceInput extends FilterIndexInput {
         final boolean carriedContext,
         final boolean routedToDirectIO
     ) {
+        if (observing == false) {
+            return;
+        }
         final SliceObservation observation = new SliceObservation(name, offset, length, hints, intent, carriedContext, routedToDirectIO);
         observations.add(observation);
         if (isVectorDataEntry(name)) {
@@ -342,7 +415,17 @@ public final class KNNVectorCompoundSliceInput extends FilterIndexInput {
      */
     @Override
     public KNNVectorCompoundSliceInput clone() {
-        return new KNNVectorCompoundSliceInput(in.clone(), containerName, containerPath, routeRescoreToDirectIO, observations, false);
+        return new KNNVectorCompoundSliceInput(
+            in.clone(),
+            containerName,
+            containerPath,
+            routeRescoreToDirectIO,
+            observations,
+            observing,
+            routedSlices,
+            declinedSlices,
+            false
+        );
     }
 
     @Override

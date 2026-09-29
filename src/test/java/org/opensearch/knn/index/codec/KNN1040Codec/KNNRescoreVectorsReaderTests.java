@@ -5,11 +5,14 @@
 
 package org.opensearch.knn.index.codec.KNN1040Codec;
 
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 import lombok.SneakyThrows;
 import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
 import org.apache.lucene.codecs.lucene99.Lucene99FlatVectorsFormat;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.SegmentReadState;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FilterDirectory;
 import org.apache.lucene.store.IOContext;
@@ -20,9 +23,15 @@ import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.codec.KNNRescoreVectorsReader;
+import org.opensearch.knn.index.query.scorers.VectorScorerMode;
+import org.opensearch.knn.index.store.DirectIOReadPoolTests;
+import org.opensearch.knn.index.store.DirectIOVectorIndexInput;
 import org.opensearch.knn.index.store.KNNVectorReadIntent;
+import org.opensearch.knn.index.store.KNNVectorStorageDirectory;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -48,6 +57,7 @@ import static org.opensearch.knn.index.codec.KNN1040Codec.KNN1040ScalarQuantized
  * ({@link KNN1040ScalarQuantizedTestUtils#writeQuantizedVectors}), so the {@code .vec}, its {@code .vemf}
  * sidecar and the {@code .veq} codes beside them are laid out exactly as they are in an index.
  */
+@ThreadLeakFilters(defaultFilters = true, filters = { DirectIOReadPoolTests.ReadPoolThreadFilter.class })
 public class KNNRescoreVectorsReaderTests extends KNNTestCase {
 
     @Mock
@@ -268,5 +278,171 @@ public class KNNRescoreVectorsReaderTests extends KNNTestCase {
     public void testCreateWithoutAReadStateOrFormatYieldsNothing() {
         assertNull(KNNRescoreVectorsReader.create(null, null));
         assertNull(KNNRescoreVectorsReader.create(new KNN1040ScalarQuantizedVectorsFormat().rawVectorsFormat(), null));
+    }
+
+    // -------------------------------------------------------------------------------------------------
+    // The whole chain, with the storage layer's half installed: what/how end to end
+    // -------------------------------------------------------------------------------------------------
+
+    /**
+     * Skipped rather than failed where {@code O_DIRECT} is unavailable — no
+     * {@code ExtendedOpenOption.DIRECT} on this JDK, or a filesystem that answers {@code EINVAL}. Asked
+     * through the production entry point, so the assumption is exactly the condition the directory's
+     * fourth dispatch condition tests.
+     */
+    @SneakyThrows
+    private void assumeDirectIOWorksHere() {
+        final Path probe = createTempDir().resolve("probe");
+        Files.write(probe, new byte[8192]);
+        try (IndexInput input = DirectIOVectorIndexInput.open(probe)) {
+            assumeTrue("O_DIRECT is not available here", input != null);
+        }
+    }
+
+    /**
+     * The design, end to end, with nothing mocked between the codec and the kernel: a format builds a
+     * rescore view over a {@link KNNVectorStorageDirectory}, the view's {@code .vec} open is the one the
+     * directory serves with {@code O_DIRECT}, and the vectors that come back are bit-for-bit the ones the
+     * ordinary memory-mapped reader returns.
+     *
+     * <p>Every earlier proof in this phase was an identity proof through mmap — the intent was attached and
+     * nothing acted on it, so identity was true by construction. This is the first one where the two sides
+     * read the same file through different system calls, so it is the first that could fail. It asserts
+     * both halves: that the route was taken (the counter, because identical bytes would also be what a
+     * silently un-routed read returns) and that the bytes are identical.
+     */
+    @SneakyThrows
+    public void testTheRescoreViewIsServedWithDirectIOAndStillReadsTheSameBytes() {
+        assumeDirectIOWorksHere();
+        final KNN1040ScalarQuantizedVectorsFormat format = new KNN1040ScalarQuantizedVectorsFormat();
+        try (MMapDirectory dir = new MMapDirectory(createTempDir())) {
+            final SegmentReadState state = KNN1040ScalarQuantizedTestUtils.writeQuantizedVectors(dir, format, random());
+            final Lucene99FlatVectorsFormat rawFormat = format.rawVectorsFormat();
+
+            final List<float[]> expected;
+            try (FlatVectorsReader stock = rawFormat.fieldsReader(state)) {
+                expected = readAll(stock.getFloatVectorValues(FIELD_NAME));
+            }
+
+            try (KNNVectorStorageDirectory storage = new KNNVectorStorageDirectory(dir, "test-index")) {
+                try (KNNRescoreVectorsReader rescoreView = KNNRescoreVectorsReader.create(rawFormat, stateOver(state, storage))) {
+                    final FloatVectorValues rescoreValues = rescoreView.floatVectorValues(FIELD_NAME);
+                    assertNotNull("the view did not compose over the storage directory", rescoreValues);
+
+                    assertEquals(
+                        "the view's .vec open should have been served with O_DIRECT, declined=" + storage.declinedOpens(),
+                        1,
+                        storage.routedOpens()
+                    );
+                    assertEquals(0, storage.declinedOpens());
+
+                    final List<float[]> actual = readAll(rescoreValues);
+                    assertEquals(expected.size(), actual.size());
+                    for (int ord = 0; ord < expected.size(); ord++) {
+                        assertArrayEquals(
+                            "ordinal " + ord + " differs between the mmap reader and the O_DIRECT rescore view",
+                            expected.get(ord),
+                            actual.get(ord),
+                            0.0f
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Scores too, through the mode the query path actually uses. {@link VectorScorerMode#RESCORE} is
+     * {@code values.rescorer(target)}, so this is Lucene's own scorer over the same fp32 bytes arriving by
+     * two different mechanisms — exact equality, not a delta.
+     */
+    @SneakyThrows
+    public void testScoresThroughTheDirectIORescoreViewAreIdenticalToMmap() {
+        assumeDirectIOWorksHere();
+        final KNN1040ScalarQuantizedVectorsFormat format = new KNN1040ScalarQuantizedVectorsFormat();
+        try (MMapDirectory dir = new MMapDirectory(createTempDir())) {
+            final SegmentReadState state = KNN1040ScalarQuantizedTestUtils.writeQuantizedVectors(dir, format, random());
+            final Lucene99FlatVectorsFormat rawFormat = format.rawVectorsFormat();
+            final float[] target = KNN1040ScalarQuantizedTestUtils.randomVector(DIMENSION, random());
+
+            try (
+                FlatVectorsReader stock = rawFormat.fieldsReader(state);
+                KNNVectorStorageDirectory storage = new KNNVectorStorageDirectory(dir, "test-index")
+            ) {
+                try (KNNRescoreVectorsReader rescoreView = KNNRescoreVectorsReader.create(rawFormat, stateOver(state, storage))) {
+                    final FloatVectorValues mmapValues = stock.getFloatVectorValues(FIELD_NAME);
+                    final FloatVectorValues directValues = rescoreView.floatVectorValues(FIELD_NAME);
+                    assertNotNull(directValues);
+                    assertEquals(1, storage.routedOpens());
+
+                    final VectorScorer expected = VectorScorerMode.RESCORE.createScorer(mmapValues, target);
+                    final VectorScorer actual = VectorScorerMode.RESCORE.createScorer(directValues, target);
+                    assertNotNull(expected);
+                    assertNotNull(actual);
+
+                    final DocIdSetIterator expectedDocs = expected.iterator();
+                    final DocIdSetIterator actualDocs = actual.iterator();
+                    int scored = 0;
+                    for (int doc = expectedDocs.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = expectedDocs.nextDoc()) {
+                        assertEquals(doc, actualDocs.nextDoc());
+                        assertEquals("doc " + doc, expected.score(), actual.score(), 0.0f);
+                        scored++;
+                    }
+                    assertEquals(NUM_VECTORS, scored);
+                    assertEquals(DocIdSetIterator.NO_MORE_DOCS, actualDocs.nextDoc());
+                }
+            }
+        }
+    }
+
+    /**
+     * The other half of the invariant, and the one a regression would hide: with the storage directory
+     * installed, the segment's <em>ordinary</em> reader — the object traversal, merge, warmup and
+     * derived-source reads all share — opens the same {@code .vec} and is not routed. Nothing about
+     * installing the directory changes how that file is read; only the intent does, and only the rescore
+     * view attaches it.
+     */
+    @SneakyThrows
+    public void testTheOrdinaryReaderOverTheSameStorageDirectoryIsNotRouted() {
+        assumeDirectIOWorksHere();
+        final KNN1040ScalarQuantizedVectorsFormat format = new KNN1040ScalarQuantizedVectorsFormat();
+        try (MMapDirectory dir = new MMapDirectory(createTempDir())) {
+            final SegmentReadState state = KNN1040ScalarQuantizedTestUtils.writeQuantizedVectors(dir, format, random());
+            try (KNNVectorStorageDirectory storage = new KNNVectorStorageDirectory(dir, "test-index")) {
+                try (FlatVectorsReader stock = format.rawVectorsFormat().fieldsReader(stateOver(state, storage))) {
+                    assertNotNull(stock.getFloatVectorValues(FIELD_NAME));
+                    assertEquals("an untagged .vec open must never be routed", 0, storage.routedOpens());
+                    assertEquals(0, storage.declinedOpens());
+                }
+            }
+        }
+    }
+
+    /**
+     * With the setting off the storage directory is inert on this path for two independent reasons — the
+     * view is never built, so no intent-bearing open is ever issued, and the directory checks the setting
+     * itself. Asserted because "off means byte-identical to a node without the feature" is the property the
+     * default configuration rests on.
+     */
+    @SneakyThrows
+    public void testWithTheSettingOffTheStorageDirectoryRoutesNothing() {
+        final KNN1040ScalarQuantizedVectorsFormat format = new KNN1040ScalarQuantizedVectorsFormat();
+        try (MMapDirectory dir = new MMapDirectory(createTempDir())) {
+            final SegmentReadState state = KNN1040ScalarQuantizedTestUtils.writeQuantizedVectors(dir, format, random());
+            setRescoreEnabled(false);
+            try (KNNVectorStorageDirectory storage = new KNNVectorStorageDirectory(dir, "test-index")) {
+                try (
+                    KNNRescoreVectorsReader rescoreView = KNNRescoreVectorsReader.create(
+                        format.rawVectorsFormat(),
+                        stateOver(state, storage)
+                    )
+                ) {
+                    assertNull(rescoreView.floatVectorValues(FIELD_NAME));
+                    assertEquals(0, storage.routedOpens());
+                    assertEquals(0, storage.declinedOpens());
+                    assertEquals(0, storage.wrappedContainers());
+                }
+            }
+        }
     }
 }

@@ -76,10 +76,17 @@ public class KNNVectorIntentProbeStoreFactoryTests extends KNNTestCase {
         }
     }
 
+    /**
+     * The factory names are part of the contract — an {@code index.store.factory} the node has no factory
+     * for fails shard open — so both are pinned here. The probe is kept alongside the production directory
+     * because this phase's gate evidence was gathered through it.
+     */
     public void testPluginRegistersTheFactoryUnderItsDocumentedName() {
         final Map<String, IndexStorePlugin.StoreFactory> factories = new KNNPlugin().getStoreFactories();
-        assertEquals(1, factories.size());
+        assertEquals("the plugin offers the probe and the production storage directory", 2, factories.size());
         assertTrue(factories.containsKey(KNN_INTENT_PROBE_STORE_FACTORY));
         assertTrue(factories.get(KNN_INTENT_PROBE_STORE_FACTORY) instanceof KNNVectorIntentProbeStoreFactory);
+        assertTrue(factories.containsKey(KNNVectorStorageStoreFactory.KNN_VECTOR_STORAGE_STORE_FACTORY));
+        assertTrue(factories.get(KNNVectorStorageStoreFactory.KNN_VECTOR_STORAGE_STORE_FACTORY) instanceof KNNVectorStorageStoreFactory);
     }
 }
