@@ -20,6 +20,7 @@ import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.opensearch.common.Nullable;
+import org.opensearch.knn.index.codec.KNNRescoreVectorsReader;
 import org.opensearch.knn.index.store.DirectIOVectorSource;
 import org.opensearch.knn.index.store.KNNVectorIntentProbeDirectory;
 import org.opensearch.knn.index.store.KNNVectorReadIntent;
@@ -81,6 +82,19 @@ public class Faiss1040ScalarQuantizedFlatVectorsReader extends FlatVectorsReader
     private final Map<String, Optional<VectorLoaderSource>> vectorLoaderSources = new ConcurrentHashMap<>();
 
     /**
+     * The segment's second, intent-carrying view of the same full-precision vectors, or {@code null} when
+     * this reader was built without one. Opens nothing until a rescore query asks for values and the
+     * Direct I/O rescore setting is on.
+     * <p>
+     * This is the generic replacement for {@link #vectorLoaderSources}: the loader seam needs the plugin
+     * to name the file, compute the vector region's offset and size an entry, which is why it reaches
+     * exactly one encoding; the view needs none of that, because Lucene's own flat vectors format does the
+     * layout work over a {@link org.apache.lucene.store.Directory} that adds the intent.
+     */
+    @Nullable
+    private final KNNRescoreVectorsReader rescoreVectorsReader;
+
+    /**
      * @param lucene104ScalarQuantizedVectorsReader the delegate reader whose {@link FloatVectorValues}
      *                                              will be wrapped to implement {@code HasIndexSlice}
      */
@@ -99,9 +113,30 @@ public class Faiss1040ScalarQuantizedFlatVectorsReader extends FlatVectorsReader
         final FlatVectorsReader lucene104ScalarQuantizedVectorsReader,
         @Nullable final SegmentReadState state
     ) {
+        this(lucene104ScalarQuantizedVectorsReader, state, null);
+    }
+
+    /**
+     * @param lucene104ScalarQuantizedVectorsReader the delegate reader whose {@link FloatVectorValues}
+     *                                              will be wrapped to implement {@code HasIndexSlice}
+     * @param state the read state the segment is being opened with, used only to name the {@code .vec}
+     *              file for Direct I/O rescoring. Passing {@code null} builds a reader that offers no
+     *              Direct I/O source, which is exactly the behaviour before that path existed.
+     * @param rescoreVectorsReader the segment's intent-carrying second view of the full-precision
+     *              vectors, or {@code null} to offer none. Holding it here rather than in the
+     *              {@code KnnVectorsReader} above is deliberate: this is the class whose
+     *              {@link #getFloatVectorValues(String)} the rescore path reaches, so it is the class that
+     *              can hand the view to the values object without anything in between having to know.
+     */
+    protected Faiss1040ScalarQuantizedFlatVectorsReader(
+        final FlatVectorsReader lucene104ScalarQuantizedVectorsReader,
+        @Nullable final SegmentReadState state,
+        @Nullable final KNNRescoreVectorsReader rescoreVectorsReader
+    ) {
         super();
         this.delegateFlatVectorsReader = lucene104ScalarQuantizedVectorsReader;
         this.vectorDataPath = resolveVectorDataPath(state);
+        this.rescoreVectorsReader = rescoreVectorsReader;
         probeReadIntentChannel(state);
     }
 
@@ -238,6 +273,20 @@ public class Faiss1040ScalarQuantizedFlatVectorsReader extends FlatVectorsReader
         }).orElse(null);
     }
 
+    /**
+     * A second view of {@code field}'s full-precision vectors whose reads carry the rescore intent, or
+     * {@code null} when this segment offers none — which is the default, because the Direct I/O rescore
+     * setting is off by default and the view is what checks it.
+     * <p>
+     * Fresh values on every call, deliberately: {@link FloatVectorValues} carries a cursor and is not
+     * thread safe, so they cannot be cached the way a loader source can. The shared, segment-scoped thing
+     * is the reader behind them.
+     */
+    @Nullable
+    FloatVectorValues rescoreVectorValues(final String field) {
+        return rescoreVectorsReader == null ? null : rescoreVectorsReader.floatVectorValues(field);
+    }
+
     @Override
     public RandomVectorScorer getRandomVectorScorer(String field, float[] target) throws IOException {
         return delegateFlatVectorsReader.getRandomVectorScorer(field, target);
@@ -273,7 +322,8 @@ public class Faiss1040ScalarQuantizedFlatVectorsReader extends FlatVectorsReader
         return new ScalarQuantizedFloatVectorValues(
             floatVectorValues,
             KNN1040ScalarQuantizedUtils.extractQuantizedByteVectorValues(floatVectorValues),
-            () -> vectorLoaderSource(field)
+            () -> vectorLoaderSource(field),
+            () -> rescoreVectorValues(field)
         );
     }
 
@@ -283,12 +333,19 @@ public class Faiss1040ScalarQuantizedFlatVectorsReader extends FlatVectorsReader
     }
 
     /**
-     * Closes the delegate and any loader seams this reader established. The delegate is closed even if a
-     * seam fails to close, since it owns every file the default path reads.
+     * Closes the delegate, the rescore view and any loader seams this reader established. The delegate is
+     * closed even if one of the others fails to close, since it owns every file the default path reads.
      */
     @Override
     public void close() throws IOException {
         try {
+            if (rescoreVectorsReader != null) {
+                try {
+                    rescoreVectorsReader.close();
+                } catch (IOException e) {
+                    log.warn("Failed to close the rescore view of the full-precision vectors", e);
+                }
+            }
             for (final Map.Entry<String, Optional<VectorLoaderSource>> entry : vectorLoaderSources.entrySet()) {
                 final Optional<VectorLoaderSource> source = entry.getValue();
                 if (source.isPresent()) {

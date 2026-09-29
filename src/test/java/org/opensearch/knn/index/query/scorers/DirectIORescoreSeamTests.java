@@ -13,6 +13,7 @@ import org.mockito.Mock;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.index.KNNSettings;
+import org.opensearch.knn.index.codec.scorer.HasRescoreVectorValues;
 import org.opensearch.knn.index.codec.scorer.HasVectorLoaderSource;
 import org.opensearch.knn.index.store.VectorLoaderSource;
 import org.opensearch.knn.index.vectorvalues.TestVectorValues;
@@ -190,6 +191,129 @@ public class DirectIORescoreSeamTests extends KNNTestCase {
         setFlag(false);
         final FloatVectorValues values = new SourceNamingValues(source(SIZE, DIMENSION, DIMENSION * Float.BYTES));
         assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, false, fieldInfo));
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // The rescore view route. Preferred over the loader seam because it is Lucene's own values over an
+    // intent-carrying IndexInput: no plugin decoding, no offset arithmetic, and one mechanism per file
+    // rather than one per encoding.
+    // ---------------------------------------------------------------------------------------------------
+
+    /**
+     * The engaged case for the new route. The seam returns the view itself — not a wrapper around anything —
+     * so the scorer built from it one line later in {@code VectorScorers} is Lucene's own.
+     */
+    public void testVectorValuesForRescore_whenAViewIsOffered_thenReturnsTheViewUnwrapped() {
+        setFlag(true);
+        final FloatVectorValues view = values();
+        final FloatVectorValues values = new ViewOfferingValues(view);
+
+        final FloatVectorValues chosen = DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, false, fieldInfo);
+
+        assertSame(view, chosen);
+    }
+
+    /**
+     * When both routes are on offer the view wins. It has to: it is the route that reaches every encoding,
+     * and running both would put two Direct I/O mechanisms on the same reads.
+     */
+    public void testVectorValuesForRescore_whenBothRoutesAreOffered_thenTheViewWins() {
+        setFlag(true);
+        final FloatVectorValues view = values();
+        final FloatVectorValues values = new ViewAndSourceValues(view, source(SIZE, DIMENSION, DIMENSION * Float.BYTES));
+
+        final FloatVectorValues chosen = DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, false, fieldInfo);
+
+        assertSame(view, chosen);
+        assertFalse(chosen instanceof DirectIOFloatVectorValues);
+    }
+
+    /**
+     * No view — the setting off, a directory with no rescore route, a format that did not recognise the
+     * segment — falls through to the loader seam rather than to the default path, so the encoding the seam
+     * already covered keeps working while the view is being rolled out across the others.
+     */
+    @SneakyThrows
+    public void testVectorValuesForRescore_whenNoViewButASourceMatches_thenFallsBackToTheLoaderSeam() {
+        setFlag(true);
+        when(fieldInfo.getVectorSimilarityFunction()).thenReturn(VectorSimilarityFunction.EUCLIDEAN);
+        final FloatVectorValues values = new ViewAndSourceValues(null, source(SIZE, DIMENSION, DIMENSION * Float.BYTES));
+
+        final FloatVectorValues chosen = DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, false, fieldInfo);
+
+        assertTrue(chosen.getClass().getSimpleName(), chosen instanceof DirectIOFloatVectorValues);
+        assertArrayEquals(SOURCE_VECTOR, chosen.vectorValue(0), 0.0f);
+    }
+
+    /**
+     * A view that disagrees with the values on ordinal count is not reading the same segment's vectors — a
+     * wrong segment suffix, a format that resolved a different field — and scoring through it would silently
+     * score the wrong vectors. The seam declines and neither route engages.
+     */
+    public void testVectorValuesForRescore_whenTheViewShapeDisagrees_thenReturnsSameInstance() {
+        setFlag(true);
+        final FloatVectorValues shorter = new TestVectorValues.PreDefinedFloatVectorValues(List.of());
+        final FloatVectorValues values = new ViewOfferingValues(shorter);
+
+        assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, false, fieldInfo));
+    }
+
+    /**
+     * The two conditions that cannot be seen from inside the codec layer still gate the view: with the
+     * setting off, and on a radial query, the view is never even asked for. The radial half is the reason
+     * this class still exists — {@code rescorer()} has no way to see that flag.
+     */
+    public void testVectorValuesForRescore_whenFlagOffOrRadial_thenTheViewIsNeverAsked() {
+        final ViewOfferingValues values = new ViewOfferingValues(values());
+
+        setFlag(false);
+        assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, false, fieldInfo));
+        assertEquals(0, values.timesAsked);
+
+        setFlag(true);
+        assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, true, fieldInfo));
+        assertEquals(0, values.timesAsked);
+
+        assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.SCORE, false, fieldInfo));
+        assertEquals(0, values.timesAsked);
+    }
+
+    /**
+     * Stands in for a values class that offers the rescore view: the shape of {@link #values()} plus the one
+     * interface the seam's preferred route looks for. Counts the asks, because "never opened with the setting
+     * off" is a property of who calls whom, not of what is returned.
+     */
+    private static class ViewOfferingValues extends TestVectorValues.PreDefinedFloatVectorValues implements HasRescoreVectorValues {
+
+        private final FloatVectorValues view;
+        private int timesAsked;
+
+        private ViewOfferingValues(final FloatVectorValues view) {
+            super(VECTORS);
+            this.view = view;
+        }
+
+        @Override
+        public FloatVectorValues rescoreVectorValues() {
+            timesAsked++;
+            return view;
+        }
+    }
+
+    /** Offers both routes, as {@code ScalarQuantizedFloatVectorValues} does. */
+    private static final class ViewAndSourceValues extends ViewOfferingValues implements HasVectorLoaderSource {
+
+        private final VectorLoaderSource source;
+
+        private ViewAndSourceValues(final FloatVectorValues view, final VectorLoaderSource source) {
+            super(view);
+            this.source = source;
+        }
+
+        @Override
+        public VectorLoaderSource vectorLoaderSource() {
+            return source;
+        }
     }
 
     /**

@@ -8,7 +8,9 @@ package org.opensearch.knn.index.query.scorers;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FloatVectorValues;
+import org.opensearch.common.Nullable;
 import org.opensearch.knn.index.KNNSettings;
+import org.opensearch.knn.index.codec.scorer.HasRescoreVectorValues;
 import org.opensearch.knn.index.codec.scorer.HasVectorLoaderSource;
 import org.opensearch.knn.index.store.VectorLoaderSource;
 
@@ -45,17 +47,39 @@ import org.opensearch.knn.index.store.VectorLoaderSource;
  *       default path.</li>
  * </ol>
  *
- * <h2>What the engaged branch does</h2>
- * It asks the values for a {@link VectorLoaderSource} through {@link HasVectorLoaderSource} and, if it gets
- * one, wraps them in {@link DirectIOFloatVectorValues} so every vector the rescorer reads comes through that
- * seam rather than out of the page cache. Three further things send a query back to the default path, and
- * none of them is an error: values that name no source (any other vector format), a source that could not be
- * established or verified (a compound segment, a filesystem that refuses {@code O_DIRECT}), and a source
- * whose shape does not match the values.
+ * <h2>What the engaged branch does — two routes, in order</h2>
+ * <ol>
+ *   <li><b>The rescore view ({@link HasRescoreVectorValues}), preferred.</b> It asks the values for a second
+ *       view of the same {@code .vec} vectors whose reads carry the rescore intent, and returns it. The view
+ *       is Lucene's own {@code FloatVectorValues}, built by the segment's own flat vectors format over a
+ *       {@link org.apache.lucene.store.Directory} that adds the intent below the codec, so the scorer built
+ *       from it one line later in {@link VectorScorers} is Lucene's own too — including the shipped
+ *       bulk-prefetch path — and the plugin contributes no decoding, no offset arithmetic and no entry
+ *       sizing for any encoding. Nothing here is wrapped: the values object the traversal path holds is
+ *       returned to no one and its SIMD binding cannot be disturbed.</li>
+ *   <li><b>The loader seam ({@link HasVectorLoaderSource}), the earlier route.</b> If no view is on offer it
+ *       asks the values for a {@link VectorLoaderSource} and, if it gets one, wraps them in
+ *       {@link DirectIOFloatVectorValues}. This route needs the plugin to name the file, derive the vector
+ *       region's offset and size an entry by hand, which is why it reaches exactly one encoding.</li>
+ * </ol>
+ * Several further things send a query back to the default path, and none of them is an error: values that
+ * offer neither (any other vector format), a view or source that could not be established (the setting off,
+ * a directory with no rescore route, a filesystem that refuses {@code O_DIRECT}), and a view or source whose
+ * shape does not match the values.
  *
- * <p>This class knows nothing about {@code O_DIRECT}. It decides <em>whether</em> a read is a rescore read
- * and hands the mode down as a reuse hint; <em>how</em> the bytes arrive is the loader seam's business, and
- * the seam's one implementation today happens to use {@code O_DIRECT}.
+ * <p>This class knows nothing about {@code O_DIRECT}. It decides <em>whether</em> a read is a rescore read;
+ * <em>how</em> the bytes then arrive is decided below it — by the storage layer for route 1, by the loader
+ * seam for route 2.
+ *
+ * <h2>Why this class still exists once the view covers everything</h2>
+ * With route 1 the substitution itself needs no query-layer help: {@code VectorScorerMode.RESCORE} is
+ * literally {@code values.rescorer(target)}, so Lucene's own API already names <em>what</em> the read is, and
+ * a values class could return the view from {@code rescorer()} with no call from here at all. One thing
+ * cannot be moved, and it is the reason for the gate: <b>the radial exclusion is query-layer knowledge.</b>
+ * {@code radialSearch} is a parameter of {@code VectorScorers#getBaseScorer}, threaded from
+ * {@code ExactSearcher}, and {@code rescorer()} has no way to see it — while a radial rescore does arrive in
+ * {@code RESCORE} mode. So the gate stays here, where all three conditions are visible at once, and the
+ * codec layer offers a capability rather than deciding to use it.
  */
 @Log4j2
 public final class DirectIORescoreSeam {
@@ -99,6 +123,15 @@ public final class DirectIORescoreSeam {
         if (isEngaged(vectorScorerMode, radialSearch) == false) {
             return values;
         }
+
+        // The generic route first. It returns Lucene's own values over an intent-carrying IndexInput, so
+        // the scorer built from them one line later in VectorScorers is Lucene's own too - including the
+        // shipped bulk-prefetch path - and the plugin contributes no decoding for any encoding.
+        final FloatVectorValues rescoreValues = rescoreVectorValues(values, fieldInfo);
+        if (rescoreValues != null) {
+            return rescoreValues;
+        }
+
         if ((values instanceof HasVectorLoaderSource) == false) {
             // Every other vector format keeps the default path. This is not a gap to close later: the fp32
             // .vec rescore chain the project measures resolves to values that do implement it, and a format
@@ -141,5 +174,59 @@ public final class DirectIORescoreSeam {
         // The mode goes down as well as gating on it: it is the loader seam's reuse hint, and RESCORE is the
         // only value the gate above lets through.
         return new DirectIOFloatVectorValues(values, source, fieldInfo.getVectorSimilarityFunction(), vectorScorerMode);
+    }
+
+    /**
+     * The segment's intent-carrying view of the same full-precision vectors, or {@code null} when there is
+     * none and the caller should try the loader seam or the default path.
+     *
+     * <p>{@code null} is the ordinary answer on a node with no rescore-aware directory installed, on a
+     * values class that offers no view, and on any failure below — the view's whole safety argument is that
+     * both views read the same bytes, so declining it can only cost the isolation, never a result.
+     *
+     * <p>The shape check is not defensive boilerplate. The view is built by handing the segment's own flat
+     * vectors format a different {@link org.apache.lucene.store.Directory}, so a view that disagrees with
+     * the values on ordinal count, dimension or entry size means the two are not reading the same segment's
+     * vectors — a wrong {@code segmentSuffix}, a format that resolved a different field — and scoring
+     * through it would silently score the wrong vectors. Lucene catches most of that loudly at
+     * {@code CodecUtil.checkIndexHeader}; this catches the rest quietly and declines.
+     */
+    @Nullable
+    private static FloatVectorValues rescoreVectorValues(final FloatVectorValues values, final FieldInfo fieldInfo) {
+        if ((values instanceof HasRescoreVectorValues) == false) {
+            return null;
+        }
+        final FloatVectorValues rescoreValues = ((HasRescoreVectorValues) values).rescoreVectorValues();
+        if (rescoreValues == null) {
+            // The view logs its own reason once per segment. With the setting off this is every query, so
+            // it must stay cheap and quiet.
+            return null;
+        }
+        if (rescoreValues.size() != values.size()
+            || rescoreValues.dimension() != values.dimension()
+            || rescoreValues.getVectorByteLength() != values.getVectorByteLength()
+            || rescoreValues.getEncoding() != values.getEncoding()) {
+            log.warn(
+                "[KNN] Direct I/O rescore declined the rescore view for field [{}]: view has {} vectors of {} bytes at "
+                    + "dimension {} encoded {}, values have {} of {} at {} encoded {}",
+                fieldInfo.name,
+                rescoreValues.size(),
+                rescoreValues.getVectorByteLength(),
+                rescoreValues.dimension(),
+                rescoreValues.getEncoding(),
+                values.size(),
+                values.getVectorByteLength(),
+                values.dimension(),
+                values.getEncoding()
+            );
+            return null;
+        }
+        log.debug(
+            "[KNN] Direct I/O rescore engaged the rescore view for field [{}], values [{}], view [{}]",
+            fieldInfo.name,
+            values.getClass().getName(),
+            rescoreValues.getClass().getName()
+        );
+        return rescoreValues;
     }
 }
