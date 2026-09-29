@@ -37,12 +37,16 @@ import java.util.Set;
  * The first gate of the directory design: an intent named at the codec layer has to arrive, intact,
  * at the deepest {@link Directory} a plugin can supply.
  *
- * <p>{@code Directory.openInput} is the only channel that can still change how bytes are fetched — a
- * three-argument {@code slice} takes no {@link IOContext} and the context-carrying overload has no
- * call site in Lucene, and {@code IndexInput.updateIOContext} can only re-advise a mapping it already
- * made. So the design needs a plugin-authored {@code openInput}, and needs the hint on it to survive
- * {@code Store$StoreDirectory} and {@code ByteSizeCachingDirectory}, which a real {@link Store} puts
- * above whatever directory it is handed.
+ * <p>On a non-compound segment {@code Directory.openInput} is the only channel that can still change how
+ * bytes are fetched — a three-argument {@code slice} takes no {@link IOContext}, and
+ * {@code IndexInput.updateIOContext} can only re-advise a mapping it already made. So the design needs a
+ * plugin-authored {@code openInput}, and needs the hint on it to survive {@code Store$StoreDirectory} and
+ * {@code ByteSizeCachingDirectory}, which a real {@link Store} puts above whatever directory it is handed.
+ *
+ * <p>Inside a compound file there is a second channel, and it is the one gate 3 uses: the
+ * context-carrying four-argument {@code slice} does have a call site —
+ * {@code Lucene90CompoundReader#openInput} — so the container's {@code IndexInput} is handed each entry
+ * by name with the caller's context. See {@link KNNVectorCompoundSliceInputTests}.
  *
  * <p>These tests use a real {@link Store} rather than hand-stacked wrappers precisely so that the
  * classes under test are the server's own, at the version on the classpath.
@@ -220,23 +224,25 @@ public class KNNVectorReadIntentTests extends KNNTestCase {
     }
 
     /**
-     * The demonstrated limit of the channel, and the reason the coverage matrix needs a compound-segment
-     * row.
-     *
-     * <p>On a non-compound segment the directory a codec is handed is the store's, so the walk finds the
-     * plugin's directory and an intent can ride on a plugin-issued open. On a compound segment it is not:
+     * The limit of <em>this</em> channel on a compound segment: the {@code getDelegate()} walk does not
+     * reach the plugin's directory, and no {@code openInput} named {@code .vec} arrives at it.
      * {@code KNN1040Codec.compoundFormat()} wraps Lucene's compound reader in a
      * {@link KNN80CompoundDirectory}, which extends {@link CompoundDirectory} — a bare {@link Directory},
-     * not a {@link FilterDirectory} — so {@code getDelegate()} does not exist to walk. Two consequences,
-     * both asserted here: the plugin cannot find its own directory, and a {@code .vec} read is served
-     * from inside the {@code .cfs}, so the plugin directory never sees the name either. Extension
-     * dispatch and intent dispatch are therefore *both* unavailable on a compound segment, which is the
-     * same wall the existing {@code Path}-based seam hits by a different route.
+     * not a {@link FilterDirectory} — so there is no {@code getDelegate()} to walk, and the entry is
+     * served from inside the {@code .cfs} rather than opened by name.
      *
-     * <p>The one thing that survives is recorded too: {@link KNN80CompoundDirectory} keeps a reference to
-     * the outer directory, so the store chain is reachable from a compound segment even though the walk
-     * is not — that, plus the {@code .cfs} entry offset, is the only route a compound-segment design
-     * could take.
+     * <p><b>This is not the general compound-segment answer, and gate 1 read it as one.</b> The compound
+     * reader below is a stand-in that serves its entries from a nested {@link Directory}; Lucene's real
+     * one slices the {@code .cfs} handle it opened <em>on the outer directory</em>, using the
+     * context-carrying four-argument {@code slice}, so both the name and the intent do reach the plugin —
+     * at its {@code IndexInput} rather than at its {@code Directory}. That is gate 3, and it is asserted
+     * against the real compound reader in {@link KNNVectorCompoundSliceInputTests}. What survives here is
+     * narrower than it looked: the walk fails, and a design that only ever looks at {@code Directory}
+     * fails with it.
+     *
+     * <p>The other thing that survives is recorded too: {@link KNN80CompoundDirectory} keeps a reference
+     * to the outer directory, so the store chain is reachable from a compound segment even though the
+     * walk is not.
      */
     public void testCompoundSegmentBreaksTheWalkToThePluginDirectory() throws IOException {
         final KNNVectorIntentProbeDirectory probe = new KNNVectorIntentProbeDirectory(new ByteBuffersDirectory());
@@ -289,7 +295,8 @@ public class KNNVectorReadIntentTests extends KNNTestCase {
 
         compoundSegmentDirectory.openInput(VEC_FILE, KNNVectorReadIntent.RESCORE.vectorDataContext()).close();
         assertEquals(
-            "a .vec read of a compound segment must not be expected to arrive at the plugin directory as a .vec open",
+            "a .vec read of a compound segment does not arrive at the plugin directory as a .vec openInput; "
+                + "it arrives at the plugin's IndexInput for the .cfs as a slice -- see KNNVectorCompoundSliceInputTests",
             List.of(),
             probe.vectorDataObservations()
         );

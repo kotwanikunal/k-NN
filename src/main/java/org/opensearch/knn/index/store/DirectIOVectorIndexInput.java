@@ -68,18 +68,27 @@ import java.util.concurrent.atomic.AtomicLong;
  *       {@code DefaultFlatVectorScorer}. That fallback is what makes {@code vectorValue(ord)} — and so
  *       {@link #seek} plus {@link #readFloats} on this input — actually run. A SIMD scorer bound straight to
  *       a mapping would never call us.</li>
- *   <li><b>Not a {@code FilterIndexInput}.</b> The same {@code create} calls
- *       {@code FilterIndexInput.unwrapOnlyTest} first, so a wrapper around an mmap input would be seen
- *       through and the SIMD scorer would bind to the delegate. This extends {@link IndexInput} directly.</li>
+ *   <li><b>Not a {@code FilterIndexInput}.</b> Not for the reason first recorded here: the same
+ *       {@code create} does call {@code FilterIndexInput.unwrapOnlyTest} first, but that method only
+ *       unwraps classes registered through {@code TestSecrets}, whose setter Lucene restricts to its own
+ *       test framework, so a <em>production</em> {@code FilterIndexInput} subclass is <b>not</b> seen
+ *       through and would displace the SIMD scorer just as well (gate 3). The reason to extend
+ *       {@link IndexInput} directly is the other one: {@link FilterIndexInput} delegates only
+ *       {@code readByte} and {@code readBytes}, so it inherits {@code IndexInput}'s no-op
+ *       {@link #prefetch} and {@code DataInput}'s per-{@code float} {@code readFloats} loop — a wrapper
+ *       would have to override the very methods this class exists to implement.</li>
  * </ul>
  * The values object, by contrast, <em>keeps</em> {@code HasIndexSlice}, which is how the prefetch burst
  * above reaches us. That is strictly better placed than the seam, which had to hide {@code HasIndexSlice}
  * to keep the SIMD scorer off and therefore had to rebuild read-ahead in the query layer.
  *
  * <h2>Direct I/O is a property of this object, inherited</h2>
- * An {@code IOContext} does not survive {@link #slice}: Lucene calls the three-argument overload, which has
- * no context parameter, and the context-carrying four-argument overload has no call site in lucene-core
- * 10.5.0. So "these bytes are fetched with {@code O_DIRECT}" cannot be re-decided per slice and must be
+ * An {@code IOContext} does not survive the {@link #slice} Lucene uses <em>on a non-compound segment</em>:
+ * {@code OffHeapFloatVectorValues} calls the three-argument overload, which has no context parameter. The
+ * context-carrying four-argument overload does have one call site — {@code Lucene90CompoundReader#openInput},
+ * which is how every entry of every compound segment is opened, and which gate 3 turns into the
+ * compound-segment dispatch point (see {@link KNNVectorCompoundSliceInput}). Outside a compound file,
+ * though, "these bytes are fetched with {@code O_DIRECT}" cannot be re-decided per slice and must be
  * carried by the object. {@link #slice} and {@link #clone} therefore return instances over the same
  * {@link Handle} by construction, and there is no code path by which a slice of this input becomes an mmap
  * read. Only the input that opened the handle closes it.
