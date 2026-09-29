@@ -180,6 +180,29 @@ public class KNNSettings {
     public static final String KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE = "knn.direct_io.rescore.cache.bytes_per_source";
     public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_DEFAULT_VALUE = new ByteSizeValue(8, ByteSizeUnit.MB);
 
+    // The waste guard on the directory design's read-ahead channel: the largest single prefetch span
+    // DirectIOVectorIndexInput will put in flight. A span above it is declined, which is correct by the
+    // prefetch contract and leaves the bytes to blocking reads that touch only the blocks a vector is in.
+    //
+    // It exists because the read-ahead channel is Lucene's IndexInput#prefetch, whose only arguments are
+    // an offset and a length, and because the caller on this path -- PrefetchHelper#prefetchExactVectorSize
+    // -- asks for the SPAN of a coalesced group of ordinals, gaps included, extending a group while
+    // (vector end - group start) <= 128 KB. A group of two ordinals 120 KB apart is therefore one
+    // 120 KB request for 6 KB of vectors, and the input cannot see which bytes inside the span will be
+    // read: the gap structure is the caller's and is not in the arguments. So a guard here can only be a
+    // bound on the span, never a bound on the waste, and 9e-2's R60 -- that the paced p99 tracks byte
+    // volume (2.55x against a 2.50x p99 ratio) -- is what says whether bounding the span is worth its
+    // cost in queue depth.
+    //
+    // The default is 128 KB + one 4 KB block, i.e. PrefetchHelper's own grouping budget plus the
+    // alignment slack at each end, which is the value 9e-2 measured; at the default this setting changes
+    // nothing. Lower it to trade read-ahead for byte economy.
+    public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN = "knn.direct_io.rescore.prefetch.max_span_bytes";
+    public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_DEFAULT_VALUE = new ByteSizeValue(
+        128 * 1024 + 4096,
+        ByteSizeUnit.BYTES
+    );
+
     /**
      * For more details on supported engines, refer to {@link MemoryOptimizedSearchSupportSpec}
      */
@@ -464,6 +487,21 @@ public class KNNSettings {
     public static final Setting<ByteSizeValue> KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_SETTING = Setting.byteSizeSetting(
         KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE,
         KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_DEFAULT_VALUE,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
+     * The waste guard on the read-ahead channel of the directory design: the largest single
+     * {@code IndexInput#prefetch} span {@code DirectIOVectorIndexInput} will stage. Read once per
+     * {@code .vec} open, so it takes effect on the next open of the index rather than on the next query.
+     * <p>
+     * Dynamic and node scoped for the same reason the cache budget is: it is the knob an A/B of the
+     * read-ahead economy turns, and turning it must not need a rebuild. At its default it is inert.
+     */
+    public static final Setting<ByteSizeValue> KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING = Setting.byteSizeSetting(
+        KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN,
+        KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_DEFAULT_VALUE,
         NodeScope,
         Dynamic
     );
@@ -928,6 +966,10 @@ public class KNNSettings {
             return KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_SETTING;
         }
 
+        if (KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN.equals(key)) {
+            return KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING;
+        }
+
         throw new IllegalArgumentException("Cannot find setting by key [" + key + "]");
     }
 
@@ -975,7 +1017,9 @@ public class KNNSettings {
             KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_SETTING,
             KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING,
             // Rescore-seam vector cache
-            KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_SETTING
+            KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_SETTING,
+            // Waste guard on the directory design's read-ahead channel
+            KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
             .collect(Collectors.toList());
@@ -996,7 +1040,11 @@ public class KNNSettings {
             if (currentClusterService == null) {
                 return setting.getDefault(Settings.EMPTY);
             }
-            return currentClusterService.getClusterSettings().get(setting);
+            final T value = currentClusterService.getClusterSettings().get(setting);
+            // A null is "could not be read" and is treated the same as a missing cluster service. It is not
+            // hypothetical: a ClusterSettings that does not have this setting registered answers null, which
+            // would otherwise reach the caller as an unboxing NullPointerException at a shard's Directory.
+            return value != null ? value : setting.getDefault(Settings.EMPTY);
         } catch (Exception e) {
             logger.warn("Could not read setting [" + setting.getKey() + "]; falling back to its default", e);
             return setting.getDefault(Settings.EMPTY);
@@ -1047,6 +1095,13 @@ public class KNNSettings {
      */
     public static ByteSizeValue getDirectIORescoreCacheBytesPerSource() {
         return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_SETTING);
+    }
+
+    /**
+     * @return the largest single prefetch span the Direct I/O vector input will stage, in bytes
+     */
+    public static ByteSizeValue getDirectIORescorePrefetchMaxSpan() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING);
     }
 
     public static boolean isCircuitBreakerTriggered() {

@@ -7,6 +7,8 @@ package org.opensearch.knn.index.store;
 
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.store.IndexInput;
+import org.opensearch.core.common.unit.ByteSizeValue;
+import org.opensearch.knn.index.KNNSettings;
 
 import java.io.EOFException;
 import java.io.IOException;
@@ -159,6 +161,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 buffer.clear().limit(alignedLength);
                 valid = channel.read(buffer, alignedStart);
                 STATS.stagedReads.incrementAndGet();
+                STATS.stagedBytes.addAndGet(Math.max(valid, 0));
             } finally {
                 STATS.inFlightNow.decrementAndGet();
             }
@@ -186,6 +189,16 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      *
      * <p>{@link #inFlightPeak} is the number gate 2 turns on: it is the measured queue depth this input
      * offers the device, so a prefetch that stages nothing shows up here as 1 and not as a latency riddle.
+     *
+     * <h2>The byte counters, and why they are not a duplicate of {@code /proc/diskstats}</h2>
+     * 9e-2 priced the design's read amplification from the device side: {@code sectors_read} over the
+     * queries of a block, divided by the vectors those queries rescored. That number is a sum of every
+     * read the node made, so attributing it to this class was an inference (R60) rather than a
+     * measurement — the graph, the quantized codes and the doc values are on the same device.
+     * {@link #stagedBytes} + {@link #blockingBytes} over {@link #servedBytes} is the same ratio taken
+     * inside the one object that issues the reads, so it can neither include another reader's traffic nor
+     * miss any of this one's. Both byte figures are what the device <em>returned</em>, which equals the
+     * block-aligned request except at end of file.
      */
     public static final class Stats {
         private final AtomicLong blockingReads = new AtomicLong();
@@ -195,6 +208,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         private final AtomicLong prefetchCalls = new AtomicLong();
         private final AtomicLong inFlightNow = new AtomicLong();
         private final AtomicLong inFlightPeak = new AtomicLong();
+        private final AtomicLong stagedBytes = new AtomicLong();
+        private final AtomicLong blockingBytes = new AtomicLong();
+        private final AtomicLong servedBytes = new AtomicLong();
+        private final AtomicLong declinedSpanBytes = new AtomicLong();
 
         private void recordInFlightPeak() {
             final long now = inFlightNow.get();
@@ -233,6 +250,26 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             return inFlightPeak.get();
         }
 
+        /** Bytes the device returned for staged reads, i.e. the read-ahead channel's traffic. */
+        public long stagedBytes() {
+            return stagedBytes.get();
+        }
+
+        /** Bytes the device returned for blocking reads, i.e. the traffic of everything not staged. */
+        public long blockingBytes() {
+            return blockingBytes.get();
+        }
+
+        /** Bytes handed to callers out of either route — the denominator of read amplification. */
+        public long servedBytes() {
+            return servedBytes.get();
+        }
+
+        /** Span bytes asked for by prefetch calls that were declined, i.e. what the waste guard refused. */
+        public long declinedSpanBytes() {
+            return declinedSpanBytes.get();
+        }
+
         public void reset() {
             blockingReads.set(0);
             stagedReads.set(0);
@@ -240,19 +277,31 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             stageDeclined.set(0);
             prefetchCalls.set(0);
             inFlightPeak.set(0);
+            stagedBytes.set(0);
+            blockingBytes.set(0);
+            servedBytes.set(0);
+            declinedSpanBytes.set(0);
         }
 
         @Override
         public String toString() {
+            final long read = stagedBytes.get() + blockingBytes.get();
+            final long served = servedBytes.get();
             return String.format(
                 Locale.ROOT,
-                "blockingReads=%d stagedReads=%d stagedHits=%d stageDeclined=%d prefetchCalls=%d inFlightPeak=%d",
+                "blockingReads=%d stagedReads=%d stagedHits=%d stageDeclined=%d prefetchCalls=%d inFlightPeak=%d "
+                    + "stagedBytes=%d blockingBytes=%d servedBytes=%d declinedSpanBytes=%d amplification=%.3f",
                 blockingReads.get(),
                 stagedReads.get(),
                 stagedHits.get(),
                 stageDeclined.get(),
                 prefetchCalls.get(),
-                inFlightPeak.get()
+                inFlightPeak.get(),
+                stagedBytes.get(),
+                blockingBytes.get(),
+                served,
+                declinedSpanBytes.get(),
+                served == 0 ? 0.0 : (double) read / served
             );
         }
     }
@@ -267,6 +316,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * Largest single prefetch range this input will stage, in bytes. {@code PrefetchHelper} groups up to
      * 128 KB, so this is that plus a block for the alignment slack at each end; a larger range falls back to
      * blocking reads rather than to a buffer nobody budgeted for.
+     *
+     * <p>Since 9d-5 this is only the <em>default</em>: {@link #open(Path)} reads
+     * {@code knn.direct_io.rescore.prefetch.max_span_bytes}, whose own default is this value, so that the
+     * bound can be lowered without a rebuild. Lowering it is the waste guard — see {@link #prefetch}.
      */
     static final int DEFAULT_MAX_STAGED_RANGE_BYTES = 128 * 1024 + 4096;
 
@@ -326,7 +379,38 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * must cost a fall back to the default path, never a failed query.
      */
     public static DirectIOVectorIndexInput open(final Path path) {
-        return open(path, 0, DEFAULT_MAX_STAGED_RANGES, DEFAULT_MAX_STAGED_RANGE_BYTES);
+        return open(path, 0, configuredMaxStagedRanges(), configuredMaxStagedRangeBytes());
+    }
+
+    /**
+     * How many ranges one burst may hold in flight, from {@code knn.direct_io.rescore.prefetch_window}.
+     *
+     * <p>That setting is the rescore seam's window, and it is reused here rather than duplicated because it
+     * is the same quantity — reads one scorer keeps in flight — and because the two paths are mutually
+     * exclusive in practice (9e-2 measured 0 seam engagements in every block of this build). Its default of
+     * 48 is <b>smaller than the burst it has to hold</b>: {@code PrefetchHelper} is driven by Lucene's
+     * 64-ordinal bulk batch, so a table of 48 declines the last ranges of every burst and sends them to
+     * blocking reads. That is visible as {@code stageDeclined} rising in step with {@code prefetchCalls},
+     * and it is a knob this class deliberately does not decide for itself.
+     */
+    private static int configuredMaxStagedRanges() {
+        final int configured = KNNSettings.getDirectIORescorePrefetchWindow();
+        return configured > 0 ? configured : DEFAULT_MAX_STAGED_RANGES;
+    }
+
+    /**
+     * The span bound from {@code knn.direct_io.rescore.prefetch.max_span_bytes}, clamped into int range.
+     * Read here, once per {@code .vec} open, rather than per prefetch: the bound sizes the staging buffers,
+     * and a bound that moved under a burst would mean a buffer allocated for one size holding another.
+     * A setting that cannot be read falls back to its default, the same contract every other Direct I/O
+     * setting has — this must never be the reason a shard fails to open.
+     */
+    private static int configuredMaxStagedRangeBytes() {
+        final ByteSizeValue configured = KNNSettings.getDirectIORescorePrefetchMaxSpan();
+        if (configured == null || configured.getBytes() <= 0) {
+            return DEFAULT_MAX_STAGED_RANGE_BYTES;
+        }
+        return Math.toIntExact(Math.min(configured.getBytes(), Integer.MAX_VALUE / 2));
     }
 
     /**
@@ -395,6 +479,16 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         return bufferSize;
     }
 
+    /** Ranges one prefetch burst may hold in flight, after the setting was read at open. */
+    int maxStagedRanges() {
+        return maxStagedRanges;
+    }
+
+    /** The waste guard's bound: the largest single prefetch span this input will stage, in bytes. */
+    int maxStagedRangeBytes() {
+        return maxStagedRangeBytes;
+    }
+
     // ---------------------------------------------------------------------------------------------------
     // Read ahead
     // ---------------------------------------------------------------------------------------------------
@@ -407,6 +501,22 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * stage nothing, and a caller that then reads something else, or reads out of order, still gets correct
      * bytes from blocking reads. No returned value tells the caller which happened, so nothing can come to
      * depend on it.
+     *
+     * <h2>The span bound is the waste guard, and it is a bound on the span because it cannot be a bound
+     * on the waste</h2>
+     * The caller on the rescore path is {@code PrefetchHelper#prefetchExactVectorSize}, which sorts the
+     * batch's ordinals and then asks for the <em>span</em> of each coalesced group — extending a group
+     * while {@code (vector end) - (group start) <= 128 KB} and then calling
+     * {@code prefetch(groupStart, lastEnd - groupStart)}. The gaps between the group's vectors are inside
+     * that span and are not in these two arguments, so this method cannot tell a group of 42 back-to-back
+     * vectors (a 128 KB span, none of it wasted) from a group of two vectors 120 KB apart (a 120 KB span,
+     * 95% of it wasted). The gap structure exists one layer up and is not on this interface.
+     *
+     * <p>What is left is a bound on the span, {@code knn.direct_io.rescore.prefetch.max_span_bytes}. Above
+     * it the range is declined, which costs read-ahead for exactly those groups and saves whatever their
+     * gaps were: the bytes are then served by {@link #blockingSource}, one {@link #bufferSize} window per
+     * vector touched and nothing for the gaps. That is a real trade and not a free win, which is why the
+     * bound is a setting with the measured value as its default rather than a new constant.
      */
     @Override
     public void prefetch(final long offset, final long length) throws IOException {
@@ -419,6 +529,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             // Checked before any int arithmetic, so a caller asking to prefetch gigabytes declines here
             // rather than overflowing the aligned-length computation below.
             STATS.stageDeclined.incrementAndGet();
+            STATS.declinedSpanBytes.addAndGet(length);
             return;
         }
         // A burst has no explicit boundary, so it is recovered: the first prefetch after any read ends the
@@ -432,6 +543,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final int alignedLength = alignUp(Math.toIntExact(absolute + length - alignedStart), blockSize);
         if (alignedLength > maxStagedRangeBytes) {
             STATS.stageDeclined.incrementAndGet();
+            STATS.declinedSpanBytes.addAndGet(length);
             return;
         }
         if (staged != null) {
@@ -524,6 +636,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final Source source = source(1);
         final byte value = source.buffer.get(source.position);
         filePointer++;
+        STATS.servedBytes.incrementAndGet();
         return value;
     }
 
@@ -537,6 +650,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             filePointer += available;
             written += available;
         }
+        STATS.servedBytes.addAndGet(count);
     }
 
     /**
@@ -566,6 +680,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             filePointer += (long) usableFloats * Float.BYTES;
             written += usableFloats;
         }
+        STATS.servedBytes.addAndGet((long) count * Float.BYTES);
     }
 
     /** Where the bytes at the current file pointer live: a buffer, a position in it, and how much follows. */
@@ -653,6 +768,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         syncBuffer.clear().limit(bufferSize);
         final int read = handle.channel.read(syncBuffer, alignedStart);
         STATS.blockingReads.incrementAndGet();
+        STATS.blockingBytes.addAndGet(Math.max(read, 0));
         syncStart = alignedStart;
         syncValid = Math.max(read, 0);
         final int position = Math.toIntExact(absolute - alignedStart);
@@ -759,6 +875,12 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         resetStaging();
         if (ownsHandle) {
             handle.channel.close();
+            // One snapshot per file closed, and deliberately not per burst or per clone: clones close once
+            // per query thread per segment, and a line there would be per-query log traffic inside the very
+            // blocks whose latency is being measured. {@link #STATS} is node wide and cumulative, so a
+            // measurement reads this line before and after a block and takes the difference — which is why
+            // the message says so rather than leaving a reader to assume the numbers are this file's.
+            log.debug("Direct I/O vector reads (node totals, cumulative) at close of [{}]: {}", handle.path.getFileName(), STATS);
         }
     }
 

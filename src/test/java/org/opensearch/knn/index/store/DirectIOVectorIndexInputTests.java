@@ -18,7 +18,11 @@ import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
+import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.common.settings.Setting;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.knn.KNNTestCase;
+import org.opensearch.knn.index.KNNSettings;
 
 import java.io.EOFException;
 import java.io.IOException;
@@ -29,7 +33,11 @@ import java.nio.file.Files;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.HashSet;
 import java.util.Random;
+import java.util.Set;
+
+import static org.mockito.Mockito.when;
 
 /**
  * Phase 9b gate 2: whether an {@code O_DIRECT} {@link IndexInput} can carry read ahead by itself.
@@ -520,5 +528,288 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
                 assertEquals("prefetched ordinal " + ord, mmapScorer.score(ord), dioScorer.score(ord), 0.0f);
             }
         }
+    }
+
+    // -----------------------------------------------------------------------------------------------
+    // 5. Phase 9d-5: the read-ahead economy — the byte counters and the span bound
+    // -----------------------------------------------------------------------------------------------
+
+    /**
+     * Rewrites the cluster settings this test case's mock {@code ClusterService} answers with, so that a
+     * test can open an input under a non-default bound. {@code KNNTestCase#setUp} installs a
+     * {@code ClusterSettings} built from {@code Settings.EMPTY}, i.e. every setting at its default, and
+     * re-installs it between tests, so nothing here leaks into another test.
+     */
+    private void withNodeSettings(final Settings settings) {
+        final Set<Setting<?>> registered = new HashSet<>(ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
+        registered.addAll(
+            KNNSettings.state()
+                .getSettings()
+                .stream()
+                .filter(setting -> setting.getProperties().contains(Setting.Property.NodeScope))
+                .collect(java.util.stream.Collectors.toList())
+        );
+        when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(settings, registered));
+        KNNSettings.state().setClusterService(clusterService);
+    }
+
+    /**
+     * {@code PrefetchHelper#prefetchExactVectorSize}'s grouping, driven against this input.
+     *
+     * <p>A mirror of {@code PrefetchHelper:92-108} rather than a call to it, for one reason: that method is
+     * gated behind {@code KNNFeatureFlags#isPrefetchEnabled()}, which reads the settings singleton through a
+     * different accessor than the one this test case initializes, so a call would test the harness rather
+     * than the grouping. The node runs the real one — this asserts what the shape of its requests does to
+     * the input. Kept literal, including the 128 KB budget being a parameter here so a test can show what
+     * the group span controls.
+     */
+    @SneakyThrows
+    private static int prefetchLikeHelper(
+        final DirectIOVectorIndexInput input,
+        final long baseOffset,
+        final int vectorBytes,
+        final int[] ords,
+        final long groupBudget
+    ) {
+        final int[] sorted = ords.clone();
+        java.util.Arrays.sort(sorted);
+        int groups = 0;
+        long groupStart = baseOffset + (long) sorted[0] * vectorBytes;
+        for (int i = 1; i < sorted.length; i++) {
+            final long current = baseOffset + (long) sorted[i] * vectorBytes;
+            if ((current + vectorBytes) - groupStart > groupBudget) {
+                final long previous = baseOffset + (long) sorted[i - 1] * vectorBytes;
+                input.prefetch(groupStart, (previous + vectorBytes) - groupStart);
+                groups++;
+                groupStart = current;
+            }
+        }
+        final long last = baseOffset + (long) sorted[sorted.length - 1] * vectorBytes;
+        input.prefetch(groupStart, (last + vectorBytes) - groupStart);
+        return groups + 1;
+    }
+
+    /** Ordinals drawn from one narrow window, so that a coalesced group spans several of them. */
+    private static int[] clusteredOrds(final int count, final int windowSize, final int firstOrd) {
+        final Random random = new Random(11L);
+        final int[] ords = new int[count];
+        for (int i = 0; i < count; i++) {
+            ords[i] = firstOrd + random.nextInt(windowSize);
+        }
+        return ords;
+    }
+
+    /**
+     * Both bounds come from settings, and both defaults are the values 9e-2 measured — so installing this
+     * change on a node with no settings written changes nothing.
+     */
+    @SneakyThrows
+    public void testBothStagingBoundsAreReadFromSettingsAndDefaultToTheMeasuredValues() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final Path path = writeVectorFile(dir, randomVectors(8));
+
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+            assertNotNull(input);
+            assertEquals(
+                "the span bound must default to PrefetchHelper's group budget plus a block",
+                DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGE_BYTES,
+                input.maxStagedRangeBytes()
+            );
+            assertEquals(
+                "the table size must default to the rescore prefetch window",
+                KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_DEFAULT_VALUE,
+                input.maxStagedRanges()
+            );
+        }
+
+        withNodeSettings(
+            Settings.builder()
+                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN, "16kb")
+                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW, 64)
+                .build()
+        );
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+            assertNotNull(input);
+            assertEquals("the span bound must follow the setting", 16 * 1024, input.maxStagedRangeBytes());
+            assertEquals("the table size must follow the setting", 64, input.maxStagedRanges());
+        }
+    }
+
+    /**
+     * The byte counters must account for every read and for exactly the bytes handed out, because the whole
+     * point of them is that read amplification stops being an inference from {@code /proc/diskstats}.
+     *
+     * <p>9e-2's R60 divided a block's device {@code sectors_read} by its candidate count and attributed the
+     * result to this class. That numerator is the whole node's traffic — the faiss graph and the quantized
+     * codes are read from the same device in the same block — so the ratio it produced was an upper bound
+     * on this path's amplification, not a measurement of it. These counters are taken inside the object
+     * that issues the reads, so they can neither borrow another reader's bytes nor miss any of their own.
+     */
+    @SneakyThrows
+    public void testByteCountersMeasureAmplificationExactly() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(2000);
+        final Path path = writeVectorFile(dir, vectors);
+        final int[] ords = scatteredOrds(40, vectors.length);
+        final float[] scratch = new float[DIMENSION];
+
+        // Arm A: no prefetch, so every byte read is a blocking read and the served total is exact.
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+            assertNotNull(input);
+            for (final int ord : ords) {
+                input.seek(HEADER_LENGTH + (long) ord * VECTOR_BYTES);
+                input.readFloats(scratch, 0, DIMENSION);
+                assertArrayEquals(vectors[ord], scratch, 0.0f);
+            }
+            final int blockSize = input.blockSize();
+            assertEquals(
+                "servedBytes must be exactly the vectors handed out",
+                (long) ords.length * VECTOR_BYTES,
+                DirectIOVectorIndexInput.STATS.servedBytes()
+            );
+            assertEquals("nothing may be staged without a prefetch", 0L, DirectIOVectorIndexInput.STATS.stagedBytes());
+            final long blocking = DirectIOVectorIndexInput.STATS.blockingBytes();
+            assertEquals("every blocking read is block aligned", 0L, blocking % blockSize);
+            assertTrue(
+                "a 3072 byte vector cannot be read in fewer than 3072 bytes, got " + blocking,
+                blocking >= (long) ords.length * VECTOR_BYTES
+            );
+            logger.info("9d-5 amplification, no prefetch: {}", DirectIOVectorIndexInput.STATS);
+        }
+
+        // Arm B: the same reads behind a prefetch burst. The served total is unchanged -- the same vectors
+        // were handed out -- and the device traffic has moved from the blocking counter to the staged one.
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+            assertNotNull(input);
+            prefetchLikeHelper(input, HEADER_LENGTH, VECTOR_BYTES, ords, 128 * 1024);
+            for (final int ord : ords) {
+                input.seek(HEADER_LENGTH + (long) ord * VECTOR_BYTES);
+                input.readFloats(scratch, 0, DIMENSION);
+                assertArrayEquals(vectors[ord], scratch, 0.0f);
+            }
+        }
+        assertEquals(
+            "servedBytes must not depend on how the bytes were fetched",
+            (long) ords.length * VECTOR_BYTES,
+            DirectIOVectorIndexInput.STATS.servedBytes()
+        );
+        assertTrue("the burst must have read through the staging channel", DirectIOVectorIndexInput.STATS.stagedBytes() > 0);
+        assertTrue(
+            "bytes read must cover bytes served",
+            DirectIOVectorIndexInput.STATS.stagedBytes() + DirectIOVectorIndexInput.STATS.blockingBytes() >= (long) ords.length
+                * VECTOR_BYTES
+        );
+        logger.info("9d-5 amplification, prefetched: {}", DirectIOVectorIndexInput.STATS);
+    }
+
+    /**
+     * <b>The waste guard, and the two opposite things it does — which is the whole finding.</b>
+     *
+     * <p>Two batches of the same size over the same file, both through {@code PrefetchHelper}'s grouping:
+     * one <em>scattered</em> over 20,000 vectors, one <em>clustered</em> inside a 40-vector window. The span
+     * bound is then lowered to one block pair and both are read again.
+     *
+     * <p>The measurement (numbers from this test's own log, 9d-5):
+     * <table>
+     *   <caption>bytes the device delivered, against bytes handed to the caller</caption>
+     *   <tr><th>batch</th><th>groups</th><th>bound</th><th>read</th><th>served</th><th>amplification</th></tr>
+     *   <tr><td>scattered</td><td>53</td><td>132 KB</td><td>1,064,960</td><td>196,608</td><td>5.42x</td></tr>
+     *   <tr><td>scattered</td><td>53</td><td>8 KB</td><td>450,560</td><td>196,608</td><td><b>2.29x</b></td></tr>
+     *   <tr><td>clustered</td><td>1</td><td>132 KB</td><td>126,976</td><td>196,608</td><td><b>0.65x</b></td></tr>
+     *   <tr><td>clustered</td><td>1</td><td>8 KB</td><td>499,712</td><td>196,608</td><td>2.54x</td></tr>
+     * </table>
+     *
+     * <p>So the bound's sign depends on the batch, and the span it is given cannot tell it which it has.
+     * A <em>sparse</em> group — 53 groups covering 64 scattered ordinals, so some groups hold two or three
+     * vectors 100 KB apart — is mostly gap, and declining it saves 58% of the traffic. A <em>dense</em>
+     * group — 64 ordinals inside 40 vectors, coalescing into one 124 KB span that every read then hits —
+     * is the case the grouping was built for, and declining it costs 3.9x, because the span it replaces
+     * with 64 blocking reads was being read once and reused. Span length is the same 124 KB in both.
+     *
+     * <p>That is why the bound is a setting whose default leaves 9e-2's behaviour exactly as measured,
+     * rather than a new constant: it is a trade to be made per substrate, and the shape-aware version of
+     * it (a bound driven by the amplification the <em>previous</em> burst actually achieved, which is
+     * observable here where the gaps are not) is a further step this does not take. Correctness is
+     * asserted on every ordinal in all four combinations, because a guard that changed a byte would be
+     * worse than no guard at all.
+     */
+    @SneakyThrows
+    public void testTheSpanBoundCutsSparseGroupsAndCostsDenseOnes() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(20000);
+        final Path path = writeVectorFile(dir, vectors);
+        final float[] scratch = new float[DIMENSION];
+        final int[] scattered = scatteredOrds(64, vectors.length);
+        final int[] clustered = clusteredOrds(64, 40, 5000);
+
+        final long[][] measured = new long[4][];
+        final String[] labels = { "scattered/default-bound", "clustered/default-bound", "scattered/8kb-bound", "clustered/8kb-bound" };
+        int slot = 0;
+        for (final int bound : new int[] { DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGE_BYTES, 8192 }) {
+            for (final int[] ords : new int[][] { scattered, clustered }) {
+                DirectIOVectorIndexInput.STATS.reset();
+                try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, bound)) {
+                    assertNotNull(input);
+                    final int groups = prefetchLikeHelper(input, HEADER_LENGTH, VECTOR_BYTES, ords, 128 * 1024);
+                    for (final int ord : ords) {
+                        input.seek(HEADER_LENGTH + (long) ord * VECTOR_BYTES);
+                        input.readFloats(scratch, 0, DIMENSION);
+                        // The guard must be invisible in the bytes, in every combination.
+                        assertArrayEquals(labels[slot] + " ordinal " + ord, vectors[ord], scratch, 0.0f);
+                    }
+                    measured[slot] = new long[] {
+                        groups,
+                        DirectIOVectorIndexInput.STATS.stagedBytes() + DirectIOVectorIndexInput.STATS.blockingBytes(),
+                        DirectIOVectorIndexInput.STATS.servedBytes(),
+                        DirectIOVectorIndexInput.STATS.stageDeclined(),
+                        DirectIOVectorIndexInput.STATS.declinedSpanBytes() };
+                }
+                logger.info(
+                    "9d-5 span bound {}: {} groups={} read={} served={} declined={} declinedSpan={}",
+                    bound,
+                    labels[slot],
+                    measured[slot][0],
+                    measured[slot][1],
+                    measured[slot][2],
+                    measured[slot][3],
+                    measured[slot][4]
+                );
+                slot++;
+            }
+        }
+
+        // The grouping itself, because if it ever changes the rest of this test measures something else:
+        // scattered ordinals coalesce only incidentally (53 groups for 64 ordinals), clustered ones fully.
+        assertTrue("a scattered batch must stay mostly ungrouped, groups=" + measured[0][0], measured[0][0] > 32);
+        assertTrue("a scattered batch must coalesce somewhat, groups=" + measured[0][0], measured[0][0] < 64);
+        assertEquals("64 ordinals inside 40 vectors must coalesce into one group", 1L, measured[1][0]);
+
+        // Neither batch is declined at the default bound: it is PrefetchHelper's own budget plus a block,
+        // so by construction no group can exceed it. Installing the setting changes nothing by itself.
+        assertEquals("nothing may be declined at the default bound, scattered", 0L, measured[0][3]);
+        assertEquals("nothing may be declined at the default bound, clustered", 0L, measured[1][3]);
+
+        // The finding, in both directions. Sparse groups are mostly gap, so declining them saves traffic.
+        assertTrue("an 8 KB bound must decline sparse groups", measured[2][3] > 0);
+        assertTrue(
+            "the bound must reduce bytes read on a scattered batch, " + measured[0][1] + " -> " + measured[2][1],
+            measured[2][1] < measured[0][1]
+        );
+        // Dense groups are the case the grouping exists for, so declining them costs traffic. This is the
+        // assertion that stops the bound being described as a free win anywhere.
+        assertTrue("an 8 KB bound must decline the dense group too", measured[3][3] > 0);
+        assertTrue(
+            "the bound must COST bytes on a clustered batch, " + measured[1][1] + " -> " + measured[3][1],
+            measured[3][1] > measured[1][1]
+        );
+
+        // And in every combination the caller got the same bytes, which is the only invariant the guard owes.
+        assertEquals("served bytes cannot depend on the bound, scattered", measured[0][2], measured[2][2]);
+        assertEquals("served bytes cannot depend on the bound, clustered", measured[1][2], measured[3][2]);
     }
 }
