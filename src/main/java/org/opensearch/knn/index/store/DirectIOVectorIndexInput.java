@@ -309,8 +309,12 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     /** The one counter set, because the pool it counts is node wide too. */
     public static final Stats STATS = new Stats();
 
-    /** Default ranges a single prefetch burst may hold in flight. */
-    static final int DEFAULT_MAX_STAGED_RANGES = 48;
+    /**
+     * Default ranges a single prefetch burst may hold in flight: the size of Lucene's bulk batch, because
+     * a table smaller than the burst declines the burst's tail. Only the fallback since 9d-5 —
+     * {@link #open(Path)} reads {@code knn.direct_io.rescore.prefetch.staged_ranges}, whose default this is.
+     */
+    static final int DEFAULT_MAX_STAGED_RANGES = 64;
 
     /**
      * Largest single prefetch range this input will stage, in bytes. {@code PrefetchHelper} groups up to
@@ -383,18 +387,19 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     }
 
     /**
-     * How many ranges one burst may hold in flight, from {@code knn.direct_io.rescore.prefetch_window}.
+     * How many ranges one burst may hold in flight, from
+     * {@code knn.direct_io.rescore.prefetch.staged_ranges}.
      *
-     * <p>That setting is the rescore seam's window, and it is reused here rather than duplicated because it
-     * is the same quantity — reads one scorer keeps in flight — and because the two paths are mutually
-     * exclusive in practice (9e-2 measured 0 seam engagements in every block of this build). Its default of
-     * 48 is <b>smaller than the burst it has to hold</b>: {@code PrefetchHelper} is driven by Lucene's
-     * 64-ordinal bulk batch, so a table of 48 declines the last ranges of every burst and sends them to
-     * blocking reads. That is visible as {@code stageDeclined} rising in step with {@code prefetchCalls},
-     * and it is a knob this class deliberately does not decide for itself.
+     * <p>Its own setting rather than the rescore seam's {@code prefetch_window}, which task-15 first tried:
+     * the seam's window is a rolling ring refilled as it drains, this is a table that must <b>hold a whole
+     * burst</b>, and the burst's size is not ours to choose. {@code PrefetchHelper} is driven by Lucene's
+     * 64-ordinal bulk batch, so a table smaller than 64 declines the tail of <em>every</em> burst and those
+     * ranges become blocking reads on the calling thread. Measured on {@code dio-1m}: at 48 the route made
+     * 5.4 blocking reads per query and the paced p99 was 30 ms; at 64 it makes 0.0 and the paced p99 is
+     * 11 ms, at <b>identical byte volume</b> (2,581 vs 2,591 KiB/query).
      */
     private static int configuredMaxStagedRanges() {
-        final int configured = KNNSettings.getDirectIORescorePrefetchWindow();
+        final int configured = KNNSettings.getDirectIORescorePrefetchStagedRanges();
         return configured > 0 ? configured : DEFAULT_MAX_STAGED_RANGES;
     }
 

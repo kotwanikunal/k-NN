@@ -197,6 +197,23 @@ public class KNNSettings {
     // The default is 128 KB + one 4 KB block, i.e. PrefetchHelper's own grouping budget plus the
     // alignment slack at each end, which is the value 9e-2 measured; at the default this setting changes
     // nothing. Lower it to trade read-ahead for byte economy.
+    // How many prefetch ranges ONE Direct I/O vector input keeps in flight for one burst. Separate
+    // from knn.direct_io.rescore.prefetch_window above, which is the rescore *seam*'s rolling ring,
+    // because the two are not the same quantity and their right values differ: the seam's 48 came from
+    // a sweep of a ring that is refilled as it drains, while this is a table that has to HOLD a whole
+    // burst, and the burst's size is not ours to choose -- PrefetchHelper is driven by Lucene's
+    // 64-ordinal bulk batch, so a table of 48 declines the tail of every burst and those ranges fall
+    // back to blocking reads on the calling thread.
+    //
+    // 64 on measurement (task-15, dio-1m, k=100, 200 queries x 3, cold, mincore-verified). At 48 the
+    // route made 5.4 blocking reads per query and the paced p99 was 30 ms; at 64 it makes 0.0 and the
+    // paced p99 is 11 ms, with byte volume UNCHANGED (2,581 vs 2,591 KiB/query) -- so the tail was
+    // serialization, not traffic. Saturated, the same change is p99 31 -> 28 and median 10 -> 9. The
+    // value is the batch size rather than a tuned number: raising it further cannot help, because
+    // nothing asks for more than 64 ranges in one burst.
+    public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES = "knn.direct_io.rescore.prefetch.staged_ranges";
+    public static final int KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_DEFAULT_VALUE = 64;
+
     public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN = "knn.direct_io.rescore.prefetch.max_span_bytes";
     public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_DEFAULT_VALUE = new ByteSizeValue(
         128 * 1024 + 4096,
@@ -499,6 +516,21 @@ public class KNNSettings {
      * Dynamic and node scoped for the same reason the cache budget is: it is the knob an A/B of the
      * read-ahead economy turns, and turning it must not need a rebuild. At its default it is inert.
      */
+    /**
+     * Ranges one Direct I/O vector input keeps in flight per prefetch burst. Node scoped and dynamic,
+     * read once per {@code .vec} open, so it takes effect on the next open of the index.
+     * <p>
+     * Lower bound 1 rather than 48-ish: a node that wants to measure the serial case should be able to
+     * ask for it, and every value is correct — declining a prefetch only costs read-ahead.
+     */
+    public static final Setting<Integer> KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_SETTING = Setting.intSetting(
+        KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES,
+        KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_DEFAULT_VALUE,
+        1,
+        NodeScope,
+        Dynamic
+    );
+
     public static final Setting<ByteSizeValue> KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING = Setting.byteSizeSetting(
         KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN,
         KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_DEFAULT_VALUE,
@@ -970,6 +1002,10 @@ public class KNNSettings {
             return KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING;
         }
 
+        if (KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES.equals(key)) {
+            return KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_SETTING;
+        }
+
         throw new IllegalArgumentException("Cannot find setting by key [" + key + "]");
     }
 
@@ -1018,7 +1054,8 @@ public class KNNSettings {
             KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING,
             // Rescore-seam vector cache
             KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_SETTING,
-            // Waste guard on the directory design's read-ahead channel
+            // The directory design's read-ahead channel: staging table size and the waste guard
+            KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_SETTING,
             KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
@@ -1095,6 +1132,13 @@ public class KNNSettings {
      */
     public static ByteSizeValue getDirectIORescoreCacheBytesPerSource() {
         return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_SETTING);
+    }
+
+    /**
+     * @return prefetch ranges one Direct I/O vector input keeps in flight per burst
+     */
+    public static int getDirectIORescorePrefetchStagedRanges() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_SETTING);
     }
 
     /**

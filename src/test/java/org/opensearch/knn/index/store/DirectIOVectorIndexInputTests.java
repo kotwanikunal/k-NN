@@ -616,23 +616,26 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
                 DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGE_BYTES,
                 input.maxStagedRangeBytes()
             );
+            // 64, the size of Lucene's bulk batch. A smaller table declines the tail of every burst,
+            // which task-15 measured as a paced p99 of 30 ms against 11 ms at identical byte volume.
             assertEquals(
-                "the table size must default to the rescore prefetch window",
-                KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_DEFAULT_VALUE,
+                "the table size must default to the burst size",
+                KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_DEFAULT_VALUE,
                 input.maxStagedRanges()
             );
+            assertEquals("and that default must be Lucene's bulk batch size", 64, input.maxStagedRanges());
         }
 
         withNodeSettings(
             Settings.builder()
                 .put(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN, "16kb")
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW, 64)
+                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES, 12)
                 .build()
         );
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
             assertEquals("the span bound must follow the setting", 16 * 1024, input.maxStagedRangeBytes());
-            assertEquals("the table size must follow the setting", 64, input.maxStagedRanges());
+            assertEquals("the table size must follow the setting", 12, input.maxStagedRanges());
         }
     }
 
