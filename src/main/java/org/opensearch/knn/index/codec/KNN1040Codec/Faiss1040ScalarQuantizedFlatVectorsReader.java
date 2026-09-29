@@ -15,9 +15,13 @@ import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.FilterDirectory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.opensearch.common.Nullable;
 import org.opensearch.knn.index.store.DirectIOVectorSource;
+import org.opensearch.knn.index.store.KNNVectorIntentProbeDirectory;
+import org.opensearch.knn.index.store.KNNVectorReadIntent;
 import org.opensearch.knn.index.store.VectorLoaderSource;
 
 import java.io.IOException;
@@ -97,6 +101,62 @@ public class Faiss1040ScalarQuantizedFlatVectorsReader extends FlatVectorsReader
         super();
         this.delegateFlatVectorsReader = lucene104ScalarQuantizedVectorsReader;
         this.vectorDataPath = resolveVectorDataPath(state);
+        probeReadIntentChannel(state);
+    }
+
+    /**
+     * Issues one plugin-authored {@code .vec} {@code openInput} carrying
+     * {@link KNNVectorReadIntent#RESCORE}, so that a {@link KNNVectorIntentProbeDirectory} below can
+     * record whether the intent survived the descent, and closes it again immediately.
+     * <p>
+     * This runs only when the index opted in with {@code index.store.factory: knn_intent_probe}, which
+     * is what puts a probe in the chain. On every other index it is a walk of at most sixteen
+     * {@code getDelegate()} links at segment open and nothing else — no file is opened, and the
+     * default read path is byte-for-byte unchanged.
+     * <p>
+     * It exists because the directory design turns on a fact that cannot be read off the source: an
+     * {@link IOContext} is built here, five OpenSearch wrappers sit between here and the deepest
+     * directory a plugin can supply, and while none of them was seen to rebuild the context, only a
+     * running node can show what the chain actually is — including whether a compound segment reaches
+     * a plugin directory at all.
+     */
+    private static void probeReadIntentChannel(@Nullable final SegmentReadState state) {
+        if (state == null) {
+            return;
+        }
+        final String name = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, VECTOR_DATA_EXTENSION);
+        final KNNVectorIntentProbeDirectory probe = KNNVectorIntentProbeDirectory.find(state.directory);
+        if (probe == null) {
+            // Logged, not silent, and only once a probe exists somewhere on the node: "no probe found"
+            // is the compound-segment answer, and an absent line would be indistinguishable from a
+            // reader that never ran.
+            if (KNNVectorIntentProbeDirectory.isInstalledOnNode()) {
+                log.info(
+                    "k-NN read-intent probe: segment [{}] file [{}] CANNOT reach a plugin directory; "
+                        + "state.directory is [{}] and the chain from it is {}",
+                    state.segmentInfo.name,
+                    name,
+                    state.directory.getClass().getSimpleName(),
+                    KNNVectorIntentProbeDirectory.wrapperChain(state.directory)
+                );
+            }
+            return;
+        }
+        log.info(
+            "k-NN read-intent probe [{}]: segment [{}] suffix [{}] file [{}] directory chain {}",
+            probe.indexName(),
+            state.segmentInfo.name,
+            state.segmentSuffix,
+            name,
+            KNNVectorIntentProbeDirectory.wrapperChain(state.directory)
+        );
+        try (IndexInput ignored = state.directory.openInput(name, KNNVectorReadIntent.RESCORE.vectorDataContext())) {
+            log.info("k-NN read-intent probe [{}]: plugin-issued openInput of [{}] succeeded", probe.indexName(), name);
+        } catch (IOException | RuntimeException e) {
+            // A probe must never fail a segment open. A compound segment is expected to land here:
+            // Lucene's compound reader knows the logical name but the plugin asks for the physical one.
+            log.info("k-NN read-intent probe: plugin-issued openInput of [{}] failed: {}", name, e.toString());
+        }
     }
 
     /**
