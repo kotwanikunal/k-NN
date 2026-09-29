@@ -248,6 +248,17 @@ public final class KNNVectorCompoundSliceInput extends FilterIndexInput {
         final IndexInput routed = route ? directIOSlice(sliceDescription, offset, length) : null;
         if (route) {
             (routed != null ? routedSlices : declinedSlices).incrementAndGet();
+            // The counters are reachable only from a test that holds this object. On a node the compound
+            // dispatch point has to be observable too, and the non-compound one already is
+            // (KNNVectorStorageDirectory.openInput), so this is the same statement for the other shape.
+            log.debug(
+                "k-NN vector storage: {} compound entry [{}] of [{}] with O_DIRECT, offset {} length {}",
+                routed != null ? "serving" : "could not serve",
+                sliceDescription,
+                containerName,
+                offset,
+                length
+            );
         }
         record(sliceDescription, offset, length, context.hints(), intent, true, routed != null);
         return routed != null ? routed : in.slice(sliceDescription, offset, length, context);
