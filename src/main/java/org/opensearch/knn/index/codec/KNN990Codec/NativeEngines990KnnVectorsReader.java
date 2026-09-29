@@ -24,7 +24,9 @@ import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.util.Bits;
+import org.opensearch.common.Nullable;
 import org.opensearch.common.UUIDs;
+import org.opensearch.knn.index.codec.KNNRescoreVectorsReader;
 import org.opensearch.knn.index.codec.nativeindex.AbstractNativeEnginesKnnVectorsReader;
 import org.opensearch.knn.index.codec.util.KNNCodecUtil;
 import org.opensearch.knn.index.codec.util.NativeMemoryCacheKeyHelper;
@@ -55,7 +57,22 @@ public class NativeEngines990KnnVectorsReader extends AbstractNativeEnginesKnnVe
     private final List<String> cacheKeys;
 
     public NativeEngines990KnnVectorsReader(final SegmentReadState state, final FlatVectorsReader flatVectorsReader) {
-        super(state, flatVectorsReader);
+        this(state, flatVectorsReader, null);
+    }
+
+    /**
+     * @param rescoreVectorsReader the lazily opened second view of the full-precision {@code .vec} vectors
+     *                             whose reads carry the rescore intent, or {@code null} for none. This row's
+     *                             flat reader is a bare {@code Lucene99FlatVectorsReader}, so unlike the
+     *                             faiss scalar-quantized row the view cannot live below this reader and is
+     *                             held by the base class instead.
+     */
+    public NativeEngines990KnnVectorsReader(
+        final SegmentReadState state,
+        final FlatVectorsReader flatVectorsReader,
+        @Nullable final KNNRescoreVectorsReader rescoreVectorsReader
+    ) {
+        super(state, flatVectorsReader, rescoreVectorsReader);
         this.cacheKeys = getVectorCacheKeysFromSegmentReaderState(state);
         loadCacheKeyMap();
     }

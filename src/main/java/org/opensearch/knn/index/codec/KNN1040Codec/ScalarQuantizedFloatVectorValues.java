@@ -12,7 +12,6 @@ import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.search.VectorScorer;
 import org.opensearch.common.Nullable;
-import org.opensearch.knn.index.codec.scorer.HasRescoreVectorValues;
 import org.opensearch.knn.index.codec.scorer.HasVectorLoaderSource;
 import org.opensearch.knn.index.codec.scorer.HasFullPrecisionVectorValues;
 import org.opensearch.knn.index.store.VectorLoaderSource;
@@ -39,11 +38,7 @@ import java.util.function.Supplier;
  * <p>For an empty vector segment, the quantized delegate may be {@code null}.
  */
 @Getter
-class ScalarQuantizedFloatVectorValues extends FloatVectorValues
-    implements
-        HasFullPrecisionVectorValues,
-        HasVectorLoaderSource,
-        HasRescoreVectorValues {
+class ScalarQuantizedFloatVectorValues extends FloatVectorValues implements HasFullPrecisionVectorValues, HasVectorLoaderSource {
     /**
      * The full-precision float delegate (reads the {@code .vec} file).
      */
@@ -70,19 +65,9 @@ class ScalarQuantizedFloatVectorValues extends FloatVectorValues
     @Getter(lombok.AccessLevel.NONE)
     @Nullable
     private final Supplier<VectorLoaderSource> vectorLoaderSourceSupplier;
-    /**
-     * Supplies a second view of the {@code .vec} vectors whose reads carry the rescore intent, or {@code null}
-     * when this values object was built without one. A supplier rather than the values themselves for the same
-     * reason {@link #vectorLoaderSourceSupplier} is one — nothing may be opened on a node whose Direct I/O
-     * rescore setting is off — and because {@link FloatVectorValues} carry a cursor, so each rescorer needs
-     * their own.
-     */
-    @Getter(lombok.AccessLevel.NONE)
-    @Nullable
-    private final Supplier<FloatVectorValues> rescoreVectorValuesSupplier;
 
     ScalarQuantizedFloatVectorValues(final FloatVectorValues floatVectorValues, final QuantizedByteVectorValues quantizedVectorValues) {
-        this(floatVectorValues, quantizedVectorValues, null, null);
+        this(floatVectorValues, quantizedVectorValues, null);
     }
 
     ScalarQuantizedFloatVectorValues(
@@ -90,20 +75,10 @@ class ScalarQuantizedFloatVectorValues extends FloatVectorValues
         final QuantizedByteVectorValues quantizedVectorValues,
         @Nullable final Supplier<VectorLoaderSource> vectorLoaderSourceSupplier
     ) {
-        this(floatVectorValues, quantizedVectorValues, vectorLoaderSourceSupplier, null);
-    }
-
-    ScalarQuantizedFloatVectorValues(
-        final FloatVectorValues floatVectorValues,
-        final QuantizedByteVectorValues quantizedVectorValues,
-        @Nullable final Supplier<VectorLoaderSource> vectorLoaderSourceSupplier,
-        @Nullable final Supplier<FloatVectorValues> rescoreVectorValuesSupplier
-    ) {
         this.floatVectorValues = floatVectorValues;
         this.quantizedVectorValues = quantizedVectorValues;
         this.fullPrecisionVectorValues = KNN1040ScalarQuantizedUtils.extractRawFloatVectorValues(floatVectorValues);
         this.vectorLoaderSourceSupplier = vectorLoaderSourceSupplier;
-        this.rescoreVectorValuesSupplier = rescoreVectorValuesSupplier;
     }
 
     /**
@@ -114,16 +89,6 @@ class ScalarQuantizedFloatVectorValues extends FloatVectorValues
     @Override
     public VectorLoaderSource vectorLoaderSource() {
         return vectorLoaderSourceSupplier == null ? null : vectorLoaderSourceSupplier.get();
-    }
-
-    /**
-     * A second view of the same {@code .vec} vectors this wrapper serves, whose reads carry the rescore
-     * intent, or {@code null} when there is none. Shares this wrapper's ordinal space, because it is the
-     * same file read by the same format over the same segment — only the {@code IndexInput} differs.
-     */
-    @Override
-    public FloatVectorValues rescoreVectorValues() {
-        return rescoreVectorValuesSupplier == null ? null : rescoreVectorValuesSupplier.get();
     }
 
     /**
@@ -159,8 +124,7 @@ class ScalarQuantizedFloatVectorValues extends FloatVectorValues
         return new ScalarQuantizedFloatVectorValues(
             floatVectorValues.copy(),
             quantizedVectorValues == null ? null : quantizedVectorValues.copy(),
-            vectorLoaderSourceSupplier,
-            rescoreVectorValuesSupplier
+            vectorLoaderSourceSupplier
         );
     }
 

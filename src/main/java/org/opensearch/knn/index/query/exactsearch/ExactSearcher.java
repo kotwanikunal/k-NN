@@ -28,6 +28,7 @@ import org.opensearch.common.lucene.Lucene;
 import org.opensearch.knn.common.FieldInfoExtractor;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.index.codec.scorer.RescoreVectorValuesSelector;
 import org.opensearch.knn.index.query.SegmentLevelQuantizationInfo;
 import org.opensearch.knn.index.query.SegmentLevelQuantizationUtil;
 import org.opensearch.knn.index.engine.KNNEngine;
@@ -357,6 +358,10 @@ public class ExactSearcher {
             // that has to tell the rescore seam whether the query is radial - the mode alone does not,
             // since a radial rescore also arrives here as RESCORE.
             final boolean radialSearch = context.getRadius() != null;
+            // It is also the only place that holds the SegmentReader, which is what the segment's rescore
+            // view of the same full-precision vectors has to be looked up from. Passed as a supplier, not
+            // resolved here: asking for the view is what opens a second handle on .vec, and the seam may
+            // decline this query. See RescoreVectorValuesSelector.
             return VectorScorers.createScorer(
                 iteratorValues,
                 context.getFloatQueryVector(),
@@ -365,7 +370,8 @@ public class ExactSearcher {
                 fieldInfo,
                 context.getMatchedDocsIterator(),
                 parentBitSet,
-                radialSearch
+                radialSearch,
+                () -> RescoreVectorValuesSelector.select(reader, fieldInfo.getName())
             );
         }
 

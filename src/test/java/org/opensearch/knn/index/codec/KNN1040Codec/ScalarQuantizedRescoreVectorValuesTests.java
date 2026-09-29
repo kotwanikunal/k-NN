@@ -17,7 +17,7 @@ import org.mockito.Mock;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.index.KNNSettings;
-import org.opensearch.knn.index.codec.scorer.HasRescoreVectorValues;
+import org.opensearch.knn.index.codec.scorer.HasRescoreVectorsReader;
 import org.opensearch.knn.index.query.scorers.VectorScorerMode;
 
 import java.io.IOException;
@@ -32,10 +32,14 @@ import static org.opensearch.knn.index.codec.KNN1040Codec.KNN1040ScalarQuantized
 
 /**
  * The <em>what</em>-signal, end to end on a real segment: the faiss SQ format builds a rescore view, the
- * flat reader hands it to the values object, and the values object offers it through
- * {@link HasRescoreVectorValues} — so a rescore query reads the same full-precision vectors through an
+ * flat reader holds it, and the segment's {@code KnnVectorsReader} offers it through
+ * {@link HasRescoreVectorsReader} — so a rescore query reads the same full-precision vectors through an
  * {@link org.apache.lucene.store.IndexInput} the storage layer chose, while every other read of the same
  * file is untouched.
+ *
+ * <p>The capability is on the <em>reader</em> and deliberately not on the values: two of the four
+ * rescore-reachable encodings have no plugin values class, and a values wrapper per encoding is the one shape
+ * this design avoids. {@link #testTheValuesDoNotCarryTheCapability()} is the regression guard for that.
  *
  * <p>Where {@code KNNRescoreVectorsReaderTests} pins the composition in isolation, this pins the
  * <em>wiring</em>: that it is reached from the format the codec actually selects, on a segment written by the
@@ -86,19 +90,24 @@ public class ScalarQuantizedRescoreVectorValuesTests extends KNNTestCase {
         return flatReader.getFloatVectorValues(FIELD_NAME);
     }
 
+    /** The rescore view as the query layer reaches it: from the segment's reader, by field name. */
+    private static FloatVectorValues viewFrom(final KnnVectorsReader reader) {
+        return ((HasRescoreVectorsReader) reader).rescoreVectorValues(FIELD_NAME);
+    }
+
     /**
      * The wiring, and the identity it has to preserve. The format hands the flat reader a rescore view, the
      * values offer it, and it yields the same vectors at the same ordinals.
      */
     @SneakyThrows
-    public void testTheValuesOfferARescoreViewOfTheSameVectors() {
+    public void testTheReaderOffersARescoreViewOfTheSameVectors() {
         try (MMapDirectory dir = new MMapDirectory(createTempDir())) {
             final SegmentReadState state = segment(dir);
             try (KnnVectorsReader reader = new Faiss1040ScalarQuantizedKnnVectorsFormat().fieldsReader(state)) {
                 final FloatVectorValues values = valuesFrom(reader);
-                assertTrue(values.getClass().getName(), values instanceof HasRescoreVectorValues);
+                assertTrue(reader.getClass().getName(), reader instanceof HasRescoreVectorsReader);
 
-                final FloatVectorValues view = ((HasRescoreVectorValues) values).rescoreVectorValues();
+                final FloatVectorValues view = viewFrom(reader);
                 assertNotNull("the faiss SQ row must offer a rescore view when the setting is on", view);
 
                 assertEquals(NUM_VECTORS, view.size());
@@ -127,7 +136,7 @@ public class ScalarQuantizedRescoreVectorValuesTests extends KNNTestCase {
             final SegmentReadState state = segment(dir);
             try (KnnVectorsReader reader = new Faiss1040ScalarQuantizedKnnVectorsFormat().fieldsReader(state)) {
                 final FloatVectorValues values = valuesFrom(reader);
-                final FloatVectorValues view = ((HasRescoreVectorValues) values).rescoreVectorValues();
+                final FloatVectorValues view = viewFrom(reader);
                 assertNotNull(view);
 
                 final float[] target = KNN1040ScalarQuantizedTestUtils.randomVector(DIMENSION, random());
@@ -162,9 +171,8 @@ public class ScalarQuantizedRescoreVectorValuesTests extends KNNTestCase {
         try (MMapDirectory dir = new MMapDirectory(createTempDir())) {
             final SegmentReadState state = segment(dir);
             try (KnnVectorsReader reader = new Faiss1040ScalarQuantizedKnnVectorsFormat().fieldsReader(state)) {
-                final FloatVectorValues values = valuesFrom(reader);
-                assertTrue(values instanceof HasRescoreVectorValues);
-                assertNull(((HasRescoreVectorValues) values).rescoreVectorValues());
+                assertTrue(reader instanceof HasRescoreVectorsReader);
+                assertNull(viewFrom(reader));
             }
         }
     }
@@ -179,9 +187,9 @@ public class ScalarQuantizedRescoreVectorValuesTests extends KNNTestCase {
         try (MMapDirectory dir = new MMapDirectory(createTempDir())) {
             final SegmentReadState state = segment(dir);
             try (KnnVectorsReader reader = new Faiss1040ScalarQuantizedKnnVectorsFormat().fieldsReader(state)) {
-                assertNull(((HasRescoreVectorValues) valuesFrom(reader)).rescoreVectorValues());
+                assertNull(viewFrom(reader));
                 setRescoreEnabled(true);
-                assertNotNull(((HasRescoreVectorValues) valuesFrom(reader)).rescoreVectorValues());
+                assertNotNull(viewFrom(reader));
             }
         }
     }
@@ -196,9 +204,8 @@ public class ScalarQuantizedRescoreVectorValuesTests extends KNNTestCase {
         try (MMapDirectory dir = new MMapDirectory(createTempDir())) {
             final SegmentReadState state = segment(dir);
             try (KnnVectorsReader reader = new Faiss1040ScalarQuantizedKnnVectorsFormat().fieldsReader(state)) {
-                final FloatVectorValues values = valuesFrom(reader);
-                final FloatVectorValues first = ((HasRescoreVectorValues) values).rescoreVectorValues();
-                final FloatVectorValues second = ((HasRescoreVectorValues) values).rescoreVectorValues();
+                final FloatVectorValues first = viewFrom(reader);
+                final FloatVectorValues second = viewFrom(reader);
                 assertNotNull(first);
                 assertNotNull(second);
                 assertNotSame(first, second);
@@ -207,18 +214,23 @@ public class ScalarQuantizedRescoreVectorValuesTests extends KNNTestCase {
     }
 
     /**
-     * {@code copy()} exists so a caller can iterate the same vectors independently, and it must carry the
-     * capability with it. Dropping the supplier there would silently disable the rescore path for every
-     * caller that copies first, with nothing failing.
+     * The values do <em>not</em> carry the capability, and neither does a copy of them. This is the regression
+     * guard for the design decision the reader-level route exists to enforce: the moment a values class can be
+     * asked for the view, the two encodings that have no plugin values class stop being reachable by the same
+     * mechanism, and the pressure is to introduce a per-encoding values wrapper — the one shape that can lose
+     * Lucene's SIMD binding while still returning identical bytes, which measured 5.3x slower and which no
+     * correctness test can catch.
      */
     @SneakyThrows
-    public void testCopyKeepsTheRescoreView() {
+    public void testTheValuesDoNotCarryTheCapability() {
         try (MMapDirectory dir = new MMapDirectory(createTempDir())) {
             final SegmentReadState state = segment(dir);
             try (KnnVectorsReader reader = new Faiss1040ScalarQuantizedKnnVectorsFormat().fieldsReader(state)) {
-                final FloatVectorValues copy = valuesFrom(reader).copy();
-                assertTrue(copy instanceof HasRescoreVectorValues);
-                assertNotNull(((HasRescoreVectorValues) copy).rescoreVectorValues());
+                final FloatVectorValues values = valuesFrom(reader);
+                assertFalse(values.getClass().getName(), values instanceof HasRescoreVectorsReader);
+                assertFalse(values.copy().getClass().getName(), values.copy() instanceof HasRescoreVectorsReader);
+                // and the reader still does, so the route is not simply gone
+                assertNotNull(viewFrom(reader));
             }
         }
     }
@@ -233,26 +245,38 @@ public class ScalarQuantizedRescoreVectorValuesTests extends KNNTestCase {
         try (MMapDirectory dir = new MMapDirectory(createTempDir())) {
             final SegmentReadState state = segment(dir);
             final KnnVectorsReader reader = new Faiss1040ScalarQuantizedKnnVectorsFormat().fieldsReader(state);
-            final FloatVectorValues values = valuesFrom(reader);
-            assertNotNull(((HasRescoreVectorValues) values).rescoreVectorValues());
+            assertNotNull(viewFrom(reader));
 
             reader.close();
 
-            assertNull(((HasRescoreVectorValues) values).rescoreVectorValues());
+            assertNull(viewFrom(reader));
         }
     }
 
     /**
-     * An empty segment's values are built without either capability, because Lucene exposes no quantized
-     * delegate for one. The rescore path must decline rather than throw.
+     * An empty segment's values are built without the loader-seam capability, because Lucene exposes no
+     * quantized delegate for one. The rescore path must decline rather than throw.
      */
     @SneakyThrows
-    public void testEmptyValuesOfferNoView() {
+    public void testEmptyValuesOfferNoLoaderSource() {
         final ScalarQuantizedFloatVectorValues empty = new ScalarQuantizedFloatVectorValues(
             new org.opensearch.knn.index.vectorvalues.TestVectorValues.PreDefinedFloatVectorValues(List.of()),
             null
         );
-        assertNull(empty.rescoreVectorValues());
         assertNull(empty.vectorLoaderSource());
+    }
+
+    /**
+     * A field the reader knows nothing about yields no view and does not throw. The query layer asks by name,
+     * so a name that does not resolve has to be an ordinary decline.
+     */
+    @SneakyThrows
+    public void testAnUnknownFieldYieldsNoView() {
+        try (MMapDirectory dir = new MMapDirectory(createTempDir())) {
+            final SegmentReadState state = segment(dir);
+            try (KnnVectorsReader reader = new Faiss1040ScalarQuantizedKnnVectorsFormat().fieldsReader(state)) {
+                assertNull(((HasRescoreVectorsReader) reader).rescoreVectorValues("no_such_field"));
+            }
+        }
     }
 }

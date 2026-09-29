@@ -21,6 +21,7 @@ import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.opensearch.common.Nullable;
 import org.opensearch.knn.index.codec.KNNRescoreVectorsReader;
+import org.opensearch.knn.index.codec.scorer.HasRescoreVectorsReader;
 import org.opensearch.knn.index.store.DirectIOVectorSource;
 import org.opensearch.knn.index.store.KNNVectorIntentProbeDirectory;
 import org.opensearch.knn.index.store.KNNVectorReadIntent;
@@ -53,7 +54,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>All other operations are delegated directly to the underlying reader.
  */
 @Log4j2
-public class Faiss1040ScalarQuantizedFlatVectorsReader extends FlatVectorsReader {
+public class Faiss1040ScalarQuantizedFlatVectorsReader extends FlatVectorsReader implements HasRescoreVectorsReader {
 
     /** Extension of Lucene's flat full-precision vector file, the one the rescore path reads. */
     private static final String VECTOR_DATA_EXTENSION = "vec";
@@ -282,8 +283,9 @@ public class Faiss1040ScalarQuantizedFlatVectorsReader extends FlatVectorsReader
      * thread safe, so they cannot be cached the way a loader source can. The shared, segment-scoped thing
      * is the reader behind them.
      */
+    @Override
     @Nullable
-    FloatVectorValues rescoreVectorValues(final String field) {
+    public FloatVectorValues rescoreVectorValues(final String field) {
         return rescoreVectorsReader == null ? null : rescoreVectorsReader.floatVectorValues(field);
     }
 
@@ -319,11 +321,13 @@ public class Faiss1040ScalarQuantizedFlatVectorsReader extends FlatVectorsReader
             return new ScalarQuantizedFloatVectorValues(floatVectorValues, null);
         }
 
+        // The rescore view is deliberately NOT offered on the values. It is offered on this reader, via
+        // HasRescoreVectorsReader, because two of the four rescore-reachable encodings have no plugin values
+        // class to put it on and a values wrapper per encoding is the one shape this design must avoid.
         return new ScalarQuantizedFloatVectorValues(
             floatVectorValues,
             KNN1040ScalarQuantizedUtils.extractQuantizedByteVectorValues(floatVectorValues),
-            () -> vectorLoaderSource(field),
-            () -> rescoreVectorValues(field)
+            () -> vectorLoaderSource(field)
         );
     }
 

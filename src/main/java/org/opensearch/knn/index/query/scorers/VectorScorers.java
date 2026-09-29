@@ -27,6 +27,7 @@ import org.opensearch.knn.index.vectorvalues.KNNVectorValuesIterator;
 import org.opensearch.knn.memoryoptsearch.faiss.FlatVectorsScorerProvider;
 
 import java.io.IOException;
+import java.util.function.Supplier;
 
 import static org.opensearch.knn.index.query.MemoryOptimizedSearchScoreConverter.convertInnerProductScoreToCosineScore;
 
@@ -129,7 +130,63 @@ public final class VectorScorers {
         @Nullable final BitSet parentBitSet,
         final boolean radialSearch
     ) throws IOException {
-        final VectorScorer scorer = getBaseScorer(docIdsIteratorValues, target, vectorScorerMode, spaceType, fieldInfo, radialSearch);
+        return createScorer(
+            docIdsIteratorValues,
+            target,
+            vectorScorerMode,
+            spaceType,
+            fieldInfo,
+            filteredIdsIterator,
+            parentBitSet,
+            radialSearch,
+            null
+        );
+    }
+
+    /**
+     * Creates a {@link VectorScorer} for the given float query vector, additionally offering the
+     * {@link DirectIORescoreSeam} the segment's rescore view of the same full-precision vectors.
+     *
+     * <p>The view is the storage layer's answer to "this read is a rescore read": values built by the
+     * segment's own flat vectors format over a {@code Directory} that adds the intent, so the scorer this
+     * method returns is Lucene's own either way and nothing here decodes, offsets or wraps anything. It is
+     * passed as a {@link Supplier} because asking for it is what opens a second handle on {@code .vec}, and
+     * a query the seam declines must not open one.
+     *
+     * @param docIdsIteratorValues wraps the {@link DocIdSetIterator} and {@link KnnVectorValues}
+     *                             for the segment being scored
+     * @param target    the float query vector
+     * @param vectorScorerMode determines whether to use scoring or rescoring
+     * @param spaceType the space type defining the similarity function
+     * @param fieldInfo the field info for the vector field
+     * @param filteredIdsIterator iterator over accepted child documents, or null if not nested
+     * @param parentBitSet bit set identifying parent documents, or null if not nested
+     * @param radialSearch true if this scorer serves a radial (min-score) query
+     * @param rescoreViewSupplier supplies the segment's rescore view of these vectors, or null when the
+     *                            caller has none to offer
+     * @return a {@link VectorScorer} appropriate for the underlying vector storage format
+     * @throws IOException if an I/O error occurs
+     */
+    public static VectorScorer createScorer(
+        final KNNVectorValuesIterator.DocIdsIteratorValues docIdsIteratorValues,
+        final float[] target,
+        final VectorScorerMode vectorScorerMode,
+        final SpaceType spaceType,
+        final FieldInfo fieldInfo,
+        @Nullable final DocIdSetIterator filteredIdsIterator,
+        @Nullable final BitSet parentBitSet,
+        final boolean radialSearch,
+        @Nullable final Supplier<FloatVectorValues> rescoreViewSupplier
+    ) throws IOException {
+        final VectorScorer scorer = getBaseScorer(
+            docIdsIteratorValues,
+            target,
+            vectorScorerMode,
+            spaceType,
+            fieldInfo,
+            radialSearch,
+            rescoreViewSupplier
+        );
         return maybeWrapWithNestedScorer(scorer, filteredIdsIterator, parentBitSet);
     }
 
@@ -189,7 +246,8 @@ public final class VectorScorers {
         final VectorScorerMode vectorScorerMode,
         final SpaceType spaceType,
         final FieldInfo fieldInfo,
-        final boolean radialSearch
+        final boolean radialSearch,
+        @Nullable final Supplier<FloatVectorValues> rescoreViewSupplier
     ) throws IOException {
         final DocIdSetIterator docIdSetIterator = docIdsIteratorValues.getDocIdSetIterator();
 
@@ -208,7 +266,8 @@ public final class VectorScorers {
                     floatVectorValues,
                     vectorScorerMode,
                     radialSearch,
-                    fieldInfo
+                    fieldInfo,
+                    rescoreViewSupplier
                 );
                 return vectorScorerMode.createScorer(valuesToScore, target);
             }
