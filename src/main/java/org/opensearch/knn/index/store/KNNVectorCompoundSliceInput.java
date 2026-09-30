@@ -115,7 +115,7 @@ public final class KNNVectorCompoundSliceInput extends FilterIndexInput {
      */
     private final Path containerPath;
 
-    /** Shared with the {@link KNNVectorIntentProbeDirectory} that created this input, and with clones. */
+    /** Shared with the directory that created this input, and with clones. */
     private final List<SliceObservation> observations;
 
     /**
@@ -148,7 +148,7 @@ public final class KNNVectorCompoundSliceInput extends FilterIndexInput {
     /** Set once {@link DirectIOVectorIndexInput#open} has answered {@code null}, so it is asked once. */
     private boolean directIOUnavailable;
 
-    /** The observing form, for the probe and its tests: a fixed answer to condition 3, every slice recorded. */
+    /** The observing form, for tests: a fixed answer to condition 3, and every slice recorded. */
     KNNVectorCompoundSliceInput(
         final IndexInput delegate,
         final String containerName,

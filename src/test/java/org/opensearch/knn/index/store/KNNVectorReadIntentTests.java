@@ -29,13 +29,15 @@ import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.index.codec.KNN80Codec.KNN80CompoundDirectory;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
- * The first gate of the directory design: an intent named at the codec layer has to arrive, intact,
- * at the deepest {@link Directory} a plugin can supply.
+ * The first half of the directory design: an intent named at the codec layer has to arrive, intact, at
+ * the deepest {@link Directory} a plugin can supply.
  *
  * <p>On a non-compound segment {@code Directory.openInput} is the only channel that can still change how
  * bytes are fetched — a three-argument {@code slice} takes no {@link IOContext}, and
@@ -43,17 +45,74 @@ import java.util.Set;
  * plugin-authored {@code openInput}, and needs the hint on it to survive {@code Store$StoreDirectory} and
  * {@code ByteSizeCachingDirectory}, which a real {@link Store} puts above whatever directory it is handed.
  *
- * <p>Inside a compound file there is a second channel, and it is the one gate 3 uses: the
+ * <p>Inside a compound file there is a second channel, and it is the one the compound route uses: the
  * context-carrying four-argument {@code slice} does have a call site —
  * {@code Lucene90CompoundReader#openInput} — so the container's {@code IndexInput} is handed each entry
  * by name with the caller's context. See {@link KNNVectorCompoundSliceInputTests}.
  *
  * <p>These tests use a real {@link Store} rather than hand-stacked wrappers precisely so that the
- * classes under test are the server's own, at the version on the classpath.
+ * classes under test are the server's own, at the version on the classpath. The directory below the
+ * store is a local recorder rather than {@link KNNVectorStorageDirectory}: what is under test here is
+ * the <em>signal</em>, so the assertion has to be over the {@link IOContext} that arrived, which the
+ * production directory deliberately does not retain. Its dispatch rule is pinned separately in
+ * {@link KNNVectorStorageDirectoryTests}.
  */
 public class KNNVectorReadIntentTests extends KNNTestCase {
 
     private static final String VEC_FILE = "_0_Lucene99FlatVectorsFormat_0.vec";
+
+    /** What reached the plugin's directory, in the terms a dispatch rule would be written in. */
+    private record Seen(String name, Set<IOContext.FileOpenHint> hints, IOContext.Context context, KNNVectorReadIntent intent) {
+    }
+
+    /** Records the {@code (name, context)} of every {@code openInput} that reaches it, then delegates. */
+    private static final class RecordingDirectory extends FilterDirectory {
+
+        private final List<Seen> seen = new CopyOnWriteArrayList<>();
+
+        private RecordingDirectory(final Directory delegate) {
+            super(delegate);
+        }
+
+        @Override
+        public IndexInput openInput(final String name, final IOContext context) throws IOException {
+            seen.add(new Seen(name, context.hints(), context.context(), KNNVectorReadIntent.of(context)));
+            return in.openInput(name, context);
+        }
+
+        private List<Seen> seen() {
+            return List.copyOf(seen);
+        }
+
+        private List<Seen> vectorData() {
+            return seen.stream().filter(s -> s.name().endsWith(".vec")).toList();
+        }
+
+        private void clear() {
+            seen.clear();
+        }
+    }
+
+    /**
+     * The chain from {@code directory} down, as simple class names. {@link FilterDirectory#unwrap} answers
+     * only what is at the bottom; the design needs to know what is in between, because any wrapper that
+     * rebuilt the {@link IOContext} rather than passing the caller's through would break the intent
+     * signal. Walking {@link FilterDirectory#getDelegate()} is the only way to see them from outside the
+     * server.
+     */
+    private static List<String> chainOf(final Directory directory) {
+        final List<String> chain = new ArrayList<>();
+        Directory current = directory;
+        for (int depth = 0; current != null && depth < 16; depth++) {
+            chain.add(current.getClass().getSimpleName());
+            if (current instanceof FilterDirectory filterDirectory) {
+                current = filterDirectory.getDelegate();
+            } else {
+                break;
+            }
+        }
+        return List.copyOf(chain);
+    }
 
     /** A {@link ShardLock} that owns nothing, for a {@link Store} over a directory with no shard behind it. */
     private static ShardLock noopShardLock(final ShardId shardId) {
@@ -85,19 +144,19 @@ public class KNNVectorReadIntentTests extends KNNTestCase {
      */
     public void testRescoreIntentSurvivesTheStoreWrapperChain() throws IOException {
         final ShardId shardId = new ShardId("test-index", "_na_", 0);
-        final KNNVectorIntentProbeDirectory probe = new KNNVectorIntentProbeDirectory(new ByteBuffersDirectory());
-        writeEmptyFile(probe, VEC_FILE);
-        probe.clearObservations();
+        final RecordingDirectory plugin = new RecordingDirectory(new ByteBuffersDirectory());
+        writeEmptyFile(plugin, VEC_FILE);
+        plugin.clear();
 
-        try (Store store = new Store(shardId, indexSettings(), probe, noopShardLock(shardId))) {
+        try (Store store = new Store(shardId, indexSettings(), plugin, noopShardLock(shardId))) {
             // Exactly what the codec would do, through exactly the directory the codec is handed.
             try (IndexInput input = store.directory().openInput(VEC_FILE, KNNVectorReadIntent.RESCORE.vectorDataContext())) {
                 assertNotNull(input);
             }
 
-            final List<KNNVectorIntentProbeDirectory.Observation> seen = probe.vectorDataObservations();
+            final List<Seen> seen = plugin.vectorData();
             assertEquals("expected exactly one .vec open to reach the plugin directory", 1, seen.size());
-            final KNNVectorIntentProbeDirectory.Observation observation = seen.get(0);
+            final Seen observation = seen.get(0);
 
             assertEquals(VEC_FILE, observation.name());
             assertEquals(KNNVectorReadIntent.RESCORE, observation.intent());
@@ -117,16 +176,15 @@ public class KNNVectorReadIntentTests extends KNNTestCase {
      */
     public void testStoreExposesTheExpectedWrapperChainAboveThePluginDirectory() throws IOException {
         final ShardId shardId = new ShardId("test-index", "_na_", 0);
-        final KNNVectorIntentProbeDirectory probe = new KNNVectorIntentProbeDirectory(new ByteBuffersDirectory());
+        final RecordingDirectory plugin = new RecordingDirectory(new ByteBuffersDirectory());
 
-        try (Store store = new Store(shardId, indexSettings(), probe, noopShardLock(shardId))) {
-            final List<String> chain = KNNVectorIntentProbeDirectory.wrapperChain(store.directory());
+        try (Store store = new Store(shardId, indexSettings(), plugin, noopShardLock(shardId))) {
+            final List<String> chain = chainOf(store.directory());
             assertEquals(
                 "chain was " + chain,
-                List.of("StoreDirectory", "ByteSizeCachingDirectory", "KNNVectorIntentProbeDirectory", "ByteBuffersDirectory"),
+                List.of("StoreDirectory", "ByteSizeCachingDirectory", "RecordingDirectory", "ByteBuffersDirectory"),
                 chain
             );
-            assertSame(probe, KNNVectorIntentProbeDirectory.find(store.directory()));
         }
     }
 
@@ -192,62 +250,56 @@ public class KNNVectorReadIntentTests extends KNNTestCase {
     }
 
     /**
-     * The probe records what reaches it, including the reads it would decline to route. Suffix alone
-     * cannot tell a re-score read of {@code .vec} from a traversal or warmup read of the same file,
-     * which is the obstacle the intent is there to remove; the probe therefore has to report both the
-     * suffix and the intent, and callers of it must not collapse them.
+     * The file suffix and the read intent are two independent facts, and the directory needs both. Suffix
+     * alone cannot tell a re-score read of {@code .vec} from a traversal or warmup read of the same file,
+     * which is the obstacle the intent is there to remove; so an unhinted {@code .vec} open and a hinted
+     * one must arrive distinguishable, and a caller must not collapse them.
      */
-    public void testProbeSeparatesFileSuffixFromReadIntent() throws IOException {
-        final KNNVectorIntentProbeDirectory probe = new KNNVectorIntentProbeDirectory(new ByteBuffersDirectory());
-        writeEmptyFile(probe, VEC_FILE);
-        writeEmptyFile(probe, "_0_Lucene104ScalarQuantizedVectorsFormat_0.veq");
-        writeEmptyFile(probe, "segments_1");
-        probe.clearObservations();
+    public void testFileSuffixAloneCannotSeparateAReadIntent() throws IOException {
+        try (RecordingDirectory plugin = new RecordingDirectory(new ByteBuffersDirectory())) {
+            writeEmptyFile(plugin, VEC_FILE);
+            writeEmptyFile(plugin, "segments_1");
+            plugin.clear();
 
-        // An unhinted .vec open: what Lucene's own reader issues, and what traversal, warmup and
-        // derived-source reconstruction all arrive as.
-        probe.openInput(VEC_FILE, IOContext.DEFAULT.withHints(FileTypeHint.DATA, FileDataHint.KNN_VECTORS, DataAccessHint.RANDOM)).close();
-        // A hinted one: the re-score read.
-        probe.openInput(VEC_FILE, KNNVectorReadIntent.RESCORE.vectorDataContext()).close();
-        // A file the design would never route.
-        probe.openInput("segments_1", IOContext.DEFAULT).close();
+            // An unhinted .vec open: what Lucene's own reader issues, and what traversal, warmup and
+            // derived-source reconstruction all arrive as.
+            plugin.openInput(VEC_FILE, IOContext.DEFAULT.withHints(FileTypeHint.DATA, FileDataHint.KNN_VECTORS, DataAccessHint.RANDOM))
+                .close();
+            // A hinted one: the re-score read.
+            plugin.openInput(VEC_FILE, KNNVectorReadIntent.RESCORE.vectorDataContext()).close();
+            // A file the design would never route.
+            plugin.openInput("segments_1", IOContext.DEFAULT).close();
 
-        final List<KNNVectorIntentProbeDirectory.Observation> vectorData = probe.vectorDataObservations();
-        assertEquals(2, vectorData.size());
-        assertNull("an unhinted .vec open is indistinguishable by suffix alone", vectorData.get(0).intent());
-        assertEquals(KNNVectorReadIntent.RESCORE, vectorData.get(1).intent());
-        assertEquals("segments_1 must not be counted as vector data", 3, probe.observations().size());
-
-        assertTrue(KNNVectorIntentProbeDirectory.isVectorDataFile(VEC_FILE));
-        assertFalse(KNNVectorIntentProbeDirectory.isVectorDataFile("segments_1"));
-        probe.close();
+            final List<Seen> vectorData = plugin.vectorData();
+            assertEquals(2, vectorData.size());
+            assertNull("an unhinted .vec open is indistinguishable by suffix alone", vectorData.get(0).intent());
+            assertEquals(KNNVectorReadIntent.RESCORE, vectorData.get(1).intent());
+            assertEquals("segments_1 must not be counted as vector data", 3, plugin.seen().size());
+        }
     }
 
     /**
-     * The limit of <em>this</em> channel on a compound segment: the {@code getDelegate()} walk does not
-     * reach the plugin's directory, and no {@code openInput} named {@code .vec} arrives at it.
-     * {@code KNN1040Codec.compoundFormat()} wraps Lucene's compound reader in a
+     * The limit of <em>this</em> channel on a compound segment, which is why the design has a second
+     * dispatch point at all. {@code KNN1040Codec.compoundFormat()} wraps Lucene's compound reader in a
      * {@link KNN80CompoundDirectory}, which extends {@link CompoundDirectory} — a bare {@link Directory},
-     * not a {@link FilterDirectory} — so there is no {@code getDelegate()} to walk, and the entry is
-     * served from inside the {@code .cfs} rather than opened by name.
+     * not a {@link FilterDirectory} — so there is no {@code getDelegate()} to walk from a compound
+     * segment's read state, and no {@code openInput} named {@code .vec} arrives at the plugin's directory.
      *
-     * <p><b>This is not the general compound-segment answer, and gate 1 read it as one.</b> The compound
-     * reader below is a stand-in that serves its entries from a nested {@link Directory}; Lucene's real
-     * one slices the {@code .cfs} handle it opened <em>on the outer directory</em>, using the
-     * context-carrying four-argument {@code slice}, so both the name and the intent do reach the plugin —
-     * at its {@code IndexInput} rather than at its {@code Directory}. That is gate 3, and it is asserted
-     * against the real compound reader in {@link KNNVectorCompoundSliceInputTests}. What survives here is
-     * narrower than it looked: the walk fails, and a design that only ever looks at {@code Directory}
-     * fails with it.
+     * <p><b>That is not the compound-segment answer, only this channel's.</b> The compound reader below is
+     * a stand-in that serves its entries from a nested {@link Directory}; Lucene's real one slices the
+     * {@code .cfs} handle it opened <em>on the outer directory</em>, using the context-carrying
+     * four-argument {@code slice}, so both the name and the intent do reach the plugin — at its
+     * {@code IndexInput} rather than at its {@code Directory}. That is asserted against the real compound
+     * reader in {@link KNNVectorCompoundSliceInputTests}.
      *
      * <p>The other thing that survives is recorded too: {@link KNN80CompoundDirectory} keeps a reference
      * to the outer directory, so the store chain is reachable from a compound segment even though the
      * walk is not.
      */
     public void testCompoundSegmentBreaksTheWalkToThePluginDirectory() throws IOException {
-        final KNNVectorIntentProbeDirectory probe = new KNNVectorIntentProbeDirectory(new ByteBuffersDirectory());
-        writeEmptyFile(probe, VEC_FILE);
-        probe.clearObservations();
+        final RecordingDirectory plugin = new RecordingDirectory(new ByteBuffersDirectory());
+        writeEmptyFile(plugin, VEC_FILE);
+        plugin.clear();
 
         // Stands in for Lucene's compound reader: it serves the segment's files out of a container it
         // opened itself, which is exactly why the name ".vec" never reaches the directory below.
@@ -284,45 +336,30 @@ public class KNNVectorReadIntentTests extends KNNTestCase {
         };
 
         // What SegmentReadState.directory is for a compound segment on this branch.
-        final Directory compoundSegmentDirectory = new KNN80CompoundDirectory(luceneCompoundReader, probe);
+        final Directory compoundSegmentDirectory = new KNN80CompoundDirectory(luceneCompoundReader, plugin);
 
         assertFalse("a compound segment's directory is not a FilterDirectory", compoundSegmentDirectory instanceof FilterDirectory);
         assertNull(
             "the getDelegate() walk cannot reach the plugin directory from a compound segment",
-            KNNVectorIntentProbeDirectory.find(compoundSegmentDirectory)
+            KNNVectorStorageDirectory.find(compoundSegmentDirectory)
         );
-        assertEquals(List.of("KNN80CompoundDirectory"), KNNVectorIntentProbeDirectory.wrapperChain(compoundSegmentDirectory));
+        assertEquals(List.of("KNN80CompoundDirectory"), chainOf(compoundSegmentDirectory));
 
         compoundSegmentDirectory.openInput(VEC_FILE, KNNVectorReadIntent.RESCORE.vectorDataContext()).close();
         assertEquals(
             "a .vec read of a compound segment does not arrive at the plugin directory as a .vec openInput; "
                 + "it arrives at the plugin's IndexInput for the .cfs as a slice -- see KNNVectorCompoundSliceInputTests",
             List.of(),
-            probe.vectorDataObservations()
+            plugin.vectorData()
         );
 
         assertSame(
             "the outer directory is still reachable, which is the only route a compound design has",
-            probe,
+            plugin,
             ((KNN80CompoundDirectory) compoundSegmentDirectory).getDir()
         );
 
         compoundSegmentDirectory.close();
-        probe.close();
-    }
-
-    /**
-     * {@code find} must be null-safe and bottom out, since it runs at every segment open on every
-     * index, including ones that never opted in.
-     */
-    public void testFindReturnsNullWhenNoProbeIsInstalled() throws IOException {
-        try (Directory plain = new ByteBuffersDirectory()) {
-            assertNull(KNNVectorIntentProbeDirectory.find(plain));
-            assertNull(KNNVectorIntentProbeDirectory.find(new FilterDirectory(plain) {
-            }));
-            assertEquals(List.of("ByteBuffersDirectory"), KNNVectorIntentProbeDirectory.wrapperChain(plain));
-        }
-        assertNull(KNNVectorIntentProbeDirectory.find(null));
-        assertEquals(List.of(), KNNVectorIntentProbeDirectory.wrapperChain(null));
+        plugin.close();
     }
 }

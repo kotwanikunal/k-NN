@@ -122,7 +122,6 @@ import org.opensearch.plugins.ReloadablePlugin;
 import org.opensearch.plugins.ScriptPlugin;
 import org.opensearch.plugins.SearchPipelinePlugin;
 import org.opensearch.plugins.SearchPlugin;
-import org.opensearch.knn.index.store.KNNVectorIntentProbeStoreFactory;
 import org.opensearch.knn.index.store.KNNVectorStorageStoreFactory;
 import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.plugins.SystemIndexPlugin;
@@ -163,7 +162,6 @@ import static org.opensearch.knn.common.KNNConstants.MODEL_INDEX_NAME;
 import static org.opensearch.knn.common.KNNConstants.TRAIN_THREAD_POOL;
 import static org.opensearch.knn.index.KNNCircuitBreaker.KNN_CIRCUIT_BREAKER_TIER;
 import static org.opensearch.knn.index.KNNSettings.KNN_DERIVED_SOURCE_ENABLED;
-import static org.opensearch.knn.index.store.KNNVectorIntentProbeStoreFactory.KNN_INTENT_PROBE_STORE_FACTORY;
 import static org.opensearch.knn.index.store.KNNVectorStorageStoreFactory.KNN_VECTOR_STORAGE_STORE_FACTORY;
 
 /**
@@ -325,20 +323,12 @@ public class KNNPlugin extends Plugin
      * Registering a factory costs nothing on an index that does not name it: the setting defaults to
      * empty, and an empty value resolves to the server's own store factory without consulting this map.
      * <p>
-     * Two are offered. {@code knn_vector_storage} is the production one: it dispatches full-precision
-     * vector re-score reads to Direct I/O and leaves every other read on the store type's own path.
-     * {@code knn_intent_probe} observes and routes nothing but a compound container's re-score entries;
-     * it is the spike that established the mechanism and is kept because the phase's evidence was
-     * gathered through it.
+     * One is offered. {@code knn_vector_storage} dispatches full-precision vector re-score reads to
+     * Direct I/O and leaves every other read on the store type's own path.
      */
     @Override
     public Map<String, IndexStorePlugin.StoreFactory> getStoreFactories() {
-        return Map.of(
-            KNN_VECTOR_STORAGE_STORE_FACTORY,
-            new KNNVectorStorageStoreFactory(),
-            KNN_INTENT_PROBE_STORE_FACTORY,
-            new KNNVectorIntentProbeStoreFactory()
-        );
+        return Map.of(KNN_VECTOR_STORAGE_STORE_FACTORY, new KNNVectorStorageStoreFactory());
     }
 
     @Override

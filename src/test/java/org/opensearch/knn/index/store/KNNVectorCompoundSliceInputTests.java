@@ -21,8 +21,11 @@ import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.index.TieredMergePolicy;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.store.DataAccessHint;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.FileDataHint;
 import org.apache.lucene.store.FileTypeHint;
+import org.apache.lucene.store.FilterDirectory;
 import org.apache.lucene.store.FilterIndexInput;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
@@ -37,9 +40,12 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.nio.channels.FileChannel;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Phase 9b gate 3: whether a compound segment's {@code .vec} can be dispatched on after all.
@@ -81,6 +87,58 @@ public class KNNVectorCompoundSliceInputTests extends KNNTestCase {
         }
     }
 
+    /**
+     * The minimum outer {@link Directory} these tests need: one that records the names it is asked to
+     * open and wraps every {@code .cfs} in the class under test, keeping a handle on the container so the
+     * slices taken out of it are observable.
+     *
+     * <p>It is a test harness rather than the production {@link KNNVectorStorageDirectory} on purpose.
+     * Production keeps bounded counters and no per-slice record — which is the right trade on a shard's
+     * real slice traffic and the wrong one here, where the assertion <em>is</em> the record. The
+     * dispatch rule itself is pinned against the production directory in
+     * {@link KNNVectorStorageDirectoryTests}; what these tests pin is the channel one level down.
+     */
+    private static final class ObservingDirectory extends FilterDirectory {
+
+        private final List<String> opens = new CopyOnWriteArrayList<>();
+        private final Map<String, KNNVectorCompoundSliceInput> containers = new ConcurrentHashMap<>();
+
+        private ObservingDirectory(final Directory delegate) {
+            super(delegate);
+        }
+
+        @Override
+        public IndexInput openInput(final String name, final IOContext context) throws IOException {
+            opens.add(name);
+            final IndexInput input = in.openInput(name, context);
+            if (name.endsWith(".cfs")) {
+                // Exactly what KNNVectorStorageDirectory does, in its observing form: every entry of the
+                // container is a four-argument slice of THIS input, carrying the name and the context.
+                final KNNVectorCompoundSliceInput wrapped = new KNNVectorCompoundSliceInput(input, name, resolvePath(name), true);
+                containers.put(name, wrapped);
+                return wrapped;
+            }
+            return input;
+        }
+
+        private Path resolvePath(final String name) {
+            final Directory bottom = FilterDirectory.unwrap(in);
+            return bottom instanceof FSDirectory fsDirectory ? fsDirectory.getDirectory().resolve(name) : null;
+        }
+
+        private List<String> opens() {
+            return List.copyOf(opens);
+        }
+
+        private void clearOpens() {
+            opens.clear();
+        }
+
+        private Map<String, KNNVectorCompoundSliceInput> compoundContainers() {
+            return Map.copyOf(containers);
+        }
+    }
+
     private static float[] vector(final Random random) {
         final float[] values = new float[DIMENSION];
         for (int d = 0; d < DIMENSION; d++) {
@@ -95,7 +153,7 @@ public class KNNVectorCompoundSliceInputTests extends KNNTestCase {
      * Lucene test framework randomises that, and a codec that does not write a {@code .vec} would make
      * this test pass for the wrong reason.
      */
-    private static void writeCompoundSegmentWithVectors(final KNNVectorIntentProbeDirectory directory) throws IOException {
+    private static void writeCompoundSegmentWithVectors(final ObservingDirectory directory) throws IOException {
         final IndexWriterConfig config = new IndexWriterConfig();
         config.setCodec(new Lucene104Codec());
         config.setUseCompoundFile(true);
@@ -116,7 +174,7 @@ public class KNNVectorCompoundSliceInputTests extends KNNTestCase {
         }
     }
 
-    private static SegmentCommitInfo onlySegment(final KNNVectorIntentProbeDirectory directory) throws IOException {
+    private static SegmentCommitInfo onlySegment(final ObservingDirectory directory) throws IOException {
         final SegmentInfos infos = SegmentInfos.readLatestCommit(directory);
         assertEquals("the fixture must be one segment", 1, infos.size());
         return infos.info(0);
@@ -145,20 +203,20 @@ public class KNNVectorCompoundSliceInputTests extends KNNTestCase {
      */
     public void testCompoundSegmentVecEntryArrivesAtThePluginWithNameAndIntent() throws IOException {
         final Path path = createTempDir();
-        try (KNNVectorIntentProbeDirectory probe = new KNNVectorIntentProbeDirectory(new MMapDirectory(path), "cfs-gate3")) {
-            writeCompoundSegmentWithVectors(probe);
-            final SegmentCommitInfo commit = onlySegment(probe);
+        try (ObservingDirectory outer = new ObservingDirectory(new MMapDirectory(path))) {
+            writeCompoundSegmentWithVectors(outer);
+            final SegmentCommitInfo commit = onlySegment(outer);
             assertTrue("the fixture must be a compound segment", commit.info.getUseCompoundFile());
 
-            probe.clearObservations();
-            try (CompoundDirectory compound = commit.info.getCodec().compoundFormat().getCompoundReader(probe, commit.info)) {
+            outer.clearOpens();
+            try (CompoundDirectory compound = commit.info.getCodec().compoundFormat().getCompoundReader(outer, commit.info)) {
                 // The container itself is an ordinary openInput on the plugin's directory, which is what
                 // makes the slices below reachable at all.
                 assertTrue(
-                    "the .cfs must be opened on the plugin directory, saw " + probe.observations(),
-                    probe.observations().stream().anyMatch(o -> o.name().endsWith(".cfs"))
+                    "the .cfs must be opened on the plugin directory, saw " + outer.opens(),
+                    outer.opens().stream().anyMatch(name -> name.endsWith(".cfs"))
                 );
-                final KNNVectorCompoundSliceInput container = probe.compoundContainers()
+                final KNNVectorCompoundSliceInput container = outer.compoundContainers()
                     .values()
                     .stream()
                     .findFirst()
@@ -215,12 +273,12 @@ public class KNNVectorCompoundSliceInputTests extends KNNTestCase {
     public void testRoutedVecEntryIsServedByDirectIOAndReadsIdenticalBytes() throws IOException {
         assumeDirectIOWorksHere();
         final Path path = createTempDir();
-        try (KNNVectorIntentProbeDirectory probe = new KNNVectorIntentProbeDirectory(new MMapDirectory(path), "cfs-gate3-dio")) {
-            writeCompoundSegmentWithVectors(probe);
-            final SegmentCommitInfo commit = onlySegment(probe);
+        try (ObservingDirectory outer = new ObservingDirectory(new MMapDirectory(path))) {
+            writeCompoundSegmentWithVectors(outer);
+            final SegmentCommitInfo commit = onlySegment(outer);
             assertTrue(commit.info.getUseCompoundFile());
 
-            try (CompoundDirectory compound = commit.info.getCodec().compoundFormat().getCompoundReader(probe, commit.info)) {
+            try (CompoundDirectory compound = commit.info.getCodec().compoundFormat().getCompoundReader(outer, commit.info)) {
                 final String vecName = vecEntryName(compound);
 
                 try (
@@ -267,11 +325,11 @@ public class KNNVectorCompoundSliceInputTests extends KNNTestCase {
      */
     public void testEveryOtherEntryKeepsTheDelegateInputUnwrapped() throws IOException {
         final Path path = createTempDir();
-        try (KNNVectorIntentProbeDirectory probe = new KNNVectorIntentProbeDirectory(new MMapDirectory(path), "cfs-gate3-cost")) {
-            writeCompoundSegmentWithVectors(probe);
-            final SegmentCommitInfo commit = onlySegment(probe);
+        try (ObservingDirectory outer = new ObservingDirectory(new MMapDirectory(path))) {
+            writeCompoundSegmentWithVectors(outer);
+            final SegmentCommitInfo commit = onlySegment(outer);
 
-            try (CompoundDirectory compound = commit.info.getCodec().compoundFormat().getCompoundReader(probe, commit.info)) {
+            try (CompoundDirectory compound = commit.info.getCodec().compoundFormat().getCompoundReader(outer, commit.info)) {
                 for (final String name : compound.listAll()) {
                     try (IndexInput entry = compound.openInput(name, IOContext.DEFAULT)) {
                         assertFalse(

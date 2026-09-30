@@ -6,7 +6,6 @@
 package org.opensearch.knn.index.codec.KNN1040Codec;
 
 import lombok.extern.log4j.Log4j2;
-import org.apache.lucene.codecs.CompoundDirectory;
 import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
 import org.apache.lucene.codecs.hnsw.FlatVectorsScorer;
 import org.apache.lucene.index.ByteVectorValues;
@@ -16,15 +15,11 @@ import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.FilterDirectory;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.opensearch.common.Nullable;
 import org.opensearch.knn.index.codec.KNNRescoreVectorsReader;
 import org.opensearch.knn.index.codec.scorer.HasRescoreVectorsReader;
 import org.opensearch.knn.index.store.DirectIOVectorSource;
-import org.opensearch.knn.index.store.KNNVectorIntentProbeDirectory;
-import org.opensearch.knn.index.store.KNNVectorReadIntent;
 import org.opensearch.knn.index.store.VectorLoaderSource;
 
 import java.io.IOException;
@@ -138,79 +133,6 @@ public class Faiss1040ScalarQuantizedFlatVectorsReader extends FlatVectorsReader
         this.delegateFlatVectorsReader = lucene104ScalarQuantizedVectorsReader;
         this.vectorDataPath = resolveVectorDataPath(state);
         this.rescoreVectorsReader = rescoreVectorsReader;
-        probeReadIntentChannel(state);
-    }
-
-    /**
-     * Issues one plugin-authored {@code .vec} {@code openInput} carrying
-     * {@link KNNVectorReadIntent#RESCORE}, so that a {@link KNNVectorIntentProbeDirectory} below can
-     * record whether the intent survived the descent, and closes it again immediately.
-     * <p>
-     * This runs only when the index opted in with {@code index.store.factory: knn_intent_probe}, which
-     * is what puts a probe in the chain. On every other index it is a walk of at most sixteen
-     * {@code getDelegate()} links at segment open and nothing else — no file is opened, and the
-     * default read path is byte-for-byte unchanged.
-     * <p>
-     * It exists because the directory design turns on a fact that cannot be read off the source: an
-     * {@link IOContext} is built here, five OpenSearch wrappers sit between here and the deepest
-     * directory a plugin can supply, and while none of them was seen to rebuild the context, only a
-     * running node can show what the chain actually is — including whether a compound segment reaches
-     * a plugin directory at all.
-     * <p>
-     * The open is attempted on a compound segment as well, where the {@code getDelegate()} walk finds
-     * nothing. Gate 1 treated that as the end of the road; it is not. Lucene's compound reader opens the
-     * {@code .cfs} on the outer directory and serves each entry as a four-argument
-     * {@code slice(name, offset, length, context)} of that handle, so this intent arrives at the
-     * plugin's {@code IndexInput} for the container. See
-     * {@link org.opensearch.knn.index.store.KNNVectorCompoundSliceInput}.
-     */
-    private static void probeReadIntentChannel(@Nullable final SegmentReadState state) {
-        if (state == null) {
-            return;
-        }
-        if (KNNVectorIntentProbeDirectory.isInstalledOnNode() == false) {
-            return;
-        }
-        final String name = IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, VECTOR_DATA_EXTENSION);
-        final KNNVectorIntentProbeDirectory probe = KNNVectorIntentProbeDirectory.find(state.directory);
-        final boolean compoundSegment = state.directory instanceof CompoundDirectory;
-        if (probe == null && compoundSegment == false) {
-            // Neither an opted-in non-compound segment nor a compound one, so there is nothing for the
-            // intent to reach. Returning here is not only pointless work avoided: a second openInput of
-            // the same .vec is *observable*, because anything keyed by file name -- including
-            // FaissMemoryOptimizedSearcherTests.ReadTrackingDirectory -- cannot tell the plugin's handle
-            // from the reader's and keeps only the last.
-            return;
-        }
-        final String label = probe != null ? probe.indexName() : "compound-segment";
-        log.info(
-            "k-NN read-intent probe [{}]: segment [{}] suffix [{}] file [{}] directory chain {} probeInChain={}",
-            label,
-            state.segmentInfo.name,
-            state.segmentSuffix,
-            name,
-            KNNVectorIntentProbeDirectory.wrapperChain(state.directory),
-            probe != null
-        );
-        // The open is attempted whether or not the getDelegate() walk found a probe. On a compound
-        // segment it does not -- KNN80CompoundDirectory is a bare Directory -- and gate 1 stopped there,
-        // which was premature: KNN80CompoundDirectory delegates to Lucene's compound reader, which
-        // serves the entry by slicing the .cfs handle it opened on the outer (plugin) directory, and the
-        // four-argument slice it uses carries both the name and this context. So the intent reaches the
-        // plugin on a compound segment too, one level below the Directory. Logging the class of the
-        // returned input is what makes that visible: a routed slice comes back as a
-        // DirectIOVectorIndexInput.
-        try (IndexInput input = state.directory.openInput(name, KNNVectorReadIntent.RESCORE.vectorDataContext())) {
-            log.info(
-                "k-NN read-intent probe [{}]: plugin-issued openInput of [{}] succeeded, input=[{}]",
-                label,
-                name,
-                input.getClass().getSimpleName()
-            );
-        } catch (IOException | RuntimeException e) {
-            // A probe must never fail a segment open.
-            log.info("k-NN read-intent probe [{}]: plugin-issued openInput of [{}] failed: {}", label, name, e.toString());
-        }
     }
 
     /**

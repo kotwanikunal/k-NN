@@ -81,11 +81,11 @@ import java.util.function.BooleanSupplier;
  * result, because both routes read the same bytes of the same file.
  *
  * <h2>What this class deliberately does not have</h2>
- * Its predecessor {@link KNNVectorIntentProbeDirectory} is a spike: it records every {@code openInput}
- * in an unbounded list and sets a node-wide static flag so a test can tell "never installed" from
- * "installed but unreachable". Neither belongs on a production read path — the list grows for the life
- * of the shard and the static outlives every index that set it. This class keeps bounded counters and
- * no static state at all; {@link #find(Directory)} is a walk of the caller's own chain, not a registry.
+ * The spike this design grew out of recorded every {@code openInput} in an unbounded list and set a
+ * node-wide static flag so a test could tell "never installed" from "installed but unreachable".
+ * Neither belongs on a production read path — the list grows for the life of the shard and the static
+ * outlives every index that set it. This class keeps bounded counters and no static state at all;
+ * {@link #find(Directory)} is a walk of the caller's own chain, not a registry.
  */
 @Log4j2
 public final class KNNVectorStorageDirectory extends FilterDirectory {
