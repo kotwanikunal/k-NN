@@ -11,13 +11,9 @@ import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.search.VectorScorer;
-import org.opensearch.common.Nullable;
-import org.opensearch.knn.index.codec.scorer.HasVectorLoaderSource;
 import org.opensearch.knn.index.codec.scorer.HasFullPrecisionVectorValues;
-import org.opensearch.knn.index.store.VectorLoaderSource;
 
 import java.io.IOException;
-import java.util.function.Supplier;
 
 /**
  * A {@link FloatVectorValues} wrapper that holds both the full-precision float delegate (backed by
@@ -38,7 +34,7 @@ import java.util.function.Supplier;
  * <p>For an empty vector segment, the quantized delegate may be {@code null}.
  */
 @Getter
-class ScalarQuantizedFloatVectorValues extends FloatVectorValues implements HasFullPrecisionVectorValues, HasVectorLoaderSource {
+class ScalarQuantizedFloatVectorValues extends FloatVectorValues implements HasFullPrecisionVectorValues {
     /**
      * The full-precision float delegate (reads the {@code .vec} file).
      */
@@ -55,40 +51,11 @@ class ScalarQuantizedFloatVectorValues extends FloatVectorValues implements HasF
      * reach the file.
      */
     private final KnnVectorValues fullPrecisionVectorValues;
-    /**
-     * Supplies the segment-scoped loader seam for the {@code .vec} file, or {@code null} when this values
-     * object was built without one. Held as a supplier rather than a source so that nothing is established
-     * until a query that knows its reads have no reuse asks: these values are constructed on every search,
-     * the source is owned by the reader, and the reader must not open a file handle on a node whose Direct
-     * I/O rescore flag is off.
-     */
-    @Getter(lombok.AccessLevel.NONE)
-    @Nullable
-    private final Supplier<VectorLoaderSource> vectorLoaderSourceSupplier;
 
     ScalarQuantizedFloatVectorValues(final FloatVectorValues floatVectorValues, final QuantizedByteVectorValues quantizedVectorValues) {
-        this(floatVectorValues, quantizedVectorValues, null);
-    }
-
-    ScalarQuantizedFloatVectorValues(
-        final FloatVectorValues floatVectorValues,
-        final QuantizedByteVectorValues quantizedVectorValues,
-        @Nullable final Supplier<VectorLoaderSource> vectorLoaderSourceSupplier
-    ) {
         this.floatVectorValues = floatVectorValues;
         this.quantizedVectorValues = quantizedVectorValues;
         this.fullPrecisionVectorValues = KNN1040ScalarQuantizedUtils.extractRawFloatVectorValues(floatVectorValues);
-        this.vectorLoaderSourceSupplier = vectorLoaderSourceSupplier;
-    }
-
-    /**
-     * The loader seam for the {@code .vec} vectors this wrapper serves through {@link #vectorValue(int)}, or
-     * {@code null} when there is none. Shares this wrapper's ordinal space, for the same reason
-     * {@link #getFullPrecisionVectorValues()} does.
-     */
-    @Override
-    public VectorLoaderSource vectorLoaderSource() {
-        return vectorLoaderSourceSupplier == null ? null : vectorLoaderSourceSupplier.get();
     }
 
     /**
@@ -123,8 +90,7 @@ class ScalarQuantizedFloatVectorValues extends FloatVectorValues implements HasF
     public FloatVectorValues copy() throws IOException {
         return new ScalarQuantizedFloatVectorValues(
             floatVectorValues.copy(),
-            quantizedVectorValues == null ? null : quantizedVectorValues.copy(),
-            vectorLoaderSourceSupplier
+            quantizedVectorValues == null ? null : quantizedVectorValues.copy()
         );
     }
 

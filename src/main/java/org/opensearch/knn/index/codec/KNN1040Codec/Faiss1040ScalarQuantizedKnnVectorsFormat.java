@@ -159,16 +159,12 @@ public class Faiss1040ScalarQuantizedKnnVectorsFormat extends KnnVectorsFormat {
         final KNN1040ScalarQuantizedVectorsFormat flatFormat = flatFormatFor();
         return new Faiss1040ScalarQuantizedKnnVectorsReader(
             state,
-            // The state is handed down only so the flat reader can name this segment's .vec file for
-            // Direct I/O rescoring; it opens nothing until a Direct I/O rescore query asks it to.
-            //
             // The rescore view is built on the *raw* fp32 format nested inside the quantized one, not on
             // the quantized format: the rescore path reads .vec and its .vemf sidecar and never the .veq
             // codes, and a view built on the quantized format would put a second handle on the codes file
             // for a caller that will never look at it. Creating the view opens nothing.
             new Faiss1040ScalarQuantizedFlatVectorsReader(
                 flatFormat.fieldsReader(state),
-                state,
                 KNNRescoreVectorsReader.create(flatFormat.rawVectorsFormat(), state)
             )
         );

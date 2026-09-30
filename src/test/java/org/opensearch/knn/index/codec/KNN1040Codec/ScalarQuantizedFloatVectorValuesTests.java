@@ -12,12 +12,7 @@ import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.util.quantization.QuantizedByteVectorValues;
 import org.opensearch.knn.KNNTestCase;
-import org.opensearch.knn.index.codec.scorer.HasVectorLoaderSource;
 import org.opensearch.knn.index.codec.scorer.HasFullPrecisionVectorValues;
-import org.opensearch.knn.index.store.VectorLoaderSource;
-
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Supplier;
 
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -224,49 +219,5 @@ public class ScalarQuantizedFloatVectorValuesTests extends KNNTestCase {
     public void testScorer_whenQuantizedValuesAreNull_thenReturnsNull() {
         var wrapper = new ScalarQuantizedFloatVectorValues(mock(FloatVectorValues.class), null);
         assertNull(wrapper.scorer(new float[] { 1.0f, 2.0f }));
-    }
-
-    /**
-     * Values built without a supplier - which is every caller outside the codec's own
-     * {@code getFloatVectorValues} - name no Direct I/O source, so the rescore seam falls back on them.
-     */
-    public void testVectorLoaderSource_whenNoSupplier_thenNull() {
-        var wrapper = new ScalarQuantizedFloatVectorValues(mock(FloatVectorValues.class), mock(QuantizedByteVectorValues.class));
-        assertNull(wrapper.vectorLoaderSource());
-        assertTrue(wrapper instanceof HasVectorLoaderSource);
-    }
-
-    /**
-     * The supplier must not be consulted until the source is actually asked for: these values are built on
-     * every query, and with the flag off nobody asks, so nothing is opened.
-     */
-    public void testVectorLoaderSource_whenSupplierIsGiven_thenLazyAndPassedThrough() {
-        final VectorLoaderSource source = mock(VectorLoaderSource.class);
-        final AtomicInteger calls = new AtomicInteger();
-        final Supplier<VectorLoaderSource> supplier = () -> {
-            calls.incrementAndGet();
-            return source;
-        };
-
-        var wrapper = new ScalarQuantizedFloatVectorValues(mock(FloatVectorValues.class), mock(QuantizedByteVectorValues.class), supplier);
-        assertEquals("constructing the values must not open anything", 0, calls.get());
-
-        assertSame(source, wrapper.vectorLoaderSource());
-        assertEquals(1, calls.get());
-    }
-
-    /**
-     * Lucene copies these values per scoring task, and the seam looks at the copy. A copy that dropped the
-     * supplier would silently disable the Direct I/O path with no symptom other than flat counters.
-     */
-    @SneakyThrows
-    public void testCopy_thenCarriesTheLoaderSourceSupplier() {
-        final VectorLoaderSource source = mock(VectorLoaderSource.class);
-        FloatVectorValues fvv = mock(FloatVectorValues.class);
-        when(fvv.copy()).thenReturn(mock(FloatVectorValues.class));
-
-        var copied = (ScalarQuantizedFloatVectorValues) new ScalarQuantizedFloatVectorValues(fvv, null, () -> source).copy();
-
-        assertSame(source, copied.vectorLoaderSource());
     }
 }

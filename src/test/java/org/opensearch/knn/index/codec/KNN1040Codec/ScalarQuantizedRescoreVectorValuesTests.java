@@ -254,19 +254,6 @@ public class ScalarQuantizedRescoreVectorValuesTests extends KNNTestCase {
     }
 
     /**
-     * An empty segment's values are built without the loader-seam capability, because Lucene exposes no
-     * quantized delegate for one. The rescore path must decline rather than throw.
-     */
-    @SneakyThrows
-    public void testEmptyValuesOfferNoLoaderSource() {
-        final ScalarQuantizedFloatVectorValues empty = new ScalarQuantizedFloatVectorValues(
-            new org.opensearch.knn.index.vectorvalues.TestVectorValues.PreDefinedFloatVectorValues(List.of()),
-            null
-        );
-        assertNull(empty.vectorLoaderSource());
-    }
-
-    /**
      * A field the reader knows nothing about yields no view and does not throw. The query layer asks by name,
      * so a name that does not resolve has to be an ordinary decline.
      */
