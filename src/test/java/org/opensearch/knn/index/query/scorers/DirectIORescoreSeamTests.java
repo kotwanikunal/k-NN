@@ -5,40 +5,29 @@
 
 package org.opensearch.knn.index.query.scorers;
 
-import lombok.SneakyThrows;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FloatVectorValues;
-import org.apache.lucene.index.VectorSimilarityFunction;
 import org.mockito.Mock;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.index.KNNSettings;
-import org.opensearch.knn.index.codec.scorer.HasVectorLoaderSource;
-import org.opensearch.knn.index.store.VectorLoaderSource;
 import org.opensearch.knn.index.vectorvalues.TestVectorValues;
 
 import java.util.List;
 import java.util.function.Supplier;
 
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.opensearch.knn.index.KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED_SETTING;
 
 /**
  * Pins the three conditions of the Direct I/O rescore gate, that the seam is a pass-through in every case
- * that fails one of them, and that the one case which passes all of them reads through
- * {@link DirectIOFloatVectorValues}.
+ * that fails one of them, and that the one case which passes all of them scores through the segment's
+ * rescore view.
  */
 public class DirectIORescoreSeamTests extends KNNTestCase {
 
-    private static final int DIMENSION = 2;
     private static final List<float[]> VECTORS = List.of(new float[] { 1.0f, 2.0f });
-    private static final int SIZE = VECTORS.size();
-    /** What the stub source answers, chosen to differ from {@link #VECTORS} so a swap is observable. */
-    private static final float[] SOURCE_VECTOR = { 30.0f, 40.0f };
 
     @Mock
     ClusterSettings clusterSettings;
@@ -102,106 +91,48 @@ public class DirectIORescoreSeamTests extends KNNTestCase {
         assertFalse(DirectIORescoreSeam.isEngaged(VectorScorerMode.RESCORE, false));
     }
 
+    /**
+     * With the flag off the seam hands back what it was given in every mode, so a disabled path is identical
+     * to having no seam at all rather than merely equivalent to it.
+     */
     public void testVectorValuesForRescore_whenFlagIsOff_thenReturnsSameInstance() {
         setFlag(false);
         final FloatVectorValues values = values();
-        assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, false, fieldInfo));
-        assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.SCORE, false, fieldInfo));
-    }
-
-    /**
-     * Any vector format whose values do not name a Direct I/O source keeps the default path. There is no
-     * fallback to arrange here: the seam simply hands back what it was given.
-     */
-    public void testVectorValuesForRescore_whenValuesNameNoSource_thenReturnsSameInstance() {
-        setFlag(true);
-        final FloatVectorValues values = values();
-        assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, false, fieldInfo));
+        assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, false, fieldInfo, () -> values()));
+        assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.SCORE, false, fieldInfo, () -> values()));
     }
 
     public void testVectorValuesForRescore_whenRadial_thenReturnsSameInstance() {
         setFlag(true);
         final FloatVectorValues values = values();
-        assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, true, fieldInfo));
+        assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, true, fieldInfo, () -> values()));
     }
 
     /**
-     * A source that could not be opened or verified - a compound segment, a filesystem that refuses
-     * {@code O_DIRECT} - is an ordinary answer of {@code null}, not an error, and must not disturb the query.
+     * A caller that offers no view at all — every {@code createScorer} overload except the one
+     * {@code ExactSearcher} uses — keeps the default path. This is what makes the parameter a no-op for every
+     * other caller.
      */
-    public void testVectorValuesForRescore_whenSourceIsNull_thenReturnsSameInstance() {
+    public void testVectorValuesForRescore_whenNoSupplierIsGiven_thenReturnsSameInstance() {
         setFlag(true);
-        final FloatVectorValues values = new SourceNamingValues(null);
-        assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, false, fieldInfo));
+        final FloatVectorValues values = values();
+        assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, false, fieldInfo, null));
     }
 
     /**
-     * A source whose shape disagrees with the values was verified against something else, so reading
-     * through it would score the wrong vectors. The seam falls back rather than trusting it.
+     * No view on offer — the setting off, a directory with no rescore route, a codec reader that offers none —
+     * is an ordinary answer of {@code null}, not an error, and must not disturb the query.
      */
-    public void testVectorValuesForRescore_whenSourceShapeDisagrees_thenReturnsSameInstance() {
+    public void testVectorValuesForRescore_whenTheSupplierOffersNoView_thenReturnsSameInstance() {
         setFlag(true);
-        final VectorLoaderSource source = source(SIZE + 1, DIMENSION, DIMENSION * Float.BYTES);
-        final FloatVectorValues values = new SourceNamingValues(source);
-        assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, false, fieldInfo));
+        final FloatVectorValues values = values();
+        assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, false, fieldInfo, () -> null));
     }
 
     /**
-     * The one case that swaps the values, and the only place the whole chain is asserted end to end: with
-     * the flag on, a matching source, and a non-radial rescore, reads go through
-     * {@code DirectIOFloatVectorValues}.
-     */
-    @SneakyThrows
-    public void testVectorValuesForRescore_whenSourceMatches_thenReadsThroughDirectIO() {
-        setFlag(true);
-        when(fieldInfo.getVectorSimilarityFunction()).thenReturn(VectorSimilarityFunction.EUCLIDEAN);
-        final FloatVectorValues values = new SourceNamingValues(source(SIZE, DIMENSION, DIMENSION * Float.BYTES));
-
-        final FloatVectorValues wrapped = DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, false, fieldInfo);
-
-        assertNotSame(values, wrapped);
-        assertTrue(wrapped.getClass().getSimpleName(), wrapped instanceof DirectIOFloatVectorValues);
-        assertArrayEquals(SOURCE_VECTOR, wrapped.vectorValue(0), 0.0f);
-        assertEquals(values.size(), wrapped.size());
-        assertEquals(values.dimension(), wrapped.dimension());
-    }
-
-    /**
-     * The mode is both the gate and the loader seam's reuse hint, and the hint half is easy to drop: nothing
-     * in this plugin reads it, so only this assertion notices if it stops arriving. A future cache at the
-     * loader seam needs it to know that rescore reads have no reuse and must not be retained.
-     */
-    @SneakyThrows
-    public void testVectorValuesForRescore_whenEngaged_thenPassesTheModeDownAsTheReuseHint() {
-        setFlag(true);
-        when(fieldInfo.getVectorSimilarityFunction()).thenReturn(VectorSimilarityFunction.EUCLIDEAN);
-        final VectorLoaderSource source = source(SIZE, DIMENSION, DIMENSION * Float.BYTES);
-
-        DirectIORescoreSeam.vectorValuesForRescore(new SourceNamingValues(source), VectorScorerMode.RESCORE, false, fieldInfo);
-
-        verify(source).newLoader(VectorScorerMode.RESCORE);
-    }
-
-    /**
-     * The same values that would be swapped with the flag on are handed straight back with it off. This is
-     * the "flag off is identical to no seam at all" guarantee, asserted where it can actually fail.
-     */
-    @SneakyThrows
-    public void testVectorValuesForRescore_whenFlagIsOffAndSourceMatches_thenReturnsSameInstance() {
-        setFlag(false);
-        final FloatVectorValues values = new SourceNamingValues(source(SIZE, DIMENSION, DIMENSION * Float.BYTES));
-        assertSame(values, DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, false, fieldInfo));
-    }
-
-    // ---------------------------------------------------------------------------------------------------
-    // The rescore view route. Preferred over the loader seam because it is Lucene's own values over an
-    // intent-carrying IndexInput: no plugin decoding, no offset arithmetic, and one mechanism per file
-    // rather than one per encoding.
-    // ---------------------------------------------------------------------------------------------------
-
-    /**
-     * The engaged case for the new route. The seam returns the view itself — not a wrapper around anything —
-     * so the scorer built from it one line later in {@code VectorScorers} is Lucene's own.
+     * The engaged case, and the only place the whole chain is asserted end to end. The seam returns the view
+     * itself — not a wrapper around anything — so the scorer built from it one line later in
+     * {@code VectorScorers} is Lucene's own.
      */
     public void testVectorValuesForRescore_whenAViewIsOffered_thenReturnsTheViewUnwrapped() {
         setFlag(true);
@@ -217,66 +148,6 @@ public class DirectIORescoreSeamTests extends KNNTestCase {
         );
 
         assertSame(view, chosen);
-    }
-
-    /**
-     * When both routes are on offer the view wins. It has to: it is the route that reaches every encoding,
-     * and running both would put two Direct I/O mechanisms on the same reads.
-     */
-    public void testVectorValuesForRescore_whenBothRoutesAreOffered_thenTheViewWins() {
-        setFlag(true);
-        final FloatVectorValues view = values();
-        final FloatVectorValues values = new SourceNamingValues(source(SIZE, DIMENSION, DIMENSION * Float.BYTES));
-
-        final FloatVectorValues chosen = DirectIORescoreSeam.vectorValuesForRescore(
-            values,
-            VectorScorerMode.RESCORE,
-            false,
-            fieldInfo,
-            () -> view
-        );
-
-        assertSame(view, chosen);
-        assertFalse(chosen instanceof DirectIOFloatVectorValues);
-    }
-
-    /**
-     * No view — the setting off, a directory with no rescore route, a codec reader that offers none — falls
-     * through to the loader seam rather than to the default path, so the encoding the seam already covered
-     * keeps working while the view is being rolled out across the others.
-     */
-    @SneakyThrows
-    public void testVectorValuesForRescore_whenNoViewButASourceMatches_thenFallsBackToTheLoaderSeam() {
-        setFlag(true);
-        when(fieldInfo.getVectorSimilarityFunction()).thenReturn(VectorSimilarityFunction.EUCLIDEAN);
-        final FloatVectorValues values = new SourceNamingValues(source(SIZE, DIMENSION, DIMENSION * Float.BYTES));
-
-        final FloatVectorValues chosen = DirectIORescoreSeam.vectorValuesForRescore(
-            values,
-            VectorScorerMode.RESCORE,
-            false,
-            fieldInfo,
-            () -> null
-        );
-
-        assertTrue(chosen.getClass().getSimpleName(), chosen instanceof DirectIOFloatVectorValues);
-        assertArrayEquals(SOURCE_VECTOR, chosen.vectorValue(0), 0.0f);
-    }
-
-    /**
-     * A caller that offers no supplier at all - every {@code createScorer} overload except the one
-     * {@code ExactSearcher} uses - reaches the loader seam exactly as before. This is what makes adding the
-     * parameter a no-op for every existing caller.
-     */
-    @SneakyThrows
-    public void testVectorValuesForRescore_whenNoSupplierIsGiven_thenBehavesAsBefore() {
-        setFlag(true);
-        when(fieldInfo.getVectorSimilarityFunction()).thenReturn(VectorSimilarityFunction.EUCLIDEAN);
-        final FloatVectorValues values = new SourceNamingValues(source(SIZE, DIMENSION, DIMENSION * Float.BYTES));
-
-        final FloatVectorValues chosen = DirectIORescoreSeam.vectorValuesForRescore(values, VectorScorerMode.RESCORE, false, fieldInfo);
-
-        assertTrue(chosen.getClass().getSimpleName(), chosen instanceof DirectIOFloatVectorValues);
     }
 
     /**
@@ -331,47 +202,6 @@ public class DirectIORescoreSeamTests extends KNNTestCase {
         public FloatVectorValues get() {
             timesAsked++;
             return view;
-        }
-    }
-
-    /**
-     * A stub source of a given shape whose loaders answer {@link #SOURCE_VECTOR} for every ordinal.
-     * <p>
-     * Mocked as the {@link VectorLoaderSource} seam rather than as the Direct I/O implementation, which is
-     * itself an assertion: if the seam ever needed something only the implementation offers, this would stop
-     * compiling.
-     */
-    @SneakyThrows
-    private static VectorLoaderSource source(final int size, final int dimension, final int vectorByteLength) {
-        final VectorLoaderSource source = mock(VectorLoaderSource.class);
-        when(source.size()).thenReturn(size);
-        when(source.dimension()).thenReturn(dimension);
-        when(source.vectorByteLength()).thenReturn(vectorByteLength);
-        when(source.newLoader(any())).thenAnswer(invocation -> {
-            final VectorLoaderSource.Loader loader = mock(VectorLoaderSource.Loader.class);
-            when(loader.read(anyInt())).thenReturn(SOURCE_VECTOR);
-            when(loader.reuseHint()).thenReturn(invocation.getArgument(0));
-            return loader;
-        });
-        return source;
-    }
-
-    /**
-     * Stands in for {@code ScalarQuantizedFloatVectorValues}: the shape of {@link #values()} plus the one
-     * interface the seam looks for.
-     */
-    private static final class SourceNamingValues extends TestVectorValues.PreDefinedFloatVectorValues implements HasVectorLoaderSource {
-
-        private final VectorLoaderSource source;
-
-        private SourceNamingValues(final VectorLoaderSource source) {
-            super(VECTORS);
-            this.source = source;
-        }
-
-        @Override
-        public VectorLoaderSource vectorLoaderSource() {
-            return source;
         }
     }
 }
