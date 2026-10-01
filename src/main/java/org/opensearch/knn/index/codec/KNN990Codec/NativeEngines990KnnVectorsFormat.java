@@ -39,7 +39,13 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
     private static final FlatVectorsFormat flatVectorsFormat = new Lucene99FlatVectorsFormat(
         new PrefetchableFlatVectorScorer(new NativeEngines990KnnVectorsScorer(FlatVectorScorerUtil.getLucene99FlatVectorsScorer()))
     );
-    private static final String FORMAT_NAME = "NativeEngines990KnnVectorsFormat";
+    /**
+     * The per-field format name. Public because {@code PerFieldKnnVectorsFormat} puts it in the segment
+     * suffix of every file this format writes, which is how
+     * {@link org.opensearch.knn.index.store.KNNVectorStorageDirectory} recognises a native-engine
+     * {@code .vec} by name.
+     */
+    public static final String FORMAT_NAME = "NativeEngines990KnnVectorsFormat";
     private final int approximateThreshold;
     private final NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory;
 

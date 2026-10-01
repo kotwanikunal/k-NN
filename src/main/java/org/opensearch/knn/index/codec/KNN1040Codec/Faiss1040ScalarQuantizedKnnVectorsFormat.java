@@ -57,7 +57,13 @@ import static org.opensearch.knn.common.KNNConstants.SQ_CONFIG;
 @Log4j2
 public class Faiss1040ScalarQuantizedKnnVectorsFormat extends KnnVectorsFormat {
 
-    private static final String FORMAT_NAME = "Faiss1040ScalarQuantizedKnnVectorsFormat";
+    /**
+     * The per-field format name. Public because {@code PerFieldKnnVectorsFormat} puts it in the segment
+     * suffix of every file this format writes, which is how
+     * {@link org.opensearch.knn.index.store.KNNVectorStorageDirectory} recognises a faiss
+     * scalar-quantized {@code .vec} by name.
+     */
+    public static final String FORMAT_NAME = "Faiss1040ScalarQuantizedKnnVectorsFormat";
 
     // KNN1040ScalarQuantizedVectorsFormat is stateless per encoding, so we cache one instance per
     // encoding and share it across all format instances.

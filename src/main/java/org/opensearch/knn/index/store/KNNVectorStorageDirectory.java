@@ -13,6 +13,8 @@ import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.Nullable;
 import org.opensearch.knn.index.KNNSettings;
+import org.opensearch.knn.index.codec.KNN1040Codec.Faiss1040ScalarQuantizedKnnVectorsFormat;
+import org.opensearch.knn.index.codec.KNN990Codec.NativeEngines990KnnVectorsFormat;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -21,30 +23,35 @@ import java.util.function.BooleanSupplier;
 
 /**
  * The storage layer's half of the directory design: the {@link Directory} that decides <em>how</em> a
- * vector data read is served, for reads whose <em>what</em> has already been named by
- * {@link KNNVectorReadIntent}.
+ * vector data read is served, from the file's name alone.
  *
  * <h2>The dispatch rule, in one place</h2>
- * A read is served with {@code O_DIRECT} if and only if all four of these hold:
+ * A read is served with {@code O_DIRECT} if and only if all three of these hold:
  *
  * <ol>
- *   <li>the file is the full-precision flat vector data — {@code name.endsWith(".vec")};
- *   <li>the caller's {@link IOContext} carries {@link KNNVectorReadIntent#RESCORE};
+ *   <li>the file is a <b>faiss or memory-optimized-search</b> full-precision flat vector file — see
+ *       {@link #isFaissVectorData};
  *   <li>{@link KNNSettings#isDirectIORescoreEnabled()} is on — the per-substrate enablement rule, which
  *       stays a setting because Direct I/O is a win only where the {@code .vec} working set cannot stay
  *       in the page cache;
  *   <li>the delegate chain bottoms out at an {@link FSDirectory}, so there is a {@link Path} to open.
  * </ol>
  *
- * Everything else — every other file, and every other read of {@code .vec} — is the delegate's own
- * {@link IndexInput}, returned <b>unwrapped</b>. Neither condition 1 nor condition 2 is sufficient
- * alone: by name alone this would route the traversal, merge, warmup and derived-source reads of the
- * same file, and by intent alone it would route the quantized codes and the native index. The
- * conjunction is the rule.
+ * Everything else is the delegate's own {@link IndexInput}, returned <b>unwrapped</b>.
+ *
+ * <h2>Why the name is the whole signal</h2>
+ * An earlier shape of this class also required the caller's {@link IOContext} to carry a plugin-defined
+ * "this is a re-score read" hint, so that one {@code .vec} file could be served two ways. That bought
+ * selectivity at the cost of a channel that had to be threaded through the codec and the query layer: a
+ * second reader per segment, a {@code Directory} view to attach the hint below the codec, a capability
+ * interface on three readers, and an argument on the exact-search scorer factory. Under the design this
+ * class now implements — <em>all</em> faiss/MOS full-precision vectors are read with {@code O_DIRECT}
+ * when the feature is on — none of that is needed, because the file name already says everything the
+ * rule asks. The whole channel is gone and the query layer names nothing.
  *
  * <h2>Two dispatch points, because a segment has two shapes</h2>
  * <table>
- *   <caption>where the name and the intent arrive together</caption>
+ *   <caption>where the name arrives</caption>
  *   <tr><th>segment</th><th>channel</th></tr>
  *   <tr>
  *     <td>non-compound (a merged segment)</td>
@@ -53,26 +60,21 @@ import java.util.function.BooleanSupplier;
  *   </tr>
  *   <tr>
  *     <td>compound (<b>every freshly flushed segment</b>)</td>
- *     <td>{@code IndexInput.slice(name, offset, length, context)} — the four-argument overload — on the
- *         {@code .cfs} container, which Lucene opens <em>here</em> and then slices per entry. That is
+ *     <td>{@code IndexInput.slice(name, offset, length, context)} on the {@code .cfs} container, which
+ *         Lucene opens <em>here</em> and then slices per entry. That is
  *         {@link KNNVectorCompoundSliceInput}, and it is why every {@code .cfs} open is wrapped.</td>
  *   </tr>
  * </table>
- *
- * Nothing else carries both halves of the signal: the three-argument {@code slice} has no
- * {@link IOContext} parameter at all, and {@code updateIOContext} can only change access advice, for the
- * whole mapping.
  *
  * <h2>Dispatch granularity is the open, never the file</h2>
  * The decision is taken once per {@code openInput}/{@code slice} and never re-taken per read, and that
  * is forced rather than chosen. Lucene's SIMD float scorer binds by a type test on the
  * {@code IndexInput} and then reads the memory segment directly, so it never calls {@code readBytes} —
- * an input transparent enough to keep SIMD for traversal is transparent enough that a re-score read
- * would bypass the Direct I/O staging entirely, and an input opaque enough to route a re-score read
- * also declines SIMD. One {@code .vec} object cannot serve both. It does not need to: the re-score path
- * gets its <em>own</em> object, opened by its own reader
- * ({@link org.opensearch.knn.index.codec.KNNRescoreVectorsReader}), and the traversal object is
- * untouched by construction.
+ * an input transparent enough to keep SIMD is transparent enough that a re-score read would bypass the
+ * Direct I/O staging entirely, and an input opaque enough to route a re-score read also declines SIMD.
+ * One {@code .vec} object cannot serve both, and under a name-based rule there is only one object. So a
+ * routed file is routed for every reader of it — traversal, merge and warmup included — which is why
+ * condition 1 is narrowed to the faiss/MOS files rather than to {@code .vec} as such.
  *
  * <h2>Failure is a fallback</h2>
  * Every way Direct I/O can be unavailable — no {@code ExtendedOpenOption.DIRECT} on this JDK, a
@@ -100,7 +102,7 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
     private final String indexName;
 
     /**
-     * Condition 3 of the dispatch rule, read at every dispatch rather than captured once, because the
+     * Condition 2 of the dispatch rule, read at every dispatch rather than captured once, because the
      * setting is dynamic and a non-compound segment's {@code .vec} is opened once per reader while a
      * compound segment's entries are sliced once per values object.
      */
@@ -131,7 +133,7 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
 
     @Override
     public IndexInput openInput(final String name, final IOContext context) throws IOException {
-        if (routesToDirectIO(name, context)) {
+        if (routesToDirectIO(name)) {
             final IndexInput direct = directIOInput(name);
             if (direct != null) {
                 routedOpens.incrementAndGet();
@@ -142,10 +144,9 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
         }
         final IndexInput input = in.openInput(name, context);
         if (isCompoundContainer(name)) {
-            // A compound segment's .vec has no openInput of its own for the intent to ride on, but every
-            // entry of the container is a four-argument slice of THIS input, and that slice carries both
-            // the logical name and the caller's context. So the dispatch point for a compound segment is
-            // one level down, inside the container.
+            // A compound segment's .vec has no openInput of its own, but every entry of the container is
+            // a slice of THIS input and the slice carries the logical name. So the dispatch point for a
+            // compound segment is one level down, inside the container.
             wrappedContainers.incrementAndGet();
             return new KNNVectorCompoundSliceInput(input, name, resolvePath(name), directIORescoreEnabled);
         }
@@ -153,20 +154,12 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
     }
 
     /**
-     * Conditions 1–3 of the dispatch rule. Condition 4 is answered by {@link #directIOInput}, because
-     * "there is no path" and "the path cannot be opened with {@code O_DIRECT}" have the same consequence
-     * and are better answered in one place.
-     *
-     * <p>Condition 3 is belt-and-braces rather than the load-bearing gate: the only thing in the plugin
-     * that attaches {@link KNNVectorReadIntent#RESCORE} is {@link KNNRescoreIntentDirectory}, installed
-     * only by a rescore view that already checked the setting. Keeping the check here means the whole
-     * rule can be read in one method, and means an intent arriving from anywhere else still respects the
-     * operator's switch.
+     * Conditions 1 and 2 of the dispatch rule. Condition 3 is answered by {@link #directIOInput},
+     * because "there is no path" and "the path cannot be opened with {@code O_DIRECT}" have the same
+     * consequence and are better answered in one place.
      */
-    private boolean routesToDirectIO(final String name, final IOContext context) {
-        return isFullPrecisionVectorData(name)
-            && KNNVectorReadIntent.of(context) == KNNVectorReadIntent.RESCORE
-            && directIORescoreEnabled.getAsBoolean();
+    private boolean routesToDirectIO(final String name) {
+        return isFaissVectorData(name) && directIORescoreEnabled.getAsBoolean();
     }
 
     /**
@@ -207,8 +200,31 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
         return null;
     }
 
-    static boolean isFullPrecisionVectorData(final String name) {
-        return name != null && name.endsWith(VECTOR_DATA_EXTENSION);
+    /**
+     * Whether {@code name} is the full-precision flat vector data of a <b>faiss or MOS</b> field — the
+     * only file this routes.
+     *
+     * <p>The extension alone is not enough, and the difference is the whole of condition 1. Every flat
+     * vectors format writes a {@code .vec}, the Lucene-engine ones included, and a routed file is routed
+     * for all of its readers (see the class javadoc). Routing a Lucene-engine {@code .vec} would
+     * therefore take Lucene's unquantized HNSW traversal off its memory-segment SIMD scorer, which is
+     * outside what this feature is for.
+     *
+     * <p>The discriminator is already in the name. {@code PerFieldKnnVectorsFormat} builds each field's
+     * segment suffix as {@code <formatName>_<n>} from {@code KnnVectorsFormat#getName()}, and
+     * {@code Lucene99FlatVectorsReader} names the data file
+     * {@code segmentFileName(segmentName, segmentSuffix, "vec")}. So a faiss/MOS fp32 file is
+     * {@code _0_NativeEngines990KnnVectorsFormat_0.vec} or
+     * {@code _0_Faiss1040ScalarQuantizedKnnVectorsFormat_0.vec}, while a Lucene-engine one carries
+     * Lucene's own format name. Lucene's compound reader slices entries by that same full file name, so
+     * one predicate serves both dispatch points.
+     */
+    static boolean isFaissVectorData(final String name) {
+        if (name == null || name.endsWith(VECTOR_DATA_EXTENSION) == false) {
+            return false;
+        }
+        return name.contains(NativeEngines990KnnVectorsFormat.FORMAT_NAME)
+            || name.contains(Faiss1040ScalarQuantizedKnnVectorsFormat.FORMAT_NAME);
     }
 
     static boolean isCompoundContainer(final String name) {
@@ -224,7 +240,7 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
         return routedOpens.get();
     }
 
-    /** Opens that satisfied the intent rule but could not be served with {@code O_DIRECT}. */
+    /** Opens that satisfied the name rule but could not be served with {@code O_DIRECT}. */
     public long declinedOpens() {
         return declinedOpens.get();
     }

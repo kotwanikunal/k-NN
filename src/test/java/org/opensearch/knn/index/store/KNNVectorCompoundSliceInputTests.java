@@ -7,18 +7,22 @@ package org.opensearch.knn.index.store;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 import lombok.SneakyThrows;
+import org.apache.lucene.codecs.Codec;
 import org.apache.lucene.codecs.CompoundDirectory;
 import org.apache.lucene.codecs.hnsw.FlatVectorScorerUtil;
 import org.apache.lucene.codecs.hnsw.FlatVectorsScorer;
 import org.apache.lucene.codecs.lucene104.Lucene104Codec;
 import org.apache.lucene.codecs.lucene95.OffHeapFloatVectorValues;
 import org.apache.lucene.document.Document;
+import org.apache.lucene.document.FieldType;
 import org.apache.lucene.document.KnnFloatVectorField;
+import org.apache.lucene.index.IndexOptions;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.SegmentCommitInfo;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.index.TieredMergePolicy;
+import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.store.DataAccessHint;
 import org.apache.lucene.store.Directory;
@@ -32,6 +36,13 @@ import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.opensearch.knn.KNNTestCase;
+import org.opensearch.knn.common.KNNConstants;
+import org.opensearch.knn.index.SpaceType;
+import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.index.codec.KNN990Codec.NativeEngines990KnnVectorsFormat;
+import org.opensearch.knn.index.codec.util.UnitTestCodec;
+import org.opensearch.knn.index.engine.KNNEngine;
+import org.opensearch.knn.index.mapper.KNNVectorFieldMapper;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -48,20 +59,24 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
- * Phase 9b gate 3: whether a compound segment's {@code .vec} can be dispatched on after all.
+ * Whether a compound segment's {@code .vec} can be dispatched on, and whether the dispatch is confined to
+ * the faiss/MOS rows.
  *
- * <p>Gate 1 found that a plugin-authored {@link KNNVectorReadIntent} reaches a plugin {@code Directory}
- * on a non-compound segment and cannot on a compound one, because the {@code .vec} bytes are served from
- * inside the {@code .cfs} and {@code KNN80CompoundDirectory} is not a {@code FilterDirectory} to walk.
- * Since every freshly flushed segment is compound, that limit applied to the newest data in every index.
+ * <p>Looking only at {@code Directory} says it cannot be: the {@code .vec} bytes are served from inside
+ * the {@code .cfs} and {@code KNN80CompoundDirectory} is not a {@code FilterDirectory} to walk, so a
+ * directory below never sees the name {@code .vec}. Since every freshly flushed segment is compound, that
+ * limit would apply to the newest data in every index.
  *
  * <p>These tests show the limit was an artefact of stopping at {@code Directory}. Lucene's compound
  * reader opens the container on the outer directory — the plugin's — and hands each entry out as
- * {@code handle.slice(name, offset, length, context)}: the plugin's own {@code IndexInput} is given both
- * the logical file name and the caller's {@link IOContext}. The assertions here are made against Lucene's
- * real {@code Lucene90CompoundReader} over a real flushed compound segment, not a stand-in, because a
- * stand-in compound directory that opens its entries from a nested directory is exactly what made gate 1
- * read the wrong answer.
+ * {@code handle.slice(name, offset, length, context)}: the plugin's own {@code IndexInput} is given the
+ * logical file name. The assertions here are made against Lucene's real {@code Lucene90CompoundReader}
+ * over real flushed compound segments, not a stand-in, because a stand-in compound directory that opens
+ * its entries from a nested directory is exactly what makes this read the wrong answer.
+ *
+ * <p>Two segments are used, and the pair is the point: one written by the plugin's native-engine format,
+ * whose {@code .vec} must route, and one written by stock Lucene, whose {@code .vec} must not. The
+ * discriminator is the per-field format name that {@code PerFieldKnnVectorsFormat} puts in the file name.
  *
  * <p>They also pin the two traps in wrapping an {@code IndexInput} at all, both of which are silent:
  * {@link FilterIndexInput} inherits a no-op {@code prefetch} and a per-{@code float} {@code readFloats},
@@ -73,6 +88,15 @@ public class KNNVectorCompoundSliceInputTests extends KNNTestCase {
 
     private static final int DIMENSION = 32;
     private static final int DOCS = 64;
+    private static final String VECTOR_FIELD = "v";
+
+    /**
+     * The plugin's native-engine format with the graph build skipped. A negative approximate threshold
+     * makes {@code AbstractNativeEnginesKnnVectorsWriter.shouldSkipBuildingVectorDataStructure} answer
+     * true for any doc count, so the segment holds the fp32 {@code .vec} and its {@code .vemf} sidecar
+     * and no {@code .faiss} — which is all these tests read, and keeps the fixture off the JNI layer.
+     */
+    private static final Codec FAISS_CODEC = new UnitTestCodec(() -> new NativeEngines990KnnVectorsFormat(-1));
 
     @SneakyThrows
     private void assumeDirectIOWorksHere() {
@@ -113,7 +137,7 @@ public class KNNVectorCompoundSliceInputTests extends KNNTestCase {
             final IndexInput input = in.openInput(name, context);
             if (name.endsWith(".cfs")) {
                 // Exactly what KNNVectorStorageDirectory does, in its observing form: every entry of the
-                // container is a four-argument slice of THIS input, carrying the name and the context.
+                // container is a four-argument slice of THIS input, carrying the name.
                 final KNNVectorCompoundSliceInput wrapped = new KNNVectorCompoundSliceInput(input, name, resolvePath(name), true);
                 containers.put(name, wrapped);
                 return wrapped;
@@ -147,15 +171,32 @@ public class KNNVectorCompoundSliceInputTests extends KNNTestCase {
         return values;
     }
 
+    /** A native-engine vector field, so the per-field format name in the file name is the faiss one. */
+    private static FieldType nativeEngineVectorField() {
+        final FieldType fieldType = new FieldType();
+        fieldType.setTokenized(false);
+        fieldType.setIndexOptions(IndexOptions.NONE);
+        fieldType.putAttribute(KNNVectorFieldMapper.KNN_FIELD, "true");
+        fieldType.putAttribute(KNNConstants.KNN_METHOD, KNNConstants.METHOD_HNSW);
+        fieldType.putAttribute(KNNConstants.KNN_ENGINE, KNNEngine.FAISS.getName());
+        fieldType.putAttribute(KNNConstants.SPACE_TYPE, SpaceType.L2.getValue());
+        fieldType.putAttribute(KNNConstants.HNSW_ALGO_M, "32");
+        fieldType.putAttribute(KNNConstants.HNSW_ALGO_EF_CONSTRUCTION, "512");
+        fieldType.putAttribute(KNNConstants.VECTOR_DATA_TYPE_FIELD, VectorDataType.FLOAT.getValue());
+        fieldType.setVectorAttributes(DIMENSION, VectorEncoding.FLOAT32, VectorSimilarityFunction.EUCLIDEAN);
+        fieldType.freeze();
+        return fieldType;
+    }
+
     /**
-     * A real single-segment compound index with a float vector field, written through Lucene's own
-     * production codec. The codec is pinned rather than taken from {@code Codec.getDefault()} because the
-     * Lucene test framework randomises that, and a codec that does not write a {@code .vec} would make
-     * this test pass for the wrong reason.
+     * A real single-segment compound index with a float vector field. The codec is pinned rather than
+     * taken from {@code Codec.getDefault()} because the Lucene test framework randomises that, and a
+     * codec that does not write a {@code .vec} would make these tests pass for the wrong reason.
      */
-    private static void writeCompoundSegmentWithVectors(final ObservingDirectory directory) throws IOException {
+    private static void writeCompoundSegmentWithVectors(final ObservingDirectory directory, final Codec codec, final FieldType fieldType)
+        throws IOException {
         final IndexWriterConfig config = new IndexWriterConfig();
-        config.setCodec(new Lucene104Codec());
+        config.setCodec(codec);
         config.setUseCompoundFile(true);
         final TieredMergePolicy mergePolicy = new TieredMergePolicy();
         // Without this a flushed segment large relative to the index is left non-compound, which is the
@@ -167,11 +208,23 @@ public class KNNVectorCompoundSliceInputTests extends KNNTestCase {
         try (IndexWriter writer = new IndexWriter(directory, config)) {
             for (int i = 0; i < DOCS; i++) {
                 final Document document = new Document();
-                document.add(new KnnFloatVectorField("v", vector(random), VectorSimilarityFunction.EUCLIDEAN));
+                document.add(new KnnFloatVectorField(VECTOR_FIELD, vector(random), fieldType));
                 writer.addDocument(document);
             }
             writer.commit();
         }
+    }
+
+    /** The faiss fixture: a compound segment whose {@code .vec} the rule must route. */
+    private static void writeFaissCompoundSegment(final ObservingDirectory directory) throws IOException {
+        writeCompoundSegmentWithVectors(directory, FAISS_CODEC, nativeEngineVectorField());
+    }
+
+    /** The control fixture: a compound segment written by stock Lucene, whose {@code .vec} must not route. */
+    private static void writeLuceneCompoundSegment(final ObservingDirectory directory) throws IOException {
+        final FieldType fieldType = new FieldType(KnnFloatVectorField.createFieldType(DIMENSION, VectorSimilarityFunction.EUCLIDEAN));
+        fieldType.freeze();
+        writeCompoundSegmentWithVectors(directory, new Lucene104Codec(), fieldType);
     }
 
     private static SegmentCommitInfo onlySegment(final ObservingDirectory directory) throws IOException {
@@ -195,16 +248,23 @@ public class KNNVectorCompoundSliceInputTests extends KNNTestCase {
         return observations.stream().filter(o -> o.name().endsWith(".vec")).findFirst();
     }
 
+    private static final IOContext VECTOR_DATA_CONTEXT = IOContext.DEFAULT.withHints(
+        FileTypeHint.DATA,
+        FileDataHint.KNN_VECTORS,
+        DataAccessHint.RANDOM
+    );
+
     /**
-     * The gate. On a real compound segment the plugin's {@code IndexInput} for the container is handed the
-     * {@code .vec} entry by name, with the caller's {@link IOContext} — including a plugin intent the
-     * caller put there. Both halves of the dispatch signal that gate 1 could not find at
-     * {@code openInput} are present one level down, at {@code slice}.
+     * The channel. On a real compound segment the plugin's {@code IndexInput} for the container is handed
+     * the {@code .vec} entry by name, with its extent — the signal that looking only at {@code openInput}
+     * could not find is present one level down, at {@code slice}. And because the name is now the whole
+     * signal, that one call is enough to decide: the faiss entry is routed on Lucene's own read of it.
      */
-    public void testCompoundSegmentVecEntryArrivesAtThePluginWithNameAndIntent() throws IOException {
+    public void testCompoundSegmentVecEntryArrivesAtThePluginByName() throws IOException {
+        assumeDirectIOWorksHere();
         final Path path = createTempDir();
         try (ObservingDirectory outer = new ObservingDirectory(new MMapDirectory(path))) {
-            writeCompoundSegmentWithVectors(outer);
+            writeFaissCompoundSegment(outer);
             final SegmentCommitInfo commit = onlySegment(outer);
             assertTrue("the fixture must be a compound segment", commit.info.getUseCompoundFile());
 
@@ -223,76 +283,105 @@ public class KNNVectorCompoundSliceInputTests extends KNNTestCase {
                     .orElseThrow(() -> new AssertionError("the .cfs was not wrapped"));
 
                 final String vecName = vecEntryName(compound);
+                assertTrue(
+                    "the entry name must carry the per-field format name, saw " + vecName,
+                    vecName.contains(NativeEngines990KnnVectorsFormat.FORMAT_NAME)
+                );
 
-                // (1) Lucene's own read of the entry: name present, no intent. This is what traversal,
-                // merge, warmup and derived-source reconstruction all arrive as, and it is why suffix
-                // dispatch alone would starve them.
                 container.clearSliceObservations();
-                final IOContext luceneContext = IOContext.DEFAULT.withHints(
-                    FileTypeHint.DATA,
-                    FileDataHint.KNN_VECTORS,
-                    DataAccessHint.RANDOM
-                );
-                try (IndexInput luceneStyle = compound.openInput(vecName, luceneContext)) {
-                    assertNotNull(luceneStyle);
+                try (IndexInput entry = compound.openInput(vecName, VECTOR_DATA_CONTEXT)) {
+                    assertNotNull(entry);
+                    assertTrue("a faiss .vec entry routes on its name alone", entry instanceof DirectIOVectorIndexInput);
                 }
-                final KNNVectorCompoundSliceInput.SliceObservation unhinted = vecSlice(container.sliceObservations()).orElseThrow(
-                    () -> new AssertionError("Lucene's own .vec read did not reach the container, saw " + container.sliceObservations())
+                final KNNVectorCompoundSliceInput.SliceObservation observed = vecSlice(container.sliceObservations()).orElseThrow(
+                    () -> new AssertionError("the .vec read did not reach the container, saw " + container.sliceObservations())
                 );
-                assertTrue("the four-argument slice is the channel", unhinted.carriedContext());
-                assertNull("Lucene authors no intent", unhinted.intent());
+                assertTrue("the four-argument slice is the channel", observed.carriedContext());
                 assertEquals(
                     "the caller's hints arrive with the slice",
                     Set.of(FileTypeHint.DATA, FileDataHint.KNN_VECTORS, DataAccessHint.RANDOM),
-                    unhinted.hints()
+                    observed.hints()
                 );
-                assertTrue("the entry's extent is given too", unhinted.offset() > 0 && unhinted.length() > 0);
-                assertFalse("an unhinted read must keep the delegate's path", unhinted.routedToDirectIO());
-
-                // (2) The plugin's own read of the same entry, with intent. Same channel, and the intent
-                // is on it.
-                container.clearSliceObservations();
-                try (IndexInput rescore = compound.openInput(vecName, KNNVectorReadIntent.RESCORE.vectorDataContext())) {
-                    assertNotNull(rescore);
-                }
-                final KNNVectorCompoundSliceInput.SliceObservation hinted = vecSlice(container.sliceObservations()).orElseThrow(
-                    () -> new AssertionError("the intent-bearing .vec read did not reach the container")
-                );
-                assertEquals(KNNVectorReadIntent.RESCORE, hinted.intent());
-                assertEquals("the same entry, so the same extent", unhinted.offset(), hinted.offset());
-                assertEquals(unhinted.length(), hinted.length());
+                assertTrue("the entry's extent is given too", observed.offset() > 0 && observed.length() > 0);
+                assertTrue(observed.routedToDirectIO());
+                assertEquals(1, container.routedSlices());
             }
         }
     }
 
     /**
-     * The other half of the gate: having reached the entry, the wrapper can actually serve it with
-     * {@code O_DIRECT}, and the bytes are the delegate's bytes. A dispatch that reaches the right region
-     * and returns different data would be worse than no dispatch at all.
+     * The control, and the one external behaviour change this design makes explicit: a stock Lucene
+     * segment's {@code .vec} is <em>not</em> routed, so the Lucene engine stays on mmap. A routed file is
+     * routed for all of its readers, and Lucene's unquantized traversal reads this file through its
+     * memory-segment SIMD scorer, so routing it would be a regression on a path this feature is not for.
+     */
+    public void testALuceneSegmentVecEntryIsNotRouted() throws IOException {
+        final Path path = createTempDir();
+        try (ObservingDirectory outer = new ObservingDirectory(new MMapDirectory(path))) {
+            writeLuceneCompoundSegment(outer);
+            final SegmentCommitInfo commit = onlySegment(outer);
+            assertTrue(commit.info.getUseCompoundFile());
+
+            try (CompoundDirectory compound = commit.info.getCodec().compoundFormat().getCompoundReader(outer, commit.info)) {
+                final KNNVectorCompoundSliceInput container = outer.compoundContainers()
+                    .values()
+                    .stream()
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("the .cfs was not wrapped"));
+                final String vecName = vecEntryName(compound);
+                assertFalse(
+                    "a stock Lucene entry must not carry a plugin format name, saw " + vecName,
+                    vecName.contains(NativeEngines990KnnVectorsFormat.FORMAT_NAME)
+                );
+
+                container.clearSliceObservations();
+                try (IndexInput entry = compound.openInput(vecName, VECTOR_DATA_CONTEXT)) {
+                    assertFalse("a Lucene-engine .vec entry must stay on the delegate", entry instanceof DirectIOVectorIndexInput);
+                    assertSame("and must not be wrapped at all", entry, FilterIndexInput.unwrap(entry));
+                }
+                assertEquals(0, container.routedSlices());
+                assertEquals(0, container.declinedSlices());
+            }
+        }
+    }
+
+    /**
+     * Having reached the entry, the wrapper can actually serve it with {@code O_DIRECT}, and the bytes are
+     * the delegate's bytes. A dispatch that reaches the right region and returns different data would be
+     * worse than no dispatch at all. The mmap control is the same entry read through a container with the
+     * gate off, so the comparison is between the two routes and nothing else.
      */
     public void testRoutedVecEntryIsServedByDirectIOAndReadsIdenticalBytes() throws IOException {
         assumeDirectIOWorksHere();
         final Path path = createTempDir();
         try (ObservingDirectory outer = new ObservingDirectory(new MMapDirectory(path))) {
-            writeCompoundSegmentWithVectors(outer);
+            writeFaissCompoundSegment(outer);
             final SegmentCommitInfo commit = onlySegment(outer);
             assertTrue(commit.info.getUseCompoundFile());
 
             try (CompoundDirectory compound = commit.info.getCodec().compoundFormat().getCompoundReader(outer, commit.info)) {
                 final String vecName = vecEntryName(compound);
+                final KNNVectorCompoundSliceInput container = outer.compoundContainers()
+                    .values()
+                    .stream()
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("the .cfs was not wrapped"));
+                final KNNVectorCompoundSliceInput.SliceObservation extent;
+                try (IndexInput probe = compound.openInput(vecName, VECTOR_DATA_CONTEXT)) {
+                    assertNotNull(probe);
+                }
+                extent = vecSlice(container.sliceObservations()).orElseThrow();
 
+                // The same region, read both ways: the delegate's own slice of the .cfs, and the routed one.
                 try (
-                    IndexInput mmap = compound.openInput(
-                        vecName,
-                        IOContext.DEFAULT.withHints(FileTypeHint.DATA, FileDataHint.KNN_VECTORS, DataAccessHint.RANDOM)
-                    );
-                    IndexInput routed = compound.openInput(vecName, KNNVectorReadIntent.RESCORE.vectorDataContext())
+                    IndexInput containerHandle = new MMapDirectory(path).openInput(commit.info.name + ".cfs", IOContext.DEFAULT);
+                    IndexInput mmap = containerHandle.slice(vecName, extent.offset(), extent.length());
+                    IndexInput routed = compound.openInput(vecName, VECTOR_DATA_CONTEXT)
                 ) {
                     assertTrue(
-                        "the intent-bearing slice must be served by Direct I/O, got " + routed.getClass().getName(),
+                        "the faiss entry must be served by Direct I/O, got " + routed.getClass().getName(),
                         routed instanceof DirectIOVectorIndexInput
                     );
-                    assertFalse("the unhinted slice must not be", mmap instanceof DirectIOVectorIndexInput);
                     assertEquals("both views must span the same entry", mmap.length(), routed.length());
 
                     final int length = Math.toIntExact(mmap.length());
@@ -320,17 +409,21 @@ public class KNNVectorCompoundSliceInputTests extends KNNTestCase {
     /**
      * Every entry the rule does not name keeps the delegate's own input, unchanged and unwrapped. This is
      * what makes the wrapper's cost one virtual call per {@code slice} — once per values object — rather
-     * than anything per read, and it is why the entries that must stay on mmap (traversal, merge, fetch,
-     * warmup, and every non-vector file in the segment) are not merely allowed to but forced to.
+     * than anything per read, and it is why the entries that must stay on mmap (the quantized codes, the
+     * metadata sidecars, and every non-vector file in the segment) are not merely allowed to but forced
+     * to.
      */
     public void testEveryOtherEntryKeepsTheDelegateInputUnwrapped() throws IOException {
         final Path path = createTempDir();
         try (ObservingDirectory outer = new ObservingDirectory(new MMapDirectory(path))) {
-            writeCompoundSegmentWithVectors(outer);
+            writeFaissCompoundSegment(outer);
             final SegmentCommitInfo commit = onlySegment(outer);
 
             try (CompoundDirectory compound = commit.info.getCodec().compoundFormat().getCompoundReader(outer, commit.info)) {
                 for (final String name : compound.listAll()) {
+                    if (KNNVectorStorageDirectory.isFaissVectorData(name)) {
+                        continue;
+                    }
                     try (IndexInput entry = compound.openInput(name, IOContext.DEFAULT)) {
                         assertFalse(
                             name + " must not be wrapped",
@@ -385,16 +478,16 @@ public class KNNVectorCompoundSliceInputTests extends KNNTestCase {
     }
 
     /**
-     * The second silent trap, and a correction to what gate 2 recorded. {@code unwrapOnlyTest} unwraps
-     * only classes registered through {@code TestSecrets}, whose setter Lucene restricts to its own test
-     * framework, so in production the registry is empty and the method is the identity. A plugin
-     * {@link FilterIndexInput} subclass therefore does <em>not</em> get seen through: it displaces the
-     * memory-segment SIMD scorer exactly as a non-filter input would.
+     * The second silent trap. {@code unwrapOnlyTest} unwraps only classes registered through
+     * {@code TestSecrets}, whose setter Lucene restricts to its own test framework, so in production the
+     * registry is empty and the method is the identity. A plugin {@link FilterIndexInput} subclass
+     * therefore does <em>not</em> get seen through: it displaces the memory-segment SIMD scorer exactly
+     * as a non-filter input would.
      *
-     * <p>That is the precise reason this design dispatches per entry rather than per file. Traversal and
-     * re-score of a Lucene-quantized or unquantized field share one {@code .vec} object, and the SIMD
-     * check is a type test on that object — so a wrapper installed for the whole file cannot keep SIMD
-     * for one caller and displace it for the other, whatever it does inside {@code readBytes}.
+     * <p>That is the reason this class returns the <em>raw</em> delegate slice for every entry it does not
+     * route, and the reason the routing predicate is narrowed to the faiss rows: a routed file is routed
+     * for all of its readers, so a file whose traversal depends on the SIMD scorer must not be named by
+     * the rule in the first place.
      */
     public void testProductionFilterIndexInputIsNotUnwrappedAndDisplacesTheSimdScorer() throws IOException {
         final Path path = createTempDir();
@@ -482,42 +575,43 @@ public class KNNVectorCompoundSliceInputTests extends KNNTestCase {
     }
 
     /**
-     * The three-argument {@code slice} cannot dispatch, and that is recorded rather than argued: it is the
-     * whole reason the four-argument overload is the mechanism, and the reason a design that hoped to
-     * re-decide {@code how} on an ordinary slice of a non-compound file cannot.
+     * The three-argument {@code slice} is not a dispatch point, and that is recorded rather than argued.
+     * Lucene's compound reader serves every entry through the four-argument overload, so a three-argument
+     * slice is always a sub-slice of an entry already dispatched — and routing one would hand a second
+     * {@code O_DIRECT} handle to a caller that already has the right input.
      */
-    public void testThreeArgumentSliceCannotCarryIntent() throws IOException {
+    public void testThreeArgumentSliceIsNotADispatchPoint() throws IOException {
         final Path path = createTempDir();
         Files.write(path.resolve("bytes"), new byte[256]);
 
         try (MMapDirectory directory = new MMapDirectory(path); IndexInput delegate = directory.openInput("bytes", IOContext.DEFAULT)) {
             try (KNNVectorCompoundSliceInput wrapper = new KNNVectorCompoundSliceInput(delegate.clone(), "bytes", null, true)) {
-                wrapper.slice("_0_Lucene99FlatVectorsFormat_0.vec", 0, 128).close();
+                wrapper.slice("_0_" + NativeEngines990KnnVectorsFormat.FORMAT_NAME + "_0.vec", 0, 128).close();
                 final KNNVectorCompoundSliceInput.SliceObservation observation = vecSlice(wrapper.sliceObservations()).orElseThrow();
-                assertFalse("no IOContext, so nothing to dispatch on", observation.carriedContext());
-                assertNull(observation.intent());
+                assertFalse("no IOContext, so not the dispatch channel", observation.carriedContext());
                 assertFalse(observation.routedToDirectIO());
+                assertEquals(0, wrapper.routedSlices());
             }
         }
     }
 
     /**
-     * Question (c): the queue depth survives being reached through a compound-file offset.
+     * The queue depth survives being reached through a compound-file offset.
      *
      * <p>A routed entry is a {@link DirectIOVectorIndexInput#slice} at the entry's offset inside the
-     * {@code .cfs} — an offset that is neither zero nor block aligned (1088 in the segment above). Gate 2
-     * measured the depth of this mechanism at the block layer; what it did not show is that the staging
-     * still works when every position is shifted by an arbitrary amount, which is the only thing the
-     * compound route changes. So: a 64-ordinal burst through the entry's own slice, and both the staged
-     * hits and a queue depth greater than one.
+     * {@code .cfs} — an offset that is neither zero nor block aligned (1088 in the segment above). What
+     * the block-layer measurements did not show is that the staging still works when every position is
+     * shifted by an arbitrary amount, which is the only thing the compound route changes. So: a
+     * 64-ordinal burst through the entry's own slice, and both the staged hits and a queue depth greater
+     * than one.
      */
     public void testStagingSurvivesACompoundEntryOffset() throws IOException {
         assumeDirectIOWorksHere();
         final int dimension = 768;
         final int vectorBytes = dimension * Float.BYTES;
         final int vectors = 600;
-        // The .vec entry offset observed in the real compound segment above: not zero, not a multiple of
-        // any block size.
+        // The .vec entry offset observed in a real compound segment: not zero, not a multiple of any
+        // block size.
         final long entryOffset = 1088;
 
         final Path path = createTempDir();
@@ -538,7 +632,11 @@ public class KNNVectorCompoundSliceInputTests extends KNNTestCase {
         try (DirectIOVectorIndexInput container = DirectIOVectorIndexInput.open(file, 0, 64, 132 * 1024)) {
             assertNotNull(container);
             // Exactly what KNNVectorCompoundSliceInput hands back for a routed entry.
-            final IndexInput entry = container.slice("_0_Lucene99FlatVectorsFormat_0.vec", entryOffset, (long) vectors * vectorBytes);
+            final IndexInput entry = container.slice(
+                "_0_" + NativeEngines990KnnVectorsFormat.FORMAT_NAME + "_0.vec",
+                entryOffset,
+                (long) vectors * vectorBytes
+            );
 
             final int[] ords = new int[64];
             for (int i = 0; i < ords.length; i++) {
@@ -561,7 +659,7 @@ public class KNNVectorCompoundSliceInputTests extends KNNTestCase {
                 );
             }
 
-            logger.info("gate3 (c) staging through a compound entry offset: {}", DirectIOVectorIndexInput.STATS);
+            logger.info("staging through a compound entry offset: {}", DirectIOVectorIndexInput.STATS);
             assertTrue("reads must be served from staged ranges", DirectIOVectorIndexInput.STATS.stagedHits() > 0);
             assertTrue(
                 "the queue depth must survive the offset, saw " + DirectIOVectorIndexInput.STATS.inFlightPeak(),

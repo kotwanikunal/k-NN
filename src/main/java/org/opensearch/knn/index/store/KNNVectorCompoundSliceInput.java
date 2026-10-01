@@ -22,13 +22,11 @@ import java.util.function.BooleanSupplier;
  * The dispatch point <em>inside</em> a compound file: an {@link IndexInput} over a {@code .cfs} whose
  * {@code slice} decides how the bytes of one entry are fetched.
  *
- * <p><b>Why this class exists — Phase 9b gate 3.</b> Gate 1 showed a plugin-authored
- * {@link KNNVectorReadIntent} reaches a plugin {@code Directory} on an {@code openInput}, and that a
- * compound segment has no such {@code openInput} to ride on: the {@code .vec} bytes live inside the
- * {@code .cfs}, so a {@code Directory} below never sees the name {@code .vec} and
- * {@link org.opensearch.knn.index.codec.KNN80Codec.KNN80CompoundDirectory} is not a
- * {@code FilterDirectory} to walk. Since every freshly flushed segment is compound, that limit applied
- * to the newest data in every index.
+ * <p><b>Why this class exists.</b> A compound segment has no {@code .vec} {@code openInput} to dispatch
+ * on: the {@code .vec} bytes live inside the {@code .cfs}, so a {@code Directory} below never sees the
+ * name {@code .vec} and {@link org.opensearch.knn.index.codec.KNN80Codec.KNN80CompoundDirectory} is not
+ * a {@code FilterDirectory} to walk. Since every freshly flushed segment is compound, that limit
+ * applied to the newest data in every index.
  *
  * <p>The limit was an artefact of looking only at {@code Directory}. Lucene's compound reader opens the
  * {@code .cfs} on the <em>outer</em> directory — the plugin's — and then serves each entry by
@@ -41,20 +39,9 @@ import java.util.function.BooleanSupplier;
  *     return handle.slice(name, entry.offset, entry.length, context); // :171 four-argument slice
  * </pre>
  *
- * So the plugin's own {@code IndexInput} for the {@code .cfs} is handed, per entry, <b>both the
- * logical file name</b> ({@code _0_Lucene99FlatVectorsFormat_0.vec}) <b>and the caller's
- * {@link IOContext}</b>, hints included. Extension dispatch and intent dispatch are therefore both
- * available on a compound segment after all — one level down from where they were looked for.
- *
- * <p>Two prior-art statements this refutes, both of which were load bearing and both of which came from
- * reading {@code IndexInput} alone:
- * <ul>
- *   <li>"the context-carrying four-argument {@code slice} has zero call sites in lucene-core 10.5.0" —
- *       it has one, and it is the one that matters, because it is how every file in every compound
- *       segment is opened. Its javadoc says as much: <em>"typically used by CompoundFormat
- *       implementations to modify the IOContext for specific files within the compound file"</em>.</li>
- *   <li>"a {@code .vec} read of a compound segment cannot reach a plugin" — it reaches one here.</li>
- * </ul>
+ * So the plugin's own {@code IndexInput} for the {@code .cfs} is handed, per entry, the <b>logical file
+ * name</b> ({@code _0_NativeEngines990KnnVectorsFormat_0.vec}). Name dispatch is therefore available on
+ * a compound segment after all — one level down from where it was looked for.
  *
  * <p><b>What this class must be, and must not be.</b> It is a {@link FilterIndexInput}, which is safe
  * for a container handle and is <em>not</em> safe for the {@code .vec} entry itself:
@@ -74,9 +61,9 @@ import java.util.function.BooleanSupplier;
  *       virtual calls. Both are overridden below; neither is optional.</li>
  * </ul>
  *
- * <p>This is a spike, deliberately limited: it records what it sees, and routes only a slice that is
- * both named {@code .vec} and carries {@link KNNVectorReadIntent#RESCORE} — which no read Lucene
- * issues ever is. Everything else is the delegate's own slice, so installing this on a {@code .cfs}
+ * <p>It routes only a slice whose name is a faiss/MOS full-precision vector file — the same predicate
+ * {@link KNNVectorStorageDirectory#isFaissVectorData} applies to a non-compound segment's
+ * {@code openInput}. Everything else is the delegate's own slice, so installing this on a {@code .cfs}
  * costs one virtual call per {@code slice} — once per values object, not once per read — and nothing
  * else.
  */
@@ -84,8 +71,8 @@ import java.util.function.BooleanSupplier;
 public final class KNNVectorCompoundSliceInput extends FilterIndexInput {
 
     /** One {@code slice} of the compound container, in the terms a dispatch rule would be written in. */
-    public record SliceObservation(String name, long offset, long length, Set<IOContext.FileOpenHint> hints, KNNVectorReadIntent intent,
-        boolean carriedContext, boolean routedToDirectIO) {
+    public record SliceObservation(String name, long offset, long length, Set<IOContext.FileOpenHint> hints, boolean carriedContext,
+        boolean routedToDirectIO) {
         @Override
         public String toString() {
             return "name="
@@ -94,8 +81,6 @@ public final class KNNVectorCompoundSliceInput extends FilterIndexInput {
                 + offset
                 + " length="
                 + length
-                + " intent="
-                + intent
                 + " carriedContext="
                 + carriedContext
                 + " routedToDirectIO="
@@ -129,7 +114,7 @@ public final class KNNVectorCompoundSliceInput extends FilterIndexInput {
     private final boolean observing;
 
     /**
-     * Whether an intent-bearing {@code .vec} slice should be served with {@code O_DIRECT} — condition 3
+     * Whether a faiss/MOS {@code .vec} slice should be served with {@code O_DIRECT} — condition 2
      * of {@link KNNVectorStorageDirectory}'s dispatch rule. A supplier rather than a boolean because the
      * setting behind it is dynamic and a container outlives the query that opened it.
      */
@@ -215,7 +200,7 @@ public final class KNNVectorCompoundSliceInput extends FilterIndexInput {
         return routedSlices.get();
     }
 
-    /** Entries that satisfied the intent rule but could not be served with {@code O_DIRECT}. */
+    /** Entries that satisfied the name rule but could not be served with {@code O_DIRECT}. */
     public long declinedSlices() {
         return declinedSlices.get();
     }
@@ -234,17 +219,13 @@ public final class KNNVectorCompoundSliceInput extends FilterIndexInput {
     // ---------------------------------------------------------------------------------------------------
 
     /**
-     * The channel that carries both halves of the signal: {@code sliceDescription} is the logical file
-     * name and {@code context} is the caller's, hints included. This is where a compound segment gets the
-     * dispatch that {@code openInput} gives a non-compound one.
+     * The channel that carries the signal: {@code sliceDescription} is the logical file name. This is
+     * where a compound segment gets the dispatch that {@code openInput} gives a non-compound one.
      */
     @Override
     public IndexInput slice(final String sliceDescription, final long offset, final long length, final IOContext context)
         throws IOException {
-        final KNNVectorReadIntent intent = KNNVectorReadIntent.of(context);
-        final boolean route = intent == KNNVectorReadIntent.RESCORE
-            && isFullPrecisionVectorData(sliceDescription)
-            && routeRescoreToDirectIO.getAsBoolean();
+        final boolean route = KNNVectorStorageDirectory.isFaissVectorData(sliceDescription) && routeRescoreToDirectIO.getAsBoolean();
         final IndexInput routed = route ? directIOSlice(sliceDescription, offset, length) : null;
         if (route) {
             (routed != null ? routedSlices : declinedSlices).incrementAndGet();
@@ -260,19 +241,19 @@ public final class KNNVectorCompoundSliceInput extends FilterIndexInput {
                 length
             );
         }
-        record(sliceDescription, offset, length, context.hints(), intent, true, routed != null);
+        record(sliceDescription, offset, length, context.hints(), true, routed != null);
         return routed != null ? routed : in.slice(sliceDescription, offset, length, context);
     }
 
     /**
-     * The overload with no {@link IOContext}. It cannot dispatch on intent, by construction — which is
-     * the precise reason the four-argument overload above is the whole mechanism, and the reason a design
-     * that hoped to re-decide {@code how} on an ordinary slice cannot. Recorded so that the distinction
-     * is visible in the evidence rather than argued.
+     * The overload with no {@link IOContext}. Not a dispatch point: Lucene's compound reader serves every
+     * entry of a container through the four-argument overload above, so a three-argument slice is always
+     * a sub-slice of an entry already dispatched, and its description is a caller's label rather than a
+     * file name. Recorded so that the distinction is visible in the evidence rather than argued.
      */
     @Override
     public IndexInput slice(final String sliceDescription, final long offset, final long length) throws IOException {
-        record(sliceDescription, offset, length, Set.of(), null, false, false);
+        record(sliceDescription, offset, length, Set.of(), false, false);
         return in.slice(sliceDescription, offset, length);
     }
 
@@ -281,14 +262,13 @@ public final class KNNVectorCompoundSliceInput extends FilterIndexInput {
         final long offset,
         final long length,
         final Set<IOContext.FileOpenHint> hints,
-        final KNNVectorReadIntent intent,
         final boolean carriedContext,
         final boolean routedToDirectIO
     ) {
         if (observing == false) {
             return;
         }
-        final SliceObservation observation = new SliceObservation(name, offset, length, hints, intent, carriedContext, routedToDirectIO);
+        final SliceObservation observation = new SliceObservation(name, offset, length, hints, carriedContext, routedToDirectIO);
         observations.add(observation);
         if (isVectorDataEntry(name)) {
             log.info("k-NN compound slice probe [{}] saw slice {}", containerName, observation);
@@ -324,16 +304,6 @@ public final class KNNVectorCompoundSliceInput extends FilterIndexInput {
             log.warn("k-NN compound slice probe [{}]: could not route [{}] to Direct I/O", containerName, name, e);
             return null;
         }
-    }
-
-    /**
-     * Whether {@code name} is the full-precision flat vector data — the only entry this routes. Named by
-     * suffix, which is all a slice description ever is, and sufficient here only because the intent is
-     * checked alongside it: suffix alone cannot tell a re-score read from a traversal, merge, warmup or
-     * derived-source read of the same file.
-     */
-    static boolean isFullPrecisionVectorData(final String name) {
-        return name != null && name.endsWith(".vec");
     }
 
     /** Whether {@code name} is one of the entries a dispatch rule would ever look at. */
