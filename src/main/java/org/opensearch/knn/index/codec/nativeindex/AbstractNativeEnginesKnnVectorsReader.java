@@ -19,10 +19,7 @@ import org.apache.lucene.store.FileDataHint;
 import org.apache.lucene.store.FileTypeHint;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.util.IOSupplier;
-import org.opensearch.common.Nullable;
 import org.opensearch.knn.common.FieldInfoExtractor;
-import org.opensearch.knn.index.codec.KNNRescoreVectorsReader;
-import org.opensearch.knn.index.codec.scorer.HasRescoreVectorsReader;
 import org.opensearch.knn.index.codec.util.KNNCodecUtil;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.warmup.WarmableReader;
@@ -44,7 +41,7 @@ import static org.opensearch.knn.index.mapper.KNNVectorFieldMapper.KNN_FIELD;
  * Provides shared infrastructure for lazy-loading a {@link VectorSearcher} in a thread-safe manner.
  */
 @Log4j2
-public abstract class AbstractNativeEnginesKnnVectorsReader extends KnnVectorsReader implements WarmableReader, HasRescoreVectorsReader {
+public abstract class AbstractNativeEnginesKnnVectorsReader extends KnnVectorsReader implements WarmableReader {
 
     protected final FlatVectorsReader flatVectorsReader;
     protected final SegmentReadState segmentReadState;
@@ -55,53 +52,14 @@ public abstract class AbstractNativeEnginesKnnVectorsReader extends KnnVectorsRe
     // the lock object will not be needed
     protected final Object vectorSearcherHolderLockObject;
     protected final FieldInfos fieldInfos;
-    /**
-     * The lazily opened second view of the full-precision vectors, when this reader owns one directly, or
-     * {@code null}. Two of the native-engine rows put the view in different places, because the plugin owns a
-     * different amount of the reader chain in each: the faiss scalar-quantized row already has a plugin flat
-     * reader ({@code Faiss1040ScalarQuantizedFlatVectorsReader}) and keeps the view there, while the
-     * unquantized row nests a bare {@code Lucene99FlatVectorsReader} and so holds the view here instead.
-     * {@link #rescoreVectorValues(String)} answers from whichever of the two has it.
-     */
-    @Nullable
-    private final KNNRescoreVectorsReader rescoreVectorsReader;
 
     protected AbstractNativeEnginesKnnVectorsReader(final SegmentReadState state, final FlatVectorsReader flatVectorsReader) {
-        this(state, flatVectorsReader, null);
-    }
-
-    protected AbstractNativeEnginesKnnVectorsReader(
-        final SegmentReadState state,
-        final FlatVectorsReader flatVectorsReader,
-        @Nullable final KNNRescoreVectorsReader rescoreVectorsReader
-    ) {
         this.flatVectorsReader = flatVectorsReader;
         this.segmentReadState = state;
         this.ioContext = state.context.withHints(FileTypeHint.DATA, FileDataHint.KNN_VECTORS, DataAccessHint.RANDOM);
         this.vectorSearcherHolder = new VectorSearcherHolder();
         this.vectorSearcherHolderLockObject = new Object();
         this.fieldInfos = state.fieldInfos;
-        this.rescoreVectorsReader = rescoreVectorsReader;
-    }
-
-    /**
-     * A second view of {@code field}'s full-precision vectors whose reads carry the rescore intent, or
-     * {@code null} when this segment offers none — which is the default, because the Direct I/O rescore
-     * setting is off by default and the view is what checks it.
-     *
-     * <p>Answered from this reader's own view when it has one, and otherwise from the flat reader, which is
-     * where the faiss scalar-quantized row keeps it.
-     */
-    @Override
-    @Nullable
-    public FloatVectorValues rescoreVectorValues(final String field) {
-        if (rescoreVectorsReader != null) {
-            return rescoreVectorsReader.floatVectorValues(field);
-        }
-        if (flatVectorsReader instanceof HasRescoreVectorsReader rescoreAware) {
-            return rescoreAware.rescoreVectorValues(field);
-        }
-        return null;
     }
 
     /**
@@ -134,10 +92,6 @@ public abstract class AbstractNativeEnginesKnnVectorsReader extends KnnVectorsRe
         final List<Closeable> closeables = new ArrayList<>();
         // Close reader.
         closeables.add(flatVectorsReader);
-
-        // Close the second, rescore-intent view of the full-precision vectors when this reader owns one.
-        // Null unless a rescore query on this segment actually opened it; IOUtils.close ignores nulls.
-        closeables.add(rescoreVectorsReader);
 
         // Close Vector Searcher
         if (vectorSearcherHolder != null) {

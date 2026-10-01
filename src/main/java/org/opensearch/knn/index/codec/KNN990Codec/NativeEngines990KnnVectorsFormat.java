@@ -21,7 +21,6 @@ import org.apache.lucene.codecs.lucene99.Lucene99FlatVectorsFormat;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
 import org.opensearch.knn.index.KNNSettings;
-import org.opensearch.knn.index.codec.KNNRescoreVectorsReader;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactory;
 import org.opensearch.knn.index.codec.scorer.NativeEngines990KnnVectorsScorer;
 import org.opensearch.knn.index.codec.scorer.PrefetchableFlatVectorScorer;
@@ -88,15 +87,7 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
      */
     @Override
     public KnnVectorsReader fieldsReader(final SegmentReadState state) throws IOException {
-        return new NativeEngines990KnnVectorsReader(
-            state,
-            flatVectorsFormat.fieldsReader(state),
-            // The second, rescore-intent view of the same fp32 .vec. Built on this very format, so the view's
-            // values are the same Lucene OffHeapFloatVectorValues the default path uses and carry the same
-            // shipped PrefetchableFlatVectorScorer; only the IndexInput differs. Creating it opens nothing -
-            // a node with the Direct I/O rescore setting off never acquires a second handle.
-            KNNRescoreVectorsReader.create(flatVectorsFormat, state)
-        );
+        return new NativeEngines990KnnVectorsReader(state, flatVectorsFormat.fieldsReader(state));
     }
 
     /**

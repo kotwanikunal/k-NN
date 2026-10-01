@@ -36,11 +36,11 @@ import java.io.IOException;
  *
  * <h2>What opting in does and does not turn on</h2>
  * Installing the directory is necessary but not sufficient. A read is only served with {@code O_DIRECT}
- * when it also carries {@link KNNVectorReadIntent#RESCORE}, which only a rescore view attaches, and only
- * when {@code knn.direct_io.rescore.enabled} is on — off by default, because Direct I/O is a win only
- * where the {@code .vec} working set cannot stay in the page cache. So an index that opts in on a node
- * with the setting off reads exactly as it did before, one virtual call per compound-container slice
- * aside.
+ * when the file is a faiss or MOS full-precision flat vector file
+ * ({@link KNNVectorStorageDirectory#isFaissVectorData}) and {@code knn.direct_io.rescore.enabled} is on
+ * — off by default, because Direct I/O is a win only where the {@code .vec} working set cannot stay in
+ * the page cache. So an index that opts in on a node with the setting off reads exactly as it did
+ * before, one virtual call per compound-container slice aside.
  */
 @Log4j2
 public class KNNVectorStorageStoreFactory implements IndexStorePlugin.StoreFactory {
