@@ -16,7 +16,6 @@ import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsWriter;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.search.TaskExecutor;
-import org.opensearch.knn.index.codec.KNNRescoreVectorsReader;
 import org.opensearch.knn.index.engine.KNNEngine;
 
 import java.io.IOException;
@@ -86,25 +85,9 @@ public class KNN1040HnswScalarQuantizedVectorsFormat extends Lucene104HnswScalar
         );
     }
 
-    /**
-     * Returns the stock HNSW reader wrapped so that this row can offer a rescore view of the
-     * full-precision {@code .vec} vectors.
-     *
-     * <p>The wrapper is the only plugin-owned object on the path from the segment to this row's {@code .vec}
-     * — {@link Lucene99HnswVectorsReader} is final and the flat reader it holds is private — and it changes
-     * nothing that Lucene returns: see {@link KNN1040RescoreAwareHnswVectorsReader} for why it is a reader
-     * delegate rather than a values wrapper, and for the two interfaces merge depends on.
-     *
-     * <p>The view is built on the <em>raw</em> fp32 format nested inside the quantized one, not on the
-     * quantized format: the rescore path reads {@code .vec} and its {@code .vemf} sidecar and never the
-     * {@code .veq} codes. Creating it opens nothing.
-     */
     @Override
     public KnnVectorsReader fieldsReader(SegmentReadState state) throws IOException {
-        return new KNN1040RescoreAwareHnswVectorsReader(
-            new Lucene99HnswVectorsReader(state, flatVectorsFormat.fieldsReader(state)),
-            KNNRescoreVectorsReader.create(flatVectorsFormat.rawVectorsFormat(), state)
-        );
+        return new Lucene99HnswVectorsReader(state, flatVectorsFormat.fieldsReader(state));
     }
 
     @Override
