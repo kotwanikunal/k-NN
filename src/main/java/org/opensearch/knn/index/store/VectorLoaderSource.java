@@ -51,8 +51,8 @@ import java.io.IOException;
  *
  * <p>A hint is still not a gate. An implementation may ignore it entirely; what it may not do is decide
  * caching policy without it. Note that whether a given read <em>reaches</em> this seam at all is a separate
- * decision made above it, by {@code DirectIORescoreSeam}, and this hint neither widens nor narrows that
- * gate.
+ * decision made below it, by {@link KNNVectorStorageDirectory}, and this hint neither widens nor narrows
+ * that gate.
  *
  * <h2>Separate from the staging seam, deliberately</h2>
  * Read ahead is {@link VectorStagingArea}, a different interface that a {@link Loader} may also implement.

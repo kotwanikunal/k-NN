@@ -132,10 +132,10 @@ public class KNNSettings {
     public static final String KNN_DIRECT_IO_MAX_BUFFER_SIZE = "knn.direct_io.max_buffer_size";
     public static final ByteSizeValue KNN_DIRECT_IO_MAX_BUFFER_SIZE_DEFAULT_VALUE = new ByteSizeValue(32, ByteSizeUnit.KB);
 
-    // Node level gate for the Direct I/O rescore seam. Off by default: with it off DirectIORescoreSeam
-    // returns its input unchanged, so the rescore path is byte for byte what it is without this code. A
-    // per-query decision read once per scorer built at the seam, so flipping it takes effect on the next
-    // query with no index or node restart.
+    // Node level gate for routing faiss/MOS full-precision vector data to Direct I/O. Off by default:
+    // with it off KNNVectorStorageDirectory returns the delegate's own input, so every read is byte for
+    // byte what it is without this code. Read at every dispatch, so flipping it takes effect on the next
+    // reader or values object with no index or node restart.
     public static final String KNN_DIRECT_IO_RESCORE_ENABLED = "knn.direct_io.rescore.enabled";
     public static final boolean KNN_DIRECT_IO_RESCORE_ENABLED_DEFAULT_VALUE = false;
 
@@ -426,12 +426,14 @@ public class KNNSettings {
     );
 
     /**
-     * Node level switch for reading full-precision vectors with Direct I/O on the rescore path, at the
-     * query seam in {@link org.opensearch.knn.index.query.scorers.DirectIORescoreSeam}. A per-query
-     * decision that needs no index close and reopen, so flipping it takes effect on the next query.
+     * Node level switch for reading faiss and memory-optimized-search full-precision vectors with Direct
+     * I/O, at the storage layer in {@link org.opensearch.knn.index.store.KNNVectorStorageDirectory}. Read
+     * at every dispatch and needs no index close and reopen, so flipping it takes effect on the next
+     * reader or values object.
      * <p>
-     * Off by default. With it off the rescore path is the one every existing measurement was taken
-     * against, byte for byte.
+     * Necessary but not sufficient: the index also has to have opted in with
+     * {@code index.store.factory: knn_vector_storage}. Off by default, and with it off every read is the
+     * one every existing measurement was taken against, byte for byte.
      */
     public static final Setting<Boolean> KNN_DIRECT_IO_RESCORE_ENABLED_SETTING = Setting.boolSetting(
         KNN_DIRECT_IO_RESCORE_ENABLED,

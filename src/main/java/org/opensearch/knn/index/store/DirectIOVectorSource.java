@@ -826,7 +826,7 @@ public final class DirectIOVectorSource implements VectorLoaderSource {
         // seam javadoc will expect the opposite polarity: it argued RESCORE reads were the ones not to
         // cache, on the strength of a rescore pass reading each candidate once. That is true within a
         // query and wrong across queries, which is where the reuse Phase 6 measured actually lives. This
-        // narrows nothing: whether a read reaches this source at all is DirectIORescoreSeam's decision,
+        // narrows nothing: whether a read reaches this source at all is the storage directory's decision,
         // untouched here, and a SCORE-mode loader simply does not cache.
         return new Reader(reuseHint, reuseHint == VectorScorerMode.RESCORE ? cache : null);
     }
