@@ -36,11 +36,23 @@ public class FaissFlatIndexFactory {
      * To add support for other flat storage types (e.g., fp32 flat), add new conditions here.
      */
     static FaissIndex createFlatIndex(final FieldInfo fieldInfo, final FlatVectorsReader flatVectorsReader) {
-        if (FieldInfoExtractor.isSQField(fieldInfo)
-            && FaissSQEncoder.isSQCodedBits(FieldInfoExtractor.extractSQConfig(fieldInfo).getBits())) {
+        if (usesLuceneFlatStorage(fieldInfo)) {
             return new FaissScalarQuantizedFlatIndex(flatVectorsReader, fieldInfo.getName());
         }
         return null;
+    }
+
+    /**
+     * Whether this field's flat storage is Lucene's rather than the {@code .faiss} file's own — which is
+     * the same question as "do this field's full-precision floats come out of the {@code .vec} file".
+     *
+     * <p>Exposed because the warmup path needs the answer for a different reason: a {@code .vec} that the
+     * storage directory is serving with {@code O_DIRECT} is not worth reading into the page cache, while
+     * flat storage that lives inside the {@code .faiss} file still is.
+     */
+    static boolean usesLuceneFlatStorage(final FieldInfo fieldInfo) {
+        return FieldInfoExtractor.isSQField(fieldInfo)
+            && FaissSQEncoder.isSQCodedBits(FieldInfoExtractor.extractSQConfig(fieldInfo).getBits());
     }
 
     /**
