@@ -220,6 +220,27 @@ public class KNNSettings {
         ByteSizeUnit.BYTES
     );
 
+    // Sequential read-ahead for DirectIOVectorIndexInput, a mechanism SEPARATE from the burst table above.
+    // The burst table (staged_ranges / max_span_bytes) serves the rescore seam, whose access is random and
+    // bursty and declared by prefetch() calls. A sequential bulk consumer -- a merge, the faiss-unquantized
+    // exact first pass, unquantized traversal -- issues no prefetch() at all, so every one of its reads is a
+    // blocking QD1 pread one buffer at a time, slower than mmap's kernel read-ahead. These two settings add
+    // an internal rolling ring that detects a gapless-forward run of blocking reads and puts the next
+    // windows in flight, bringing sequential O_DIRECT toward mmap parity WITHOUT changing which bytes are
+    // read. The ring stands down whenever a prefetch burst is active, so the rescore path is untouched.
+    //
+    // window: how many bufferSize-sized windows the ring keeps in flight ahead of the frontier. 0 disables
+    // read-ahead entirely -- the input is then byte-for-byte and syscall-for-syscall what it is with this
+    // code absent. Lands at 0; flipped to a measured value only after the block-layer sweep confirms it.
+    public static final String KNN_DIRECT_IO_READAHEAD_WINDOW = "knn.direct_io.readahead.window";
+    public static final int KNN_DIRECT_IO_READAHEAD_WINDOW_DEFAULT_VALUE = 0;
+    // trigger: how many consecutive gapless-forward blocking reads must occur before the ring arms. This is
+    // the no-waste guard: a random (rescore) workload must never cross it, so read-ahead issues ZERO
+    // speculative reads on that pattern. A knob rather than a constant precisely because that no-waste claim
+    // is a claim about this value, and an operator who distrusts it must be able to raise it without a build.
+    public static final String KNN_DIRECT_IO_READAHEAD_TRIGGER = "knn.direct_io.readahead.trigger";
+    public static final int KNN_DIRECT_IO_READAHEAD_TRIGGER_DEFAULT_VALUE = 2;
+
     /**
      * For more details on supported engines, refer to {@link MemoryOptimizedSearchSupportSpec}
      */
@@ -536,6 +557,33 @@ public class KNNSettings {
     public static final Setting<ByteSizeValue> KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING = Setting.byteSizeSetting(
         KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN,
         KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_DEFAULT_VALUE,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
+     * How many {@code bufferSize}-sized windows {@code DirectIOVectorIndexInput}'s sequential read-ahead
+     * ring keeps in flight ahead of the file-order frontier. Node scoped and dynamic, read once per
+     * {@code .vec} open. Lower bound 0, which disables the ring and makes the input exact passthrough.
+     */
+    public static final Setting<Integer> KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING = Setting.intSetting(
+        KNN_DIRECT_IO_READAHEAD_WINDOW,
+        KNN_DIRECT_IO_READAHEAD_WINDOW_DEFAULT_VALUE,
+        0,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
+     * Consecutive gapless-forward blocking reads needed before the read-ahead ring arms. Node scoped and
+     * dynamic, read once per {@code .vec} open. Lower bound 1 so a node can force arm-on-first-read to test
+     * the ring in isolation; the no-waste property comes from the default of 2, which random access cannot
+     * reach.
+     */
+    public static final Setting<Integer> KNN_DIRECT_IO_READAHEAD_TRIGGER_SETTING = Setting.intSetting(
+        KNN_DIRECT_IO_READAHEAD_TRIGGER,
+        KNN_DIRECT_IO_READAHEAD_TRIGGER_DEFAULT_VALUE,
+        1,
         NodeScope,
         Dynamic
     );
@@ -1008,6 +1056,14 @@ public class KNNSettings {
             return KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_SETTING;
         }
 
+        if (KNN_DIRECT_IO_READAHEAD_WINDOW.equals(key)) {
+            return KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING;
+        }
+
+        if (KNN_DIRECT_IO_READAHEAD_TRIGGER.equals(key)) {
+            return KNN_DIRECT_IO_READAHEAD_TRIGGER_SETTING;
+        }
+
         throw new IllegalArgumentException("Cannot find setting by key [" + key + "]");
     }
 
@@ -1058,7 +1114,10 @@ public class KNNSettings {
             KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_SETTING,
             // The directory design's read-ahead channel: staging table size and the waste guard
             KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_SETTING,
-            KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING
+            KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING,
+            // Sequential read-ahead ring: window and arm trigger
+            KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING,
+            KNN_DIRECT_IO_READAHEAD_TRIGGER_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
             .collect(Collectors.toList());
@@ -1148,6 +1207,20 @@ public class KNNSettings {
      */
     public static ByteSizeValue getDirectIORescorePrefetchMaxSpan() {
         return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING);
+    }
+
+    /**
+     * @return how many windows the Direct I/O sequential read-ahead ring keeps in flight; 0 disables it
+     */
+    public static int getDirectIOReadaheadWindow() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING);
+    }
+
+    /**
+     * @return consecutive gapless-forward blocking reads needed before the read-ahead ring arms
+     */
+    public static int getDirectIOReadaheadTrigger() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_READAHEAD_TRIGGER_SETTING);
     }
 
     public static boolean isCircuitBreakerTriggered() {

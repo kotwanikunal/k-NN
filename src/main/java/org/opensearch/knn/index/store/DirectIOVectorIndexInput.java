@@ -129,6 +129,14 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         private final FloatBuffer floats;
         private final long alignedStart;
         private final int alignedLength;
+        /**
+         * Where this read's completion is tallied. The burst path passes {@link Stats#stagedReads} /
+         * {@link Stats#stagedBytes}; the read-ahead ring passes its own counters. The queue-depth counters
+         * ({@link Stats#inFlightNow}) stay shared, because a read in flight is a read in flight whichever
+         * channel issued it, and the R3 arms must be comparable.
+         */
+        private final AtomicLong readCounter;
+        private final AtomicLong byteCounter;
         private final AtomicBoolean started = new AtomicBoolean();
         private Future<?> future;
         /** Bytes the read actually delivered; only meaningful once {@link #future} has completed. */
@@ -140,7 +148,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             final ByteBuffer buffer,
             final FloatBuffer floats,
             final long alignedStart,
-            final int alignedLength
+            final int alignedLength,
+            final AtomicLong readCounter,
+            final AtomicLong byteCounter
         ) {
             this.channel = channel;
             this.path = path;
@@ -148,6 +158,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             this.floats = floats;
             this.alignedStart = alignedStart;
             this.alignedLength = alignedLength;
+            this.readCounter = readCounter;
+            this.byteCounter = byteCounter;
         }
 
         @Override
@@ -160,8 +172,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             try {
                 buffer.clear().limit(alignedLength);
                 valid = channel.read(buffer, alignedStart);
-                STATS.stagedReads.incrementAndGet();
-                STATS.stagedBytes.addAndGet(Math.max(valid, 0));
+                readCounter.incrementAndGet();
+                byteCounter.addAndGet(Math.max(valid, 0));
             } finally {
                 STATS.inFlightNow.decrementAndGet();
             }
@@ -212,6 +224,11 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         private final AtomicLong blockingBytes = new AtomicLong();
         private final AtomicLong servedBytes = new AtomicLong();
         private final AtomicLong declinedSpanBytes = new AtomicLong();
+        private final AtomicLong readaheadReads = new AtomicLong();
+        private final AtomicLong readaheadBytes = new AtomicLong();
+        private final AtomicLong readaheadHits = new AtomicLong();
+        private final AtomicLong readaheadDeclined = new AtomicLong();
+        private final AtomicLong readaheadArmed = new AtomicLong();
 
         private void recordInFlightPeak() {
             final long now = inFlightNow.get();
@@ -270,6 +287,34 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             return declinedSpanBytes.get();
         }
 
+        /**
+         * Device reads the sequential read-ahead ring issued. The no-waste proof's number: on a random
+         * (rescore) workload detection must never arm, so this must stay 0.
+         */
+        public long readaheadReads() {
+            return readaheadReads.get();
+        }
+
+        /** Bytes the device returned for read-ahead reads. */
+        public long readaheadBytes() {
+            return readaheadBytes.get();
+        }
+
+        /** Reads served out of a read-ahead ring slot rather than by a blocking read. */
+        public long readaheadHits() {
+            return readaheadHits.get();
+        }
+
+        /** Ring refills refused because there was no pool or the pool rejected the submit. */
+        public long readaheadDeclined() {
+            return readaheadDeclined.get();
+        }
+
+        /** Times detection crossed the trigger and the ring armed. The "did it ever engage" number. */
+        public long readaheadArmed() {
+            return readaheadArmed.get();
+        }
+
         public void reset() {
             blockingReads.set(0);
             stagedReads.set(0);
@@ -281,16 +326,25 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             blockingBytes.set(0);
             servedBytes.set(0);
             declinedSpanBytes.set(0);
+            readaheadReads.set(0);
+            readaheadBytes.set(0);
+            readaheadHits.set(0);
+            readaheadDeclined.set(0);
+            readaheadArmed.set(0);
         }
 
         @Override
         public String toString() {
-            final long read = stagedBytes.get() + blockingBytes.get();
+            // Read-ahead bytes join the numerator because they are traffic this object caused, the same as
+            // the staged and blocking channels; a window fetched and never served is amplification.
+            final long read = stagedBytes.get() + blockingBytes.get() + readaheadBytes.get();
             final long served = servedBytes.get();
             return String.format(
                 Locale.ROOT,
                 "blockingReads=%d stagedReads=%d stagedHits=%d stageDeclined=%d prefetchCalls=%d inFlightPeak=%d "
-                    + "stagedBytes=%d blockingBytes=%d servedBytes=%d declinedSpanBytes=%d amplification=%.3f",
+                    + "stagedBytes=%d blockingBytes=%d servedBytes=%d declinedSpanBytes=%d "
+                    + "readaheadReads=%d readaheadBytes=%d readaheadHits=%d readaheadDeclined=%d readaheadArmed=%d "
+                    + "amplification=%.3f",
                 blockingReads.get(),
                 stagedReads.get(),
                 stagedHits.get(),
@@ -301,6 +355,11 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 blockingBytes.get(),
                 served,
                 declinedSpanBytes.get(),
+                readaheadReads.get(),
+                readaheadBytes.get(),
+                readaheadHits.get(),
+                readaheadDeclined.get(),
+                readaheadArmed.get(),
                 served == 0 ? 0.0 : (double) read / served
             );
         }
@@ -336,6 +395,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     private final int bufferSize;
     private final int maxStagedRanges;
     private final int maxStagedRangeBytes;
+    /** Windows the read-ahead ring keeps in flight. 0 ⇒ the ring is disabled and this is exact passthrough. */
+    private final int readaheadWindows;
+    /** Consecutive gapless-forward blocking reads before the ring arms. */
+    private final int readaheadTrigger;
 
     private long filePointer;
     private boolean closed;
@@ -355,6 +418,26 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     /** Whether a read has happened since the last {@link #prefetch}, which is how a burst's end is found. */
     private boolean readSincePrefetch;
 
+    // -- Sequential read-ahead ring. Distinct from the burst table above: it holds no state in common with
+    // it, is scanned independently in source(), and neither mechanism resets the other. Allocated lazily
+    // on the first arm, so a non-sequential input never pays for it; null until then. --
+    /** The previous blocking read's aligned start, for the forward-and-gapless detection predicate. */
+    private long blockingStart = -1;
+    /** The previous blocking read's aligned end: the file-order frontier read-ahead runs ahead of. */
+    private long blockingEnd = -1;
+    /** Consecutive gapless-forward blocking reads seen so far; reset on any gap, backward jump or seek-away. */
+    private int sequentialRun;
+    /** The ring, size {@link #readaheadWindows}, used circularly; null until the first arm. */
+    private StagedRange[] readaheadRing;
+    private ByteBuffer[] readaheadBuffers;
+    private FloatBuffer[] readaheadFloats;
+    /** Index of the oldest live slot. */
+    private int readaheadHead;
+    /** Live slots, 0..{@link #readaheadWindows}. */
+    private int readaheadCount;
+    /** Aligned start of the next window the ring will submit. */
+    private long readaheadNext;
+
     private DirectIOVectorIndexInput(
         final String resourceDescription,
         final Handle handle,
@@ -363,7 +446,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final boolean ownsHandle,
         final int bufferSize,
         final int maxStagedRanges,
-        final int maxStagedRangeBytes
+        final int maxStagedRangeBytes,
+        final int readaheadWindows,
+        final int readaheadTrigger
     ) {
         super(resourceDescription);
         this.handle = handle;
@@ -373,6 +458,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         this.bufferSize = bufferSize;
         this.maxStagedRanges = maxStagedRanges;
         this.maxStagedRangeBytes = maxStagedRangeBytes;
+        this.readaheadWindows = readaheadWindows;
+        this.readaheadTrigger = readaheadTrigger;
     }
 
     /**
@@ -383,7 +470,14 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * must cost a fall back to the default path, never a failed query.
      */
     public static DirectIOVectorIndexInput open(final Path path) {
-        return open(path, 0, configuredMaxStagedRanges(), configuredMaxStagedRangeBytes());
+        return open(
+            path,
+            0,
+            configuredMaxStagedRanges(),
+            configuredMaxStagedRangeBytes(),
+            configuredReadaheadWindow(),
+            configuredReadaheadTrigger()
+        );
     }
 
     /**
@@ -419,6 +513,32 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     }
 
     /**
+     * Windows the sequential read-ahead ring keeps in flight, from {@code knn.direct_io.readahead.window}.
+     * Read here, once per {@code .vec} open, like the staging bounds: the value sizes the ring's buffers,
+     * and a value that moved under a running ring would mean a buffer allocated for one count holding
+     * another. A setting that cannot be read falls back to its default — this must never be why a shard
+     * fails to open. 0 means the ring is off.
+     */
+    private static int configuredReadaheadWindow() {
+        try {
+            return Math.max(0, KNNSettings.getDirectIOReadaheadWindow());
+        } catch (RuntimeException e) {
+            log.debug("Could not read knn.direct_io.readahead.window; read-ahead disabled for this open", e);
+            return KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW_DEFAULT_VALUE;
+        }
+    }
+
+    /** The arm trigger, from {@code knn.direct_io.readahead.trigger}; same read-once, fall-back contract. */
+    private static int configuredReadaheadTrigger() {
+        try {
+            return Math.max(1, KNNSettings.getDirectIOReadaheadTrigger());
+        } catch (RuntimeException e) {
+            log.debug("Could not read knn.direct_io.readahead.trigger; using the default", e);
+            return KNNSettings.KNN_DIRECT_IO_READAHEAD_TRIGGER_DEFAULT_VALUE;
+        }
+    }
+
+    /**
      * As {@link #open(Path)}, with the sizes chosen by the caller so that a measurement can sweep them.
      *
      * @param bufferSize          bytes per blocking read, or 0 for twice the block size, which serves any
@@ -431,6 +551,26 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final int bufferSize,
         final int maxStagedRanges,
         final int maxStagedRangeBytes
+    ) {
+        // The four-argument overload keeps its signature so the phase-9 queue-depth probe compiles against
+        // it unchanged; it picks up the read-ahead sizes from settings, exactly as open(Path) does.
+        return open(path, bufferSize, maxStagedRanges, maxStagedRangeBytes, configuredReadaheadWindow(), configuredReadaheadTrigger());
+    }
+
+    /**
+     * As the four-argument overload, with the read-ahead ring sized by the caller so that a measurement
+     * can sweep it without a {@link org.opensearch.cluster.service.ClusterService}.
+     *
+     * @param readaheadWindows windows the sequential ring keeps in flight; 0 disables it (exact passthrough)
+     * @param readaheadTrigger consecutive gapless-forward blocking reads before the ring arms
+     */
+    public static DirectIOVectorIndexInput open(
+        final Path path,
+        final int bufferSize,
+        final int maxStagedRanges,
+        final int maxStagedRangeBytes,
+        final int readaheadWindows,
+        final int readaheadTrigger
     ) {
         final OpenOption direct = DirectIOVectorSource.directOpenOption();
         if (direct == null) {
@@ -459,7 +599,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 true,
                 reads,
                 Math.max(1, maxStagedRanges),
-                Math.max(blockSize, maxStagedRangeBytes)
+                Math.max(blockSize, maxStagedRangeBytes),
+                Math.max(0, readaheadWindows),
+                Math.max(1, readaheadTrigger)
             );
         } catch (IOException | RuntimeException e) {
             if (channel != null) {
@@ -492,6 +634,16 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     /** The waste guard's bound: the largest single prefetch span this input will stage, in bytes. */
     int maxStagedRangeBytes() {
         return maxStagedRangeBytes;
+    }
+
+    /** Windows the sequential read-ahead ring keeps in flight, after the setting was read at open. */
+    int readaheadWindows() {
+        return readaheadWindows;
+    }
+
+    /** Consecutive gapless-forward blocking reads before the ring arms, after the setting was read at open. */
+    int readaheadTrigger() {
+        return readaheadTrigger;
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -577,7 +729,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             stagedBuffers[slot],
             stagedFloats[slot],
             alignedStart,
-            alignedLength
+            alignedLength,
+            STATS.stagedReads,
+            STATS.stagedBytes
         );
         try {
             range.future = pool.submit(range);
@@ -704,8 +858,11 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     }
 
     /**
-     * Resolves the current file pointer to a buffer holding at least {@code needed} bytes of it — out of a
-     * staged range when this burst put one there, and otherwise by one blocking {@code pread}.
+     * Resolves the current file pointer to a buffer holding at least {@code needed} bytes of it. Three
+     * sources are consulted in order of how specific each is: the prefetch burst table (caller-declared,
+     * random), then the sequential read-ahead ring (inferred from a forward run), then one blocking
+     * {@code pread}. The two staging mechanisms are independent — neither resets the other, and the burst
+     * table is scanned first because a {@link #prefetch} is a stronger signal than a detected run.
      */
     private Source source(final int needed) throws IOException {
         ensureOpen();
@@ -729,6 +886,12 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 }
                 STATS.stagedHits.incrementAndGet();
                 return new Source(range.buffer, range.floats, position, range.valid - position);
+            }
+        }
+        if (readaheadWindows > 0 && readaheadRing != null) {
+            final Source ahead = readaheadSource(absolute, needed);
+            if (ahead != null) {
+                return ahead;
             }
         }
         return blockingSource(absolute, needed);
@@ -776,6 +939,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         STATS.blockingBytes.addAndGet(Math.max(read, 0));
         syncStart = alignedStart;
         syncValid = Math.max(read, 0);
+        // Detection runs on the device read, not the sync-window hit above: a hit means no new device read
+        // and so no advance of the file-order frontier. With read-ahead off this is a no-op (gated inside).
+        noteBlockingRead(alignedStart);
         final int position = Math.toIntExact(absolute - alignedStart);
         if (position + needed > syncValid) {
             throw new IOException(
@@ -790,6 +956,187 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             );
         }
         return new Source(syncBuffer, syncFloats, position, syncValid - position);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // Sequential read-ahead ring
+    //
+    // A rolling ring, structurally separate from the burst table: it shares no field with it, is consulted
+    // independently in source(), and neither mechanism resets the other. The burst table serves a
+    // caller-declared random pattern (prefetch); this serves a forward run inferred from blocking reads,
+    // which is the one shape prefetch never covers — a merge, the faiss-unquantized first pass, traversal.
+    // ---------------------------------------------------------------------------------------------------
+
+    /**
+     * Records a blocking device read against the file-order frontier and, once a gapless-forward run
+     * reaches {@link #readaheadTrigger}, arms the ring and keeps it refilled ahead of the frontier.
+     *
+     * <p>The detection predicate is forward-and-gapless: {@code alignedStart} is at or behind the previous
+     * window's start (so not a backward jump) and at or before its end (so not a gap). The overlap case
+     * {@code blockingStart <= alignedStart < blockingEnd} is the legitimate re-read a sequential scan makes
+     * when a vector straddles a window boundary ({@link #readFloats} asks for four bytes, misses by a few,
+     * and re-floors into the window it just read); it counts as sequential. A gap or backward jump resets
+     * the run and quiesces whatever the ring had in flight — this is the seek-away reset, driven by file
+     * order at this layer rather than by {@link #seek}, because the faiss first pass {@code seek}s per
+     * ordinal <em>while remaining sequential</em> and a blanket seek reset would disarm it.
+     *
+     * <p>With {@link #readaheadWindows} zero this returns immediately and keeps no state, so the input is
+     * exact passthrough.
+     */
+    private void noteBlockingRead(final long alignedStart) {
+        if (readaheadWindows == 0) {
+            return;
+        }
+        final long alignedEnd = alignedStart + bufferSize;
+        final boolean sequential = blockingEnd >= 0 && alignedStart >= blockingStart && alignedStart <= blockingEnd;
+        if (sequential) {
+            if (sequentialRun < Integer.MAX_VALUE) {
+                sequentialRun++;
+            }
+        } else {
+            // A discontinuity: abandon the now-wrong windows and start a fresh run at this read.
+            if (readaheadCount > 0) {
+                quiesceReadahead();
+            }
+            sequentialRun = 1;
+        }
+        blockingStart = alignedStart;
+        blockingEnd = alignedEnd;
+        if (sequentialRun < readaheadTrigger) {
+            return;
+        }
+        if (sequentialRun == readaheadTrigger) {
+            STATS.readaheadArmed.incrementAndGet();
+        }
+        // Armed: point the ring's frontier just past this window and fill it. When the ring is empty this is
+        // the arm point outright; when windows are already live the frontier is whichever is further ahead,
+        // because those windows were submitted from the old frontier and re-submitting behind them would
+        // fetch bytes the ring already holds.
+        readaheadNext = readaheadCount == 0 ? alignedEnd : Math.max(readaheadNext, alignedEnd);
+        refillReadahead();
+    }
+
+    /**
+     * Serves {@code [absolute, absolute + needed)} from the ring if a live window covers it, else returns
+     * null to fall through to a blocking read. Retires windows fully behind the read, keeps the ring
+     * ordered, and refills after a hit so ~{@link #readaheadWindows} windows stay in flight ahead.
+     */
+    private Source readaheadSource(final long absolute, final int needed) throws IOException {
+        // Retire head windows the read has moved past, so the ring stays ordered oldest-first.
+        while (readaheadCount > 0) {
+            final StagedRange head = readaheadRing[readaheadHead];
+            if (head == null || head.alignedStart + head.alignedLength > absolute) {
+                break;
+            }
+            retireHead();
+        }
+        for (int i = 0; i < readaheadCount; i++) {
+            final int slot = (readaheadHead + i) % readaheadWindows;
+            final StagedRange range = readaheadRing[slot];
+            if (range == null || range.covers(absolute, needed) == false) {
+                continue;
+            }
+            await(range);
+            final int position = Math.toIntExact(absolute - range.alignedStart);
+            if (position + needed > range.valid) {
+                // Came up short — only at EOF. Let a blocking read handle these bytes.
+                return null;
+            }
+            STATS.readaheadHits.incrementAndGet();
+            // Advance the detection frontier to the window just served so a later seek-away is seen as a
+            // discontinuity against where we actually are, not against the stale arm-point frontier.
+            blockingStart = range.alignedStart;
+            blockingEnd = range.alignedStart + range.alignedLength;
+            refillReadahead();
+            return new Source(range.buffer, range.floats, position, range.valid - position);
+        }
+        return null;
+    }
+
+    /**
+     * Submits windows until {@link #readaheadWindows} are in flight ahead of {@link #readaheadNext}, within
+     * this input's own region. Stands down when a prefetch burst is active ({@code stagedCount > 0}): the
+     * rescore scorer then owns the input and its access is random, not sequential, so the ring issues no
+     * speculative reads. Allocates the ring lazily on the first call that reaches here.
+     */
+    private void refillReadahead() {
+        if (stagedCount > 0) {
+            return;
+        }
+        if (readaheadRing == null) {
+            final ExecutorService acquired = DirectIOReadPool.executor();
+            if (acquired == null) {
+                STATS.readaheadDeclined.incrementAndGet();
+                return;
+            }
+            readaheadRing = new StagedRange[readaheadWindows];
+            readaheadBuffers = new ByteBuffer[readaheadWindows];
+            readaheadFloats = new FloatBuffer[readaheadWindows];
+            pool = acquired;
+        }
+        final long regionEnd = offset + length;
+        while (readaheadCount < readaheadWindows && readaheadNext < regionEnd) {
+            final int slot = (readaheadHead + readaheadCount) % readaheadWindows;
+            if (readaheadBuffers[slot] == null) {
+                readaheadBuffers[slot] = ByteBuffer.allocateDirect(bufferSize + handle.blockSize - 1)
+                    .alignedSlice(handle.blockSize)
+                    .order(ByteOrder.LITTLE_ENDIAN);
+                readaheadFloats[slot] = readaheadBuffers[slot].asFloatBuffer();
+            }
+            final StagedRange range = new StagedRange(
+                handle.channel,
+                handle.path,
+                readaheadBuffers[slot],
+                readaheadFloats[slot],
+                readaheadNext,
+                bufferSize,
+                STATS.readaheadReads,
+                STATS.readaheadBytes
+            );
+            try {
+                range.future = pool.submit(range);
+            } catch (RejectedExecutionException e) {
+                STATS.readaheadDeclined.incrementAndGet();
+                log.debug("The Direct I/O read pool refused a read-ahead of {}; reads will block", handle.path);
+                return;
+            }
+            readaheadRing[slot] = range;
+            readaheadCount++;
+            readaheadNext += bufferSize;
+        }
+    }
+
+    /** Claims and forgets the oldest live window, keeping its buffer for reuse. */
+    private void retireHead() {
+        final StagedRange head = readaheadRing[readaheadHead];
+        readaheadRing[readaheadHead] = null;
+        if (head != null && head.skipIfNotStarted() == false) {
+            try {
+                head.future.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (ExecutionException e) {
+                log.debug("Abandoned a read-ahead read of {}", handle.path);
+            }
+        }
+        readaheadHead = (readaheadHead + 1) % readaheadWindows;
+        readaheadCount--;
+    }
+
+    /**
+     * Quiesces every window the ring still has in flight and forgets them, keeping the buffers. Mirrors
+     * {@link #resetStaging} for the burst table, and like it does not touch the other mechanism's state —
+     * the run counter and frontier are left to the caller ({@link #noteBlockingRead} resets the run; a
+     * close just drops everything).
+     */
+    private void quiesceReadahead() {
+        if (readaheadRing == null) {
+            return;
+        }
+        while (readaheadCount > 0) {
+            retireHead();
+        }
+        readaheadHead = 0;
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -847,7 +1194,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             false,
             bufferSize,
             maxStagedRanges,
-            maxStagedRangeBytes
+            maxStagedRangeBytes,
+            readaheadWindows,
+            readaheadTrigger
         );
     }
 
@@ -865,7 +1214,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             false,
             bufferSize,
             maxStagedRanges,
-            maxStagedRangeBytes
+            maxStagedRangeBytes,
+            readaheadWindows,
+            readaheadTrigger
         );
         copy.filePointer = filePointer;
         return copy;
@@ -878,6 +1229,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
         closed = true;
         resetStaging();
+        quiesceReadahead();
         if (ownsHandle) {
             handle.channel.close();
             // One snapshot per file closed, and deliberately not per burst or per clone: clones close once

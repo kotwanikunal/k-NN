@@ -815,4 +815,255 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
         assertEquals("served bytes cannot depend on the bound, scattered", measured[0][2], measured[2][2]);
         assertEquals("served bytes cannot depend on the bound, clustered", measured[1][2], measured[3][2]);
     }
+
+    // -----------------------------------------------------------------------------------------------
+    // 5. Sequential read-ahead ring
+    //
+    // The ring exists to close the gap prefetch never covers: a bulk sequential consumer (a merge, the
+    // faiss-unquantized exact first pass, traversal) issues no prefetch() and so reads one blocking QD1
+    // window at a time. These tests assert the ring arms on a forward run and not otherwise, serves
+    // correct bytes, stands down under a prefetch burst, and is exact passthrough when disabled.
+    // -----------------------------------------------------------------------------------------------
+
+    /** Reads every vector in ascending order and checks it against the written data. @return blockingReads. */
+    @SneakyThrows
+    private long sequentialScan(final DirectIOVectorIndexInput input, final float[][] vectors) {
+        final float[] scratch = new float[DIMENSION];
+        for (int ord = 0; ord < vectors.length; ord++) {
+            input.seek(HEADER_LENGTH + (long) ord * VECTOR_BYTES);
+            input.readFloats(scratch, 0, DIMENSION);
+            assertArrayEquals("ordinal " + ord, vectors[ord], scratch, 0.0f);
+        }
+        return DirectIOVectorIndexInput.STATS.blockingReads();
+    }
+
+    /**
+     * With the window at zero the ring is off: no field is written, no read is issued, and the input is
+     * byte-for-byte and syscall-for-syscall what it is with this code absent. This is the arm every other
+     * Direct I/O number was taken against, so it has to be a true passthrough rather than a quiet ring.
+     */
+    @SneakyThrows
+    public void testReadaheadWindowZeroIsExactPassthrough() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(1500);
+        final Path path = writeVectorFile(dir, vectors);
+
+        DirectIOReadPool.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 0, 2)) {
+            assertNotNull(input);
+            assertEquals("window zero must mean the ring is off", 0, input.readaheadWindows());
+            final long blocking = sequentialScan(input, vectors);
+            assertTrue("a passthrough scan still issues its blocking reads, blocking=" + blocking, blocking > 100);
+        }
+        assertEquals("the ring must never arm when off", 0L, DirectIOVectorIndexInput.STATS.readaheadArmed());
+        assertEquals("the ring must issue no reads when off", 0L, DirectIOVectorIndexInput.STATS.readaheadReads());
+        assertEquals("the ring must serve nothing when off", 0L, DirectIOVectorIndexInput.STATS.readaheadHits());
+        assertEquals("no ring, no ring bytes", 0L, DirectIOVectorIndexInput.STATS.readaheadBytes());
+    }
+
+    /**
+     * A forward scan arms the ring and most of its reads come from it, so the blocking-read count collapses
+     * far below the passthrough count at identical served bytes. This is the whole point: sequential
+     * O_DIRECT stops being one QD1 pread per window.
+     */
+    @SneakyThrows
+    public void testSequentialScanArmsAndServesFromTheRing() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(1500);
+        final Path path = writeVectorFile(dir, vectors);
+
+        // Baseline: passthrough.
+        DirectIOReadPool.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+        final long passthroughBlocking;
+        final long passthroughServed;
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 0, 2)) {
+            passthroughBlocking = sequentialScan(input, vectors);
+            passthroughServed = DirectIOVectorIndexInput.STATS.servedBytes();
+        }
+
+        // Armed: the same scan with an eight-window ring.
+        DirectIOReadPool.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+        final long armedBlocking;
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 8, 2)) {
+            assertEquals(8, input.readaheadWindows());
+            armedBlocking = sequentialScan(input, vectors);
+        }
+        logger.info(
+            "readahead sequential: passthroughBlocking={} armedBlocking={} | {}",
+            passthroughBlocking,
+            armedBlocking,
+            DirectIOVectorIndexInput.STATS
+        );
+        assertTrue("the ring must arm on a forward scan", DirectIOVectorIndexInput.STATS.readaheadArmed() > 0);
+        assertTrue(
+            "most reads must come from the ring, hits=" + DirectIOVectorIndexInput.STATS.readaheadHits(),
+            DirectIOVectorIndexInput.STATS.readaheadHits() > 100
+        );
+        assertTrue("the ring must issue reads", DirectIOVectorIndexInput.STATS.readaheadReads() > 0);
+        assertTrue(
+            "arming must collapse the blocking-read count, " + passthroughBlocking + " -> " + armedBlocking,
+            armedBlocking < passthroughBlocking / 2
+        );
+        assertEquals("served bytes cannot change with the ring on", passthroughServed, DirectIOVectorIndexInput.STATS.servedBytes());
+    }
+
+    /**
+     * The no-waste proof. A random (rescore-shaped) access pattern must never cross the trigger, so the
+     * ring issues ZERO speculative reads — O_DIRECT's no-amplification behaviour on the rescore pattern is
+     * preserved exactly even with read-ahead configured on.
+     */
+    @SneakyThrows
+    public void testRandomAccessNeverArmsTheRing() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(20000);
+        final Path path = writeVectorFile(dir, vectors);
+        final int[] ords = scatteredOrds(400, vectors.length);
+        final float[] scratch = new float[DIMENSION];
+
+        DirectIOReadPool.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 8, 2)) {
+            assertNotNull(input);
+            for (final int ord : ords) {
+                input.seek(HEADER_LENGTH + (long) ord * VECTOR_BYTES);
+                input.readFloats(scratch, 0, DIMENSION);
+                assertArrayEquals(vectors[ord], scratch, 0.0f);
+            }
+        }
+        logger.info("readahead no-waste: {}", DirectIOVectorIndexInput.STATS);
+        assertEquals("random access must never arm the ring", 0L, DirectIOVectorIndexInput.STATS.readaheadArmed());
+        assertEquals("random access must issue zero speculative reads", 0L, DirectIOVectorIndexInput.STATS.readaheadReads());
+        assertEquals("and serve nothing from it", 0L, DirectIOVectorIndexInput.STATS.readaheadHits());
+    }
+
+    /**
+     * While a prefetch burst is active the ring stands down — the rescore scorer owns the input, its access
+     * is random and bursty, and the burst table serves it. The ring issues zero reads; the burst's hits are
+     * unchanged. The two mechanisms coexist without resetting each other.
+     */
+    @SneakyThrows
+    public void testActiveBurstMakesTheRingStandDown() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(1500);
+        final Path path = writeVectorFile(dir, vectors);
+        final float[] scratch = new float[DIMENSION];
+
+        DirectIOReadPool.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 8, 2)) {
+            assertNotNull(input);
+            // One burst up front, left active for the whole scan (no second prefetch, so no reset). Then
+            // read ascending: reads the burst covers are served from it, the rest go blocking and try to
+            // arm the ring, which must stand down because stagedCount > 0.
+            for (int ord = 0; ord < vectors.length; ord++) {
+                input.prefetch(HEADER_LENGTH + (long) ord * VECTOR_BYTES, VECTOR_BYTES);
+            }
+            for (int ord = 0; ord < vectors.length; ord++) {
+                input.seek(HEADER_LENGTH + (long) ord * VECTOR_BYTES);
+                input.readFloats(scratch, 0, DIMENSION);
+                assertArrayEquals("ordinal " + ord, vectors[ord], scratch, 0.0f);
+            }
+        }
+        logger.info("readahead stand-down: {}", DirectIOVectorIndexInput.STATS);
+        assertTrue("the burst must have served reads", DirectIOVectorIndexInput.STATS.stagedHits() > 0);
+        assertEquals("an active burst must suppress all ring reads", 0L, DirectIOVectorIndexInput.STATS.readaheadReads());
+        assertEquals("and all ring hits", 0L, DirectIOVectorIndexInput.STATS.readaheadHits());
+    }
+
+    /**
+     * A backward jump mid-scan is a discontinuity: the ring quiesces the now-wrong windows, the bytes stay
+     * correct, and a renewed forward run re-arms it. Proves the detection ramp both tears down and rebuilds.
+     */
+    @SneakyThrows
+    public void testBackwardSeekQuiescesThenReArms() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(1500);
+        final Path path = writeVectorFile(dir, vectors);
+        final float[] scratch = new float[DIMENSION];
+
+        DirectIOReadPool.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 8, 2)) {
+            assertNotNull(input);
+            // Forward through the first half: arms.
+            for (int ord = 0; ord < 700; ord++) {
+                input.seek(HEADER_LENGTH + (long) ord * VECTOR_BYTES);
+                input.readFloats(scratch, 0, DIMENSION);
+                assertArrayEquals("fwd " + ord, vectors[ord], scratch, 0.0f);
+            }
+            final long armedFirst = DirectIOVectorIndexInput.STATS.readaheadArmed();
+            assertTrue("the first run must arm", armedFirst > 0);
+            // Jump back to the start and scan forward again: the ring must quiesce and re-arm.
+            for (int ord = 0; ord < 700; ord++) {
+                input.seek(HEADER_LENGTH + (long) ord * VECTOR_BYTES);
+                input.readFloats(scratch, 0, DIMENSION);
+                assertArrayEquals("back " + ord, vectors[ord], scratch, 0.0f);
+            }
+            assertTrue("the renewed forward run must re-arm", DirectIOVectorIndexInput.STATS.readaheadArmed() > armedFirst);
+        }
+    }
+
+    /**
+     * A slice carries its own ring, as it carries its own buffers and burst table today, so a slice of this
+     * input reads correctly and arms on its own forward run.
+     */
+    @SneakyThrows
+    public void testSliceCarriesItsOwnRing() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(1500);
+        final Path path = writeVectorFile(dir, vectors);
+        final float[] scratch = new float[DIMENSION];
+
+        DirectIOReadPool.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 8, 2)) {
+            assertNotNull(input);
+            final DirectIOVectorIndexInput region = input.slice("vectors", HEADER_LENGTH, (long) vectors.length * VECTOR_BYTES);
+            assertEquals("a slice inherits the window", 8, region.readaheadWindows());
+            for (int ord = 0; ord < vectors.length; ord++) {
+                region.seek((long) ord * VECTOR_BYTES);
+                region.readFloats(scratch, 0, DIMENSION);
+                assertArrayEquals("slice ordinal " + ord, vectors[ord], scratch, 0.0f);
+            }
+        }
+        assertTrue("the slice's ring must arm and serve", DirectIOVectorIndexInput.STATS.readaheadHits() > 100);
+    }
+
+    /**
+     * Both read-ahead settings are read at open and default to off, mirroring the staging-bound test above:
+     * installing this change on a node with no settings written leaves the input a pure passthrough.
+     */
+    @SneakyThrows
+    public void testReadaheadSettingsAreReadFromSettingsAndDefaultToOff() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final Path path = writeVectorFile(dir, randomVectors(8));
+
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+            assertNotNull(input);
+            assertEquals("the window must default to off", 0, input.readaheadWindows());
+            assertEquals("the trigger must default to the measured value", 2, input.readaheadTrigger());
+        }
+
+        withNodeSettings(
+            Settings.builder()
+                .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 8)
+                .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_TRIGGER, 3)
+                .build()
+        );
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+            assertNotNull(input);
+            assertEquals("the window must follow the setting", 8, input.readaheadWindows());
+            assertEquals("the trigger must follow the setting", 3, input.readaheadTrigger());
+        }
+    }
 }
