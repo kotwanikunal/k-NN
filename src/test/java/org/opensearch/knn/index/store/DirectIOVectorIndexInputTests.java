@@ -1039,18 +1039,19 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
     }
 
     /**
-     * Both read-ahead settings are read at open and default to off, mirroring the staging-bound test above:
-     * installing this change on a node with no settings written leaves the input a pure passthrough.
+     * Both read-ahead settings are read at open and default to the measured values, mirroring the
+     * staging-bound test above. The window default of 8 is what the block-layer sweep earned; 0 is still
+     * reachable by setting, and is the exact-passthrough escape hatch.
      */
     @SneakyThrows
-    public void testReadaheadSettingsAreReadFromSettingsAndDefaultToOff() {
+    public void testReadaheadSettingsAreReadFromSettingsAndDefaultToTheMeasuredValues() {
         assumeDirectIOWorksHere();
         final Path dir = createTempDir();
         final Path path = writeVectorFile(dir, randomVectors(8));
 
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
-            assertEquals("the window must default to off", 0, input.readaheadWindows());
+            assertEquals("the window must default to the measured value", 8, input.readaheadWindows());
             assertEquals("the trigger must default to the measured value", 2, input.readaheadTrigger());
         }
 
