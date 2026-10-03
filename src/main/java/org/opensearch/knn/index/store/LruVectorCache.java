@@ -169,15 +169,53 @@ public final class LruVectorCache {
     }
 
     /**
-     * The node's configured per-source budget in bytes, or zero - meaning no cache - if it cannot be read.
+     * Largest per-source budget this will honour, whatever the setting says.
+     *
+     * <p>The budget is charged <b>per source</b> — one field in one segment — so the node-wide footprint is
+     * this times the number of open rescore-served segments, and an operator setting it has no way to know
+     * that number in advance. On Oct 2 an operator set it to 1 GB on a node with 32 GB of RAM and a 26 GB
+     * heap; it happened to cost nothing only because this class is not currently reachable from the query
+     * path, which is not a property to rely on.
+     *
+     * <p>128 MB rather than a smaller number because it is the largest budget the reuse analysis in the
+     * class javadoc actually evaluated: the hit rate goes 41.4 % at 4 MB, 44.2 % at 8 MB, 45.3 % at 16 MB,
+     * 50.3 % at 128 MB. Above it the setting is unmeasured, and the curve says there is nothing left to
+     * buy — 128 MB is sixteen times the default for six points of hit rate.
+     */
+    static final long MAX_BUDGET_BYTES_PER_SOURCE = 128L * 1024 * 1024;
+
+    /**
+     * The node's configured per-source budget in bytes, clamped to {@link #MAX_BUDGET_BYTES_PER_SOURCE},
+     * or zero - meaning no cache - if it cannot be read.
      *
      * <p>Read defensively, for the reason every setting on this path is: a setting that cannot be read must
      * leave the query working, and the safe direction here is no cache.
+     *
+     * <p>Clamped <em>here</em>, at the point of use, rather than bounded on the setting itself. A
+     * {@code Setting.byteSizeSetting} with a maximum would reject the value, which is the better signal to
+     * an operator typing a {@code PUT} but turns an already-persisted oversized value into a node that
+     * will not start. Clamping keeps the key's contract unchanged, costs an operator nothing they can
+     * observe except a {@code WARN}, and is the smaller change.
      */
     static long budgetBytesFromSettings() {
         try {
             final ByteSizeValue configured = KNNSettings.getDirectIORescoreCacheBytesPerSource();
-            return configured == null ? 0L : configured.getBytes();
+            if (configured == null) {
+                return 0L;
+            }
+            final long requested = configured.getBytes();
+            if (requested > MAX_BUDGET_BYTES_PER_SOURCE) {
+                log.warn(
+                    "{} is set to {} bytes, which is above the {} byte maximum this cache honours; using the maximum. "
+                        + "The budget is charged per field per segment, so the node-wide cost is this times the number of "
+                        + "open rescore-served segments.",
+                    KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE,
+                    requested,
+                    MAX_BUDGET_BYTES_PER_SOURCE
+                );
+                return MAX_BUDGET_BYTES_PER_SOURCE;
+            }
+            return requested;
         } catch (Exception e) {
             log.debug(
                 "Could not read {}; serving the rescore seam without a cache",

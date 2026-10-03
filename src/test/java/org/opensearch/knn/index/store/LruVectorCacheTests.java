@@ -304,6 +304,42 @@ public class LruVectorCacheTests extends KNNTestCase {
         assertEquals(new ByteSizeValue(4, ByteSizeUnit.MB).getBytes(), atFourMegabytes.budgetBytes());
     }
 
+    /**
+     * A budget above the maximum is clamped rather than honoured. The budget is charged per field per
+     * segment, so an operator who sets a gigabyte is asking for a gigabyte times however many
+     * rescore-served segments the node has open — a number they cannot see. On Oct 2 an operator did set
+     * 1 GB, on a node with 32 GB of RAM.
+     *
+     * <p>The clamp, not a rejection: bounding the setting itself would be the better signal on a
+     * {@code PUT} but would turn an already-persisted oversized value into a node that will not start.
+     */
+    public void testABudgetAboveTheMaximumIsClamped() {
+        setNodeSettings(Settings.builder().put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE, "1gb").build());
+        final LruVectorCache clamped = LruVectorCache.forSource("test", 768);
+        assertNotNull(clamped);
+        assertEquals("a 1 GB per-source budget must not be honoured", LruVectorCache.MAX_BUDGET_BYTES_PER_SOURCE, clamped.budgetBytes());
+    }
+
+    /** At or below the maximum nothing is clamped, so the measured 128 MB arm stays reachable. */
+    public void testABudgetAtTheMaximumIsHonouredExactly() {
+        setNodeSettings(Settings.builder().put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE, "128mb").build());
+        final LruVectorCache atMaximum = LruVectorCache.forSource("test", 768);
+        assertNotNull(atMaximum);
+        assertEquals(LruVectorCache.MAX_BUDGET_BYTES_PER_SOURCE, atMaximum.budgetBytes());
+        assertEquals(new ByteSizeValue(128, ByteSizeUnit.MB).getBytes(), atMaximum.budgetBytes());
+    }
+
+    /**
+     * The clamp is on the setting, not on the package-private explicit-budget factory, which tests and
+     * measurements use to sweep budgets the node setting would not allow.
+     */
+    public void testTheClampDoesNotApplyToAnExplicitBudget() {
+        final long aboveMaximum = LruVectorCache.MAX_BUDGET_BYTES_PER_SOURCE * 2;
+        final LruVectorCache explicit = LruVectorCache.forSource("test", 768, aboveMaximum);
+        assertNotNull(explicit);
+        assertEquals(aboveMaximum, explicit.budgetBytes());
+    }
+
     /** A source opened in a harness that never gave KNNSettings a ClusterService still gets the default. */
     public void testForSourceWithoutAClusterServiceUsesTheDefault() {
         KNNSettings.state().setClusterService(null);
