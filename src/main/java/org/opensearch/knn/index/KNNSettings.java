@@ -162,9 +162,38 @@ public class KNNSettings {
     public static final int KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_DEFAULT_VALUE = 48;
     // Upper bound on in-flight reads across the whole node, not per segment: per-leaf scoring tasks run
     // concurrently, so total in-flight is segments x window, and a per-segment bound oversaturates the
-    // device. Sized to the device queue rather than to the core count for that reason.
+    // device.
+    //
+    // DERIVED FROM THE CORE COUNT, not fixed at 64. The fixed 64 was sized to the device queue
+    // (nr_requests = 63) on a host with cores to spare, and on a 4-vCPU node it is 16x oversubscribed:
+    // 64 reader threads contend for 4 cores with the search threads that are waiting on them, and every
+    // staged read then queues behind ~13 others (measured: a 16-thread concurrent probe on 4 pinned cores
+    // held 654-857 tasks queued with all 64 threads active). clamp(2 x cores, 2, 16) keeps enough threads
+    // to overlap reads on a small box without that contention, and still reaches a useful queue depth on a
+    // large one. An operator who wants the old value sets the key explicitly; only the DEFAULT moves.
     public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS = "knn.direct_io.rescore.prefetch_threads";
-    public static final int KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_DEFAULT_VALUE = 64;
+    public static final int KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_DEFAULT_VALUE = defaultDirectIORescorePrefetchThreads();
+
+    /** Lower bound on the derived pool size: two threads is the smallest pool that can overlap two reads. */
+    static final int KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_MIN = 2;
+
+    /**
+     * Upper bound on the derived pool size. 16 rather than the device queue's 63 because the queue depth
+     * that helps is bounded by the device, not by the host: phase 9 measured a 200-wide fan-out at p90 2.2x
+     * and p99 2.0x worse than a 64-wide one, and 16 readers x the staged ranges each one holds already
+     * offers the device more than it can retire.
+     */
+    static final int KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_MAX = 16;
+
+    /**
+     * {@code clamp(2 x availableProcessors, 2, 16)} — two readers per core so a read can overlap the
+     * scoring that follows it, bounded below so the pool can always overlap something and above so a large
+     * host does not offer the device more than it can retire.
+     */
+    private static int defaultDirectIORescorePrefetchThreads() {
+        final int cores = Runtime.getRuntime().availableProcessors();
+        return Math.min(KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_MAX, Math.max(KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_MIN, 2 * cores));
+    }
 
     // Memory budget for the rescore seam's full-precision vector cache, per loader source, i.e. per field
     // per segment. Zero means the cache is not built at all, which is the arm to compare against: with it
@@ -507,6 +536,10 @@ public class KNNSettings {
      * Node level size of the shared pool that performs the rescore seam's reads, and so the bound on
      * in-flight Direct I/O reads for the whole node. Threads are created on demand and reaped when idle,
      * so on a node whose rescore traffic never engages the seam the pool costs nothing.
+     * <p>
+     * The <b>default</b> is {@code clamp(2 x availableProcessors, 2, 16)} rather than a fixed 64, so that
+     * the pool scales down to a small node instead of oversubscribing it 16x. The bounds of the setting
+     * itself are unchanged, so an operator who has set a value keeps it.
      */
     public static final Setting<Integer> KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING = Setting.intSetting(
         KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS,

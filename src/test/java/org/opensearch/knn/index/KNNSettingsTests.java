@@ -402,7 +402,48 @@ public class KNNSettingsTests extends KNNTestCase {
     public void testDirectIORescorePrefetchSettings_defaults() {
         assertTrue(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED_SETTING.getDefault(Settings.EMPTY));
         assertEquals(Integer.valueOf(48), KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_SETTING.getDefault(Settings.EMPTY));
-        assertEquals(Integer.valueOf(64), KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING.getDefault(Settings.EMPTY));
+        assertEquals(
+            Integer.valueOf(expectedPrefetchThreadsDefault()),
+            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING.getDefault(Settings.EMPTY)
+        );
+    }
+
+    /**
+     * The pool default is derived from the core count rather than fixed at 64, so that a 4-vCPU node does
+     * not get 64 reader threads contending with the search threads that wait on them. Asserted as the
+     * clamp rather than as a literal, because the literal differs between the CI host and the node; the
+     * properties worth pinning are the two bounds and the 2x slope.
+     */
+    public void testDirectIORescorePrefetchThreads_defaultIsClampedAroundTheCoreCount() {
+        final int derived = KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING.getDefault(Settings.EMPTY);
+        assertEquals(expectedPrefetchThreadsDefault(), derived);
+        assertTrue(
+            "the derived pool size must not drop below " + KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_MIN,
+            derived >= KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_MIN
+        );
+        assertTrue(
+            "the derived pool size must not exceed " + KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_MAX,
+            derived <= KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_MAX
+        );
+    }
+
+    /** An explicitly set value still wins: only the default moved, so the operator contract is unchanged. */
+    public void testDirectIORescorePrefetchThreads_explicitValueStillWins() {
+        assertEquals(
+            Integer.valueOf(64),
+            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING.get(
+                Settings.builder().put(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS, 64).build()
+            )
+        );
+    }
+
+    /** {@code clamp(2 x cores, 2, 16)}, recomputed here so the test states the rule rather than a number. */
+    private static int expectedPrefetchThreadsDefault() {
+        final int cores = Runtime.getRuntime().availableProcessors();
+        return Math.min(
+            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_MAX,
+            Math.max(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_MIN, 2 * cores)
+        );
     }
 
     /** A window or pool size of zero would mean "no reads at all"; the bounds have to reject it. */
@@ -418,7 +459,7 @@ public class KNNSettingsTests extends KNNTestCase {
     public void testDirectIORescorePrefetchAccessors_returnDefaultsWhenUnset() {
         assertTrue(KNNSettings.isDirectIORescorePrefetchEnabled());
         assertEquals(48, KNNSettings.getDirectIORescorePrefetchWindow());
-        assertEquals(64, KNNSettings.getDirectIORescorePrefetchThreads());
+        assertEquals(expectedPrefetchThreadsDefault(), KNNSettings.getDirectIORescorePrefetchThreads());
     }
 
     /**
@@ -429,13 +470,16 @@ public class KNNSettingsTests extends KNNTestCase {
         KNNSettings.state().setClusterService(null);
         assertTrue(KNNSettings.isDirectIORescorePrefetchEnabled());
         assertEquals(48, KNNSettings.getDirectIORescorePrefetchWindow());
-        assertEquals(64, KNNSettings.getDirectIORescorePrefetchThreads());
+        assertEquals(expectedPrefetchThreadsDefault(), KNNSettings.getDirectIORescorePrefetchThreads());
     }
 
     public void testDirectIORescorePrefetchSettings_areReadableByKey() {
         assertEquals(Boolean.TRUE, KNNSettings.state().getSettingValue(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED));
         assertEquals(Integer.valueOf(48), KNNSettings.state().getSettingValue(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW));
-        assertEquals(Integer.valueOf(64), KNNSettings.state().getSettingValue(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS));
+        assertEquals(
+            Integer.valueOf(expectedPrefetchThreadsDefault()),
+            KNNSettings.state().getSettingValue(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS)
+        );
     }
 
     public void testDirectIONodeSettingAccessors_returnDefaultsWhenUnset() {
