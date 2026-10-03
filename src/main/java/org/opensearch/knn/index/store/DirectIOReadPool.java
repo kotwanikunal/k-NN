@@ -8,8 +8,8 @@ package org.opensearch.knn.index.store;
 import lombok.extern.log4j.Log4j2;
 import org.opensearch.knn.index.KNNSettings;
 
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -36,9 +36,31 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <p>The idle timeout is safe here for a reason worth stating rather than assuming: reaping a thread can
  * only lose work if the queue can be non-empty with no worker to drain it, and
- * {@link ThreadPoolExecutor} replaces a worker that exits while work is queued. Every task is also
- * awaited by the thread that submitted it before that thread can finish its batch, so an unbounded queue
- * cannot grow past {@code concurrent scorers x window} entries.
+ * {@link ThreadPoolExecutor} replaces a worker that exits while work is queued.
+ *
+ * <h2>The queue is bounded, and why the old argument for leaving it unbounded no longer holds</h2>
+ * This pool used to be an {@code Executors.newFixedThreadPool}, i.e. an unbounded
+ * {@code LinkedBlockingQueue}, on the argument that every task is awaited by the thread that submitted it
+ * before that thread can finish its batch, so the queue could not grow past
+ * {@code concurrent scorers x window} entries. Two things falsify that:
+ *
+ * <ul>
+ *   <li>{@code DirectIOVectorIndexInput}'s sequential read-ahead ring also submits, and a ring window can
+ *       be <em>retired without ever being awaited</em>, so not every task has a waiting submitter.</li>
+ *   <li>{@code concurrent scorers x window} is not small. Measured: a 16-thread probe driving the real
+ *       stack on 4 pinned cores with the shipped {@code staged_ranges=64} held <b>654-857 tasks
+ *       queued</b> with all 64 threads active, sustained. Every staged read in that state waits behind
+ *       about thirteen others, on a search thread, with no bound.</li>
+ * </ul>
+ *
+ * So the queue is an {@link ArrayBlockingQueue} of {@link #queueCapacity}, and a submit past it is
+ * refused with the default abort policy. That is not a new failure mode: both submit sites already catch
+ * {@link java.util.concurrent.RejectedExecutionException} and fall back — {@code prefetch} counts
+ * {@code stageDeclined} and lets the bytes be served by a blocking read, {@code refillReadahead} counts
+ * {@code readaheadDeclined} and leaves the scan at queue depth one. Bounding the queue makes those
+ * already-written paths reachable rather than adding anything. Declining is also the <em>cheaper</em>
+ * fallback: a declined prefetch span is replaced by blocking reads of only the blocks a vector actually
+ * occupies, where caller-running the submit would read the whole span inline.
  *
  * <p>Resizing is live: a change to the setting is applied on the next {@link #executor()} call, which
  * happens once per scorer, so the pool follows the setting without a restart. Shrinking is honoured the
@@ -49,6 +71,21 @@ final class DirectIOReadPool {
 
     /** How long an idle reader thread is kept before it is reaped. */
     static final long KEEP_ALIVE_SECONDS = 60L;
+
+    /**
+     * Reads one reader thread may have waiting behind it. Past about this depth a queued read costs more to
+     * wait for than to issue on the calling thread, and more than that to wait for than to decline.
+     */
+    static final int QUEUED_READS_PER_THREAD = 8;
+
+    /**
+     * Floor on the queue, so that one whole prefetch burst from one scorer always fits. This is a
+     * compatibility bound rather than a tuning one: {@code PrefetchHelper} is driven by Lucene's
+     * 64-ordinal bulk batch, and task-15 measured that a table which declines the tail of every burst
+     * makes 5.4 blocking reads per query and a paced p99 of 30 ms where one that holds the burst makes 0.0
+     * and 11 ms. A queue that could not hold a burst would reintroduce exactly that.
+     */
+    static final int MIN_QUEUE_CAPACITY = 64;
 
     /** Reader threads are named from this so that a thread dump attributes the read to this seam. */
     static final String THREAD_NAME_PREFIX = "knn-direct-io-rescore-";
@@ -97,12 +134,28 @@ final class DirectIOReadPool {
             resize(executor, threads);
             return executor;
         }
-        final ThreadPoolExecutor created = (ThreadPoolExecutor) Executors.newFixedThreadPool(threads, THREAD_FACTORY);
-        created.setKeepAliveTime(KEEP_ALIVE_SECONDS, TimeUnit.SECONDS);
+        final int capacity = queueCapacity(threads);
+        final ThreadPoolExecutor created = new ThreadPoolExecutor(
+            threads,
+            threads,
+            KEEP_ALIVE_SECONDS,
+            TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(capacity),
+            THREAD_FACTORY
+        );
         created.allowCoreThreadTimeOut(true);
-        log.info("Direct I/O rescore reads will run on a shared pool of up to {} threads", threads);
+        log.info("Direct I/O rescore reads will run on a shared pool of up to {} threads with at most {} reads queued", threads, capacity);
         executor = created;
         return created;
+    }
+
+    /**
+     * How many reads may wait behind the pool, derived from the size it is created at. Not resized when the
+     * setting changes, because {@link ArrayBlockingQueue} has no resize and because the safe direction is
+     * the one that happens anyway: growing the pool leaves the queue relatively shallower.
+     */
+    static int queueCapacity(final int threads) {
+        return Math.max(MIN_QUEUE_CAPACITY, QUEUED_READS_PER_THREAD * threads);
     }
 
     /**

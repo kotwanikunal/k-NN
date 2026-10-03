@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
@@ -97,5 +98,65 @@ public class DirectIOReadPoolTests extends KNNTestCase {
 
         assertSame(pool, DirectIOReadPool.executor());
         assertEquals(expected, pool.getCorePoolSize());
+    }
+
+    /**
+     * The queue is bounded, which is the whole of the hardening: with an unbounded one a search thread can
+     * end up waiting on a read queued behind hundreds of others with no bound at all. Measured on the real
+     * stack: 654-857 tasks queued, sustained, at 16 concurrent readers on 4 cores.
+     */
+    public void testTheQueueIsBounded() {
+        final ThreadPoolExecutor pool = (ThreadPoolExecutor) DirectIOReadPool.executor();
+        final int expected = DirectIOReadPool.queueCapacity(org.opensearch.knn.index.KNNSettings.getDirectIORescorePrefetchThreads());
+        assertEquals(
+            "an unbounded queue is the thing this bound exists to prevent",
+            expected,
+            pool.getQueue().remainingCapacity() + pool.getQueue().size()
+        );
+    }
+
+    /**
+     * The floor matters for a reason that is not about safety: one prefetch burst is Lucene's 64-ordinal
+     * bulk batch, and task-15 measured that a staging path which declines the tail of every burst makes
+     * 5.4 blocking reads per query and a paced p99 of 30 ms against 0.0 and 11 ms for one that holds it.
+     * So the queue must hold a whole burst however small the pool is.
+     */
+    public void testTheQueueAlwaysHoldsAWholeBurst() {
+        assertEquals(DirectIOReadPool.MIN_QUEUE_CAPACITY, DirectIOReadPool.queueCapacity(1));
+        assertEquals(DirectIOReadPool.MIN_QUEUE_CAPACITY, DirectIOReadPool.queueCapacity(8));
+        assertEquals(8 * DirectIOReadPool.QUEUED_READS_PER_THREAD, DirectIOReadPool.queueCapacity(8));
+        assertEquals(64 * DirectIOReadPool.QUEUED_READS_PER_THREAD, DirectIOReadPool.queueCapacity(64));
+    }
+
+    /**
+     * Past the bound a submit is refused rather than queued, and refused is a condition both submit sites
+     * already handle: {@code prefetch} counts {@code stageDeclined} and lets a blocking read serve the
+     * bytes, {@code refillReadahead} counts {@code readaheadDeclined}. This test pins that the pool really
+     * does refuse, because if it silently queued instead, those fallbacks would stay dead code.
+     */
+    @SneakyThrows
+    public void testSubmitIsRefusedPastTheBoundRatherThanQueuedForever() {
+        final ThreadPoolExecutor pool = (ThreadPoolExecutor) DirectIOReadPool.executor();
+        final CountDownLatch release = new CountDownLatch(1);
+        final int toSubmit = pool.getMaximumPoolSize() + pool.getQueue().remainingCapacity() + 1;
+        int accepted = 0;
+        boolean refused = false;
+        try {
+            for (int i = 0; i < toSubmit; i++) {
+                try {
+                    pool.submit(() -> {
+                        release.await();
+                        return null;
+                    });
+                    accepted++;
+                } catch (RejectedExecutionException e) {
+                    refused = true;
+                    break;
+                }
+            }
+        } finally {
+            release.countDown();
+        }
+        assertTrue("the pool must refuse past its bound, not queue without limit; accepted " + accepted, refused);
     }
 }
