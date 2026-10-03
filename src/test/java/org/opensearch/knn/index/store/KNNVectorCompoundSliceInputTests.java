@@ -100,7 +100,7 @@ public class KNNVectorCompoundSliceInputTests extends KNNTestCase {
 
     @SneakyThrows
     private void assumeDirectIOWorksHere() {
-        final OpenOption direct = DirectIOVectorSource.directOpenOption();
+        final OpenOption direct = DirectIOVectorIndexInput.directOpenOption();
         assumeTrue("this JDK has no ExtendedOpenOption.DIRECT", direct != null);
         final Path probe = createTempDir().resolve("probe");
         Files.write(probe, new byte[8192]);

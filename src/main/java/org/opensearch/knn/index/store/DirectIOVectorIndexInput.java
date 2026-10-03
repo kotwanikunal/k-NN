@@ -36,8 +36,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * block-aligned reads in flight on {@link DirectIOReadPool}.
  *
  * <p><b>This class exists to answer one question</b> — Phase 9b gate 2. The rescore seam reaches its queue
- * depth through a seam of its own ({@link VectorStagingArea#stage}, driven by a query-layer scorer wrapper),
- * because Lucene's {@code DirectIOIndexInput} has no {@code prefetch} member at all and
+ * depth through a seam of its own (a staging interface driven by a query-layer scorer wrapper, removed in
+ * phase 12 H5), because Lucene's {@code DirectIOIndexInput} has no {@code prefetch} member at all and
  * {@link IndexInput#prefetch} defaults to a no-op. A {@code Directory}-based design has no query-layer
  * wrapper to lean on, so it can only match the seam's numbers if an {@code IndexInput} can carry read-ahead
  * by itself. That is what this class tests, and it is deliberately not wired into the codec: gate 2 is about
@@ -61,7 +61,7 @@ import java.util.concurrent.atomic.AtomicLong;
  *       staging table here is keyed by <b>file range</b> and an entry survives being read.</li>
  *   <li>A burst has no explicit boundary. It is recovered instead: the first {@link #prefetch} to arrive
  *       after any read ends the previous burst and quiesces its table, which is exactly what
- *       {@code DirectIOVectorSource.Reader#stage} does with {@code abandonBatch()} on entry.</li>
+ *       the rescore seam's staging reader did with {@code abandonBatch()} on entry.</li>
  * </ul>
  *
  * <h2>Two things this class must not be, both load bearing</h2>
@@ -119,9 +119,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * One block-aligned range staged by {@link #prefetch}, keyed by the range it holds rather than by a
      * position in a ring.
      *
-     * <p>The claim is what makes a buffer reusable, and it is {@code DirectIOVectorSource.StagedRead}'s
-     * argument verbatim: {@code Future#cancel} completes the future while a started read runs on, so a read
-     * abandoned before it began is skipped by the claim and one that has begun is waited out.
+     * <p>The claim is what makes a buffer reusable: {@code Future#cancel} completes the future while a
+     * started read runs on, so a read abandoned before it began is skipped by the claim and one that has
+     * begun is waited out.
      */
     private static final class StagedRange implements Callable<Void> {
         private final FileChannel channel;
@@ -516,7 +516,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * Opens {@code path} with {@code O_DIRECT} and returns an input over the whole file, or {@code null}
      * when Direct I/O cannot serve it — no {@code ExtendedOpenOption.DIRECT} on this JDK, a filesystem that
      * answers {@code EINVAL}, or a path that is not a regular file. Returning {@code null} rather than
-     * throwing is the same fallback contract {@link DirectIOVectorSource#open} has: a file this cannot serve
+     * throwing is the fallback contract every Direct I/O open in this package has: a file this cannot serve
      * must cost a fall back to the default path, never a failed query.
      */
     public static DirectIOVectorIndexInput open(final Path path) {
@@ -534,8 +534,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * How many ranges one burst may hold in flight, from
      * {@code knn.direct_io.rescore.prefetch.staged_ranges}.
      *
-     * <p>Its own setting rather than the rescore seam's {@code prefetch_window}, which task-15 first tried:
-     * the seam's window is a rolling ring refilled as it drains, this is a table that must <b>hold a whole
+     * <p>Its own setting rather than the rescore seam's removed {@code prefetch_window}, which task-15
+     * first tried: that window was a rolling ring refilled as it drained, this is a table that must
+     * <b>hold a whole
      * burst</b>, and the burst's size is not ours to choose. {@code PrefetchHelper} is driven by Lucene's
      * 64-ordinal bulk batch, so a table smaller than 64 declines the tail of <em>every</em> burst and those
      * ranges become blocking reads on the calling thread. Measured on {@code dio-1m}: at 48 the route made
@@ -622,7 +623,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final int readaheadWindows,
         final int readaheadTrigger
     ) {
-        final OpenOption direct = DirectIOVectorSource.directOpenOption();
+        final OpenOption direct = directOpenOption();
         if (direct == null) {
             log.warn("This JDK does not expose ExtendedOpenOption.DIRECT; a Direct I/O IndexInput cannot be opened");
             return null;
@@ -714,10 +715,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * Puts the block-aligned range covering {@code [offset, offset + length)} in flight on
      * {@link DirectIOReadPool}.
      *
-     * <p>Advisory in both directions, the same contract {@link VectorStagingArea#stage} states: this may
-     * stage nothing, and a caller that then reads something else, or reads out of order, still gets correct
-     * bytes from blocking reads. No returned value tells the caller which happened, so nothing can come to
-     * depend on it.
+     * <p>Advisory in both directions: this may stage nothing, and a caller that then reads something else,
+     * or reads out of order, still gets correct bytes from blocking reads. No returned value tells the
+     * caller which happened, so nothing can come to depend on it.
      *
      * <h2>The span bound is the waste guard, and it is a bound on the span because it cannot be a bound
      * on the waste</h2>
@@ -750,7 +750,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             return;
         }
         // A burst has no explicit boundary, so it is recovered: the first prefetch after any read ends the
-        // previous burst. Same move as DirectIOVectorSource.Reader#stage calling abandonBatch() on entry.
+        // previous burst. Same move the rescore seam's stage() made by calling abandonBatch() on entry.
         if (readSincePrefetch) {
             resetStaging();
         }
@@ -855,7 +855,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * less often. One arena makes a per-input {@code staged_ranges}-slot table <b>one</b>
      * {@code allocateDirect} instead of up to {@code staged_ranges} of them, and drops the per-slot
      * {@code blockSize - 1} alignment slack (12,287 B → 8,192 B per slot at a 4 KiB block), which is the
-     * same arena move {@code DirectIOVectorSource.Reader} already made for its own reader buffers.
+     * same arena move the rescore seam's reader made for its own buffers before phase 12 H5 removed it.
      *
      * <p><b>What this does not claim.</b> It does not bound total direct memory and it does not promise the
      * pages go back to the OS: glibc raises its {@code mmap} threshold to the size of the first {@code mmap}ed
@@ -935,8 +935,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      *
      * <p>Bulk-copies through a {@code FloatBuffer} view when the vector starts four-byte aligned inside the
      * buffer holding it, and falls back to a float at a time when it does not — the same computed guard, for
-     * the same reason, as {@code DirectIOVectorSource.Reader#decode}: the alignment holds for every layout
-     * this meets, and a layout where it does not must cost a slower decode rather than a wrong read.
+     * the same reason, as the rescore seam's decode did: the alignment holds for every layout this meets,
+     * and a layout where it does not must cost a slower decode rather than a wrong read.
      */
     @Override
     public void readFloats(final float[] destination, final int destinationOffset, final int count) throws IOException {
@@ -1054,8 +1054,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             throw new IOException("Interrupted waiting for a Direct I/O read of " + handle.path, e);
         } catch (ExecutionException e) {
             final Throwable cause = e.getCause();
-            // Error propagates for the reason DirectIOVectorSource does not catch it: a direct-buffer
-            // OutOfMemoryError is a misconfiguration to fix, not a condition to read around.
+            // Error propagates rather than being caught: a direct-buffer OutOfMemoryError is a
+            // misconfiguration to fix, not a condition to read around.
             if (cause instanceof Error) {
                 throw (Error) cause;
             }
@@ -1433,5 +1433,28 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
     private static int alignUp(final int value, final int blockSize) {
         return ((value + blockSize - 1) / blockSize) * blockSize;
+    }
+
+    /**
+     * {@code com.sun.nio.file.ExtendedOpenOption.DIRECT}, or {@code null} on a runtime that does not have
+     * it.
+     *
+     * <p>Looked up reflectively for the reasons Lucene's {@code DirectIODirectory} gives for doing the
+     * same: it is a proprietary OpenJDK API that emits an unsuppressible warning when referenced under
+     * {@code --release}, and it does not link at all on runtimes without it. Lucene's own copy of the
+     * constant is private with no accessor.
+     */
+    static OpenOption directOpenOption() {
+        try {
+            final Class<? extends OpenOption> clazz = Class.forName("com.sun.nio.file.ExtendedOpenOption").asSubclass(OpenOption.class);
+            for (final OpenOption option : clazz.getEnumConstants()) {
+                if (option.toString().equalsIgnoreCase("DIRECT")) {
+                    return option;
+                }
+            }
+            return null;
+        } catch (ClassNotFoundException | RuntimeException e) {
+            return null;
+        }
     }
 }

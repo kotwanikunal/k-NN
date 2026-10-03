@@ -280,7 +280,7 @@ public final class KNNVectorCompoundSliceInput extends FilterIndexInput {
     /**
      * A view of the entry over an {@code O_DIRECT} handle on the container, or {@code null} when Direct
      * I/O cannot serve it. Returning {@code null} rather than throwing keeps
-     * {@link DirectIOVectorSource#open}'s fallback contract: a file this cannot serve costs a fall back
+     * {@link DirectIOVectorIndexInput#open}'s fallback contract: a file this cannot serve costs a fall back
      * to the delegate's slice, never a failed read.
      *
      * <p>The container is opened once and every routed entry slices it, because the {@code .cfs} is one

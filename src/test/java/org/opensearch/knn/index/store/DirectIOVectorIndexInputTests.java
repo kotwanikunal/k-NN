@@ -66,8 +66,9 @@ import static org.mockito.Mockito.when;
  *       produces match the mmap path exactly.</li>
  * </ol>
  *
- * <p>Tests needing an open handle are skipped, not failed, where the filesystem refuses {@code O_DIRECT},
- * for the reason {@link DirectIOVectorSourceTests} gives. Staged reads run on {@link DirectIOReadPool},
+ * <p>Tests needing an open handle are skipped, not failed, where the filesystem refuses {@code O_DIRECT}:
+ * tmpfs and overlayfs answer {@code EINVAL} on an {@code O_DIRECT} open, so a skip there is the harness
+ * reporting its own substrate rather than this code failing. Staged reads run on {@link DirectIOReadPool},
  * whose daemon threads outlive a suite by design, hence the same thread filter.
  */
 @ThreadLeakFilters(defaultFilters = true, filters = { DirectIOReadPoolTests.ReadPoolThreadFilter.class })
@@ -80,7 +81,7 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
 
     @SneakyThrows
     private void assumeDirectIOWorksHere() {
-        final OpenOption direct = DirectIOVectorSource.directOpenOption();
+        final OpenOption direct = DirectIOVectorIndexInput.directOpenOption();
         assumeTrue("this JDK has no ExtendedOpenOption.DIRECT", direct != null);
         final Path probe = createTempDir().resolve("probe");
         Files.write(probe, new byte[8192]);

@@ -16,7 +16,6 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.network.NetworkModule;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.env.Environment;
 import org.opensearch.knn.KNNTestCase;
@@ -320,12 +319,8 @@ public class KNNSettingsTests extends KNNTestCase {
 
     public void testDirectIONodeSettings_properties() {
         for (Setting<?> setting : List.of(
-            KNNSettings.KNN_DIRECT_IO_MAX_BUFFER_SIZE_SETTING,
             KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED_SETTING,
-            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED_SETTING,
-            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_SETTING,
-            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING,
-            KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_SETTING
+            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING
         )) {
             final EnumSet<Setting.Property> properties = setting.getProperties();
             assertTrue(setting.getKey(), properties.contains(Setting.Property.NodeScope));
@@ -333,10 +328,6 @@ public class KNNSettingsTests extends KNNTestCase {
             assertFalse(setting.getKey(), properties.contains(Setting.Property.IndexScope));
             assertFalse(setting.getKey(), properties.contains(Setting.Property.Final));
         }
-    }
-
-    public void testDirectIOSettings_defaults() {
-        assertEquals(new ByteSizeValue(32, ByteSizeUnit.KB), KNNSettings.KNN_DIRECT_IO_MAX_BUFFER_SIZE_SETTING.getDefault(Settings.EMPTY));
     }
 
     /**
@@ -347,61 +338,22 @@ public class KNNSettingsTests extends KNNTestCase {
         final List<String> registeredKeys = KNNSettings.state().getSettings().stream().map(Setting::getKey).collect(Collectors.toList());
         for (String key : List.of(
             KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED,
-            KNNSettings.KNN_DIRECT_IO_MAX_BUFFER_SIZE,
-            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED,
-            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW,
             KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS,
-            KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE
+            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES,
+            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN,
+            KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW,
+            KNNSettings.KNN_DIRECT_IO_READAHEAD_TRIGGER
         )) {
             assertTrue(key + " is not registered", registeredKeys.contains(key));
         }
     }
 
     /**
-     * The cache budget's default is 8 MB on measurement: an exact LRU stack-distance analysis of a
-     * 2,000-query candidate trace put the steady-state hit rate at 41.4% for 4 MB, 44.2% for 8 MB, 45.3%
-     * for 16 MB and 50.3% for 128 MB, so 8 MB is where the curve flattens. A change to the default should
-     * be a change to this assertion too.
-     */
-    public void testDirectIORescoreCacheSetting_default() {
-        assertEquals(
-            new ByteSizeValue(8, ByteSizeUnit.MB),
-            KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_SETTING.getDefault(Settings.EMPTY)
-        );
-        assertEquals(new ByteSizeValue(8, ByteSizeUnit.MB), KNNSettings.getDirectIORescoreCacheBytesPerSource());
-    }
-
-    /**
-     * Zero has to be an accepted value, not a rejected one: it is how the cache is turned off, and the
-     * off arm is what every cache measurement is read against.
-     */
-    public void testDirectIORescoreCacheSetting_acceptsZero() {
-        final Settings zero = Settings.builder().put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE, "0b").build();
-        assertEquals(ByteSizeValue.ZERO, KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE_SETTING.get(zero));
-    }
-
-    public void testDirectIORescoreCacheSetting_isReadableByKey() {
-        assertEquals(
-            new ByteSizeValue(8, ByteSizeUnit.MB),
-            KNNSettings.state().getSettingValue(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_BYTES_PER_SOURCE)
-        );
-    }
-
-    /** Read from a query path that must never fail, so an uninitialized singleton yields the default. */
-    public void testDirectIORescoreCacheAccessor_whenClusterServiceIsNotSet_thenReturnsDefault() {
-        KNNSettings.state().setClusterService(null);
-        assertEquals(new ByteSizeValue(8, ByteSizeUnit.MB), KNNSettings.getDirectIORescoreCacheBytesPerSource());
-    }
-
-    /**
-     * The prefetch pipeline is on by default once the seam is engaged, and its window is 48 rather than the
-     * whole candidate set: a 200-wide fan-out measured p90 2.2x worse, because the device queue holds 63
-     * requests, and even a 64-wide one took p99/median from 1.15 to 1.45. These are tuning defaults backed
-     * by measurement, so a change to one should be a change to this assertion too.
+     * The pool size is the one prefetch tuning default left after phase 12 H5 removed the rescore seam's
+     * own window; it is a measurement-backed default, so a change to it should be a change to this
+     * assertion too.
      */
     public void testDirectIORescorePrefetchSettings_defaults() {
-        assertTrue(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED_SETTING.getDefault(Settings.EMPTY));
-        assertEquals(Integer.valueOf(48), KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_SETTING.getDefault(Settings.EMPTY));
         assertEquals(
             Integer.valueOf(expectedPrefetchThreadsDefault()),
             KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING.getDefault(Settings.EMPTY)
@@ -446,19 +398,14 @@ public class KNNSettingsTests extends KNNTestCase {
         );
     }
 
-    /** A window or pool size of zero would mean "no reads at all"; the bounds have to reject it. */
+    /** A pool size of zero would mean "no reads at all"; the bound has to reject it. */
     public void testDirectIORescorePrefetchSettings_rejectNonPositiveValues() {
-        for (Setting<Integer> setting : List.of(
-            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW_SETTING,
-            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING
-        )) {
+        for (Setting<Integer> setting : List.of(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING)) {
             expectThrows(IllegalArgumentException.class, () -> setting.get(Settings.builder().put(setting.getKey(), 0).build()));
         }
     }
 
     public void testDirectIORescorePrefetchAccessors_returnDefaultsWhenUnset() {
-        assertTrue(KNNSettings.isDirectIORescorePrefetchEnabled());
-        assertEquals(48, KNNSettings.getDirectIORescorePrefetchWindow());
         assertEquals(expectedPrefetchThreadsDefault(), KNNSettings.getDirectIORescorePrefetchThreads());
     }
 
@@ -468,22 +415,14 @@ public class KNNSettingsTests extends KNNTestCase {
      */
     public void testDirectIORescorePrefetchAccessors_whenClusterServiceIsNotSet_thenReturnDefaults() {
         KNNSettings.state().setClusterService(null);
-        assertTrue(KNNSettings.isDirectIORescorePrefetchEnabled());
-        assertEquals(48, KNNSettings.getDirectIORescorePrefetchWindow());
         assertEquals(expectedPrefetchThreadsDefault(), KNNSettings.getDirectIORescorePrefetchThreads());
     }
 
     public void testDirectIORescorePrefetchSettings_areReadableByKey() {
-        assertEquals(Boolean.TRUE, KNNSettings.state().getSettingValue(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_ENABLED));
-        assertEquals(Integer.valueOf(48), KNNSettings.state().getSettingValue(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WINDOW));
         assertEquals(
             Integer.valueOf(expectedPrefetchThreadsDefault()),
             KNNSettings.state().getSettingValue(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS)
         );
-    }
-
-    public void testDirectIONodeSettingAccessors_returnDefaultsWhenUnset() {
-        assertEquals(new ByteSizeValue(32, ByteSizeUnit.KB), KNNSettings.getDirectIOMaxBufferSize());
     }
 
     /** Off by default: with it off the rescore path is byte for byte what it is without the seam. */
@@ -502,19 +441,4 @@ public class KNNSettingsTests extends KNNTestCase {
         assertEquals(Boolean.FALSE, KNNSettings.state().getSettingValue(KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED));
     }
 
-    /**
-     * The accessors are called while a shard's Directory is being built, which can happen before
-     * KNNSettings has a ClusterService. That must yield the defaults, not an exception.
-     */
-    public void testDirectIONodeSettingAccessors_whenClusterServiceIsNotSet_thenReturnDefaults() {
-        KNNSettings.state().setClusterService(null);
-        assertEquals(new ByteSizeValue(32, ByteSizeUnit.KB), KNNSettings.getDirectIOMaxBufferSize());
-    }
-
-    public void testDirectIONodeSettings_areReadableByKey() {
-        assertEquals(
-            new ByteSizeValue(32, ByteSizeUnit.KB),
-            (ByteSizeValue) KNNSettings.state().getSettingValue(KNNSettings.KNN_DIRECT_IO_MAX_BUFFER_SIZE)
-        );
-    }
 }
