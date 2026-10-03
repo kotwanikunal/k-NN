@@ -1252,6 +1252,186 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
         );
     }
 
+    // -----------------------------------------------------------------------------------------------
+    // 7. One allocation per input, not one per slot
+    //
+    // Phase 12 S1.3 measured direct-buffer capacity cycling to 4,365 MB under 16-way load, against a node
+    // now configured with -XX:MaxDirectMemorySize=2g. The cause is structural: a fresh input per query per
+    // segment, each allocating its own sync window plus up to staged_ranges staged slots plus a ring, and
+    // no end-of-life signal on the production path to free any of them (Lucene's OffHeapFloatVectorValues
+    // is not Closeable, so close() never runs and the Cleaner waits for a GC). These tests assert the fix:
+    // the per-slot allocations become one arena per table, the alignment slack per slot goes away, and
+    // nothing about what the reads return changes.
+    // -----------------------------------------------------------------------------------------------
+
+    /**
+     * The burst table is one allocation whose slots carry no alignment slack, it is allocated once for the
+     * input's life however many bursts run through it, and every slot is block aligned — which is what
+     * {@code O_DIRECT} requires of the buffer address.
+     */
+    @SneakyThrows
+    public void testTheBurstTableIsOneAllocationAndNotOnePerSlot() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(4000);
+        final Path path = writeVectorFile(dir, vectors);
+        final int[] ords = scatteredOrds(64, vectors.length);
+        final float[] scratch = new float[DIMENSION];
+
+        DirectIOReadPool.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 0, 2)) {
+            assertNotNull(input);
+            assertNull("nothing is allocated before the first prefetch", input.stagingArena());
+
+            for (final int ord : ords) {
+                input.prefetch(HEADER_LENGTH + (long) ord * VECTOR_BYTES, VECTOR_BYTES);
+            }
+            final ByteBuffer arena = input.stagingArena();
+            assertNotNull("the first prefetch must carve the table's one allocation", arena);
+
+            final int slotBytes = input.arenaSlotBytes();
+            assertEquals("a slot is one bufferSize window", input.bufferSize(), slotBytes);
+            assertTrue(
+                "the arena must hold every slot, capacity=" + arena.capacity() + " need=" + 64 * slotBytes,
+                arena.capacity() >= 64 * slotBytes
+            );
+            // The saving this change exists for, stated as the arithmetic rather than as a measurement:
+            // per-slot allocation needed blockSize-1 of slack in each of 64 allocations so that an aligned
+            // slice existed inside it. One arena needs that slack once.
+            assertTrue(
+                "the arena must cost less than 64 slack-padded slots, "
+                    + arena.capacity()
+                    + " vs "
+                    + 64 * (slotBytes + input.blockSize() - 1),
+                arena.capacity() < 64L * (slotBytes + input.blockSize() - 1)
+            );
+
+            // Several further bursts, each ended by a read, must reuse the same allocation.
+            for (int repeat = 0; repeat < 5; repeat++) {
+                for (final int ord : ords) {
+                    input.seek(HEADER_LENGTH + (long) ord * VECTOR_BYTES);
+                    input.readFloats(scratch, 0, DIMENSION);
+                    assertArrayEquals("burst " + repeat + " ordinal " + ord, vectors[ord], scratch, 0.0f);
+                }
+                for (final int ord : ords) {
+                    input.prefetch(HEADER_LENGTH + (long) ord * VECTOR_BYTES, VECTOR_BYTES);
+                }
+                assertSame("the table must not be re-carved per burst", arena, input.stagingArena());
+            }
+            assertTrue(
+                "the arena-backed slots must actually have served the reads, " + DirectIOVectorIndexInput.STATS,
+                DirectIOVectorIndexInput.STATS.stagedHits() > 0
+            );
+        }
+    }
+
+    /**
+     * A slice gets its own arena rather than sharing one, because a slice reads independently and a staged
+     * read writes into its slot from a pool thread. Sharing would be a data race, and the footprint fix must
+     * not have introduced one.
+     */
+    @SneakyThrows
+    public void testASliceCarvesItsOwnArena() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(2000);
+        final Path path = writeVectorFile(dir, vectors);
+        final long region = (long) vectors.length * VECTOR_BYTES;
+        final float[] scratch = new float[DIMENSION];
+
+        DirectIOReadPool.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+        try (
+            DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 0, 2);
+            DirectIOVectorIndexInput first = input.slice("first", HEADER_LENGTH, region);
+            DirectIOVectorIndexInput second = input.slice("second", HEADER_LENGTH, region)
+        ) {
+            for (int ord = 0; ord < 32; ord++) {
+                first.prefetch((long) ord * VECTOR_BYTES, VECTOR_BYTES);
+                second.prefetch((long) ord * VECTOR_BYTES, VECTOR_BYTES);
+            }
+            assertNotNull(first.stagingArena());
+            assertNotNull(second.stagingArena());
+            assertNotSame("two slices must not share one arena", first.stagingArena(), second.stagingArena());
+            assertNull("the parent prefetched nothing, so it carved nothing", input.stagingArena());
+
+            for (int ord = 0; ord < 32; ord++) {
+                first.seek((long) ord * VECTOR_BYTES);
+                first.readFloats(scratch, 0, DIMENSION);
+                assertArrayEquals("first slice ordinal " + ord, vectors[ord], scratch, 0.0f);
+                second.seek((long) ord * VECTOR_BYTES);
+                second.readFloats(scratch, 0, DIMENSION);
+                assertArrayEquals("second slice ordinal " + ord, vectors[ord], scratch, 0.0f);
+            }
+        }
+    }
+
+    /**
+     * A coalesced group wider than an arena slot keeps its own allocation and still reads correctly. The
+     * arena is sized for the measured common case — S3.1 put the mean aligned span at 7,310 B for a 3,072 B
+     * vector — and this is the case it is deliberately not sized for.
+     */
+    @SneakyThrows
+    public void testAGroupWiderThanASlotKeepsItsOwnBufferAndReadsCorrectly() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(2000);
+        final Path path = writeVectorFile(dir, vectors);
+        // Clustered in one narrow window, so prefetchLikeHelper coalesces them into groups far wider than
+        // the two blocks a slot holds.
+        final int[] ords = clusteredOrds(64, 64, 500);
+        final float[] scratch = new float[DIMENSION];
+
+        DirectIOReadPool.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 0, 2)) {
+            assertNotNull(input);
+            final int groups = prefetchLikeHelper(input, HEADER_LENGTH, VECTOR_BYTES, ords, 128 * 1024);
+            assertTrue("the window must coalesce into few wide groups, groups=" + groups, groups < ords.length / 4);
+            assertNotNull("a table is still carved for the groups that do fit", input.stagingArena());
+            for (final int ord : ords) {
+                input.seek(HEADER_LENGTH + (long) ord * VECTOR_BYTES);
+                input.readFloats(scratch, 0, DIMENSION);
+                assertArrayEquals("clustered ordinal " + ord, vectors[ord], scratch, 0.0f);
+            }
+            assertTrue(
+                "the wide groups must have been staged and served, " + DirectIOVectorIndexInput.STATS,
+                DirectIOVectorIndexInput.STATS.stagedHits() > 0
+            );
+        }
+    }
+
+    /**
+     * The read-ahead ring is one allocation too, and needs no per-slot fall-back at all: every window it
+     * submits is exactly one {@code bufferSize}, which is exactly what a slot holds.
+     */
+    @SneakyThrows
+    public void testTheReadaheadRingIsOneAllocation() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(1500);
+        final Path path = writeVectorFile(dir, vectors);
+
+        DirectIOReadPool.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 8, 2)) {
+            assertNotNull(input);
+            assertNull("the ring is not allocated until it arms", input.readaheadArena());
+            sequentialScan(input, vectors);
+            final ByteBuffer arena = input.readaheadArena();
+            assertNotNull("a forward scan must arm the ring and carve it", arena);
+            assertTrue(
+                "the arena must hold all eight windows, capacity=" + arena.capacity(),
+                arena.capacity() >= 8 * input.arenaSlotBytes()
+            );
+            assertTrue(
+                "the ring must have served the scan, " + DirectIOVectorIndexInput.STATS,
+                DirectIOVectorIndexInput.STATS.readaheadHits() > 100
+            );
+        }
+    }
+
     /**
      * Fills the read pool so that exactly one submit can still be accepted and will not run until
      * {@code release} is counted down. Deterministic rather than arithmetic: submit until the pool refuses,

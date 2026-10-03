@@ -454,6 +454,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     private StagedRange[] staged;
     private ByteBuffer[] stagedBuffers;
     private FloatBuffer[] stagedFloats;
+    /**
+     * The one allocation {@link #stagedBuffers} is carved from. Held for this input's whole life, never
+     * re-carved: a slot given up because a read may still be writing into it (see {@link #resetStaging})
+     * leaves that read writing into this allocation, so it must stay reachable even though nothing reads it
+     * again.
+     */
+    private ByteBuffer stagingArena;
     private int stagedCount;
     private ExecutorService pool;
     /** Whether a read has happened since the last {@link #prefetch}, which is how a burst's end is found. */
@@ -472,6 +479,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     private StagedRange[] readaheadRing;
     private ByteBuffer[] readaheadBuffers;
     private FloatBuffer[] readaheadFloats;
+    /** The one allocation {@link #readaheadBuffers} is carved from; held for life, like {@link #stagingArena}. */
+    private ByteBuffer readaheadArena;
     /** Index of the oldest live slot. */
     private int readaheadHead;
     /** Live slots, 0..{@link #readaheadWindows}. */
@@ -687,6 +696,16 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         return readaheadTrigger;
     }
 
+    /** The burst table's single backing allocation, or null before the first {@link #prefetch}. */
+    ByteBuffer stagingArena() {
+        return stagingArena;
+    }
+
+    /** The read-ahead ring's single backing allocation, or null before the ring first arms. */
+    ByteBuffer readaheadArena() {
+        return readaheadArena;
+    }
+
     // ---------------------------------------------------------------------------------------------------
     // Read ahead
     // ---------------------------------------------------------------------------------------------------
@@ -759,6 +778,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
         final int slot = stagedCount;
         if (stagedBuffers[slot] == null || stagedBuffers[slot].capacity() < alignedLength) {
+            // Wider than a slot, or a slot given up after a timeout: this one range gets its own
+            // allocation, exactly as every range used to. See arenaSlotBytes() for why that is the
+            // uncommon case.
             stagedBuffers[slot] = ByteBuffer.allocateDirect(alignedLength + blockSize - 1)
                 .alignedSlice(blockSize)
                 .order(ByteOrder.LITTLE_ENDIAN);
@@ -797,8 +819,63 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         staged = new StagedRange[maxStagedRanges];
         stagedBuffers = new ByteBuffer[maxStagedRanges];
         stagedFloats = new FloatBuffer[maxStagedRanges];
+        stagingArena = carveArena(maxStagedRanges, stagedBuffers, stagedFloats);
         pool = acquired;
         return true;
+    }
+
+    /**
+     * Bytes per arena slot: one {@link #bufferSize} window, and never less than two blocks, which is the
+     * span of any single vector however it straddles a block boundary.
+     *
+     * <p>This is the size the <em>common</em> staged range needs, not the largest one allowed. A prefetch
+     * group is {@code PrefetchHelper}'s coalescing of a sorted ordinal batch, and phase 12 S3.1 measured the
+     * mean aligned span at <b>7,310 B</b> for a 3,072 B vector against an arithmetic expectation of 7,168 B
+     * — i.e. nearly every group is one vector straddling one boundary and fits in two blocks. Groups that
+     * hold several adjacent candidates are wider and keep their own allocation (see {@link #prefetch}), so
+     * sizing the arena for the worst case ({@link #maxStagedRangeBytes}, 132 KiB × {@code staged_ranges} =
+     * 8.4 MiB per input) would reserve two orders of magnitude more than the measured need.
+     */
+    int arenaSlotBytes() {
+        return Math.max(bufferSize, 2 * handle.blockSize);
+    }
+
+    /**
+     * Allocates one block-aligned direct buffer holding {@code slots} slots and fills {@code buffers} /
+     * {@code floats} with a view of each.
+     *
+     * <p><b>Why one allocation rather than one per slot.</b> Phase 12 S1.3 measured direct-buffer capacity
+     * cycling to <b>4,365 MB</b> under 16-way load, because a fresh {@link DirectIOVectorIndexInput} is
+     * created per query per segment ({@code ExactSearcher#createVectorScorer} → Lucene's flat reader →
+     * {@link #slice}), each one allocated its own sync window plus up to {@code staged_ranges} staged slots
+     * plus a read-ahead ring, and nothing frees them — Lucene's {@code OffHeapFloatVectorValues} is not
+     * {@code Closeable}, so {@link #close} never runs on a per-query slice and reclamation waits for the
+     * {@code Cleaner}, i.e. for a GC. There is no end-of-life signal on that path to return a buffer at, so
+     * the footprint cannot be fixed by pooling across inputs; what it can be fixed by is allocating less and
+     * less often. One arena makes a per-input {@code staged_ranges}-slot table <b>one</b>
+     * {@code allocateDirect} instead of up to {@code staged_ranges} of them, and drops the per-slot
+     * {@code blockSize - 1} alignment slack (12,287 B → 8,192 B per slot at a 4 KiB block), which is the
+     * same arena move {@code DirectIOVectorSource.Reader} already made for its own reader buffers.
+     *
+     * <p><b>What this does not claim.</b> It does not bound total direct memory and it does not promise the
+     * pages go back to the OS: glibc raises its {@code mmap} threshold to the size of the first {@code mmap}ed
+     * chunk it frees, so a repeated half-megabyte allocation can still end up served from a malloc arena that
+     * never shrinks. {@code MALLOC_ARENA_MAX} remains the operational lever for that. The claim here is only
+     * fewer and smaller allocations, which is measurable as peak direct-buffer capacity.
+     */
+    private ByteBuffer carveArena(final int slots, final ByteBuffer[] buffers, final FloatBuffer[] floats) {
+        final int blockSize = handle.blockSize;
+        final int slotBytes = arenaSlotBytes();
+        // Over-allocate by a block so a block-aligned slice exists inside the allocation, then carve at
+        // multiples of a slot: the base is aligned and a slot is a whole number of blocks, so every slot is
+        // aligned too and needs no slack of its own. O_DIRECT needs the buffer address, the file offset and
+        // the length all block aligned.
+        final ByteBuffer arena = ByteBuffer.allocateDirect(slots * slotBytes + blockSize - 1).alignedSlice(blockSize);
+        for (int slot = 0; slot < slots; slot++) {
+            buffers[slot] = arena.slice(slot * slotBytes, slotBytes).order(ByteOrder.LITTLE_ENDIAN);
+            floats[slot] = buffers[slot].asFloatBuffer();
+        }
+        return arena;
     }
 
     /**
@@ -1176,12 +1253,16 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             readaheadRing = new StagedRange[readaheadWindows];
             readaheadBuffers = new ByteBuffer[readaheadWindows];
             readaheadFloats = new FloatBuffer[readaheadWindows];
+            // Every ring window is exactly bufferSize, which is what an arena slot holds, so the ring never
+            // needs the per-slot fall-back the burst table keeps for a wide group.
+            readaheadArena = carveArena(readaheadWindows, readaheadBuffers, readaheadFloats);
             pool = acquired;
         }
         final long regionEnd = offset + length;
         while (readaheadCount < readaheadWindows && readaheadNext < regionEnd) {
             final int slot = (readaheadHead + readaheadCount) % readaheadWindows;
             if (readaheadBuffers[slot] == null) {
+                // Only reachable for a slot given up after a bounded wait timed out (see retireHead).
                 readaheadBuffers[slot] = ByteBuffer.allocateDirect(bufferSize + handle.blockSize - 1)
                     .alignedSlice(handle.blockSize)
                     .order(ByteOrder.LITTLE_ENDIAN);
