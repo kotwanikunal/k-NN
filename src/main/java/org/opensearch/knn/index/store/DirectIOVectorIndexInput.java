@@ -77,7 +77,7 @@ import java.util.concurrent.atomic.AtomicLong;
  *       unwraps classes registered through {@code TestSecrets}, whose setter Lucene restricts to its own
  *       test framework, so a <em>production</em> {@code FilterIndexInput} subclass is <b>not</b> seen
  *       through and would displace the SIMD scorer just as well (gate 3). The reason to extend
- *       {@link IndexInput} directly is the other one: {@link FilterIndexInput} delegates only
+ *       {@link IndexInput} directly is the other one: {@code FilterIndexInput} delegates only
  *       {@code readByte} and {@code readBytes}, so it inherits {@code IndexInput}'s no-op
  *       {@link #prefetch} and {@code DataInput}'s per-{@code float} {@code readFloats} loop — a wrapper
  *       would have to override the very methods this class exists to implement.</li>
@@ -719,8 +719,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * or reads out of order, still gets correct bytes from blocking reads. No returned value tells the
      * caller which happened, so nothing can come to depend on it.
      *
-     * <h2>The span bound is the waste guard, and it is a bound on the span because it cannot be a bound
-     * on the waste</h2>
+     * <h4>The span bound is the waste guard, and it is a bound on the span because it cannot be a bound
+     * on the waste</h4>
      * The caller on the rescore path is {@code PrefetchHelper#prefetchExactVectorSize}, which sorts the
      * batch's ordinals and then asks for the <em>span</em> of each coalesced group — extending a group
      * while {@code (vector end) - (group start) <= 128 KB} and then calling
