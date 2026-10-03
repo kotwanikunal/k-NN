@@ -36,6 +36,10 @@ import java.nio.file.StandardOpenOption;
 import java.util.HashSet;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 
 import static org.mockito.Mockito.when;
 
@@ -1066,5 +1070,217 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
             assertEquals("the window must follow the setting", 8, input.readaheadWindows());
             assertEquals("the trigger must follow the setting", 3, input.readaheadTrigger());
         }
+    }
+
+    // -----------------------------------------------------------------------------------------------
+    // 5. No search thread waits forever on a pool future
+    // -----------------------------------------------------------------------------------------------
+
+    /**
+     * The hardening property: a staged read that cannot be retired must not hold the reading thread.
+     *
+     * <p>The pool is saturated deliberately — every thread busy and every queue slot but one taken by a
+     * latched task — so the range this prefetch stages is queued behind work that will not finish until the
+     * test releases it. The read that follows therefore cannot be served from the staged range, and what is
+     * asserted is that it returns anyway, with the right bytes, having counted the event.
+     *
+     * <p>Before the bound this read waited on an unbounded {@code Future#get}: it would have blocked until
+     * the latch released, i.e. forever on a node where the pool never catches up. That is the shape of the
+     * Oct-2 incident's search tasks, which logged elapsed times of 2.1 hours.
+     */
+    @SneakyThrows
+    public void testAReadGivesUpOnASaturatedPoolAndServesItselfInstead() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(64);
+        final Path path = writeVectorFile(dir, vectors);
+        final float[] scratch = new float[DIMENSION];
+
+        DirectIOReadPool.resetForTesting();
+        final CountDownLatch release = new CountDownLatch(1);
+        saturatePoolLeavingOneSlot(release);
+
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 0, 2)) {
+            assertNotNull(input);
+            final long offset = HEADER_LENGTH + (long) 7 * VECTOR_BYTES;
+            input.prefetch(offset, VECTOR_BYTES);
+            // If the staging table could not take the range at all there is nothing to time out, so this
+            // test would be vacuous; assert it did stage before relying on the wait.
+            assumeTrue("the pool refused the prefetch, so there is no wait to bound", DirectIOVectorIndexInput.STATS.stageDeclined() == 0);
+
+            final long start = System.nanoTime();
+            input.seek(offset);
+            input.readFloats(scratch, 0, DIMENSION);
+            final long elapsedMillis = (System.nanoTime() - start) / 1_000_000L;
+
+            assertArrayEquals("the fallback must deliver the same bytes", vectors[7], scratch, 0.0f);
+            assertEquals(
+                "the give-up must be counted, so a saturated pool is visible rather than silent",
+                1L,
+                DirectIOVectorIndexInput.STATS.stagedWaitTimeouts()
+            );
+            assertTrue(
+                "the fallback must be a blocking read on this thread, blockingReads=" + DirectIOVectorIndexInput.STATS.blockingReads(),
+                DirectIOVectorIndexInput.STATS.blockingReads() > 0
+            );
+            assertTrue(
+                "the read must not have waited much past the bound, waited " + elapsedMillis + " ms",
+                elapsedMillis < 10 * DirectIOVectorIndexInput.STAGED_READ_WAIT_MILLIS
+            );
+        } finally {
+            release.countDown();
+            DirectIOReadPool.resetForTesting();
+        }
+    }
+
+    /**
+     * An abandoned range serves nothing afterwards, which is what keeps a buffer a read may still be
+     * writing into from being decoded as if it held the bytes. Without it, the second read of the same
+     * vector would find the range still in the burst table, wait again, and — worse — a buffer later reused
+     * for another range could be read as this one.
+     */
+    @SneakyThrows
+    public void testAnAbandonedRangeIsNeverServedFromAgain() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(64);
+        final Path path = writeVectorFile(dir, vectors);
+        final float[] scratch = new float[DIMENSION];
+
+        DirectIOReadPool.resetForTesting();
+        final CountDownLatch release = new CountDownLatch(1);
+        saturatePoolLeavingOneSlot(release);
+
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 0, 2)) {
+            final long offset = HEADER_LENGTH + (long) 3 * VECTOR_BYTES;
+            input.prefetch(offset, VECTOR_BYTES);
+            assumeTrue("the pool refused the prefetch", DirectIOVectorIndexInput.STATS.stageDeclined() == 0);
+
+            input.seek(offset);
+            input.readFloats(scratch, 0, DIMENSION);
+            assertEquals(1L, DirectIOVectorIndexInput.STATS.stagedWaitTimeouts());
+            assertArrayEquals(vectors[3], scratch, 0.0f);
+
+            // Read it again. The range is still in the burst table, but abandoned, so it must be skipped
+            // outright rather than waited on a second time.
+            final long start = System.nanoTime();
+            input.seek(offset);
+            input.readFloats(scratch, 0, DIMENSION);
+            final long elapsedMillis = (System.nanoTime() - start) / 1_000_000L;
+            assertArrayEquals(vectors[3], scratch, 0.0f);
+            assertEquals(
+                "the second read must not wait on the abandoned range again",
+                1L,
+                DirectIOVectorIndexInput.STATS.stagedWaitTimeouts()
+            );
+            assertTrue(
+                "and so must be fast, took " + elapsedMillis + " ms",
+                elapsedMillis < DirectIOVectorIndexInput.STAGED_READ_WAIT_MILLIS
+            );
+        } finally {
+            release.countDown();
+            DirectIOReadPool.resetForTesting();
+        }
+    }
+
+    /**
+     * Closing an input whose staged reads cannot be retired must still return. {@code close} quiesces the
+     * burst table, and that quiesce used an unbounded {@code Future#get} too — so a shard close, or the
+     * {@code resetStaging} at the head of the next {@link DirectIOVectorIndexInput#prefetch}, could hang on
+     * exactly the same condition as a read.
+     */
+    @SneakyThrows
+    public void testCloseReturnsEvenWhenAStagedReadCannotBeRetired() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(64);
+        final Path path = writeVectorFile(dir, vectors);
+
+        DirectIOReadPool.resetForTesting();
+        final CountDownLatch release = new CountDownLatch(1);
+        saturatePoolLeavingOneSlot(release);
+
+        DirectIOVectorIndexInput.STATS.reset();
+        try {
+            final DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 0, 2);
+            assertNotNull(input);
+            input.prefetch(HEADER_LENGTH, VECTOR_BYTES);
+            assumeTrue("the pool refused the prefetch", DirectIOVectorIndexInput.STATS.stageDeclined() == 0);
+            final long start = System.nanoTime();
+            input.close();
+            final long elapsedMillis = (System.nanoTime() - start) / 1_000_000L;
+            assertTrue(
+                "close must be bounded, took " + elapsedMillis + " ms",
+                elapsedMillis < 10 * DirectIOVectorIndexInput.STAGED_READ_WAIT_MILLIS
+            );
+        } finally {
+            release.countDown();
+            DirectIOReadPool.resetForTesting();
+        }
+    }
+
+    /** On a healthy pool nothing ever gives up, so the counter stays at zero on the ordinary rescore shape. */
+    @SneakyThrows
+    public void testAHealthyPoolNeverGivesUp() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(2000);
+        final Path path = writeVectorFile(dir, vectors);
+        final int[] ords = scatteredOrds(64, vectors.length);
+        final float[] scratch = new float[DIMENSION];
+
+        DirectIOReadPool.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 8, 2)) {
+            for (int repeat = 0; repeat < 10; repeat++) {
+                for (final int ord : ords) {
+                    input.prefetch(HEADER_LENGTH + (long) ord * VECTOR_BYTES, VECTOR_BYTES);
+                }
+                for (final int ord : ords) {
+                    input.seek(HEADER_LENGTH + (long) ord * VECTOR_BYTES);
+                    input.readFloats(scratch, 0, DIMENSION);
+                    assertArrayEquals(vectors[ord], scratch, 0.0f);
+                }
+            }
+        }
+        assertEquals(
+            "a healthy pool must never trip the bound, " + DirectIOVectorIndexInput.STATS,
+            0L,
+            DirectIOVectorIndexInput.STATS.stagedWaitTimeouts()
+        );
+    }
+
+    /**
+     * Fills the read pool so that exactly one submit can still be accepted and will not run until
+     * {@code release} is counted down. Deterministic rather than arithmetic: submit until the pool refuses,
+     * which means every thread is busy and the queue is full, then drop one queued task to free exactly one
+     * slot. Computing the count from {@code maximumPoolSize + remainingCapacity} races against workers
+     * picking tasks up.
+     *
+     * @return the pool, saturated but for one slot
+     */
+    private ThreadPoolExecutor saturatePoolLeavingOneSlot(final CountDownLatch release) {
+        final ThreadPoolExecutor pool = (ThreadPoolExecutor) DirectIOReadPool.executor();
+        assertNotNull(pool);
+        pool.prestartAllCoreThreads();
+        final Callable<Void> blocker = () -> {
+            release.await();
+            return null;
+        };
+        boolean refused = false;
+        // Bounded so a pool that somehow never refuses fails the test rather than hanging it.
+        for (int i = 0; i < 100_000; i++) {
+            try {
+                pool.submit(blocker);
+            } catch (RejectedExecutionException e) {
+                refused = true;
+                break;
+            }
+        }
+        assertTrue("the pool must be boundable for this test to mean anything", refused);
+        assertNotNull("dropping one queued task must free exactly one slot", pool.getQueue().poll());
+        return pool;
     }
 }

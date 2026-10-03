@@ -26,6 +26,8 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -141,6 +143,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         private Future<?> future;
         /** Bytes the read actually delivered; only meaningful once {@link #future} has completed. */
         private int valid;
+        /**
+         * Set when a bounded wait for this read gave up. From that point the range serves nothing — see
+         * {@link #covers} — and its buffer is retired rather than reused, because the read it gave up on
+         * may still be writing into it. Written by the one thread that owns this input and read by it;
+         * {@code volatile} only so that a buffer handed back is not reused on a stale read of this flag.
+         */
+        private volatile boolean abandoned;
 
         private StagedRange(
             final FileChannel channel,
@@ -185,9 +194,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             return started.compareAndSet(false, true);
         }
 
-        /** Whether this range fully contains {@code [absolute, absolute + needed)}. */
+        /**
+         * Whether this range fully contains {@code [absolute, absolute + needed)} <em>and can still serve
+         * it</em>. An abandoned range covers nothing: the check lives here rather than at the three call
+         * sites so that the read path, the read-ahead ring and {@link #prefetch}'s dedupe all agree.
+         */
         private boolean covers(final long absolute, final int needed) {
-            return absolute >= alignedStart && absolute + needed <= alignedStart + alignedLength;
+            return abandoned == false && absolute >= alignedStart && absolute + needed <= alignedStart + alignedLength;
         }
 
         @Override
@@ -229,6 +242,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         private final AtomicLong readaheadHits = new AtomicLong();
         private final AtomicLong readaheadDeclined = new AtomicLong();
         private final AtomicLong readaheadArmed = new AtomicLong();
+        private final AtomicLong stagedWaitTimeouts = new AtomicLong();
 
         private void recordInFlightPeak() {
             final long now = inFlightNow.get();
@@ -315,6 +329,18 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             return readaheadArmed.get();
         }
 
+        /**
+         * Times a read gave up waiting for a staged or read-ahead read and issued it itself. <b>Zero on a
+         * healthy node.</b> Non-zero means the pool could not retire a read within
+         * {@link #STAGED_READ_WAIT_MILLIS}, i.e. it is saturated or the device is not answering — the
+         * condition that used to hold a search thread with no bound at all. Each event costs one extra
+         * device read and leaves the query correct, so this is a saturation signal rather than an error
+         * count.
+         */
+        public long stagedWaitTimeouts() {
+            return stagedWaitTimeouts.get();
+        }
+
         public void reset() {
             blockingReads.set(0);
             stagedReads.set(0);
@@ -331,6 +357,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             readaheadHits.set(0);
             readaheadDeclined.set(0);
             readaheadArmed.set(0);
+            stagedWaitTimeouts.set(0);
         }
 
         @Override
@@ -344,7 +371,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 "blockingReads=%d stagedReads=%d stagedHits=%d stageDeclined=%d prefetchCalls=%d inFlightPeak=%d "
                     + "stagedBytes=%d blockingBytes=%d servedBytes=%d declinedSpanBytes=%d "
                     + "readaheadReads=%d readaheadBytes=%d readaheadHits=%d readaheadDeclined=%d readaheadArmed=%d "
-                    + "amplification=%.3f",
+                    + "stagedWaitTimeouts=%d amplification=%.3f",
                 blockingReads.get(),
                 stagedReads.get(),
                 stagedHits.get(),
@@ -360,6 +387,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 readaheadHits.get(),
                 readaheadDeclined.get(),
                 readaheadArmed.get(),
+                stagedWaitTimeouts.get(),
                 served == 0 ? 0.0 : (double) read / served
             );
         }
@@ -385,6 +413,19 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * bound can be lowered without a rebuild. Lowering it is the waste guard — see {@link #prefetch}.
      */
     static final int DEFAULT_MAX_STAGED_RANGE_BYTES = 128 * 1024 + 4096;
+
+    /**
+     * How long a read may wait for a staged read before giving up and issuing it itself.
+     *
+     * <p>A constant rather than a setting, because there is no value an operator should want to tune: this
+     * is not a latency target, it is the point past which waiting is certainly worse than reading. The
+     * derivation — a staged read on this stack costs a device read at the pool's queue depth, which is
+     * tens of milliseconds at the deepest queue the bounded pool allows ({@code QUEUED_READS_PER_THREAD}
+     * reads of ~30 ms), so the worst healthy wait is a few hundred milliseconds. One second is above that
+     * and two orders of magnitude above the measured per-query p99 of 11 ms, so it fires only on pathology;
+     * and when it does fire, the fallback is one {@code pread} of a few kilobytes.
+     */
+    static final long STAGED_READ_WAIT_MILLIS = 1000L;
 
     private final Handle handle;
     /** Absolute file offset of this input's byte zero, so a slice needs no other translation. */
@@ -770,15 +811,14 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             for (int i = 0; i < stagedCount; i++) {
                 final StagedRange range = staged[i];
                 staged[i] = null;
-                if (range == null || range.skipIfNotStarted()) {
+                if (range == null) {
                     continue;
                 }
-                try {
-                    range.future.get();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                } catch (ExecutionException e) {
-                    log.debug("Abandoned a staged Direct I/O read of {}", handle.path);
+                if (quiesce(range) == false) {
+                    // A read may still be writing into this slot's buffer, so the slot gives it up and the
+                    // next burst allocates a fresh one. Bounded: at most one buffer per slot per timeout.
+                    stagedBuffers[i] = null;
+                    stagedFloats[i] = null;
                 }
             }
         }
@@ -877,7 +917,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 if (range == null || range.covers(absolute, needed) == false) {
                     continue;
                 }
-                await(range);
+                if (await(range) == false) {
+                    // The bounded wait gave up. Same fall-through as the short read below.
+                    break;
+                }
                 final int position = Math.toIntExact(absolute - range.alignedStart);
                 if (position + needed > range.valid) {
                     // The read came up short of these bytes, which can only happen at end of file. Fall
@@ -897,9 +940,38 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         return blockingSource(absolute, needed);
     }
 
-    private void await(final StagedRange range) throws IOException {
+    /**
+     * Waits for a staged read, for at most {@link #STAGED_READ_WAIT_MILLIS}.
+     *
+     * <p><b>No search thread may wait forever on a pool future.</b> That is the property this bound exists
+     * for, and it was not previously held: this method used an unbounded {@code Future#get}, so a read that
+     * never completed — because the pool was saturated, because the queue in front of it was unbounded, or
+     * because the device stopped answering — held the calling search thread with no bound and no
+     * cancellation check. {@code SearchBackpressure} cancellation is cooperative, so such a thread is not
+     * recoverable; the Oct-2 incident's search tasks logged elapsed times of 2.1 hours.
+     *
+     * <p>On timeout the range is {@link StagedRange#abandoned}, which makes it {@link StagedRange#covers}
+     * nothing, and the caller falls through to {@link #blockingSource} — the same fall-through the
+     * short-read-at-EOF case already uses. The read may still be running and may still write into the
+     * range's buffer, so that buffer is retired rather than reused; {@link #releaseAbandoned} is where
+     * that happens.
+     *
+     * @return true if the bytes are in the range's buffer, false if the caller must read them itself
+     */
+    private boolean await(final StagedRange range) throws IOException {
         try {
-            range.future.get();
+            range.future.get(STAGED_READ_WAIT_MILLIS, TimeUnit.MILLISECONDS);
+            return true;
+        } catch (TimeoutException e) {
+            range.abandoned = true;
+            STATS.stagedWaitTimeouts.incrementAndGet();
+            log.debug(
+                "Gave up after {} ms waiting for a staged Direct I/O read of {} at {}; reading it on this thread",
+                STAGED_READ_WAIT_MILLIS,
+                handle.path,
+                range.alignedStart
+            );
+            return false;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("Interrupted waiting for a Direct I/O read of " + handle.path, e);
@@ -914,6 +986,35 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 throw (IOException) cause;
             }
             throw new IOException("Direct I/O read of " + handle.path + " failed", cause);
+        }
+    }
+
+    /**
+     * Quiesces a range being forgotten, within the same bound {@link #await} uses, and reports whether its
+     * buffer is safe to reuse. False means a read may still be writing into it.
+     */
+    private boolean quiesce(final StagedRange range) {
+        if (range.abandoned) {
+            return false;
+        }
+        if (range.skipIfNotStarted()) {
+            // It will now never run, so nothing can write into the buffer.
+            return true;
+        }
+        try {
+            range.future.get(STAGED_READ_WAIT_MILLIS, TimeUnit.MILLISECONDS);
+            return true;
+        } catch (TimeoutException e) {
+            range.abandoned = true;
+            STATS.stagedWaitTimeouts.incrementAndGet();
+            log.debug("Gave up after {} ms quiescing a Direct I/O read of {}", STAGED_READ_WAIT_MILLIS, handle.path);
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (ExecutionException e) {
+            log.debug("Abandoned a staged Direct I/O read of {}", handle.path);
+            return true;
         }
     }
 
@@ -1036,7 +1137,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             if (range == null || range.covers(absolute, needed) == false) {
                 continue;
             }
-            await(range);
+            if (await(range) == false) {
+                // The bounded wait gave up. Let a blocking read handle these bytes.
+                return null;
+            }
             final int position = Math.toIntExact(absolute - range.alignedStart);
             if (position + needed > range.valid) {
                 // Came up short — only at EOF. Let a blocking read handle these bytes.
@@ -1106,18 +1210,17 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
     }
 
-    /** Claims and forgets the oldest live window, keeping its buffer for reuse. */
+    /**
+     * Claims and forgets the oldest live window, keeping its buffer for reuse — unless the bounded quiesce
+     * gave up on it, in which case the buffer is given up with it, because a read may still be writing
+     * into it.
+     */
     private void retireHead() {
         final StagedRange head = readaheadRing[readaheadHead];
         readaheadRing[readaheadHead] = null;
-        if (head != null && head.skipIfNotStarted() == false) {
-            try {
-                head.future.get();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } catch (ExecutionException e) {
-                log.debug("Abandoned a read-ahead read of {}", handle.path);
-            }
+        if (head != null && quiesce(head) == false) {
+            readaheadBuffers[readaheadHead] = null;
+            readaheadFloats[readaheadHead] = null;
         }
         readaheadHead = (readaheadHead + 1) % readaheadWindows;
         readaheadCount--;
