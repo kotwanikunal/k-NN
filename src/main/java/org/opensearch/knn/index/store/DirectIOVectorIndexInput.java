@@ -221,8 +221,23 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * inside the one object that issues the reads, so it can neither include another reader's traffic nor
      * miss any of this one's. Both byte figures are what the device <em>returned</em>, which equals the
      * block-aligned request except at end of file.
+     *
+     * <h2>The dispatch counters, and why they live here</h2>
+     * {@link #routedOpens} and the four decline reasons are {@link KNNVectorStorageDirectory}'s, not this
+     * class's. They are aggregated here because the directory is created <b>per segment per reader</b> by
+     * the codec seam and is discarded with that reader, so its own instance counters are unreachable from
+     * a REST API by construction — which phase 13's re-proof notes recorded as a gap. This object is the
+     * one node-wide, cumulative place Direct I/O statistics already live, so one read of it answers both
+     * "is the seam engaging at all" and "what is it doing once engaged". The directory still keeps its own
+     * instance counters: they are what a test asserts on, and they are per segment, which the node-wide
+     * sums cannot be.
      */
     public static final class Stats {
+        private final AtomicLong routedOpens = new AtomicLong();
+        private final AtomicLong declinedChain = new AtomicLong();
+        private final AtomicLong declinedMissing = new AtomicLong();
+        private final AtomicLong declinedTooSmall = new AtomicLong();
+        private final AtomicLong declinedOpenFailed = new AtomicLong();
         private final AtomicLong blockingReads = new AtomicLong();
         private final AtomicLong stagedReads = new AtomicLong();
         private final AtomicLong stagedHits = new AtomicLong();
@@ -247,6 +262,55 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             while (now > peak && inFlightPeak.compareAndSet(peak, now) == false) {
                 peak = inFlightPeak.get();
             }
+        }
+
+        /**
+         * Counts one {@code .vec} open the dispatch rule routed to {@code O_DIRECT}. Called by
+         * {@link KNNVectorStorageDirectory}, which owns the rule; see the class javadoc for why the
+         * node-wide tally is here.
+         */
+        void recordRoutedOpen() {
+            routedOpens.incrementAndGet();
+        }
+
+        /** Counts one decline, under one of the four reasons the dispatch rule distinguishes. */
+        void recordDecline(final DeclineReason reason) {
+            switch (reason) {
+                case CHAIN -> declinedChain.incrementAndGet();
+                case MISSING -> declinedMissing.incrementAndGet();
+                case TOO_SMALL -> declinedTooSmall.incrementAndGet();
+                case OPEN_FAILED -> declinedOpenFailed.incrementAndGet();
+            }
+        }
+
+        /** Node-wide {@code .vec} opens served with {@code O_DIRECT}. */
+        public long routedOpens() {
+            return routedOpens.get();
+        }
+
+        /** Declines because no {@link java.nio.file.Path} could be resolved through the delegate chain. */
+        public long declinedChain() {
+            return declinedChain.get();
+        }
+
+        /** Declines because the resolved path did not exist or could not be sized. */
+        public long declinedMissing() {
+            return declinedMissing.get();
+        }
+
+        /** Declines because the file was below {@code knn.direct_io.min_file_size}. */
+        public long declinedTooSmall() {
+            return declinedTooSmall.get();
+        }
+
+        /** Declines because the {@code O_DIRECT} open itself failed. */
+        public long declinedOpenFailed() {
+            return declinedOpenFailed.get();
+        }
+
+        /** Every decline, whatever the reason. */
+        public long declinedOpens() {
+            return declinedChain.get() + declinedMissing.get() + declinedTooSmall.get() + declinedOpenFailed.get();
         }
 
         /** Device reads issued on the calling thread, i.e. with no queue depth behind them. */
@@ -339,6 +403,11 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
 
         public void reset() {
+            routedOpens.set(0);
+            declinedChain.set(0);
+            declinedMissing.set(0);
+            declinedTooSmall.set(0);
+            declinedOpenFailed.set(0);
             blockingReads.set(0);
             stagedReads.set(0);
             stagedHits.set(0);
@@ -365,10 +434,16 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             final long served = servedBytes.get();
             return String.format(
                 Locale.ROOT,
-                "blockingReads=%d stagedReads=%d stagedHits=%d stageDeclined=%d prefetchCalls=%d inFlightPeak=%d "
+                "routedOpens=%d declinedChain=%d declinedMissing=%d declinedTooSmall=%d declinedOpenFailed=%d "
+                    + "blockingReads=%d stagedReads=%d stagedHits=%d stageDeclined=%d prefetchCalls=%d inFlightPeak=%d "
                     + "stagedBytes=%d blockingBytes=%d servedBytes=%d declinedSpanBytes=%d "
                     + "readaheadReads=%d readaheadBytes=%d readaheadHits=%d readaheadDeclined=%d readaheadArmed=%d "
                     + "stagedWaitTimeouts=%d amplification=%.3f",
+                routedOpens.get(),
+                declinedChain.get(),
+                declinedMissing.get(),
+                declinedTooSmall.get(),
+                declinedOpenFailed.get(),
                 blockingReads.get(),
                 stagedReads.get(),
                 stagedHits.get(),
@@ -391,6 +466,18 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     }
 
     /** The one counter set, because the pool it counts is node wide too. */
+    /** Why the dispatch rule declined a {@code .vec} it matched on name and setting. */
+    public enum DeclineReason {
+        /** No {@link Path} resolvable through the delegate chain: condition 3. */
+        CHAIN,
+        /** The resolved path does not exist, or could not be sized: condition 4. */
+        MISSING,
+        /** Below {@code knn.direct_io.min_file_size}: condition 5. */
+        TOO_SMALL,
+        /** The {@code O_DIRECT} open itself failed: condition 6. */
+        OPEN_FAILED
+    }
+
     public static final Stats STATS = new Stats();
 
     /**

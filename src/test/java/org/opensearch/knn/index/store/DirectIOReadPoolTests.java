@@ -129,6 +129,38 @@ public class DirectIOReadPoolTests extends KNNTestCase {
     }
 
     /**
+     * S4: the capacity is a setting, and <b>the default does not move</b>. Phase 13's audit row 7 and phase
+     * 14's S3 both measured this as the binding constraint at concurrent-scorer load — 44%, 43.8% and 43.9%
+     * of declared reads refused at 16 scorers, because 16 scorers × 64 staged ranges want 1,024 slots and
+     * the derived capacity is {@code max(64, 8 × 16) = 128}. But the right value trades queue depth against
+     * wait on a specific device and core count, which this desktop cannot settle, so what phase 14 ships is
+     * the <em>knob</em>: the node sweeps 128 / 512 / 1024 / 4096 without a rebuild and the shipped
+     * behaviour is byte for byte what it was.
+     *
+     * <p>With no cluster service the setting reads its default of {@code 0}, which means derive — so these
+     * assertions are simultaneously "the default is unchanged" and "0 means derive".
+     */
+    public void testTheQueueCapacityIsASettingWhoseDefaultDoesNotMoveTheBehaviour() {
+        assertEquals(
+            "0 is the shipped default and means derive",
+            0,
+            org.opensearch.knn.index.KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_DEFAULT_VALUE
+        );
+        assertEquals(
+            "knn.direct_io.rescore.prefetch.queue_capacity",
+            org.opensearch.knn.index.KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING.getKey()
+        );
+        assertTrue(
+            "the node has to sweep this without a rebuild",
+            org.opensearch.knn.index.KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING.isDynamic()
+        );
+        // Unset, every value is the formula the pool has always used -- including the 128 the audit measured.
+        assertEquals(64, DirectIOReadPool.queueCapacity(2));
+        assertEquals("the capacity audit row 7 measured 44% declines at", 128, DirectIOReadPool.queueCapacity(16));
+        assertEquals(512, DirectIOReadPool.queueCapacity(64));
+    }
+
+    /**
      * Past the bound a submit is refused rather than queued, and refused is a condition both submit sites
      * already handle: {@code prefetch} counts {@code stageDeclined} and lets a blocking read serve the
      * bytes, {@code refillReadahead} counts {@code readaheadDeclined}. This test pins that the pool really

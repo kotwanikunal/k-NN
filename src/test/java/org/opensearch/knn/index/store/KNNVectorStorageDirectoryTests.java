@@ -629,6 +629,67 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
         }
     }
 
+    // -------------------------------------------------------------------------------------------------
+    // S4: the counters an operator actually reads are node wide, not per segment
+    // -------------------------------------------------------------------------------------------------
+
+    /**
+     * Every dispatch outcome is counted <b>twice</b>: on this directory's own per-segment counter, and on
+     * {@link DirectIOVectorIndexInput#STATS}, which is node wide and is what {@code _plugins/_knn/stats}
+     * reports. Both are load bearing. The codec seam creates this directory per segment per reader and
+     * discards it with that reader, so its instance counters can <em>never</em> be reached over REST — which
+     * phase 13's re-proof notes recorded as a gap and this is the fix. The instance counters stay because
+     * they are per segment, which a node-wide sum cannot be.
+     *
+     * <p>Driven through a real open of each kind, so the wiring is what is tested rather than restated.
+     */
+    @SneakyThrows
+    public void testADeclineIsCountedNodeWideAsWellAsPerSegment() {
+        assumeDirectIOWorksHere();
+        DirectIOVectorIndexInput.STATS.reset();
+        try {
+            // A chain decline: no FSDirectory underneath.
+            try (ByteBuffersDirectory noPath = new ByteBuffersDirectory()) {
+                writeFile(noPath, VECTOR_DATA, FILE_BYTES);
+                try (KNNVectorStorageDirectory storage = storageOver(noPath, true)) {
+                    storage.openInput(VECTOR_DATA, vectorDataContext()).close();
+                    assertEquals("the per-segment counter", 1, storage.declinedChain());
+                }
+            }
+            assertEquals("and the node-wide one", 1L, DirectIOVectorIndexInput.STATS.declinedChain());
+
+            // A size decline, then a routed open, on a real filesystem. One directory, because closing a
+            // KNNVectorStorageDirectory closes its delegate -- which is exactly why routeVectorData never
+            // closes the wrapper it builds.
+            final Path path = createTempDir();
+            try (MMapDirectory delegate = new MMapDirectory(path)) {
+                writeFile(delegate, VECTOR_DATA, FILE_BYTES);
+                final long[] floor = { FILE_BYTES + 1 };
+                try (KNNVectorStorageDirectory storage = new KNNVectorStorageDirectory(delegate, "_0", () -> true, () -> floor[0])) {
+                    storage.openInput(VECTOR_DATA, vectorDataContext()).close();
+                    assertEquals(1L, DirectIOVectorIndexInput.STATS.declinedTooSmall());
+
+                    floor[0] = 0L;
+                    try (IndexInput routed = storage.openInput(VECTOR_DATA, vectorDataContext())) {
+                        assertTrue(routed instanceof DirectIOVectorIndexInput);
+                    }
+                }
+                assertEquals(1L, DirectIOVectorIndexInput.STATS.routedOpens());
+            }
+
+            // The reasons are kept apart node wide, exactly as they are per segment.
+            assertEquals(2L, DirectIOVectorIndexInput.STATS.declinedOpens());
+            assertEquals(0L, DirectIOVectorIndexInput.STATS.declinedMissing());
+            assertEquals(0L, DirectIOVectorIndexInput.STATS.declinedOpenFailed());
+            assertTrue(
+                "and they are in the stats line an operator sees at DEBUG: " + DirectIOVectorIndexInput.STATS,
+                DirectIOVectorIndexInput.STATS.toString().contains("routedOpens=1 declinedChain=1 declinedMissing=0 declinedTooSmall=1")
+            );
+        } finally {
+            DirectIOVectorIndexInput.STATS.reset();
+        }
+    }
+
     /**
      * The predicate is name-based, so it is worth pinning to the names the real formats actually produce:
      * {@code PerFieldKnnVectorsFormat} builds each field's segment suffix from

@@ -225,6 +225,25 @@ public class KNNSettings {
     public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES = "knn.direct_io.rescore.prefetch.staged_ranges";
     public static final int KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_DEFAULT_VALUE = 64;
 
+    // How many reads may WAIT behind the shared pool. Phase 13 audit row 7 measured this as the binding
+    // constraint at concurrent-scorer load, and phase 14 S3 reproduced it independently: at 16 scorers with
+    // the derived default capacity of max(64, 8 * threads) = 128, stageDeclined/stagedReads is 43.8% and
+    // 43.9% in two arms, against the audit's 44% -- i.e. nearly half of every declared read is refused,
+    // because 16 scorers x 64 staged ranges want 1,024 slots and 128 exist.
+    //
+    // A refused submit is CORRECT and is the cheaper fallback -- the bytes are served by blocking reads of
+    // only the blocks a vector occupies, where caller-running the submit would read the whole span inline --
+    // so this is a tuning question and not a bug. But it is one the DESKTOP cannot answer for the node: the
+    // trade is queue depth against wait, and both sides depend on the device and the core count. So it
+    // becomes a setting the node can sweep without a rebuild, and THE DEFAULT DOES NOT MOVE.
+    //
+    // 0 means "derive", which is the shipped behaviour: max(MIN_QUEUE_CAPACITY, QUEUED_READS_PER_THREAD *
+    // threads) in DirectIOReadPool. Any positive value is taken literally. Read once, when the pool is
+    // created, because ArrayBlockingQueue has no resize; changing it takes effect on the next node restart
+    // or after the pool has been idle long enough to be dropped.
+    public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY = "knn.direct_io.rescore.prefetch.queue_capacity";
+    public static final int KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_DEFAULT_VALUE = 0;
+
     public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN = "knn.direct_io.rescore.prefetch.max_span_bytes";
     public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_DEFAULT_VALUE = new ByteSizeValue(
         128 * 1024 + 4096,
@@ -550,6 +569,23 @@ public class KNNSettings {
         KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES,
         KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_DEFAULT_VALUE,
         1,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
+     * Reads that may wait behind the shared Direct I/O pool. Node scoped and dynamic; read once, when the
+     * pool is created, because {@link java.util.concurrent.ArrayBlockingQueue} cannot be resized.
+     * <p>
+     * {@code 0} means <b>derive</b>, which is the shipped behaviour and therefore the default: phase 14
+     * deliberately does not move it. This exists so the node can sweep the one constraint phase 13's audit
+     * row 7 measured as binding — 44% of declared reads refused at 16 concurrent scorers — without a
+     * rebuild. A refused submit is the cheaper fallback, not a failure, so every value here is correct.
+     */
+    public static final Setting<Integer> KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING = Setting.intSetting(
+        KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY,
+        KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_DEFAULT_VALUE,
+        0,
         NodeScope,
         Dynamic
     );
@@ -1053,6 +1089,10 @@ public class KNNSettings {
             return KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING;
         }
 
+        if (KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY.equals(key)) {
+            return KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING;
+        }
+
         if (KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN.equals(key)) {
             return KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING;
         }
@@ -1121,6 +1161,7 @@ public class KNNSettings {
             // The directory design's read-ahead channel: staging table size and the waste guard
             KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_SETTING,
             KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING,
+            KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING,
             // Sequential read-ahead ring: window and arm trigger
             KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING,
             KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_SETTING,
@@ -1189,6 +1230,15 @@ public class KNNSettings {
      */
     public static int getDirectIORescorePrefetchStagedRanges() {
         return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_SETTING);
+    }
+
+    /**
+     * Reads that may wait behind the shared Direct I/O pool, or 0 for the derived default.
+     *
+     * @return the configured queue capacity, or 0 meaning {@code DirectIOReadPool} should derive it
+     */
+    public static int getDirectIORescorePrefetchQueueCapacity() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING);
     }
 
     /**

@@ -150,11 +150,31 @@ final class DirectIOReadPool {
     }
 
     /**
-     * How many reads may wait behind the pool, derived from the size it is created at. Not resized when the
-     * setting changes, because {@link ArrayBlockingQueue} has no resize and because the safe direction is
-     * the one that happens anyway: growing the pool leaves the queue relatively shallower.
+     * How many reads may wait behind the pool: {@code knn.direct_io.rescore.prefetch.queue_capacity} when
+     * an operator has set it, and otherwise {@code max(64, 8 x threads)} derived from the size the pool is
+     * created at. Not resized when either setting changes, because {@link ArrayBlockingQueue} has no resize
+     * and because the safe direction is the one that happens anyway: growing the pool leaves the queue
+     * relatively shallower.
+     *
+     * <p><b>The default is unchanged by design.</b> Phase 13's audit row 7 and phase 14's S3 both measured
+     * this as the binding constraint at concurrent-scorer load — 44%, 43.8% and 43.9% of declared reads
+     * refused at 16 scorers, because 16 scorers x 64 staged ranges want 1,024 slots and the derived
+     * capacity is 128 — but the right value is a trade of queue depth against wait on a specific device and
+     * core count, which this desktop cannot settle for the node. So the knob exists and the shipped
+     * behaviour does not move. A setting that cannot be read falls back to the derived value, the same
+     * contract every other Direct I/O setting has.
      */
     static int queueCapacity(final int threads) {
+        final int configured;
+        try {
+            configured = KNNSettings.getDirectIORescorePrefetchQueueCapacity();
+        } catch (Exception e) {
+            log.debug("Could not read knn.direct_io.rescore.prefetch.queue_capacity; deriving the capacity", e);
+            return Math.max(MIN_QUEUE_CAPACITY, QUEUED_READS_PER_THREAD * threads);
+        }
+        if (configured > 0) {
+            return configured;
+        }
         return Math.max(MIN_QUEUE_CAPACITY, QUEUED_READS_PER_THREAD * threads);
     }
 

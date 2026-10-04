@@ -193,6 +193,7 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
             final IndexInput direct = directIOInput(name);
             if (direct != null) {
                 routedOpens.incrementAndGet();
+                DirectIOVectorIndexInput.STATS.recordRoutedOpen();
                 log.debug("k-NN vector storage [{}]: serving [{}] with O_DIRECT", segmentName, name);
                 return direct;
             }
@@ -210,7 +211,7 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
         // (3) the chain.
         final Path path = resolvePath(in, name, PASSTHROUGH_FILTER_DIRECTORIES);
         if (path == null) {
-            declinedChain.incrementAndGet();
+            decline(declinedChain, DirectIOVectorIndexInput.DeclineReason.CHAIN);
             log.debug(
                 "k-NN vector storage [{}]: [{}] has no resolvable filesystem path below [{}], so Direct I/O cannot serve it",
                 segmentName,
@@ -225,7 +226,7 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
         try {
             final long bytes = Files.size(path);
             if (bytes < minBytes) {
-                declinedTooSmall.incrementAndGet();
+                decline(declinedTooSmall, DirectIOVectorIndexInput.DeclineReason.TOO_SMALL);
                 log.debug(
                     "k-NN vector storage [{}]: [{}] is {} B, below knn.direct_io.min_file_size of {} B; serving it from the page cache",
                     segmentName,
@@ -236,11 +237,11 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
                 return null;
             }
         } catch (NoSuchFileException e) {
-            declinedMissing.incrementAndGet();
+            decline(declinedMissing, DirectIOVectorIndexInput.DeclineReason.MISSING);
             log.debug("k-NN vector storage [{}]: [{}] does not exist at [{}]", segmentName, name, path);
             return null;
         } catch (IOException | RuntimeException e) {
-            declinedMissing.incrementAndGet();
+            decline(declinedMissing, DirectIOVectorIndexInput.DeclineReason.MISSING);
             log.warn("k-NN vector storage [{}]: could not size [{}]", segmentName, path, e);
             return null;
         }
@@ -248,12 +249,12 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
         try {
             final DirectIOVectorIndexInput direct = DirectIOVectorIndexInput.open(path);
             if (direct == null) {
-                declinedOpenFailed.incrementAndGet();
+                decline(declinedOpenFailed, DirectIOVectorIndexInput.DeclineReason.OPEN_FAILED);
                 log.warn("k-NN vector storage [{}]: Direct I/O is not available for [{}]", segmentName, path);
             }
             return direct;
         } catch (RuntimeException e) {
-            declinedOpenFailed.incrementAndGet();
+            decline(declinedOpenFailed, DirectIOVectorIndexInput.DeclineReason.OPEN_FAILED);
             log.warn("k-NN vector storage [{}]: could not open [{}] with Direct I/O", segmentName, path, e);
             return null;
         }
@@ -322,6 +323,18 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
     // -------------------------------------------------------------------------------------------------
     // Observability: bounded counters, no node-wide state
     // -------------------------------------------------------------------------------------------------
+
+    /**
+     * Records one decline twice: on this directory's own counter, which is per segment and is what a test
+     * asserts on, and on {@link DirectIOVectorIndexInput#STATS}, which is node wide and is what an operator
+     * reads at {@code _plugins/_knn/stats}. Both are needed because this object is created per segment per
+     * reader by the codec seam and is discarded with that reader, so its instance counters can never be
+     * reached from a REST API.
+     */
+    private static void decline(final AtomicLong counter, final DirectIOVectorIndexInput.DeclineReason reason) {
+        counter.incrementAndGet();
+        DirectIOVectorIndexInput.STATS.recordDecline(reason);
+    }
 
     /** Full-precision vector data opens this directory served with {@code O_DIRECT}. */
     public long routedOpens() {

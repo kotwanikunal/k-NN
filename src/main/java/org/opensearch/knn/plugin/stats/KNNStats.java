@@ -10,6 +10,7 @@ import com.google.common.collect.ImmutableMap;
 import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManager;
+import org.opensearch.knn.index.store.DirectIOVectorIndexInput;
 import org.opensearch.knn.indices.ModelCache;
 import org.opensearch.knn.indices.ModelDao;
 import org.opensearch.knn.plugin.stats.suppliers.EventOccurredWithinThresholdSupplier;
@@ -83,7 +84,72 @@ public class KNNStats {
         addModelStats(builder);
         addGraphStats(builder);
         addRemoteIndexBuildStats(builder);
+        addDirectIOStats(builder);
         return builder.build();
+    }
+
+    /**
+     * The Direct I/O read path's node-wide counters, at {@code _plugins/_knn/stats} under
+     * {@code direct_io_stats}. This is the k-NN-shaped place for them: {@code KNNStats} is already how every
+     * other node-level k-NN counter reaches an operator, and the alternative — the per-segment
+     * {@code KNNVectorStorageDirectory} the codec seam creates — is discarded with its reader and so can
+     * never be read over REST.
+     *
+     * <p>Two groups, because they answer two different questions.
+     * <ul>
+     *   <li><b>dispatch</b> — is the seam engaging, and if not, why? {@code routed_opens} against the four
+     *       decline reasons, which want four different operator responses: an unsupported substrate
+     *       ({@code declined_chain}), a bug ({@code declined_missing}), the size floor working as designed
+     *       ({@code declined_too_small}), or a filesystem with no {@code O_DIRECT}
+     *       ({@code declined_open_failed}).</li>
+     *   <li><b>reads</b> — once engaged, what is it doing? The staged/blocking/read-ahead channels and the
+     *       byte counters behind the amplification ratio. {@code stage_declined} against
+     *       {@code staged_reads} is the queue-capacity decline rate phase 13's audit row 7 measured as the
+     *       binding constraint at concurrent load, and is why
+     *       {@code knn.direct_io.rescore.prefetch.queue_capacity} is a setting.</li>
+     * </ul>
+     *
+     * <p>Node level rather than cluster level, and cumulative since node start, because every counter is a
+     * property of one node's reads: the device, the filesystem block size and the page cache that decide
+     * whether Direct I/O is winning are all per node.
+     */
+    private void addDirectIOStats(ImmutableMap.Builder<String, KNNStat<?>> builder) {
+        builder.put(StatNames.DIRECT_IO_STATS.getName(), createNodeStat(KNNStats::createDirectIOStatsMap));
+    }
+
+    private static Map<String, Map<String, Object>> createDirectIOStatsMap() {
+        final DirectIOVectorIndexInput.Stats stats = DirectIOVectorIndexInput.STATS;
+
+        final Map<String, Object> dispatch = new HashMap<>();
+        dispatch.put("routed_opens", stats.routedOpens());
+        dispatch.put("declined_opens", stats.declinedOpens());
+        dispatch.put("declined_chain", stats.declinedChain());
+        dispatch.put("declined_missing", stats.declinedMissing());
+        dispatch.put("declined_too_small", stats.declinedTooSmall());
+        dispatch.put("declined_open_failed", stats.declinedOpenFailed());
+
+        final Map<String, Object> reads = new HashMap<>();
+        reads.put("blocking_reads", stats.blockingReads());
+        reads.put("staged_reads", stats.stagedReads());
+        reads.put("staged_hits", stats.stagedHits());
+        reads.put("stage_declined", stats.stageDeclined());
+        reads.put("staged_wait_timeouts", stats.stagedWaitTimeouts());
+        reads.put("prefetch_calls", stats.prefetchCalls());
+        reads.put("in_flight_peak", stats.inFlightPeak());
+        reads.put("readahead_armed", stats.readaheadArmed());
+        reads.put("readahead_reads", stats.readaheadReads());
+        reads.put("readahead_hits", stats.readaheadHits());
+        reads.put("readahead_declined", stats.readaheadDeclined());
+        reads.put("staged_bytes", stats.stagedBytes());
+        reads.put("blocking_bytes", stats.blockingBytes());
+        reads.put("readahead_bytes", stats.readaheadBytes());
+        reads.put("served_bytes", stats.servedBytes());
+        reads.put("declined_span_bytes", stats.declinedSpanBytes());
+
+        final Map<String, Map<String, Object>> directIOStats = new HashMap<>();
+        directIOStats.put("dispatch", dispatch);
+        directIOStats.put("reads", reads);
+        return directIOStats;
     }
 
     private void addQueryStats(ImmutableMap.Builder<String, KNNStat<?>> builder) {
