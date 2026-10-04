@@ -161,11 +161,10 @@ public class Faiss1040ScalarQuantizedKnnVectorsFormat extends KnnVectorsFormat {
      * to avoid implying a per-field resolution that isn't happening.
      */
     /**
-     * <p><b>Phase 13 E2 prototype.</b> The flat reader is built over a
+     * <p>The flat reader is built over a
      * {@link KNNVectorStorageDirectory#routeVectorData derived read state}, so that its {@code .vec} open
-     * goes through k-NN's Direct I/O dispatch with <b>no {@code index.store.factory}</b>. Inert when
-     * {@code knn.direct_io.rescore.enabled} is off, and a no-op when the store factory is already in the
-     * chain.
+     * goes through k-NN's Direct I/O dispatch with <b>no index setting</b>. Inert when
+     * {@code knn.direct_io.rescore.enabled} is off.
      */
     @Override
     public KnnVectorsReader fieldsReader(SegmentReadState state) throws IOException {

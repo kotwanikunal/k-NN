@@ -45,16 +45,15 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * The phase 13 E2 prototype: {@link KNNVectorStorageDirectory#routeVectorData}, the codec-level seam that
- * reaches the same {@code .vec} open as {@code index.store.factory} <b>with no index setting</b>.
+ * {@link KNNVectorStorageDirectory#routeVectorData}, the codec-level seam — since phase 14 the plugin's
+ * <b>only</b> Direct I/O engagement point, reaching the {@code .vec} open with no index setting at all.
  *
- * <p>Four properties, because four things can go wrong with a seam placed here rather than at the store:
- * it can fire when the feature is off, it can fail to fire when it is on, it can fire <em>twice</em> on an
- * index that also has the store factory installed, and it can mis-handle a compound segment — where the
- * directory a codec is handed is not the shard's directory at all but the compound reader, which has no
- * filesystem path behind it. Each is asserted here; the fourth is asserted against a <b>real</b>
- * {@link Lucene90CompoundFormat} container rather than a stand-in, because "the decline is structural"
- * is exactly the claim being made.
+ * <p>Three properties, because three things can go wrong with a seam placed here rather than at the store:
+ * it can fire when the feature is off, it can fail to fire when it is on, and it can mis-handle a compound
+ * segment — where the directory a codec is handed is not the shard's directory at all but the compound
+ * reader, which has no filesystem path behind it. Each is asserted here; the third is asserted against a
+ * <b>real</b> {@link Lucene90CompoundFormat} container rather than a stand-in, because "the decline is
+ * structural" is exactly the claim being made.
  */
 @ThreadLeakFilters(defaultFilters = true, filters = { DirectIOReadPoolTests.ReadPoolThreadFilter.class })
 public class KNNVectorStorageCodecSeamTests extends KNNTestCase {
@@ -178,7 +177,7 @@ public class KNNVectorStorageCodecSeamTests extends KNNTestCase {
     }
 
     /**
-     * The whole point of E2: with the setting on and <b>no store factory anywhere</b>, a faiss
+     * The whole point of the seam: with the setting on and <b>no index setting anywhere</b>, a faiss
      * {@code .vec} opened through the derived state is served with {@code O_DIRECT} and reads the same
      * bytes. Everything else on the state is carried through unchanged, because a codec that found a
      * different {@code segmentSuffix} would read a different field's file.
@@ -199,9 +198,13 @@ public class KNNVectorStorageCodecSeamTests extends KNNTestCase {
             assertSame("the context must be carried through", state.context, derived.context);
             assertEquals("the segment suffix must be carried through", state.segmentSuffix, derived.segmentSuffix);
 
-            final KNNVectorStorageDirectory storage = KNNVectorStorageDirectory.find(derived.directory);
-            assertNotNull("the derived state's directory must be k-NN's", storage);
+            assertTrue(
+                "the derived state's directory must be k-NN's, got " + derived.directory.getClass().getName(),
+                derived.directory instanceof KNNVectorStorageDirectory
+            );
+            final KNNVectorStorageDirectory storage = (KNNVectorStorageDirectory) derived.directory;
             assertSame("it must wrap the caller's directory, not replace it", directory, storage.getDelegate());
+            assertEquals("the directory names the segment it serves, not an index", info.name, storage.segmentName());
 
             try (IndexInput routed = derived.directory.openInput(VECTOR_DATA, vectorDataContext())) {
                 assertTrue(
@@ -216,37 +219,16 @@ public class KNNVectorStorageCodecSeamTests extends KNNTestCase {
     }
 
     /**
-     * An index that opted in with {@code index.store.factory} must not be wrapped twice: the store
-     * factory has already taken the decision for every file of that shard, and a second wrapper would be
-     * a second {@code O_DIRECT} file handle per segment for no gain.
-     */
-    @SneakyThrows
-    public void testTheSeamDoesNotWrapAgainWhenTheStoreFactoryIsAlreadyInstalled() {
-        enableDirectIORouting();
-        try (MMapDirectory directory = new MMapDirectory(createTempDir())) {
-            writeFile(directory, VECTOR_DATA, FILE_BYTES);
-            try (KNNVectorStorageDirectory installed = new KNNVectorStorageDirectory(directory, "test-index")) {
-                final SegmentReadState state = readStateOver(installed, segmentInfoOver(directory, false, Set.of(VECTOR_DATA)));
-                assertSame(
-                    "the store factory's directory is already in the chain",
-                    state,
-                    KNNVectorStorageDirectory.routeVectorData(state)
-                );
-            }
-        }
-    }
-
-    /**
      * A compound segment, against a real {@link Lucene90CompoundFormat} container. The directory a codec
      * is handed for a compound segment is the {@link CompoundDirectory}, which is <b>not</b> a
      * {@code FilterDirectory}, so k-NN's path resolution stops there and the open is <b>declined</b> — the
      * entry is served by the compound reader's own mmap slice, and the bytes are still right.
      *
-     * <p>This is the documented behaviour of the prototype rather than a defect: a compound segment is a
-     * freshly flushed one, small, and its working set belongs in the page cache. Resolving {@code .cfe}
-     * offsets inside the codec would mean re-implementing the compound reader's entry table one layer
-     * above it. The store-factory design does not have this gap, because it sees the {@code .cfs}
-     * {@code openInput} itself (see {@code KNNVectorCompoundSliceInput}).
+     * <p>This is the measured right answer rather than a gap: a compound segment is a freshly flushed one,
+     * small, and its working set belongs in the page cache — phase 13's E4 measured a flush-sized
+     * {@code .vec} at 64.7 ops/s on {@code O_DIRECT} against 518,681 ops/s from the page cache. Resolving
+     * {@code .cfe} offsets inside the codec would mean re-implementing the compound reader's entry table
+     * one layer above it, in order to route reads that must not be routed.
      */
     @SneakyThrows
     public void testACompoundSegmentDeclinesAndStillReadsTheRightBytes() {
@@ -260,8 +242,7 @@ public class KNNVectorStorageCodecSeamTests extends KNNTestCase {
             try (CompoundDirectory compound = new Lucene90CompoundFormat().getCompoundReader(directory, info)) {
                 final SegmentReadState state = readStateOver(compound, info);
                 final SegmentReadState derived = KNNVectorStorageDirectory.routeVectorData(state);
-                final KNNVectorStorageDirectory storage = KNNVectorStorageDirectory.find(derived.directory);
-                assertNotNull(storage);
+                final KNNVectorStorageDirectory storage = (KNNVectorStorageDirectory) derived.directory;
 
                 try (IndexInput entry = derived.directory.openInput(VECTOR_DATA, vectorDataContext())) {
                     assertFalse(

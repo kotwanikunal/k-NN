@@ -108,9 +108,9 @@ public class FaissVectorDataIdentityTests extends KNNTestCase {
     }
 
     /**
-     * One non-compound segment, so the {@code .vec} arrives at the directory's own {@code openInput}
-     * rather than as a slice of a {@code .cfs} — the compound dispatch point is proven separately in
-     * {@link KNNVectorCompoundSliceInputTests}.
+     * One non-compound segment, so the {@code .vec} arrives at the directory's own {@code openInput} —
+     * the only dispatch point there is. A compound segment declines by construction, which is asserted in
+     * {@link KNNVectorStorageCodecSeamTests#testACompoundSegmentDeclinesAndStillReadsTheRightBytes}.
      */
     private static void writeSegment(final MMapDirectory directory) throws IOException {
         final IndexWriterConfig config = new IndexWriterConfig();

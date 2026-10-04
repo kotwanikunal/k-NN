@@ -440,9 +440,10 @@ public class KNNSettings {
      * at every dispatch and needs no index close and reopen, so flipping it takes effect on the next
      * reader or values object.
      * <p>
-     * Necessary but not sufficient: the index also has to have opted in with
-     * {@code index.store.factory: knn_vector_storage}. Off by default, and with it off every read is the
-     * one every existing measurement was taken against, byte for byte.
+     * This is the <b>whole</b> opt-in since phase 14: engagement is the codec seam
+     * ({@code KNNVectorStorageDirectory#routeVectorData}) and there is no per-index setting to set. Off by
+     * default, and with it off every read is the one every existing measurement was taken against, byte
+     * for byte.
      */
     public static final Setting<Boolean> KNN_DIRECT_IO_RESCORE_ENABLED_SETTING = Setting.boolSetting(
         KNN_DIRECT_IO_RESCORE_ENABLED,

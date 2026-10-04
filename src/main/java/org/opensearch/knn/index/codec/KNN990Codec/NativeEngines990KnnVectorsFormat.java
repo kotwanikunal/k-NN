@@ -85,10 +85,10 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
      * Returns a {@link KnnVectorsReader} to read the vectors from the index.
      *
      * <p>The flat reader is built over a {@link KNNVectorStorageDirectory#routeVectorData derived read
-     * state} (phase 13 E2 prototype), so that its {@code .vec} open goes through k-NN's Direct I/O
-     * dispatch when {@code knn.direct_io.rescore.enabled} is on and <b>no {@code index.store.factory} is
-     * needed</b>. Inert when the setting is off, and a no-op when the store factory is already in the
-     * chain. Only the flat reader's state is derived: the wrapper exists to serve one open, and
+     * state}, so that its {@code .vec} open goes through k-NN's Direct I/O dispatch when
+     * {@code knn.direct_io.rescore.enabled} is on. This is the plugin's only Direct I/O engagement point
+     * and it needs <b>no index setting</b>; it is inert when the node setting is off. Only the flat
+     * reader's state is derived: the wrapper exists to serve one open, and
      * {@link NativeEngines990KnnVectorsReader} reads the native index through its own channel.
      *
      * @param state {@link SegmentReadState}

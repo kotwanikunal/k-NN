@@ -87,13 +87,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * to keep the SIMD scorer off and therefore had to rebuild read-ahead in the query layer.
  *
  * <h2>Direct I/O is a property of this object, inherited</h2>
- * An {@code IOContext} does not survive the {@link #slice} Lucene uses <em>on a non-compound segment</em>:
- * {@code OffHeapFloatVectorValues} calls the three-argument overload, which has no context parameter. The
- * context-carrying four-argument overload does have one call site — {@code Lucene90CompoundReader#openInput},
- * which is how every entry of every compound segment is opened, and which gate 3 turns into the
- * compound-segment dispatch point (see {@link KNNVectorCompoundSliceInput}). Outside a compound file,
- * though, "these bytes are fetched with {@code O_DIRECT}" cannot be re-decided per slice and must be
- * carried by the object. {@link #slice} and {@link #clone} therefore return instances over the same
+ * An {@code IOContext} does not survive the {@link #slice} Lucene uses: {@code OffHeapFloatVectorValues}
+ * calls the three-argument overload, which has no context parameter. So "these bytes are fetched with
+ * {@code O_DIRECT}" cannot be re-decided per slice and must be carried by the object.
+ * {@link #slice} and {@link #clone} therefore return instances over the same
  * {@link Handle} by construction, and there is no code path by which a slice of this input becomes an mmap
  * read. Only the input that opened the handle closes it.
  */

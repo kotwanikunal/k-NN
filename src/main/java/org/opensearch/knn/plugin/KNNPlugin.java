@@ -122,8 +122,6 @@ import org.opensearch.plugins.ReloadablePlugin;
 import org.opensearch.plugins.ScriptPlugin;
 import org.opensearch.plugins.SearchPipelinePlugin;
 import org.opensearch.plugins.SearchPlugin;
-import org.opensearch.knn.index.store.KNNVectorStorageStoreFactory;
-import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.plugins.SystemIndexPlugin;
 import org.opensearch.remoteindexbuild.client.RemoteIndexHTTPClient;
 import org.opensearch.repositories.RepositoriesService;
@@ -162,7 +160,6 @@ import static org.opensearch.knn.common.KNNConstants.MODEL_INDEX_NAME;
 import static org.opensearch.knn.common.KNNConstants.TRAIN_THREAD_POOL;
 import static org.opensearch.knn.index.KNNCircuitBreaker.KNN_CIRCUIT_BREAKER_TIER;
 import static org.opensearch.knn.index.KNNSettings.KNN_DERIVED_SOURCE_ENABLED;
-import static org.opensearch.knn.index.store.KNNVectorStorageStoreFactory.KNN_VECTOR_STORAGE_STORE_FACTORY;
 
 /**
  * Entry point for the KNN plugin where we define mapper for knn_vector type
@@ -204,7 +201,6 @@ public class KNNPlugin extends Plugin
         ScriptPlugin,
         ExtensiblePlugin,
         SystemIndexPlugin,
-        IndexStorePlugin,
         ReloadablePlugin,
         SearchPipelinePlugin {
 
@@ -311,24 +307,6 @@ public class KNNPlugin extends Plugin
     @Override
     public List<Setting<?>> getSettings() {
         return KNNSettings.state().getSettings();
-    }
-
-    /**
-     * Registers the store factories the plugin offers, selected per index by
-     * {@code index.store.factory}. Unlike {@code getDirectoryFactories()}, which is keyed by
-     * {@code index.store.type} and therefore replaces the user's store type, a store factory is handed
-     * the directory the chosen store type already built and can wrap it — the insertion point the
-     * vector-directory design needs.
-     * <p>
-     * Registering a factory costs nothing on an index that does not name it: the setting defaults to
-     * empty, and an empty value resolves to the server's own store factory without consulting this map.
-     * <p>
-     * One is offered. {@code knn_vector_storage} dispatches full-precision vector re-score reads to
-     * Direct I/O and leaves every other read on the store type's own path.
-     */
-    @Override
-    public Map<String, IndexStorePlugin.StoreFactory> getStoreFactories() {
-        return Map.of(KNN_VECTOR_STORAGE_STORE_FACTORY, new KNNVectorStorageStoreFactory());
     }
 
     @Override

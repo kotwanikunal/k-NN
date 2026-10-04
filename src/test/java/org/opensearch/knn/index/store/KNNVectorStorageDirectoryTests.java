@@ -271,87 +271,40 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
     }
 
     // -------------------------------------------------------------------------------------------------
-    // The second dispatch point
+    // The compound container is no longer a dispatch point
     // -------------------------------------------------------------------------------------------------
 
     /**
-     * Every compound container is wrapped, because a compound segment's {@code .vec} has no
-     * {@code openInput} of its own to dispatch on — it arrives as a four-argument slice of this container.
-     * Nothing else is wrapped: the container is the only file whose <em>entries</em> need a decision.
+     * A {@code .cfs} is the delegate's own object. The store-factory design wrapped every compound
+     * container in a 423-line {@code KNNVectorCompoundSliceInput} so that a compound segment's {@code .vec}
+     * entry — which has no {@code openInput} of its own — could be routed as a four-argument slice. Phase
+     * 14 deleted it on measurement, not on taste: a compound segment is a freshly flushed one, and phase
+     * 13's E4 measured a flush-sized {@code .vec} at <b>64.7 ops/s</b> on {@code O_DIRECT} against
+     * <b>518,681 ops/s</b> from the page cache. The code existed to route reads that must not be routed.
+     *
+     * <p>Pinned as a test because the failure it guards is a future edit re-adding the interception.
      */
     @SneakyThrows
-    public void testTheCompoundContainerIsWrappedAndNothingElseIs() {
+    public void testTheCompoundContainerIsNotADispatchPoint() {
         final Path path = createTempDir();
         try (MMapDirectory delegate = new MMapDirectory(path)) {
             writeFile(delegate, "_0.cfs", FILE_BYTES);
             writeFile(delegate, "_0.cfe", 1024);
-            writeFile(delegate, "_0_Lucene99FlatVectorsFormat_0.vec", FILE_BYTES);
+            final Class<?> delegateInputClass;
+            try (IndexInput reference = delegate.openInput("_0.cfe", IOContext.DEFAULT)) {
+                delegateInputClass = reference.getClass();
+            }
             try (KNNVectorStorageDirectory storage = storageOver(delegate, true)) {
+                for (final String name : new String[] { "_0.cfs", "_0.cfe" }) {
+                    try (IndexInput input = storage.openInput(name, IOContext.DEFAULT)) {
+                        assertSame(name + " must be the delegate's own object, not a wrapper of it", delegateInputClass, input.getClass());
+                    }
+                }
                 try (IndexInput container = storage.openInput("_0.cfs", IOContext.DEFAULT)) {
-                    assertTrue(
-                        "the compound container is the compound segment's dispatch point",
-                        container instanceof KNNVectorCompoundSliceInput
-                    );
                     assertArrayEquals(contentOf(FILE_BYTES), readAll(container));
                 }
-                for (final String name : new String[] { "_0.cfe", "_0_Lucene99FlatVectorsFormat_0.vec" }) {
-                    try (IndexInput input = storage.openInput(name, IOContext.DEFAULT)) {
-                        assertFalse(name + " must not be wrapped", input instanceof KNNVectorCompoundSliceInput);
-                    }
-                }
-                assertEquals(1, storage.wrappedContainers());
-            }
-        }
-    }
-
-    /**
-     * The production container does not record its slices. Its predecessor did, into an unbounded
-     * {@link java.util.concurrent.CopyOnWriteArrayList}, which is correct for a spike and is a leak plus an
-     * O(n²) on a shard's real slice traffic. The counters are kept either way.
-     */
-    @SneakyThrows
-    public void testTheProductionContainerCountsSlicesRatherThanRecordingThem() {
-        final Path path = createTempDir();
-        try (MMapDirectory delegate = new MMapDirectory(path)) {
-            writeFile(delegate, "_0.cfs", FILE_BYTES);
-            try (KNNVectorStorageDirectory storage = storageOver(delegate, true)) {
-                try (IndexInput container = storage.openInput("_0.cfs", IOContext.DEFAULT)) {
-                    final KNNVectorCompoundSliceInput wrapped = (KNNVectorCompoundSliceInput) container;
-                    for (int i = 0; i < 64; i++) {
-                        wrapped.slice("entry" + i, 0, 512, IOContext.DEFAULT).close();
-                    }
-                    assertTrue("a production container must not accumulate per-slice observations", wrapped.sliceObservations().isEmpty());
-                    assertEquals("no entry here is a faiss .vec, so nothing is routed", 0, wrapped.routedSlices());
-                    assertEquals(0, wrapped.declinedSlices());
-                }
-            }
-        }
-    }
-
-    /**
-     * The container's routing follows the setting while the container is open, which is what makes the
-     * dynamic setting dynamic for compound segments: a container is opened once per segment and sliced
-     * once per values object, so a decision captured at open time would need a reopen to take effect.
-     */
-    @SneakyThrows
-    public void testTheContainersRoutingFollowsTheSettingWhileItIsOpen() {
-        assumeDirectIOWorksHere();
-        final Path path = createTempDir();
-        try (MMapDirectory delegate = new MMapDirectory(path)) {
-            writeFile(delegate, "_0.cfs", FILE_BYTES);
-            final boolean[] enabled = { false };
-            try (KNNVectorStorageDirectory storage = new KNNVectorStorageDirectory(delegate, "test-index", () -> enabled[0])) {
-                try (IndexInput container = storage.openInput("_0.cfs", IOContext.DEFAULT)) {
-                    final KNNVectorCompoundSliceInput wrapped = (KNNVectorCompoundSliceInput) container;
-                    wrapped.slice(VECTOR_DATA, 1088, 4096, vectorDataContext()).close();
-                    assertEquals("with the setting off the entry stays on the delegate's slice", 0, wrapped.routedSlices());
-
-                    enabled[0] = true;
-                    try (IndexInput entry = wrapped.slice(VECTOR_DATA, 1088, 4096, vectorDataContext())) {
-                        assertTrue("with the setting on the entry is routed", entry instanceof DirectIOVectorIndexInput);
-                    }
-                    assertEquals(1, wrapped.routedSlices());
-                }
+                assertEquals("a .cfs satisfies no condition of the rule, so nothing is counted", 0, storage.routedOpens());
+                assertEquals(0, storage.declinedOpens());
             }
         }
     }
@@ -407,22 +360,6 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
                 }
                 storage.deleteFile("written-through.bin");
                 assertFalse(java.util.Arrays.asList(storage.listAll()).contains("written-through.bin"));
-            }
-        }
-    }
-
-    /** {@link KNNVectorStorageDirectory#find} is a walk of the caller's chain and finds nothing when absent. */
-    @SneakyThrows
-    public void testFindWalksTheChainAndAnswersNullWhenNotInstalled() {
-        try (ByteBuffersDirectory base = new ByteBuffersDirectory()) {
-            assertNull(KNNVectorStorageDirectory.find(base));
-            assertNull(KNNVectorStorageDirectory.find(null));
-            try (KNNVectorStorageDirectory storage = storageOver(base, true)) {
-                final Directory above = new FilterDirectory(new FilterDirectory(storage) {
-                }) {
-                };
-                assertSame(storage, KNNVectorStorageDirectory.find(above));
-                assertSame(storage, KNNVectorStorageDirectory.find(storage));
             }
         }
     }
