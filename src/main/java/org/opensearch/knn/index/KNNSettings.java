@@ -134,6 +134,27 @@ public class KNNSettings {
     public static final String KNN_DIRECT_IO_RESCORE_ENABLED = "knn.direct_io.rescore.enabled";
     public static final boolean KNN_DIRECT_IO_RESCORE_ENABLED_DEFAULT_VALUE = false;
 
+    // The size floor on routing, and the one unambiguous defect phase 13's audit found (FIX 1). A .vec
+    // below it is served by the delegate however the rest of the rule reads.
+    //
+    // The condition the feature actually wants is "this .vec's working set cannot stay in the page cache",
+    // and that is a property of the host's memory and the shard's traffic, not of the file. Before this
+    // setting the condition was asserted ONCE PER NODE by knn.direct_io.rescore.enabled and never checked
+    // per file, and the measured cost of getting it wrong on one small file is three to four orders of
+    // magnitude: phase 13 E4, same 16-thread random rescore workload, a 0.98 MiB flushed .vec served at
+    // 64.7 ops/s with O_DIRECT against 518,681 ops/s with mmap -- 8,016x -- because mmap reads the file
+    // from the device once and then answers from the page cache forever while O_DIRECT goes to the device
+    // for every read, forever. At 2.86 GiB the two arms converge (59.5 vs 67.5) because the file no longer
+    // fits in whatever cache the workload gets.
+    //
+    // A size floor does not capture residency. It removes the case where the answer is CERTAINLY wrong --
+    // a flush-sized segment -- for one comparison. 10 MB is Lucene's own DEFAULT_MIN_BYTES_DIRECT rather
+    // than a number measured here, and is called out as such: E4's two fixtures were 0.98 MiB and 58.6 MiB
+    // and both lost on a 123 GiB desktop, so this desktop cannot locate the crossing point. Set 0b to
+    // restore pre-phase-14 behaviour and route every size.
+    public static final String KNN_DIRECT_IO_MIN_FILE_SIZE = "knn.direct_io.min_file_size";
+    public static final ByteSizeValue KNN_DIRECT_IO_MIN_FILE_SIZE_DEFAULT_VALUE = new ByteSizeValue(10, ByteSizeUnit.MB);
+
     // Direct I/O prefetch settings. These are only consulted once Direct I/O is already engaged, i.e.
     // knn.direct_io.rescore.enabled is on and KNNVectorStorageDirectory routed a .vec through
     // DirectIOVectorIndexInput, so on a node with that setting off none of them has any effect.
@@ -448,6 +469,22 @@ public class KNNSettings {
     public static final Setting<Boolean> KNN_DIRECT_IO_RESCORE_ENABLED_SETTING = Setting.boolSetting(
         KNN_DIRECT_IO_RESCORE_ENABLED,
         KNN_DIRECT_IO_RESCORE_ENABLED_DEFAULT_VALUE,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
+     * The size a faiss/MOS {@code .vec} must reach before it is routed to Direct I/O — condition (iii) of
+     * {@code KNNVectorStorageDirectory}'s guard. Node scoped and dynamic, read at every dispatch, so it
+     * takes effect on the next reader.
+     * <p>
+     * Phase 13's audit called the absence of this term the one unambiguous defect in the design:
+     * {@code O_DIRECT} on a flush-sized {@code .vec} measured <b>8,016x</b> slower than the page cache.
+     * {@code 0b} disables the floor and restores pre-phase-14 routing.
+     */
+    public static final Setting<ByteSizeValue> KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING = Setting.byteSizeSetting(
+        KNN_DIRECT_IO_MIN_FILE_SIZE,
+        KNN_DIRECT_IO_MIN_FILE_SIZE_DEFAULT_VALUE,
         NodeScope,
         Dynamic
     );
@@ -968,6 +1005,10 @@ public class KNNSettings {
             return KNN_DIRECT_IO_RESCORE_ENABLED_SETTING;
         }
 
+        if (KNN_DIRECT_IO_MIN_FILE_SIZE.equals(key)) {
+            return KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING;
+        }
+
         if (KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS.equals(key)) {
             return KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING;
         }
@@ -1029,6 +1070,7 @@ public class KNNSettings {
             // Direct I/O settings
             // Rescore-seam gate
             KNN_DIRECT_IO_RESCORE_ENABLED_SETTING,
+            KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING,
             // Rescore-seam prefetch settings
             KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING,
             // Rescore-seam vector cache
@@ -1078,6 +1120,16 @@ public class KNNSettings {
      */
     public static boolean isDirectIORescoreEnabled() {
         return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_ENABLED_SETTING);
+    }
+
+    /**
+     * The size floor on routing. Read at every dispatch, for the same reason the enablement switch is:
+     * the setting is dynamic and a {@code .vec} is opened once per reader.
+     *
+     * @return the smallest faiss/MOS {@code .vec} that may be served with Direct I/O
+     */
+    public static ByteSizeValue getDirectIOMinFileSize() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING);
     }
 
     /**

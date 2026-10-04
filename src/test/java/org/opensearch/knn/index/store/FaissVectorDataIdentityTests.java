@@ -161,7 +161,7 @@ public class FaissVectorDataIdentityTests extends KNNTestCase {
             }
             assertEquals(DOCS, expected.size());
 
-            try (KNNVectorStorageDirectory storage = new KNNVectorStorageDirectory(delegate, "test-index", () -> true)) {
+            try (KNNVectorStorageDirectory storage = new KNNVectorStorageDirectory(delegate, "_0", () -> true, () -> 0L)) {
                 final List<float[]> actual;
                 try (DirectoryReader routedReader = DirectoryReader.open(storage)) {
                     assertEquals(
@@ -202,7 +202,7 @@ public class FaissVectorDataIdentityTests extends KNNTestCase {
             try (
                 MMapDirectory control = new MMapDirectory(path);
                 DirectoryReader mmapReader = DirectoryReader.open(control);
-                KNNVectorStorageDirectory storage = new KNNVectorStorageDirectory(delegate, "test-index", () -> true);
+                KNNVectorStorageDirectory storage = new KNNVectorStorageDirectory(delegate, "_0", () -> true, () -> 0L);
                 DirectoryReader routedReader = DirectoryReader.open(storage)
             ) {
                 assertEquals(1, storage.routedOpens());
@@ -241,7 +241,7 @@ public class FaissVectorDataIdentityTests extends KNNTestCase {
                 expected = readAll(onlyLeafValues(mmapReader));
             }
 
-            try (KNNVectorStorageDirectory storage = new KNNVectorStorageDirectory(delegate, "test-index", () -> false)) {
+            try (KNNVectorStorageDirectory storage = new KNNVectorStorageDirectory(delegate, "_0", () -> false, () -> 0L)) {
                 try (DirectoryReader reader = DirectoryReader.open(storage)) {
                     assertEquals(0, storage.routedOpens());
                     assertEquals("declining on the gate is not a Direct I/O failure", 0, storage.declinedOpens());

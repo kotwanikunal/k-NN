@@ -76,13 +76,22 @@ public class KNNVectorStorageCodecSeamTests extends KNNTestCase {
         }
     }
 
-    /** The node setting both the store factory and this seam are gated on. Reset by {@code tearDown}. */
+    /**
+     * The node settings this seam is gated on. The size floor is set to {@code 0b} because the fixture here
+     * is a 16 KiB file and the property under test is the <em>engagement</em> — that the codec seam reaches
+     * k-NN's dispatch with no index setting — not the floor, which is pinned where it belongs in
+     * {@link KNNVectorStorageDirectoryTests#testAFileBelowTheSizeFloorIsNotRouted}. Reset by
+     * {@code tearDown}.
+     */
     private void enableDirectIORouting() {
         final Set<Setting<?>> settings = new HashSet<>(ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
         settings.addAll(
             KNNSettings.state().getSettings().stream().filter(s -> s.getProperties().contains(Setting.Property.NodeScope)).toList()
         );
-        final Settings enabled = Settings.builder().put(KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED, true).build();
+        final Settings enabled = Settings.builder()
+            .put(KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED, true)
+            .put(KNNSettings.KNN_DIRECT_IO_MIN_FILE_SIZE, "0b")
+            .build();
         final ClusterService clusterService = mock(ClusterService.class);
         when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(enabled, settings));
         KNNSettings.state().setClusterService(clusterService);
@@ -252,6 +261,7 @@ public class KNNVectorStorageCodecSeamTests extends KNNTestCase {
                     assertArrayEquals("declining must not change the bytes", expected, readAll(entry));
                 }
                 assertEquals("the decline must be counted, not silent", 1, storage.declinedOpens());
+                assertEquals("and its reason is the chain: a CompoundDirectory is not a FilterDirectory", 1, storage.declinedChain());
                 assertEquals(0, storage.routedOpens());
             }
         }
