@@ -253,6 +253,30 @@ public class KNNSettings {
     // lazily on the first arm, so an input that never runs sequentially never pays it.
     public static final String KNN_DIRECT_IO_READAHEAD_WINDOW = "knn.direct_io.readahead.window";
     public static final int KNN_DIRECT_IO_READAHEAD_WINDOW_DEFAULT_VALUE = 8;
+
+    // window_bytes: how LARGE each of those windows is. Phase 13 audit FIX 2, and the largest measured win
+    // in that audit. Until phase 14 the ring's request size WAS bufferSize, so one number served two access
+    // shapes with opposite needs. Measured (phase 13 e1b.out, 732 MiB ascending scan of a real 1M x 768
+    // fp32 .vec, and a 16-thread random rescore arm on the same file):
+    //
+    // bufferSize | sequential MiB/s at W=8 | random amplification, 16 threads
+    // 8 KiB | 49.7 | 2.667 <- shipped
+    // 64 KiB | 371.2 | ~21 (INFERRED, see below)
+    // 256 KiB | 370.6 | 85.3 <- measured
+    //
+    // Sequential wants >= 64 KiB: that is 7.5x, and it is the whole of the gap to mmap and past it (371.2
+    // against mmap's 239.1). Random wants <= 8 KiB: at 256 KiB amplification is 85.3x and qps collapses
+    // from 59.6 to 10.0. The 64 KiB random cell is INFERRED rather than measured -- amplification tracks
+    // bufferSize / vectorBytes almost exactly at the two measured points (8 KiB -> 2.667 at a 3,072 B
+    // vector; 256 KiB -> 85.3, a ratio of 32.0 against the size ratio of 32) -- and it is why the fix is
+    // NOT to raise bufferSize.
+    //
+    // So the ring gets its own size and bufferSize stays 8 KiB for the random path. 64 KiB is the knee:
+    // 256 KiB buys nothing sequentially (370.6 vs 371.2). Costs window * window_bytes of direct buffers per
+    // input, allocated lazily on the first ARM -- 512 KiB at the defaults for an input that runs
+    // sequentially, and zero for one that does not. The rescore path never arms, so it pays nothing.
+    public static final String KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES = "knn.direct_io.readahead.window_bytes";
+    public static final ByteSizeValue KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_DEFAULT_VALUE = new ByteSizeValue(64, ByteSizeUnit.KB);
     // trigger: how many consecutive gapless-forward blocking reads must occur before the ring arms. This is
     // the no-waste guard: a random (rescore) workload must never cross it, so read-ahead issues ZERO
     // speculative reads on that pattern. A knob rather than a constant precisely because that no-waste claim
@@ -547,6 +571,22 @@ public class KNNSettings {
         KNN_DIRECT_IO_READAHEAD_WINDOW,
         KNN_DIRECT_IO_READAHEAD_WINDOW_DEFAULT_VALUE,
         0,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
+     * Bytes per read-ahead window — the ring's request size, decoupled from {@code bufferSize} in phase 14
+     * (audit FIX 2). Node scoped and dynamic, read once per {@code .vec} open. Rounded up to a filesystem
+     * block and never applied below {@code bufferSize}, so it can only widen the ring.
+     * <p>
+     * Defaults to 64 KB on the measurement recorded above: sequential throughput 49.7 -> 371.2 MiB/s, which
+     * is the whole of the gap to mmap and past it, at unchanged random amplification because the random path
+     * keeps {@code bufferSize}.
+     */
+    public static final Setting<ByteSizeValue> KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_SETTING = Setting.byteSizeSetting(
+        KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES,
+        KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_DEFAULT_VALUE,
         NodeScope,
         Dynamic
     );
@@ -1025,6 +1065,10 @@ public class KNNSettings {
             return KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING;
         }
 
+        if (KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES.equals(key)) {
+            return KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_SETTING;
+        }
+
         if (KNN_DIRECT_IO_READAHEAD_TRIGGER.equals(key)) {
             return KNN_DIRECT_IO_READAHEAD_TRIGGER_SETTING;
         }
@@ -1079,6 +1123,7 @@ public class KNNSettings {
             KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING,
             // Sequential read-ahead ring: window and arm trigger
             KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING,
+            KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_SETTING,
             KNN_DIRECT_IO_READAHEAD_TRIGGER_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
@@ -1158,6 +1203,13 @@ public class KNNSettings {
      */
     public static int getDirectIOReadaheadWindow() {
         return getNodeSettingValueOrDefault(KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING);
+    }
+
+    /**
+     * @return bytes per read-ahead window — the sequential ring's request size, independent of {@code bufferSize}
+     */
+    public static ByteSizeValue getDirectIOReadaheadWindowBytes() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_SETTING);
     }
 
     /**

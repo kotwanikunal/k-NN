@@ -435,6 +435,33 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     private final int maxStagedRangeBytes;
     /** Windows the read-ahead ring keeps in flight. 0 ⇒ the ring is disabled and this is exact passthrough. */
     private final int readaheadWindows;
+    /**
+     * Bytes per read-ahead window — the ring's request size, <b>decoupled from {@link #bufferSize}</b>.
+     *
+     * <p>Phase 13 audit FIX 2, and the largest measured win in that audit. {@code bufferSize} was one
+     * number serving two access shapes with opposite needs ({@code bench/e1b.out}): the sequential scan
+     * wants a big request and the random rescore path wants a small one.
+     *
+     * <table>
+     *   <caption>measured on a 732 MiB ascending scan of a real 1M x 768 fp32 {@code .vec}</caption>
+     *   <tr><th>{@code bufferSize}</th><th>sequential MiB/s at W=8</th><th>random amplification, 16 threads</th></tr>
+     *   <tr><td>8 KiB</td><td>49.7</td><td><b>2.667</b></td></tr>
+     *   <tr><td>64 KiB</td><td><b>371.2</b></td><td>~21 (inferred)</td></tr>
+     *   <tr><td>256 KiB</td><td>370.6</td><td><b>85.3</b></td></tr>
+     * </table>
+     *
+     * <p>So the fix is not to raise {@code bufferSize} — at 256 KiB the rescore path's device traffic goes
+     * up 32x and its qps collapses from 59.6 to 10.0. It is to give the ring its own size while
+     * {@link #blockingSource} and the burst table keep {@code bufferSize} at 8 KiB. The ring already
+     * allocated separately and already submitted with an explicit length, so this is one field reaching
+     * three places in {@link #refillReadahead}.
+     *
+     * <p>Costs {@code readaheadWindows * this} of direct buffers per input, allocated lazily on the
+     * <em>first arm</em> — so the default is 512 KiB rather than 64 KiB for an input that runs
+     * sequentially, and still zero for one that does not. The rescore path never arms (the ring stands
+     * down while a burst is live, and random access never reaches the trigger), so it pays nothing.
+     */
+    private final int readaheadWindowBytes;
     /** Consecutive gapless-forward blocking reads before the ring arms. */
     private final int readaheadTrigger;
 
@@ -495,6 +522,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final int maxStagedRanges,
         final int maxStagedRangeBytes,
         final int readaheadWindows,
+        final int readaheadWindowBytes,
         final int readaheadTrigger
     ) {
         super(resourceDescription);
@@ -506,6 +534,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         this.maxStagedRanges = maxStagedRanges;
         this.maxStagedRangeBytes = maxStagedRangeBytes;
         this.readaheadWindows = readaheadWindows;
+        this.readaheadWindowBytes = readaheadWindowBytes;
         this.readaheadTrigger = readaheadTrigger;
     }
 
@@ -523,6 +552,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             configuredMaxStagedRanges(),
             configuredMaxStagedRangeBytes(),
             configuredReadaheadWindow(),
+            configuredReadaheadWindowBytes(),
             configuredReadaheadTrigger()
         );
     }
@@ -576,6 +606,27 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
     }
 
+    /**
+     * Bytes per read-ahead window, from {@code knn.direct_io.readahead.window_bytes}. Read once per
+     * {@code .vec} open for the same reason the window count is: the value sizes the ring's arena, and a
+     * value that moved under a running ring would mean a buffer allocated for one size holding another.
+     * Clamped into int range; a setting that cannot be read falls back to its default.
+     *
+     * @see #readaheadWindowBytes
+     */
+    private static int configuredReadaheadWindowBytes() {
+        try {
+            final ByteSizeValue configured = KNNSettings.getDirectIOReadaheadWindowBytes();
+            if (configured == null || configured.getBytes() <= 0) {
+                return Math.toIntExact(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_DEFAULT_VALUE.getBytes());
+            }
+            return Math.toIntExact(Math.min(configured.getBytes(), Integer.MAX_VALUE / 2));
+        } catch (RuntimeException e) {
+            log.debug("Could not read knn.direct_io.readahead.window_bytes; using the default", e);
+            return Math.toIntExact(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_DEFAULT_VALUE.getBytes());
+        }
+    }
+
     /** The arm trigger, from {@code knn.direct_io.readahead.trigger}; same read-once, fall-back contract. */
     private static int configuredReadaheadTrigger() {
         try {
@@ -602,12 +653,22 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     ) {
         // The four-argument overload keeps its signature so the phase-9 queue-depth probe compiles against
         // it unchanged; it picks up the read-ahead sizes from settings, exactly as open(Path) does.
-        return open(path, bufferSize, maxStagedRanges, maxStagedRangeBytes, configuredReadaheadWindow(), configuredReadaheadTrigger());
+        return open(
+            path,
+            bufferSize,
+            maxStagedRanges,
+            maxStagedRangeBytes,
+            configuredReadaheadWindow(),
+            configuredReadaheadWindowBytes(),
+            configuredReadaheadTrigger()
+        );
     }
 
     /**
-     * As the four-argument overload, with the read-ahead ring sized by the caller so that a measurement
-     * can sweep it without a {@link org.opensearch.cluster.service.ClusterService}.
+     * As the four-argument overload with the ring's <b>window count</b> chosen by the caller, each window
+     * being one {@code bufferSize} — which is what the ring was before phase 14 decoupled the two. Kept at
+     * that meaning rather than reading the new setting, so that every phase 11 read-ahead measurement and
+     * the tests that pin them keep measuring the thing they were taken against.
      *
      * @param readaheadWindows windows the sequential ring keeps in flight; 0 disables it (exact passthrough)
      * @param readaheadTrigger consecutive gapless-forward blocking reads before the ring arms
@@ -618,6 +679,27 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final int maxStagedRanges,
         final int maxStagedRangeBytes,
         final int readaheadWindows,
+        final int readaheadTrigger
+    ) {
+        return open(path, bufferSize, maxStagedRanges, maxStagedRangeBytes, readaheadWindows, 0, readaheadTrigger);
+    }
+
+    /**
+     * As the six-argument overload, with the ring's <b>window size</b> chosen too, so that a measurement can
+     * sweep audit FIX 2 without a {@link org.opensearch.cluster.service.ClusterService}.
+     *
+     * @param readaheadWindows     windows the sequential ring keeps in flight; 0 disables it (exact passthrough)
+     * @param readaheadWindowBytes bytes per window; rounded up to a block, floored at {@code bufferSize}, and
+     *                             0 means "use {@code bufferSize}", i.e. the pre-phase-14 coupled behaviour
+     * @param readaheadTrigger     consecutive gapless-forward blocking reads before the ring arms
+     */
+    public static DirectIOVectorIndexInput open(
+        final Path path,
+        final int bufferSize,
+        final int maxStagedRanges,
+        final int maxStagedRangeBytes,
+        final int readaheadWindows,
+        final int readaheadWindowBytes,
         final int readaheadTrigger
     ) {
         final OpenOption direct = directOpenOption();
@@ -649,6 +731,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 Math.max(1, maxStagedRanges),
                 Math.max(blockSize, maxStagedRangeBytes),
                 Math.max(0, readaheadWindows),
+                // A window is a whole number of blocks (O_DIRECT needs the length aligned) and never
+                // smaller than a blocking read, so decoupling can only widen the ring, never narrow it
+                // below the invariant every existing read-ahead measurement was taken at.
+                Math.max(reads, alignUp(Math.max(blockSize, readaheadWindowBytes), blockSize)),
                 Math.max(1, readaheadTrigger)
             );
         } catch (IOException | RuntimeException e) {
@@ -687,6 +773,11 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     /** Windows the sequential read-ahead ring keeps in flight, after the setting was read at open. */
     int readaheadWindows() {
         return readaheadWindows;
+    }
+
+    /** Bytes per read-ahead window, after the setting was read, block-aligned and floored at bufferSize. */
+    int readaheadWindowBytes() {
+        return readaheadWindowBytes;
     }
 
     /** Consecutive gapless-forward blocking reads before the ring arms, after the setting was read at open. */
@@ -816,7 +907,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         staged = new StagedRange[maxStagedRanges];
         stagedBuffers = new ByteBuffer[maxStagedRanges];
         stagedFloats = new FloatBuffer[maxStagedRanges];
-        stagingArena = carveArena(maxStagedRanges, stagedBuffers, stagedFloats);
+        stagingArena = carveArena(maxStagedRanges, arenaSlotBytes(), stagedBuffers, stagedFloats);
         pool = acquired;
         return true;
     }
@@ -860,9 +951,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * never shrinks. {@code MALLOC_ARENA_MAX} remains the operational lever for that. The claim here is only
      * fewer and smaller allocations, which is measurable as peak direct-buffer capacity.
      */
-    private ByteBuffer carveArena(final int slots, final ByteBuffer[] buffers, final FloatBuffer[] floats) {
+    private ByteBuffer carveArena(final int slots, final int slotBytes, final ByteBuffer[] buffers, final FloatBuffer[] floats) {
         final int blockSize = handle.blockSize;
-        final int slotBytes = arenaSlotBytes();
         // Over-allocate by a block so a block-aligned slice exists inside the allocation, then carve at
         // multiples of a slot: the base is aligned and a slot is a whole number of blocks, so every slot is
         // aligned too and needs no slack of its own. O_DIRECT needs the buffer address, the file offset and
@@ -1250,9 +1340,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             readaheadRing = new StagedRange[readaheadWindows];
             readaheadBuffers = new ByteBuffer[readaheadWindows];
             readaheadFloats = new FloatBuffer[readaheadWindows];
-            // Every ring window is exactly bufferSize, which is what an arena slot holds, so the ring never
-            // needs the per-slot fall-back the burst table keeps for a wide group.
-            readaheadArena = carveArena(readaheadWindows, readaheadBuffers, readaheadFloats);
+            // Every ring window is exactly readaheadWindowBytes, so the ring carves its arena at that size
+            // rather than at the burst table's arenaSlotBytes() and never needs the per-slot fall-back the
+            // burst table keeps for a wide group.
+            readaheadArena = carveArena(readaheadWindows, readaheadWindowBytes, readaheadBuffers, readaheadFloats);
             pool = acquired;
         }
         final long regionEnd = offset + length;
@@ -1260,7 +1351,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             final int slot = (readaheadHead + readaheadCount) % readaheadWindows;
             if (readaheadBuffers[slot] == null) {
                 // Only reachable for a slot given up after a bounded wait timed out (see retireHead).
-                readaheadBuffers[slot] = ByteBuffer.allocateDirect(bufferSize + handle.blockSize - 1)
+                readaheadBuffers[slot] = ByteBuffer.allocateDirect(readaheadWindowBytes + handle.blockSize - 1)
                     .alignedSlice(handle.blockSize)
                     .order(ByteOrder.LITTLE_ENDIAN);
                 readaheadFloats[slot] = readaheadBuffers[slot].asFloatBuffer();
@@ -1271,7 +1362,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 readaheadBuffers[slot],
                 readaheadFloats[slot],
                 readaheadNext,
-                bufferSize,
+                readaheadWindowBytes,
                 STATS.readaheadReads,
                 STATS.readaheadBytes
             );
@@ -1284,7 +1375,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             }
             readaheadRing[slot] = range;
             readaheadCount++;
-            readaheadNext += bufferSize;
+            readaheadNext += readaheadWindowBytes;
         }
     }
 
@@ -1377,6 +1468,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             maxStagedRanges,
             maxStagedRangeBytes,
             readaheadWindows,
+            readaheadWindowBytes,
             readaheadTrigger
         );
     }
@@ -1397,6 +1489,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             maxStagedRanges,
             maxStagedRangeBytes,
             readaheadWindows,
+            readaheadWindowBytes,
             readaheadTrigger
         );
         copy.filePointer = filePointer;

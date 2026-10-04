@@ -869,6 +869,85 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
     }
 
     /**
+     * Phase 13 audit FIX 2: the ring's window size is its own, independent of {@code bufferSize}. Three
+     * things have to hold, and the third is the one the audit cares about.
+     *
+     * <ol>
+     *   <li>{@code bufferSize} does not move. The random rescore path reads through
+     *       {@code blockingSource} and the burst table, and at 256 KiB its measured amplification is 85.3x
+     *       against 2.667x at 8 KiB — so a fix that raised {@code bufferSize} would pay for sequential
+     *       throughput with 32x the device traffic on the path the feature exists for.</li>
+     *   <li>The ring submits <em>that</em> size, which is what turns 49.7 MiB/s into 371.2.</li>
+     *   <li><b>The bytes are identical.</b> A wider window reads the same bytes in fewer, larger requests;
+     *       it must not read different ones. Asserted as {@code servedBytes} equality against an 8 KiB ring
+     *       over the same scan.</li>
+     * </ol>
+     */
+    @SneakyThrows
+    public void testTheReadaheadWindowSizeIsDecoupledFromBufferSize() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(1500);
+        final Path path = writeVectorFile(dir, vectors);
+
+        // The coupled shape, for the byte-level control: a ring window of one bufferSize.
+        DirectIOReadPool.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+        final long coupledServed;
+        final long coupledRingReads;
+        final int bufferSize;
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 8, 0, 2)) {
+            bufferSize = input.bufferSize();
+            assertEquals("window bytes of 0 must mean bufferSize, i.e. the pre-phase-14 ring", bufferSize, input.readaheadWindowBytes());
+            sequentialScan(input, vectors);
+            coupledServed = DirectIOVectorIndexInput.STATS.servedBytes();
+            coupledRingReads = DirectIOVectorIndexInput.STATS.readaheadReads();
+        }
+
+        // Decoupled: a 64 KiB ring window over the same 8 KiB blocking reads.
+        final int wideWindow = 64 * 1024;
+        DirectIOReadPool.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 8, wideWindow, 2)) {
+            assertEquals("bufferSize must not move: the random path reads through it", bufferSize, input.bufferSize());
+            assertEquals("the ring must take the wider window", wideWindow, input.readaheadWindowBytes());
+            assertEquals("a slice inherits both sizes", wideWindow, input.slice("region", 0, input.length()).readaheadWindowBytes());
+            assertEquals("and so does a clone", wideWindow, input.clone().readaheadWindowBytes());
+            sequentialScan(input, vectors);
+            final long wideRingReads = DirectIOVectorIndexInput.STATS.readaheadReads();
+            logger.info(
+                "readahead decoupled: bufferSize={} coupledRingReads={} wideRingReads={} | {}",
+                bufferSize,
+                coupledRingReads,
+                wideRingReads,
+                DirectIOVectorIndexInput.STATS
+            );
+            assertTrue("the ring must still arm", DirectIOVectorIndexInput.STATS.readaheadArmed() > 0);
+            assertTrue(
+                "a window "
+                    + wideWindow / bufferSize
+                    + "x wider must take fewer requests for the same scan, "
+                    + coupledRingReads
+                    + " -> "
+                    + wideRingReads,
+                wideRingReads < coupledRingReads
+            );
+            assertEquals(
+                "a wider window must read the SAME bytes, in fewer requests",
+                coupledServed,
+                DirectIOVectorIndexInput.STATS.servedBytes()
+            );
+        }
+    }
+
+    /** The shipped default, pinned: 64 KB, node scoped and dynamic so the node can sweep it. */
+    public void testTheShippedReadaheadWindowBytesIsSixtyFourKilobytes() {
+        assertEquals(64L * 1024, KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_DEFAULT_VALUE.getBytes());
+        assertEquals("knn.direct_io.readahead.window_bytes", KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_SETTING.getKey());
+        assertTrue(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_SETTING.isDynamic());
+    }
+
+    /**
      * A forward scan arms the ring and most of its reads come from it, so the blocking-read count collapses
      * far below the passthrough count at identical served bytes. This is the whole point: sequential
      * O_DIRECT stops being one QD1 pread per window.
