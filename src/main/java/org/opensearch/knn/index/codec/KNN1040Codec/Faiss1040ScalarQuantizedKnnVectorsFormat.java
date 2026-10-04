@@ -17,6 +17,7 @@ import org.apache.lucene.util.quantization.QuantizedByteVectorValues.ScalarEncod
 import org.opensearch.knn.common.FieldInfoExtractor;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactory;
 import org.opensearch.knn.index.engine.KNNEngine;
+import org.opensearch.knn.index.store.KNNVectorStorageDirectory;
 
 import java.io.IOException;
 import java.util.Locale;
@@ -159,11 +160,18 @@ public class Faiss1040ScalarQuantizedKnnVectorsFormat extends KnnVectorsFormat {
      * be dead code — the value is unused downstream. We deliberately use the default no-arg constructor
      * to avoid implying a per-field resolution that isn't happening.
      */
+    /**
+     * <p><b>Phase 13 E2 prototype.</b> The flat reader is built over a
+     * {@link KNNVectorStorageDirectory#routeVectorData derived read state}, so that its {@code .vec} open
+     * goes through k-NN's Direct I/O dispatch with <b>no {@code index.store.factory}</b>. Inert when
+     * {@code knn.direct_io.rescore.enabled} is off, and a no-op when the store factory is already in the
+     * chain.
+     */
     @Override
     public KnnVectorsReader fieldsReader(SegmentReadState state) throws IOException {
         return new Faiss1040ScalarQuantizedKnnVectorsReader(
             state,
-            new Faiss1040ScalarQuantizedFlatVectorsReader(flatFormatFor().fieldsReader(state))
+            new Faiss1040ScalarQuantizedFlatVectorsReader(flatFormatFor().fieldsReader(KNNVectorStorageDirectory.routeVectorData(state)))
         );
     }
 

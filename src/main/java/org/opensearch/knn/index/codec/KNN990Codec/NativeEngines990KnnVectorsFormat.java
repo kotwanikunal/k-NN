@@ -25,6 +25,7 @@ import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactor
 import org.opensearch.knn.index.codec.scorer.NativeEngines990KnnVectorsScorer;
 import org.opensearch.knn.index.codec.scorer.PrefetchableFlatVectorScorer;
 import org.opensearch.knn.index.engine.KNNEngine;
+import org.opensearch.knn.index.store.KNNVectorStorageDirectory;
 
 import java.io.IOException;
 
@@ -83,11 +84,21 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
     /**
      * Returns a {@link KnnVectorsReader} to read the vectors from the index.
      *
+     * <p>The flat reader is built over a {@link KNNVectorStorageDirectory#routeVectorData derived read
+     * state} (phase 13 E2 prototype), so that its {@code .vec} open goes through k-NN's Direct I/O
+     * dispatch when {@code knn.direct_io.rescore.enabled} is on and <b>no {@code index.store.factory} is
+     * needed</b>. Inert when the setting is off, and a no-op when the store factory is already in the
+     * chain. Only the flat reader's state is derived: the wrapper exists to serve one open, and
+     * {@link NativeEngines990KnnVectorsReader} reads the native index through its own channel.
+     *
      * @param state {@link SegmentReadState}
      */
     @Override
     public KnnVectorsReader fieldsReader(final SegmentReadState state) throws IOException {
-        return new NativeEngines990KnnVectorsReader(state, flatVectorsFormat.fieldsReader(state));
+        return new NativeEngines990KnnVectorsReader(
+            state,
+            flatVectorsFormat.fieldsReader(KNNVectorStorageDirectory.routeVectorData(state))
+        );
     }
 
     /**

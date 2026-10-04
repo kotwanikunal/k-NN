@@ -6,6 +6,7 @@
 package org.opensearch.knn.index.store;
 
 import lombok.extern.log4j.Log4j2;
+import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.store.FilterDirectory;
@@ -248,6 +249,60 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
     /** Compound containers wrapped so that their entries can be dispatched. */
     public long wrappedContainers() {
         return wrappedContainers.get();
+    }
+
+    // -------------------------------------------------------------------------------------------------
+    // Dispatch point 3 (PROTOTYPE, phase 13 E2): the codec seam, which needs no index setting
+    // -------------------------------------------------------------------------------------------------
+
+    /**
+     * {@code state} with its {@link Directory} wrapped in this class, so that the Lucene flat vectors
+     * reader the faiss formats delegate to opens its {@code .vec} through the dispatch rule above —
+     * <b>with no {@code index.store.factory} and no store factory in the chain</b>.
+     *
+     * <p>PROTOTYPE for phase 13 E2. It is the alternative extension point to
+     * {@link KNNVectorStorageStoreFactory}: a {@code SegmentReadState} is a plain carrier of five public
+     * final fields with a public copy-shaped constructor, and the two faiss formats construct the flat
+     * reader themselves ({@code NativeEngines990KnnVectorsFormat#fieldsReader},
+     * {@code Faiss1040ScalarQuantizedKnnVectorsFormat#fieldsReader}), so the one directory the flat reader
+     * will use is ours to choose. Scope is narrower than the store factory's by construction: this
+     * directory is only ever asked about the files of <em>one segment of one k-NN field</em>, never about
+     * the shard's translog, doc values or segment infos.
+     *
+     * <h4>Three cases, and what each gets</h4>
+     * <ul>
+     *   <li><b>Non-compound segment</b> — {@code state.directory} is the shard's directory, which bottoms
+     *       out at an {@link FSDirectory}, so {@link #resolvePath} answers and the {@code .vec} is routed.
+     *       This is the case the feature is for: every merged segment.</li>
+     *   <li><b>Compound segment</b> — {@code state.directory} is a {@code CompoundDirectory}
+     *       ({@code Lucene90CompoundReader}), which is <em>not</em> a {@link FilterDirectory}, so
+     *       {@link FilterDirectory#unwrap} stops there, {@link #resolvePath} returns {@code null} and the
+     *       open is <b>declined</b> — the entry is served by the compound reader's own mmap slice. That is
+     *       a deliberate decline, not an oversight; see {@code DESIGN-ALTERNATIVES.md}.</li>
+     *   <li><b>Store factory already installed</b> — {@link #find} already answers non-null, so the state
+     *       is returned unchanged rather than wrapped twice.</li>
+     * </ul>
+     *
+     * <p>The wrapper is never closed, and must not be: {@link FilterDirectory#close} closes its delegate,
+     * and the delegate here is the shard's (or the compound segment's) directory, owned by the reader that
+     * built {@code state}. Nothing closes a {@code SegmentReadState}'s directory, so this object simply
+     * becomes garbage with the reader — which is why it holds no resource of its own.
+     */
+    public static SegmentReadState routeVectorData(final SegmentReadState state) {
+        if (KNNSettings.isDirectIORescoreEnabled() == false) {
+            return state;
+        }
+        if (find(state.directory) != null) {
+            // index.store.factory is in effect for this shard; it has already taken the decision.
+            return state;
+        }
+        return new SegmentReadState(
+            new KNNVectorStorageDirectory(state.directory, state.segmentInfo.name),
+            state.segmentInfo,
+            state.fieldInfos,
+            state.context,
+            state.segmentSuffix
+        );
     }
 
     /**
