@@ -21,6 +21,8 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
@@ -113,13 +115,33 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
      * class name, because both are package private in OpenSearch and cannot be named as types here.
      *
      * <p><b>The allowlist is the guard, and it is deliberately short.</b> The chain the codec seam is
-     * handed for a non-compound segment is
-     * {@code Store$StoreDirectory -> ByteSizeCachingDirectory -> HybridDirectory}, and resolving a name
-     * against the bottom {@link FSDirectory}'s path is only correct if no layer above it changes which
-     * bytes a reader sees or which file a name means. These two do not: <b>neither overrides
-     * {@code openInput}</b> (verified against {@code ~/workspace/OpenSearch},
-     * {@code Store.java:1079-1135} and {@code index/store/ByteSizeCachingDirectory.java:55}), so a read
-     * through them is the bottom directory's read.
+     * handed for a non-compound segment on OpenSearch 3.9 is, MEASURED from a running node's own decline
+     * log rather than assumed:
+     *
+     * <pre>
+     * Store$StoreDirectory -> ByteSizeCachingDirectory -> BucketedCompositeDirectory -> FsDirectoryFactory$HybridDirectory
+     * </pre>
+     *
+     * Resolving a name against the bottom {@link FSDirectory}'s path is only correct if no layer above it
+     * changes which bytes a reader sees or which file a name means. None of these three does, and each
+     * claim was made by reading the class rather than by assuming:
+     *
+     * <ul>
+     *   <li>{@code Store$StoreDirectory} — overrides {@code close}, {@code deleteFile}, {@code toString},
+     *       {@code getPendingDeletions} and {@code copyFrom}, and <b>not {@code openInput}</b>
+     *       ({@code Store.java:1079-1135}).</li>
+     *   <li>{@code ByteSizeCachingDirectory} — caches an aggregate size; <b>no {@code openInput}</b>
+     *       ({@code index/store/ByteSizeCachingDirectory.java:55}).</li>
+     *   <li>{@code BucketedCompositeDirectory} — overrides <b>only {@code listAll()}</b>, to filter
+     *       {@code temp_}-prefixed child directories out of a context-aware index's listing
+     *       ({@code index/BucketedCompositeDirectory.java:35-41}). It is 42 lines and has no read path of
+     *       its own.</li>
+     * </ul>
+     *
+     * <p>The third layer is worth a note: it is not in the chain this guard was written against, and the
+     * guard found it by <em>declining</em> — the S5 re-proof's first run routed nothing and the decline log
+     * named it. That is the intended failure mode. A new layer costs engagement until someone reads it,
+     * never correctness.
      *
      * <p>An <b>unknown</b> {@link FilterDirectory} declines, and that is the whole point rather than
      * caution for its own sake. Two shapes that exist and must never be bypassed:
@@ -136,7 +158,8 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
      */
     static final Set<String> PASSTHROUGH_FILTER_DIRECTORIES = Set.of(
         "org.opensearch.index.store.Store$StoreDirectory",
-        "org.opensearch.index.store.ByteSizeCachingDirectory"
+        "org.opensearch.index.store.ByteSizeCachingDirectory",
+        "org.opensearch.index.BucketedCompositeDirectory"
     );
 
     /** How deep the chain walk will go. A guard must never be the thing that hangs a shard. */
@@ -212,11 +235,17 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
         final Path path = resolvePath(in, name, PASSTHROUGH_FILTER_DIRECTORIES);
         if (path == null) {
             decline(declinedChain, DirectIOVectorIndexInput.DeclineReason.CHAIN);
+            // The whole chain, not just its top: a chain decline is the one reason an operator cannot
+            // diagnose from the counter alone, because the answer is always "some layer is not on the
+            // allowlist" and the only useful question is which. The last entry is the layer that stopped
+            // the walk.
             log.debug(
-                "k-NN vector storage [{}]: [{}] has no resolvable filesystem path below [{}], so Direct I/O cannot serve it",
+                "k-NN vector storage [{}]: [{}] has no resolvable filesystem path; the delegate chain is {}, "
+                    + "and the known byte-passthrough layers are {}",
                 segmentName,
                 name,
-                in.getClass().getName()
+                describeChain(in),
+                PASSTHROUGH_FILTER_DIRECTORIES
             );
             return null;
         }
@@ -275,6 +304,24 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
      * <p>Package private and parameterised on the allowlist so a test can exercise the walk with its own
      * stand-in layers; production always passes {@link #PASSTHROUGH_FILTER_DIRECTORIES}.
      */
+    /**
+     * The delegate chain of {@code directory} as a list of class names, outermost first, stopping at the
+     * first layer that is not a {@link FilterDirectory}. For the decline log line only.
+     */
+    static List<String> describeChain(final Directory directory) {
+        final List<String> chain = new ArrayList<>();
+        Directory current = directory;
+        for (int depth = 0; current != null && depth < MAX_CHAIN_DEPTH; depth++) {
+            chain.add(current.getClass().getName());
+            if (current instanceof FilterDirectory filterDirectory) {
+                current = filterDirectory.getDelegate();
+            } else {
+                break;
+            }
+        }
+        return chain;
+    }
+
     @Nullable
     static Path resolvePath(final Directory directory, final String name, final Set<String> passthrough) {
         Directory current = directory;

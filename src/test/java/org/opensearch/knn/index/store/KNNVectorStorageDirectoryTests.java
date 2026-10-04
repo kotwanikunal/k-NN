@@ -511,18 +511,45 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
     }
 
     /**
-     * The production allowlist, pinned by name. Both entries are package private in OpenSearch, so the
+     * The production allowlist, pinned by name. Two of the three are package private in OpenSearch, so the
      * only check available here is that the set says what it is documented to say; the claim behind each
-     * name — that the class does not override {@code openInput} — was verified by reading
-     * {@code Store.java} and {@code ByteSizeCachingDirectory.java} and is recorded in the constant's
-     * javadoc. This test exists so that an addition to the list is a deliberate edit of a test rather than
-     * a one-line change nobody reviews.
+     * name — that the class has no read path of its own — was verified by reading {@code Store.java},
+     * {@code ByteSizeCachingDirectory.java} and {@code BucketedCompositeDirectory.java}, and is recorded
+     * per entry in the constant's javadoc. This test exists so that an addition to the list is a
+     * deliberate edit of a test rather than a one-line change nobody reviews — and the list has already
+     * grown once, when the S5 re-proof's decline log revealed a fourth layer in OpenSearch 3.9's real
+     * chain that nothing in the design notes had mentioned.
      */
-    public void testTheAllowlistNamesExactlyTheTwoVerifiedPassthroughLayers() {
+    public void testTheAllowlistNamesExactlyTheVerifiedPassthroughLayers() {
         assertEquals(
-            java.util.Set.of("org.opensearch.index.store.Store$StoreDirectory", "org.opensearch.index.store.ByteSizeCachingDirectory"),
+            java.util.Set.of(
+                "org.opensearch.index.store.Store$StoreDirectory",
+                "org.opensearch.index.store.ByteSizeCachingDirectory",
+                "org.opensearch.index.BucketedCompositeDirectory"
+            ),
             KNNVectorStorageDirectory.PASSTHROUGH_FILTER_DIRECTORIES
         );
+    }
+
+    /**
+     * The chain description that goes into the decline log, which is the only thing that makes a chain
+     * decline diagnosable: the counter can only ever say "some layer is not allowlisted", and the useful
+     * question is which. Outermost first, stopping at the first non-{@link FilterDirectory}.
+     *
+     * <p>This is not cosmetic. The first S5 re-proof run routed nothing and declined 10 times on the chain;
+     * the log line as originally written named only the <em>top</em> of the chain, which was an allowlisted
+     * class, so it pointed away from the cause. With the full chain the answer was immediate.
+     */
+    @SneakyThrows
+    public void testTheDeclineLogDescribesTheWholeChainOutermostFirst() {
+        try (ByteBuffersDirectory bottom = new ByteBuffersDirectory()) {
+            final Directory chain = new XorDirectory(new XorDirectory(bottom));
+            assertEquals(
+                java.util.List.of(XorDirectory.class.getName(), XorDirectory.class.getName(), ByteBuffersDirectory.class.getName()),
+                KNNVectorStorageDirectory.describeChain(chain)
+            );
+            assertEquals(java.util.List.of(ByteBuffersDirectory.class.getName()), KNNVectorStorageDirectory.describeChain(bottom));
+        }
     }
 
     /**
