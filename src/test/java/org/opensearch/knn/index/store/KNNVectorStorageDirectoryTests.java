@@ -708,9 +708,11 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
             assertEquals(2L, DirectIOVectorIndexInput.STATS.declinedOpens());
             assertEquals(0L, DirectIOVectorIndexInput.STATS.declinedMissing());
             assertEquals(0L, DirectIOVectorIndexInput.STATS.declinedOpenFailed());
+            assertEquals("no compound directory is involved in this test", 0L, DirectIOVectorIndexInput.STATS.declinedCompound());
             assertTrue(
                 "and they are in the stats line an operator sees at DEBUG: " + DirectIOVectorIndexInput.STATS,
-                DirectIOVectorIndexInput.STATS.toString().contains("routedOpens=1 declinedChain=1 declinedMissing=0 declinedTooSmall=1")
+                DirectIOVectorIndexInput.STATS.toString()
+                    .contains("routedOpens=1 declinedCompound=0 declinedChain=1 declinedMissing=0 declinedTooSmall=1")
             );
         } finally {
             DirectIOVectorIndexInput.STATS.reset();

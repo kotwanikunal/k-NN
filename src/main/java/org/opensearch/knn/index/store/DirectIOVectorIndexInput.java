@@ -234,6 +234,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      */
     public static final class Stats {
         private final AtomicLong routedOpens = new AtomicLong();
+        private final AtomicLong declinedCompound = new AtomicLong();
         private final AtomicLong declinedChain = new AtomicLong();
         private final AtomicLong declinedMissing = new AtomicLong();
         private final AtomicLong declinedTooSmall = new AtomicLong();
@@ -309,9 +310,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             routedOpens.incrementAndGet();
         }
 
-        /** Counts one decline, under one of the four reasons the dispatch rule distinguishes. */
+        /** Counts one decline, under one of the five reasons the dispatch rule distinguishes. */
         void recordDecline(final DeclineReason reason) {
             switch (reason) {
+                case COMPOUND -> declinedCompound.incrementAndGet();
                 case CHAIN -> declinedChain.incrementAndGet();
                 case MISSING -> declinedMissing.incrementAndGet();
                 case TOO_SMALL -> declinedTooSmall.incrementAndGet();
@@ -322,6 +324,22 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         /** Node-wide {@code .vec} opens served with {@code O_DIRECT}. */
         public long routedOpens() {
             return routedOpens.get();
+        }
+
+        /**
+         * Declines because the segment is <b>compound</b>, so the codec was handed a
+         * {@code CompoundDirectory} and the {@code .vec} is an entry in a {@code .cfs} rather than a file.
+         *
+         * <p>Counted apart from {@link #declinedChain()} since phase 15, and the distinction is the whole
+         * point: at the shipped defaults <b>every flushed segment is compound</b>
+         * ({@code index.use_compound_file} defaults to {@code true},
+         * {@code EngineConfig.java:262-266}), so a healthy node accumulates this counter steadily and only
+         * merged segments ever route. Folded into {@code declined_chain} it looked like an unsupported
+         * substrate — on the node a 27-segment reopen added +108 and a 28-segment one +234 — and an
+         * operator could not tell "the layer is unknown" from "the segment is compound" at a glance.
+         */
+        public long declinedCompound() {
+            return declinedCompound.get();
         }
 
         /** Declines because no {@link java.nio.file.Path} could be resolved through the delegate chain. */
@@ -346,7 +364,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
         /** Every decline, whatever the reason. */
         public long declinedOpens() {
-            return declinedChain.get() + declinedMissing.get() + declinedTooSmall.get() + declinedOpenFailed.get();
+            return declinedCompound.get() + declinedChain.get() + declinedMissing.get() + declinedTooSmall.get() + declinedOpenFailed.get();
         }
 
         /** Device reads issued on the calling thread, i.e. with no queue depth behind them. */
@@ -440,6 +458,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
         public void reset() {
             routedOpens.set(0);
+            declinedCompound.set(0);
             declinedChain.set(0);
             declinedMissing.set(0);
             declinedTooSmall.set(0);
@@ -472,12 +491,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             final long served = servedBytes.get();
             return String.format(
                 Locale.ROOT,
-                "routedOpens=%d declinedChain=%d declinedMissing=%d declinedTooSmall=%d declinedOpenFailed=%d "
+                "routedOpens=%d declinedCompound=%d declinedChain=%d declinedMissing=%d declinedTooSmall=%d declinedOpenFailed=%d "
                     + "blockingReads=%d stagedReads=%d stagedHits=%d stageDeclined=%d prefetchCalls=%d inFlightPeak=%d "
                     + "stagedBytes=%d blockingBytes=%d servedBytes=%d declinedSpanBytes=%d "
                     + "readaheadReads=%d readaheadBytes=%d readaheadHits=%d readaheadDeclined=%d readaheadArmed=%d "
                     + "stagedWaitTimeouts=%d queuePeak=%d poolRebuilds=%d amplification=%.3f",
                 routedOpens.get(),
+                declinedCompound.get(),
                 declinedChain.get(),
                 declinedMissing.get(),
                 declinedTooSmall.get(),
@@ -508,6 +528,12 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     /** The one counter set, because the pool it counts is node wide too. */
     /** Why the dispatch rule declined a {@code .vec} it matched on name and setting. */
     public enum DeclineReason {
+        /**
+         * The segment is compound, so the {@code Directory} the codec was handed is a
+         * {@code CompoundDirectory} and the {@code .vec} has no file of its own: condition 3, taken before
+         * the chain walk because it is the one case that is <b>expected</b> rather than diagnostic.
+         */
+        COMPOUND,
         /** No {@link Path} resolvable through the delegate chain: condition 3. */
         CHAIN,
         /** The resolved path does not exist, or could not be sized: condition 4. */

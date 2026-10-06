@@ -6,6 +6,7 @@
 package org.opensearch.knn.index.store;
 
 import lombok.extern.log4j.Log4j2;
+import org.apache.lucene.codecs.CompoundDirectory;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
@@ -33,7 +34,7 @@ import java.util.function.LongSupplier;
  * vector data read is served, from the file's name alone.
  *
  * <h2>The dispatch rule, in one place</h2>
- * A read is served with {@code O_DIRECT} if and only if <b>all six</b> of these hold:
+ * A read is served with {@code O_DIRECT} if and only if <b>all seven</b> of these hold:
  *
  * <ol>
  *   <li>the file is a <b>faiss or memory-optimized-search</b> full-precision flat vector file — see
@@ -41,6 +42,9 @@ import java.util.function.LongSupplier;
  *   <li>{@link KNNSettings#isDirectIORescoreEnabled()} is on — the per-substrate enablement rule, which
  *       stays a setting because Direct I/O is a win only where the {@code .vec} working set cannot stay
  *       in the page cache;
+ *   <li>the segment is <b>not compound</b> — a {@code CompoundDirectory} entry has no file of its own.
+ *       Checked first among the structural conditions because it is the only one that is <em>expected</em>
+ *       rather than diagnostic: see {@link #declinedCompound};
  *   <li>the delegate chain reaches an {@link FSDirectory} and <b>every layer above it is a known
  *       byte-passthrough</b> — see {@link #PASSTHROUGH_FILTER_DIRECTORIES}, and
  *       {@link #resolvePath(Directory, String, Set)} for why an unknown layer must decline rather than
@@ -51,8 +55,9 @@ import java.util.function.LongSupplier;
  * </ol>
  *
  * Everything else is the delegate's own {@link IndexInput}, returned <b>unwrapped</b>, and each of (3)
- * to (6) is counted under its own reason so an operator can tell them apart — see {@link #declinedChain},
- * {@link #declinedMissing}, {@link #declinedTooSmall}, {@link #declinedOpenFailed}.
+ * to (7) is counted under its own reason so an operator can tell them apart — see
+ * {@link #declinedCompound}, {@link #declinedChain}, {@link #declinedMissing}, {@link #declinedTooSmall},
+ * {@link #declinedOpenFailed}.
  *
  * <h2>Why the name is the whole signal</h2>
  * An earlier shape of this class also required the caller's {@link IOContext} to carry a plugin-defined
@@ -72,15 +77,24 @@ import java.util.function.LongSupplier;
  * {@code store-subdirectory}, and in the way of any encryption-at-rest wrapper. The codec seam is the
  * only engagement a plugin can take that composes with everything else.
  *
- * <h2>Compound segments delegate</h2>
- * The {@code Directory} a codec is handed for a <b>compound</b> segment is the {@code CompoundDirectory}
- * ({@code Lucene90CompoundReader}), which is not a {@link FilterDirectory} and has no filesystem path, so
- * {@link #resolvePath} answers {@code null} and the entry is served by the compound reader's own mmap
- * slice. That is the right answer rather than a gap: a compound segment is a freshly flushed one, and
- * phase 13's E4 measured a flush-sized {@code .vec} as <b>8,016x</b> better served from the page cache
- * than from {@code O_DIRECT}. Phase 14 therefore also deleted {@code KNNVectorCompoundSliceInput}, the
- * 423-line {@code .cfs}-slice interceptor the store-factory design needed to reach that same entry: the
- * code existed to route reads that measurement says must not be routed.
+ * <h2>Compound segments delegate, and that is most segments</h2>
+ * The {@code Directory} a codec is handed for a <b>compound</b> segment is the {@link CompoundDirectory}
+ * ({@code Lucene90CompoundReader}), which has no filesystem path, so condition 3 declines and the entry is
+ * served by the compound reader's own mmap slice. That is the right answer rather than a gap: a compound
+ * segment is a freshly flushed one, and phase 13's E4 measured a flush-sized {@code .vec} as
+ * <b>8,016x</b> better served from the page cache than from {@code O_DIRECT}. Phase 14 therefore also
+ * deleted {@code KNNVectorCompoundSliceInput}, the 423-line {@code .cfs}-slice interceptor the
+ * store-factory design needed to reach that same entry: the code existed to route reads that measurement
+ * says must not be routed.
+ *
+ * <p><b>How often that happens is not a corner case.</b> At the shipped defaults <em>every</em> flushed
+ * segment is compound, because {@code index.use_compound_file} defaults to {@code true}
+ * ({@code EngineConfig.java:262-266}) and that value is what reaches
+ * {@code IndexWriterConfig#setUseCompoundFile} ({@code NativeLuceneIndexWriterFactory.java:208}). So only
+ * <b>merged</b> segments ever route, which is why {@link #declinedCompound} is counted apart from
+ * {@link #declinedChain}: a healthy node accumulates it steadily and it means nothing is wrong.
+ * {@code index.compound_format} is a <em>different</em> setting that only feeds the merge policy's
+ * {@code noCFSRatio} ({@code TieredMergePolicyProvider.java:155-157}, {@code :232}), i.e. merged segments.
  *
  * <h2>Dispatch granularity is the open, never the file</h2>
  * The decision is taken once per {@code openInput} and never re-taken per read, and that is forced rather
@@ -178,6 +192,7 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
     private final LongSupplier minFileSizeBytes;
 
     private final AtomicLong routedOpens = new AtomicLong();
+    private final AtomicLong declinedCompound = new AtomicLong();
     private final AtomicLong declinedChain = new AtomicLong();
     private final AtomicLong declinedMissing = new AtomicLong();
     private final AtomicLong declinedTooSmall = new AtomicLong();
@@ -231,7 +246,24 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
      */
     @Nullable
     private IndexInput directIOInput(final String name) {
-        // (3) the chain.
+        // (3a) the compound case, taken BEFORE the chain walk. A CompoundDirectory is not a FilterDirectory,
+        // so the walk below would decline it anyway and count declinedChain -- but that conflates the one
+        // decline reason that is EXPECTED with the one that means "a layer nobody has read yet is in the
+        // way". At the shipped defaults every flushed segment is compound (index.use_compound_file defaults
+        // to true, EngineConfig.java:262-266), so this counter moves on every reader open of every flushed
+        // segment: on the node a 27-segment reopen added +108 to declinedChain and a 28-segment one +234,
+        // and nothing distinguished that from an unsupported substrate.
+        if (in instanceof CompoundDirectory) {
+            decline(declinedCompound, DirectIOVectorIndexInput.DeclineReason.COMPOUND);
+            log.debug(
+                "k-NN vector storage [{}]: [{}] is an entry in a compound segment, which has no file of its "
+                    + "own; the compound reader's mmap slice serves it",
+                segmentName,
+                name
+            );
+            return null;
+        }
+        // (3b) the chain.
         final Path path = resolvePath(in, name, PASSTHROUGH_FILTER_DIRECTORIES);
         if (path == null) {
             decline(declinedChain, DirectIOVectorIndexInput.DeclineReason.CHAIN);
@@ -389,17 +421,23 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
     }
 
     /**
-     * Opens that satisfied conditions 1 and 2 but were declined by one of 3 to 6 — the sum of the four
+     * Opens that satisfied conditions 1 and 2 but were declined by one of 3 to 6 — the sum of the five
      * reason counters below. An operator watching only this number sees that routing is not happening; the
-     * reasons say why, and they want different answers: a chain decline is a substrate the feature cannot
-     * serve, a size decline is working as designed, a missing file is a bug, and an open failure is a
-     * filesystem that does not support {@code O_DIRECT}.
+     * reasons say why, and they want different answers: a compound decline is every flushed segment and is
+     * working as designed, a chain decline is a substrate the feature cannot serve, a size decline is
+     * working as designed, a missing file is a bug, and an open failure is a filesystem that does not
+     * support {@code O_DIRECT}.
      */
     public long declinedOpens() {
-        return declinedChain.get() + declinedMissing.get() + declinedTooSmall.get() + declinedOpenFailed.get();
+        return declinedCompound.get() + declinedChain.get() + declinedMissing.get() + declinedTooSmall.get() + declinedOpenFailed.get();
     }
 
-    /** Condition 3: no {@link FSDirectory} below, or an unknown {@link FilterDirectory} in the way. */
+    /** Condition 3a: the segment is compound, so the {@code .vec} is a {@code .cfs} entry and not a file. */
+    public long declinedCompound() {
+        return declinedCompound.get();
+    }
+
+    /** Condition 3b: no {@link FSDirectory} below, or an unknown {@link FilterDirectory} in the way. */
     public long declinedChain() {
         return declinedChain.get();
     }
@@ -442,9 +480,9 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
      *   <li><b>Non-compound segment</b> — {@code state.directory} is the shard's directory, which bottoms
      *       out at an {@link FSDirectory}, so {@link #resolvePath} answers and the {@code .vec} is routed.
      *       This is the case the feature is for: every merged segment.</li>
-     *   <li><b>Compound segment</b> — {@code state.directory} is a {@code CompoundDirectory}, which is
-     *       <em>not</em> a {@link FilterDirectory}, so {@link #resolvePath} returns {@code null} and the
-     *       open is <b>declined</b>; see the class javadoc for why that is the measured right answer.</li>
+     *   <li><b>Compound segment</b> — {@code state.directory} is a {@link CompoundDirectory}, so the open is
+     *       <b>declined</b> and counted as {@link #declinedCompound}; see the class javadoc for why that is
+     *       the measured right answer, and why it is most segments.</li>
      * </ul>
      *
      * <p>Inert when the feature is off: the caller's own state object is returned, not a wrapper of it.

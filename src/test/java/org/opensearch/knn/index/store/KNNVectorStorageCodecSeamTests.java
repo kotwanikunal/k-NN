@@ -229,20 +229,28 @@ public class KNNVectorStorageCodecSeamTests extends KNNTestCase {
 
     /**
      * A compound segment, against a real {@link Lucene90CompoundFormat} container. The directory a codec
-     * is handed for a compound segment is the {@link CompoundDirectory}, which is <b>not</b> a
-     * {@code FilterDirectory}, so k-NN's path resolution stops there and the open is <b>declined</b> — the
-     * entry is served by the compound reader's own mmap slice, and the bytes are still right.
+     * is handed for a compound segment is the {@link CompoundDirectory}, whose entries have no file of their
+     * own, so the open is <b>declined</b> — the entry is served by the compound reader's own mmap slice, and
+     * the bytes are still right.
      *
      * <p>This is the measured right answer rather than a gap: a compound segment is a freshly flushed one,
      * small, and its working set belongs in the page cache — phase 13's E4 measured a flush-sized
      * {@code .vec} at 64.7 ops/s on {@code O_DIRECT} against 518,681 ops/s from the page cache. Resolving
      * {@code .cfe} offsets inside the codec would mean re-implementing the compound reader's entry table
      * one layer above it, in order to route reads that must not be routed.
+     *
+     * <p><b>D2: the reason is its own counter.</b> Before phase 15 this decline landed on
+     * {@code declinedChain}, which is where "an unknown {@code FilterDirectory} is in the way" also lands —
+     * so an operator reading {@code _plugins/_knn/stats} could not tell the expected case from the one that
+     * needs a code change. On the node that mattered: a force-merge of 28 flushed segments never engaged
+     * Direct I/O and the only trace was {@code +234} on {@code declined_chain}. The counter asserted here is
+     * {@code declined_compound}, and {@code declined_chain} must now stay at zero for this case.
      */
     @SneakyThrows
     public void testACompoundSegmentDeclinesAndStillReadsTheRightBytes() {
         assumeDirectIOWorksHere();
         enableDirectIORouting();
+        DirectIOVectorIndexInput.STATS.reset();
         try (MMapDirectory directory = new MMapDirectory(createTempDir())) {
             final SegmentInfo info = segmentInfoOver(directory, true, Set.of(VECTOR_DATA));
             final byte[] expected = writeLuceneFile(directory, VECTOR_DATA, info, FILE_BYTES);
@@ -261,9 +269,26 @@ public class KNNVectorStorageCodecSeamTests extends KNNTestCase {
                     assertArrayEquals("declining must not change the bytes", expected, readAll(entry));
                 }
                 assertEquals("the decline must be counted, not silent", 1, storage.declinedOpens());
-                assertEquals("and its reason is the chain: a CompoundDirectory is not a FilterDirectory", 1, storage.declinedChain());
+                assertEquals("and its reason is that the segment is compound", 1, storage.declinedCompound());
+                assertEquals(
+                    "which is no longer folded into the chain reason, because they want different responses",
+                    0,
+                    storage.declinedChain()
+                );
                 assertEquals(0, storage.routedOpens());
+
+                // The node-wide counters are what _plugins/_knn/stats reads; the per-segment ones above are
+                // unreachable over REST because the codec seam discards this directory with its reader.
+                assertEquals(1L, DirectIOVectorIndexInput.STATS.declinedCompound());
+                assertEquals(0L, DirectIOVectorIndexInput.STATS.declinedChain());
+                assertEquals(1L, DirectIOVectorIndexInput.STATS.declinedOpens());
+                assertTrue(
+                    "and it is named in the stats line an operator sees at DEBUG: " + DirectIOVectorIndexInput.STATS,
+                    DirectIOVectorIndexInput.STATS.toString().contains("declinedCompound=1 declinedChain=0")
+                );
             }
+        } finally {
+            DirectIOVectorIndexInput.STATS.reset();
         }
     }
 }

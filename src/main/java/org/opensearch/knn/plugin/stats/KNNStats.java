@@ -97,11 +97,12 @@ public class KNNStats {
      *
      * <p>Two groups, because they answer two different questions.
      * <ul>
-     *   <li><b>dispatch</b> — is the seam engaging, and if not, why? {@code routed_opens} against the four
-     *       decline reasons, which want four different operator responses: an unsupported substrate
-     *       ({@code declined_chain}), a bug ({@code declined_missing}), the size floor working as designed
-     *       ({@code declined_too_small}), or a filesystem with no {@code O_DIRECT}
-     *       ({@code declined_open_failed}).</li>
+     *   <li><b>dispatch</b> — is the seam engaging, and if not, why? {@code routed_opens} against the five
+     *       decline reasons, which want five different operator responses: a compound segment, i.e. every
+     *       flushed segment at the shipped defaults and nothing to act on
+     *       ({@code declined_compound}); an unsupported substrate ({@code declined_chain}); a bug
+     *       ({@code declined_missing}); the size floor working as designed ({@code declined_too_small}); or
+     *       a filesystem with no {@code O_DIRECT} ({@code declined_open_failed}).</li>
      *   <li><b>reads</b> — once engaged, what is it doing? The staged/blocking/read-ahead channels and the
      *       byte counters behind the amplification ratio. {@code stage_declined} against
      *       {@code staged_reads} is the queue-capacity decline rate phase 13's audit row 7 measured as the
@@ -126,6 +127,7 @@ public class KNNStats {
         final Map<String, Object> dispatch = new HashMap<>();
         dispatch.put("routed_opens", stats.routedOpens());
         dispatch.put("declined_opens", stats.declinedOpens());
+        dispatch.put("declined_compound", stats.declinedCompound());
         dispatch.put("declined_chain", stats.declinedChain());
         dispatch.put("declined_missing", stats.declinedMissing());
         dispatch.put("declined_too_small", stats.declinedTooSmall());
