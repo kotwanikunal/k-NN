@@ -5,6 +5,7 @@
 
 package org.opensearch.knn.index;
 
+import com.sun.management.HotSpotDiagnosticMXBean;
 import lombok.NonNull;
 import lombok.Setter;
 import lombok.extern.log4j.Log4j2;
@@ -37,6 +38,7 @@ import org.opensearch.monitor.jvm.JvmInfo;
 import org.opensearch.monitor.os.OsProbe;
 import org.opensearch.transport.client.Client;
 
+import java.lang.management.ManagementFactory;
 import java.security.InvalidParameterException;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.threadpool.ThreadPool;
@@ -251,18 +253,35 @@ public class KNNSettings {
     // with nothing bounding it. MEASURED on the bench node: 1.69 GB of live direct buffers against a
     // MaxDirectMemorySize of 2g.
     //
-    // DEFAULT = Runtime.maxMemory() / 4, i.e. HALF the direct-memory wall, because OpenSearch's launcher sets
-    // -XX:MaxDirectMemorySize to heapSize / 2 when the operator has not
-    // (distribution/tools/launchers/.../JvmErgonomics.java:72-76). Half of the wall rather than all of it,
-    // because this plugin is not the only user of it -- the transport layer's netty buffers and any other
+    // DEFAULT = HALF the JVM's actual direct-memory wall, where the wall is the operator's explicit
+    // -XX:MaxDirectMemorySize when they pinned one and heapSize / 2 otherwise -- see directMemoryWall().
+    // Half of the wall rather than all of it, because this plugin is not the only user of it: any other
     // plugin's direct allocations come out of the same budget, and a ceiling AT the wall would turn a
     // contained decline into a hard OutOfMemoryError: Direct buffer memory for whoever allocated next.
+    //
+    // D3b: this default was Runtime.maxMemory() / 4, which silently assumed the ergonomic wall. The bench
+    // node PINS the wall -- -XX:MaxDirectMemorySize=2g with -Xmx24g (MEASURED from the live JVM's cmdline) --
+    // so that default was 6 GB against a 2 GB wall, a ceiling 3x ABOVE the wall and therefore exactly the
+    // OutOfMemoryError this comment warns about rather than a bound against it. Operators pin this flag
+    // routinely. Reading the flag makes the default 1 GB there, and leaves it at maxMemory() / 4 when the
+    // flag is unset.
     //
     // Past the budget prefetch DECLINES and the bytes are served by blocking reads, which is a path the
     // design already exercises on every queue-capacity decline. 0b disables the budget.
     public static final String KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET = "knn.direct_io.direct_memory_budget";
+
+    /**
+     * The JVM-wide direct-memory wall this node actually runs against, resolved once at class load.
+     *
+     * @see #directMemoryWall(String, long)
+     */
+    public static final long KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES = directMemoryWall(
+        readMaxDirectMemorySizeFlag(),
+        Runtime.getRuntime().maxMemory()
+    );
+
     public static final ByteSizeValue KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_DEFAULT_VALUE = new ByteSizeValue(
-        Runtime.getRuntime().maxMemory() / 4,
+        KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES / 2,
         ByteSizeUnit.BYTES
     );
 
@@ -642,14 +661,22 @@ public class KNNSettings {
      * The node-wide ceiling on direct buffers the Direct I/O read path holds at once, past which a prefetch
      * declines and the bytes are served by blocking reads. Phase 13's audit FIX 3.
      *
-     * <p><b>Why {@code Runtime.maxMemory() / 4}.</b> OpenSearch's launcher sets
-     * {@code -XX:MaxDirectMemorySize} to {@code heapSize / 2} when the operator has not
-     * ({@code distribution/tools/launchers/.../JvmErgonomics.java:72-76}), so the JVM-wide direct-memory
-     * wall is half the heap. This budget is half of <em>that</em>, because the wall is shared: the transport
-     * layer's netty buffers and any other plugin's direct allocations are charged to the same
+     * <p><b>Why half the wall.</b> The default is
+     * {@link #KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES} / 2, where the wall is the operator's explicit
+     * {@code -XX:MaxDirectMemorySize} when they pinned one and {@code heapSize / 2} otherwise (see
+     * {@link #directMemoryWall(String, long)}). Half of the wall rather than all of it, because the wall is
+     * shared: every other plugin's direct allocations are charged to the same
      * {@code MaxDirectMemorySize}, and a ceiling set at the wall would convert a contained decline here into
      * an {@code OutOfMemoryError: Direct buffer memory} for whoever allocated next. MEASURED on the bench
      * node before this existed: 1.69 GB live against a 2g wall.
+     *
+     * <p><b>Why the wall is read rather than assumed (D3b).</b> This default was
+     * {@code Runtime.maxMemory() / 4}, which is half the wall only on a node that let the launcher choose
+     * it. The bench node pins it: {@code -XX:MaxDirectMemorySize=2g} with {@code -Xmx24g} (MEASURED from
+     * the live JVM's command line), where {@code maxMemory() / 4} is 6 GB — a ceiling <em>three times
+     * above</em> the 2 GB wall, which is not a bound at all but precisely the {@code OutOfMemoryError} case
+     * the paragraph above names. Pinning this flag is routine. Reading it makes the default 1 GB there, and
+     * changes nothing on a node that did not pin it.
      *
      * <p>{@code 0b} disables the budget, which is the pre-phase-15 behaviour.
      */
@@ -1392,6 +1419,72 @@ public class KNNSettings {
         // twiceAllocatedProcessors is package private in OpenSearch, so the one line is restated here.
         final int indexSearcher = Math.max(2, 2 * allocatedProcessors);
         return Math.max(2, search + indexSearcher);
+    }
+
+    /**
+     * Reads HotSpot's final {@code MaxDirectMemorySize} flag, or {@code null} on a JVM that cannot answer.
+     *
+     * <p><b>Why this bean and not {@code RuntimeMXBean.getInputArguments()}.</b> MEASURED on
+     * Corretto 17.0.20.1 under a {@code SecurityManager} with a minimal policy: {@code getVMOption}
+     * returns the value, while {@code getInputArguments()} throws
+     * {@code AccessControlException: access denied ("java.lang.management.ManagementPermission" "monitor")}.
+     * OpenSearch installs a {@code SecurityManager}, so the second mechanism would need a new grant in
+     * {@code plugin-security.policy} to read a number the first one hands over for free. It is also the
+     * better question to ask: {@code getInputArguments()} returns the argument <em>strings</em>, which
+     * would have to be parsed for {@code k/m/g} suffixes and for a later occurrence overriding an earlier
+     * one, whereas the flag is the value HotSpot itself resolved.
+     *
+     * <p>MEASURED on the same JVM: unset gives {@code value="0"}, {@code origin=DEFAULT};
+     * {@code -XX:MaxDirectMemorySize=2g} gives {@code value="2147483648"}, {@code origin=VM_CREATION}. The
+     * value alone is sufficient, so the origin is not consulted.
+     *
+     * @return the flag as a decimal string, or {@code null} if it could not be read
+     */
+    private static String readMaxDirectMemorySizeFlag() {
+        try {
+            final HotSpotDiagnosticMXBean bean = ManagementFactory.getPlatformMXBean(HotSpotDiagnosticMXBean.class);
+            return bean == null ? null : bean.getVMOption("MaxDirectMemorySize").getValue();
+        } catch (RuntimeException | LinkageError e) {
+            // A non-HotSpot JVM, or jdk.management absent, or the flag renamed. Fall back to the ergonomic
+            // wall rather than failing class initialisation of the plugin's whole settings class.
+            return null;
+        }
+    }
+
+    /**
+     * The JVM-wide direct-memory wall: the operator's explicit {@code -XX:MaxDirectMemorySize} when they
+     * pinned one, else {@code heapMaxBytes / 2}.
+     *
+     * <p>{@code heapMaxBytes / 2} is not a guess. OpenSearch's launcher adds
+     * {@code -XX:MaxDirectMemorySize=heapSize / 2} to the final JVM options when, and only when, the
+     * operator has not set it themselves
+     * ({@code distribution/tools/launchers/src/main/java/org/opensearch/tools/launchers/JvmErgonomics.java:74-75}).
+     * That same code reads the resolved flag and treats {@code 0} as "the operator did not set it"
+     * ({@code :72-76}, with {@code extractMaxDirectMemorySize} at {@code :142-144}), which is the
+     * convention this method follows.
+     *
+     * <p>A consequence worth stating: on a node started through the launcher the flag is <em>always</em>
+     * set by the time this runs, either by the operator or by the launcher's own ergonomic choice, so the
+     * two branches agree there. The {@code heapMaxBytes / 2} branch is what an embedded JVM, a test JVM, or
+     * a node started without the launcher lands on.
+     *
+     * @param maxDirectMemorySizeFlag HotSpot's final flag value as a decimal string; {@code "0"} or
+     *                                {@code null} means the operator did not pin one
+     * @param heapMaxBytes            {@code Runtime.maxMemory()}
+     * @return the wall in bytes, always positive on any JVM with a positive heap
+     */
+    static long directMemoryWall(final String maxDirectMemorySizeFlag, final long heapMaxBytes) {
+        if (maxDirectMemorySizeFlag != null) {
+            try {
+                final long pinned = Long.parseLong(maxDirectMemorySizeFlag.trim());
+                if (pinned > 0) {
+                    return pinned;
+                }
+            } catch (NumberFormatException e) {
+                // Not a number we understand; the ergonomic wall is the safer answer.
+            }
+        }
+        return heapMaxBytes / 2;
     }
 
     /** The configured allocated processors, which is what every {@code ThreadPool} builder is sized from. */

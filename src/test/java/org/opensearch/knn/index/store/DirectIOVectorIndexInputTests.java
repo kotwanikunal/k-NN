@@ -1704,18 +1704,18 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
     }
 
     /**
-     * The shipped default is half the JVM's direct-memory wall, because the wall is
-     * {@code heapSize / 2} when the operator has not set it
-     * ({@code distribution/tools/launchers/.../JvmErgonomics.java:72-76}) and this plugin is not its only
-     * user. Pinned because it is the one number in D3 that is a judgement rather than a measurement.
+     * The shipped default is half the JVM's direct-memory wall, and the wall is read rather than assumed.
+     * Pinned because it is the one number in D3 that is a judgement rather than a measurement.
      */
     public void testTheBudgetDefaultIsHalfTheDirectMemoryWall() {
         assertEquals("knn.direct_io.direct_memory_budget", KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING.getKey());
         assertTrue("it has to be tunable on a live node", KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING.isDynamic());
         assertEquals(
-            "Runtime.maxMemory() / 4 = half of MaxDirectMemorySize's heapSize/2 default",
-            Runtime.getRuntime().maxMemory() / 4,
+            "the default is exactly half of the resolved wall",
+            KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES / 2,
             KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_DEFAULT_VALUE.getBytes()
         );
+        assertTrue("and it is a positive number on this JVM", KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_DEFAULT_VALUE.getBytes() > 0);
     }
+
 }

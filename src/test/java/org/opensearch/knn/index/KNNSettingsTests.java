@@ -7,6 +7,7 @@ package org.opensearch.knn.index;
 
 import java.nio.charset.StandardCharsets;
 
+import com.sun.management.HotSpotDiagnosticMXBean;
 import lombok.SneakyThrows;
 import org.opensearch.action.admin.cluster.state.ClusterStateRequest;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
@@ -31,6 +32,7 @@ import org.opensearch.test.MockHttpTransport;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -441,4 +443,68 @@ public class KNNSettingsTests extends KNNTestCase {
         assertEquals(Boolean.FALSE, KNNSettings.state().getSettingValue(KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED));
     }
 
+    /**
+     * D3b. The direct-memory wall is the operator's explicit {@code -XX:MaxDirectMemorySize} when they
+     * pinned one, and {@code heapSize / 2} only when they did not.
+     *
+     * <p>Why this is a test and not a comment: the bench node runs {@code -XX:MaxDirectMemorySize=2g} with
+     * {@code -Xmx24g}, where D3's original default of {@code Runtime.maxMemory() / 4} is 6 GB — a ceiling
+     * three times <em>above</em> the wall, which is not a ceiling at all but exactly the
+     * {@code OutOfMemoryError: Direct buffer memory} the budget exists to avoid. Pinning the flag is
+     * routine, so the wall has to be read.
+     *
+     * <p>The resolution is a pure function of (flag, heap) so that both directions are testable from one
+     * JVM: a JVM cannot change its own {@code MaxDirectMemorySize}, which HotSpot reports as not writeable
+     * (MEASURED on Corretto 17.0.20.1: {@code VMOption.isWriteable() == false}).
+     */
+    public void testTheDirectMemoryWallIsTheExplicitFlagWhenSetAndHalfTheHeapWhenNot() {
+        final long heap = 24L * 1024 * 1024 * 1024;
+
+        // The bench node's actual configuration: 2g pinned against a 24g heap.
+        assertEquals(
+            "an explicit flag is the wall, whatever the heap says",
+            2L * 1024 * 1024 * 1024,
+            KNNSettings.directMemoryWall("2147483648", heap)
+        );
+        assertEquals(
+            "so the node's default budget is 1 GB, not 6 GB",
+            1024L * 1024 * 1024,
+            KNNSettings.directMemoryWall("2147483648", heap) / 2
+        );
+
+        // Unset. HotSpot reports value "0" with origin DEFAULT (MEASURED on the same JVM), which is the
+        // same convention JvmErgonomics.java:74 uses to decide it must add the flag itself.
+        assertEquals("\"0\" means the operator did not pin one", heap / 2, KNNSettings.directMemoryWall("0", heap));
+        assertEquals("and then the budget is heap/4, which is what D3 shipped", heap / 4, KNNSettings.directMemoryWall("0", heap) / 2);
+
+        // Degenerate readings fall back to the ergonomic wall rather than to zero, because a zero budget
+        // means "off" and silently disabling the bound is the wrong direction to fail in.
+        assertEquals("a JVM that cannot answer", heap / 2, KNNSettings.directMemoryWall(null, heap));
+        assertEquals("a value that is not a number", heap / 2, KNNSettings.directMemoryWall("not-a-number", heap));
+        assertEquals("a negative flag", heap / 2, KNNSettings.directMemoryWall("-1", heap));
+
+        // The bean hands back a bare decimal today; trim() is cheap insurance.
+        assertEquals("surrounding whitespace", 2147483648L, KNNSettings.directMemoryWall("  2147483648 ", heap));
+    }
+
+    /** The wall resolved on this JVM is positive and the shipped budget default is exactly half of it. */
+    public void testTheResolvedWallIsUsableAndTheDefaultIsHalfOfIt() {
+        assertTrue(
+            "the wall must resolve to something positive on any JVM this runs on",
+            KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES > 0
+        );
+        assertEquals(
+            KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES / 2,
+            KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING.getDefault(Settings.EMPTY).getBytes()
+        );
+        // This JVM is a gradle test worker, so whichever branch it took, the answer must agree with the
+        // function applied to what the JVM actually reports.
+        assertEquals(
+            KNNSettings.directMemoryWall(
+                ManagementFactory.getPlatformMXBean(HotSpotDiagnosticMXBean.class).getVMOption("MaxDirectMemorySize").getValue(),
+                Runtime.getRuntime().maxMemory()
+            ),
+            KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES
+        );
+    }
 }

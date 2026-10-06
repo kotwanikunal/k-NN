@@ -118,7 +118,10 @@ public class KNNStats {
      *       {@code peak_bytes} for the high-water mark, and {@code declined_budget} for prefetches the
      *       budget refused. The node sat at 1.69 GB of live direct buffers against a 2g
      *       {@code MaxDirectMemorySize} before this section existed, which is the measurement that made it
-     *       necessary.</li>
+     *       necessary. {@code wall_bytes} is the JVM-wide direct-memory wall the budget was derived from —
+     *       the operator's explicit {@code -XX:MaxDirectMemorySize} when they pinned one, else
+     *       {@code heapSize / 2} — reported beside {@code budget_bytes} so that "is this ceiling actually
+     *       below the wall" is one GET rather than an SSH to read the command line.</li>
      *   <li><b>cache</b> — the node-wide vector cache, {@code 0} throughout while
      *       {@code knn.direct_io.rescore.cache.max_bytes} is at its default of {@code 0b}.
      *       {@code hits / (hits + misses)} is the hit rate and is directly comparable with the 40.3%
@@ -175,6 +178,7 @@ public class KNNStats {
         memory.put("peak_bytes", stats.directMemoryPeak());
         memory.put("declined_budget", stats.declinedBudget());
         memory.put("budget_bytes", KNNSettings.getDirectIODirectMemoryBudget().getBytes());
+        memory.put("wall_bytes", KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES);
 
         final Map<String, Object> cache = new HashMap<>();
         cache.put("hits", DirectIOVectorCache.hits());

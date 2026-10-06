@@ -6,6 +6,7 @@
 package org.opensearch.knn.plugin.stats;
 
 import org.opensearch.knn.KNNTestCase;
+import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.store.DirectIOVectorIndexInput;
 
 import java.util.Map;
@@ -99,7 +100,7 @@ public class KNNStatsTests extends KNNTestCase {
 
         final Map<String, Map<String, Object>> directIO = (Map<String, Map<String, Object>>) stat.getValue();
         assertEquals(Set.of("dispatch", "reads", "memory", "cache"), directIO.keySet());
-        for (final String required : new String[] { "live_bytes", "peak_bytes", "declined_budget", "budget_bytes" }) {
+        for (final String required : new String[] { "live_bytes", "peak_bytes", "declined_budget", "budget_bytes", "wall_bytes" }) {
             assertTrue(
                 "memory." + required + " must be exposed, saw " + directIO.get("memory").keySet(),
                 directIO.get("memory").containsKey(required)
@@ -141,4 +142,22 @@ public class KNNStatsTests extends KNNTestCase {
         directIO.get("dispatch").forEach((name, value) -> assertEquals(name + " must start at zero", 0L, (long) (Long) value));
     }
 
+    /**
+     * D3b. {@code memory.wall_bytes} reports the JVM-wide direct-memory wall the budget was derived from, so
+     * that "is this ceiling actually below the wall" is one GET rather than an SSH to read the JVM's command
+     * line. It is a real need: the bench node pins {@code -XX:MaxDirectMemorySize=2g} against a 24g heap,
+     * where the pre-D3b default sat three times above the wall and nothing in the API said so.
+     */
+    @SuppressWarnings("unchecked")
+    public void testTheDirectMemoryWallIsReportedBesideTheBudget() {
+        final Map<String, Map<String, Object>> directIO = (Map<String, Map<String, Object>>) new KNNStats().getStats()
+            .get(StatNames.DIRECT_IO_STATS.getName())
+            .getValue();
+        final Map<String, Object> memory = directIO.get("memory");
+
+        final long wall = (Long) memory.get("wall_bytes");
+        assertEquals("it is the wall the default was derived from", KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES, wall);
+        assertTrue("and a positive number on any JVM this runs on", wall > 0);
+        assertEquals("the shipped default is exactly half of it", wall / 2, (long) (Long) memory.get("budget_bytes"));
+    }
 }
