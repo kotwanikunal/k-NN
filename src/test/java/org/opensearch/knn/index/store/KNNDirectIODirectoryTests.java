@@ -40,7 +40,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 
 /**
- * The dispatch rule of {@link KNNVectorStorageDirectory}, asserted one condition at a time, plus the two
+ * The dispatch rule of {@link KNNDirectIODirectory}, asserted one condition at a time, plus the two
  * properties that decide whether installing it is safe on an index that is not using the feature.
  *
  * <p>The rule has six conditions and the interesting failures are all failures of <em>one</em> of them:
@@ -60,7 +60,7 @@ import java.nio.file.StandardOpenOption;
  * did.
  */
 @ThreadLeakFilters(defaultFilters = true, filters = { DirectIOReadPoolTests.ReadPoolThreadFilter.class })
-public class KNNVectorStorageDirectoryTests extends KNNTestCase {
+public class KNNDirectIODirectoryTests extends KNNTestCase {
 
     /** A native-engine (faiss / MOS) fp32 flat file: the shape the rule routes. */
     private static final String VECTOR_DATA = "_0_" + NativeEngines990KnnVectorsFormat.FORMAT_NAME + "_0.vec";
@@ -114,12 +114,12 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
     }
 
     /** No size floor, so the conditions under test are the only ones that can decline. */
-    private KNNVectorStorageDirectory storageOver(final Directory delegate, final boolean enabled) {
-        return new KNNVectorStorageDirectory(delegate, "_0", () -> enabled, () -> 0L);
+    private KNNDirectIODirectory storageOver(final Directory delegate, final boolean enabled) {
+        return new KNNDirectIODirectory(delegate, "_0", () -> enabled, () -> 0L);
     }
 
-    private KNNVectorStorageDirectory storageOver(final Directory delegate, final boolean enabled, final long minFileBytes) {
-        return new KNNVectorStorageDirectory(delegate, "_0", () -> enabled, () -> minFileBytes);
+    private KNNDirectIODirectory storageOver(final Directory delegate, final boolean enabled, final long minFileBytes) {
+        return new KNNDirectIODirectory(delegate, "_0", () -> enabled, () -> minFileBytes);
     }
 
     // -------------------------------------------------------------------------------------------------
@@ -138,7 +138,7 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
         try (MMapDirectory delegate = new MMapDirectory(path)) {
             final byte[] expected = writeFile(delegate, VECTOR_DATA, FILE_BYTES);
             writeFile(delegate, FAISS_SQ_VECTOR_DATA, FILE_BYTES);
-            try (KNNVectorStorageDirectory storage = storageOver(delegate, true)) {
+            try (KNNDirectIODirectory storage = storageOver(delegate, true)) {
                 for (final String name : new String[] { VECTOR_DATA, FAISS_SQ_VECTOR_DATA }) {
                     try (IndexInput routed = storage.openInput(name, vectorDataContext())) {
                         assertTrue(
@@ -167,7 +167,7 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
         final Path path = createTempDir();
         try (MMapDirectory delegate = new MMapDirectory(path)) {
             writeFile(delegate, VECTOR_DATA, FILE_BYTES);
-            try (KNNVectorStorageDirectory storage = storageOver(delegate, true)) {
+            try (KNNDirectIODirectory storage = storageOver(delegate, true)) {
                 for (final IOContext context : new IOContext[] {
                     IOContext.DEFAULT,
                     IOContext.READONCE,
@@ -208,7 +208,7 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
             try (IndexInput reference = delegate.openInput(luceneVectorData[0], IOContext.DEFAULT)) {
                 delegateInputClass = reference.getClass();
             }
-            try (KNNVectorStorageDirectory storage = storageOver(delegate, true)) {
+            try (KNNDirectIODirectory storage = storageOver(delegate, true)) {
                 for (final String name : luceneVectorData) {
                     try (IndexInput plain = storage.openInput(name, vectorDataContext())) {
                         assertFalse(name + " is not a faiss file and must not be routed", plain instanceof DirectIOVectorIndexInput);
@@ -239,7 +239,7 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
             for (final String name : otherFaissFiles) {
                 writeFile(delegate, name, 4096);
             }
-            try (KNNVectorStorageDirectory storage = storageOver(delegate, true)) {
+            try (KNNDirectIODirectory storage = storageOver(delegate, true)) {
                 for (final String name : otherFaissFiles) {
                     try (IndexInput input = storage.openInput(name, vectorDataContext())) {
                         assertFalse(name + " must not be routed to Direct I/O", input instanceof DirectIOVectorIndexInput);
@@ -256,7 +256,7 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
         final Path path = createTempDir();
         try (MMapDirectory delegate = new MMapDirectory(path)) {
             final byte[] expected = writeFile(delegate, VECTOR_DATA, FILE_BYTES);
-            try (KNNVectorStorageDirectory storage = storageOver(delegate, false)) {
+            try (KNNDirectIODirectory storage = storageOver(delegate, false)) {
                 try (IndexInput input = storage.openInput(VECTOR_DATA, vectorDataContext())) {
                     assertFalse("with the setting off nothing may be routed", input instanceof DirectIOVectorIndexInput);
                     assertArrayEquals(expected, readAll(input));
@@ -276,7 +276,7 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
     public void testADirectoryWithNoPathDeclinesRatherThanFails() {
         try (ByteBuffersDirectory delegate = new ByteBuffersDirectory()) {
             final byte[] expected = writeFile(delegate, VECTOR_DATA, FILE_BYTES);
-            try (KNNVectorStorageDirectory storage = storageOver(delegate, true)) {
+            try (KNNDirectIODirectory storage = storageOver(delegate, true)) {
                 try (IndexInput input = storage.openInput(VECTOR_DATA, vectorDataContext())) {
                     assertFalse(input instanceof DirectIOVectorIndexInput);
                     assertArrayEquals("declining must still read the right bytes", expected, readAll(input));
@@ -312,7 +312,7 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
             try (IndexInput reference = delegate.openInput("_0.cfe", IOContext.DEFAULT)) {
                 delegateInputClass = reference.getClass();
             }
-            try (KNNVectorStorageDirectory storage = storageOver(delegate, true)) {
+            try (KNNDirectIODirectory storage = storageOver(delegate, true)) {
                 for (final String name : new String[] { "_0.cfs", "_0.cfe" }) {
                     try (IndexInput input = storage.openInput(name, IOContext.DEFAULT)) {
                         assertSame(name + " must be the delegate's own object, not a wrapper of it", delegateInputClass, input.getClass());
@@ -339,14 +339,14 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
      * This is a structural test because the failure it guards is a future edit, not current behaviour.
      *
      * <p>A static {@link java.util.Collection} is admitted only if the <em>instance</em> rejects mutation,
-     * which is checked rather than assumed: {@link KNNVectorStorageDirectory#PASSTHROUGH_FILTER_DIRECTORIES}
+     * which is checked rather than assumed: {@link KNNDirectIODirectory#PASSTHROUGH_FILTER_DIRECTORIES}
      * is a {@code Set.of(...)} of class names and so carries nothing that varies with a node's history, but
      * a later edit to a {@code HashSet} would be exactly the state joint 6 forbids and would pass a check
      * on the declared type alone.
      */
     @SneakyThrows
     public void testTheDirectoryKeepsNoNodeWideState() {
-        for (final Field field : KNNVectorStorageDirectory.class.getDeclaredFields()) {
+        for (final Field field : KNNDirectIODirectory.class.getDeclaredFields()) {
             if (Modifier.isStatic(field.getModifiers()) == false) {
                 continue;
             }
@@ -367,7 +367,7 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
             );
         }
         // And the shape it must not have, named: the spike's flag, which a later edit might copy across.
-        for (final Field field : KNNVectorStorageDirectory.class.getDeclaredFields()) {
+        for (final Field field : KNNDirectIODirectory.class.getDeclaredFields()) {
             assertFalse(
                 "a node-wide installed flag is exactly what joint 6 forbids",
                 field.getName().toLowerCase(java.util.Locale.ROOT).contains("installed")
@@ -380,7 +380,7 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
     public void testTheDirectoryIsOtherwiseTransparent() {
         final Path path = createTempDir();
         try (MMapDirectory delegate = new MMapDirectory(path)) {
-            try (KNNVectorStorageDirectory storage = storageOver(delegate, true)) {
+            try (KNNDirectIODirectory storage = storageOver(delegate, true)) {
                 final byte[] expected = writeFile(storage, "written-through.bin", 2048);
                 assertEquals(2048, storage.fileLength("written-through.bin"));
                 assertTrue(java.util.Arrays.asList(storage.listAll()).contains("written-through.bin"));
@@ -460,7 +460,7 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
                 try (IndexInput through = transforming.openInput(VECTOR_DATA, IOContext.DEFAULT)) {
                     assertArrayEquals("and the wrapper is what undoes it", expected, readAll(through));
                 }
-                try (KNNVectorStorageDirectory storage = storageOver(transforming, true)) {
+                try (KNNDirectIODirectory storage = storageOver(transforming, true)) {
                     try (IndexInput input = storage.openInput(VECTOR_DATA, vectorDataContext())) {
                         assertFalse(
                             "an unknown FilterDirectory must never be bypassed to reach the file under it",
@@ -495,18 +495,18 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
             assertEquals(
                 "a layer in the allowlist is crossed",
                 path.resolve(VECTOR_DATA),
-                KNNVectorStorageDirectory.resolvePath(known, VECTOR_DATA, allowlist)
+                KNNDirectIODirectory.resolvePath(known, VECTOR_DATA, allowlist)
             );
             assertEquals(
                 "two of them are crossed too, so the walk is a walk and not a single step",
                 path.resolve(VECTOR_DATA),
-                KNNVectorStorageDirectory.resolvePath(new XorDirectory(known), VECTOR_DATA, allowlist)
+                KNNDirectIODirectory.resolvePath(new XorDirectory(known), VECTOR_DATA, allowlist)
             );
             assertNull(
                 "a layer absent from the allowlist stops the walk",
-                KNNVectorStorageDirectory.resolvePath(known, VECTOR_DATA, java.util.Set.of())
+                KNNDirectIODirectory.resolvePath(known, VECTOR_DATA, java.util.Set.of())
             );
-            assertNull("and so does a null", KNNVectorStorageDirectory.resolvePath(null, VECTOR_DATA, allowlist));
+            assertNull("and so does a null", KNNDirectIODirectory.resolvePath(null, VECTOR_DATA, allowlist));
         }
     }
 
@@ -527,7 +527,7 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
                 "org.opensearch.index.store.ByteSizeCachingDirectory",
                 "org.opensearch.index.BucketedCompositeDirectory"
             ),
-            KNNVectorStorageDirectory.PASSTHROUGH_FILTER_DIRECTORIES
+            KNNDirectIODirectory.PASSTHROUGH_FILTER_DIRECTORIES
         );
     }
 
@@ -546,9 +546,9 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
             final Directory chain = new XorDirectory(new XorDirectory(bottom));
             assertEquals(
                 java.util.List.of(XorDirectory.class.getName(), XorDirectory.class.getName(), ByteBuffersDirectory.class.getName()),
-                KNNVectorStorageDirectory.describeChain(chain)
+                KNNDirectIODirectory.describeChain(chain)
             );
-            assertEquals(java.util.List.of(ByteBuffersDirectory.class.getName()), KNNVectorStorageDirectory.describeChain(bottom));
+            assertEquals(java.util.List.of(ByteBuffersDirectory.class.getName()), KNNDirectIODirectory.describeChain(bottom));
         }
     }
 
@@ -572,7 +572,7 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
         try (Directory hybrid = new FsDirectoryFactory().newDirectory(indexSettings, shardPath)) {
             assertTrue("the premise: hybridfs is an FSDirectory subclass", hybrid instanceof org.apache.lucene.store.FSDirectory);
             final byte[] expected = writeFile(hybrid, VECTOR_DATA, FILE_BYTES);
-            try (KNNVectorStorageDirectory storage = storageOver(hybrid, true)) {
+            try (KNNDirectIODirectory storage = storageOver(hybrid, true)) {
                 try (IndexInput routed = storage.openInput(VECTOR_DATA, vectorDataContext())) {
                     assertTrue(
                         "hybridfs is the production bottom and must engage, got " + routed.getClass().getName(),
@@ -607,7 +607,7 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
             // One directory, floor lowered between the two opens, because the setting is dynamic and is
             // read at every dispatch: a floor captured at construction would need a reopen to take effect.
             final long[] floor = { FILE_BYTES + 1 };
-            try (KNNVectorStorageDirectory storage = new KNNVectorStorageDirectory(delegate, "_0", () -> true, () -> floor[0])) {
+            try (KNNDirectIODirectory storage = new KNNDirectIODirectory(delegate, "_0", () -> true, () -> floor[0])) {
                 try (IndexInput input = storage.openInput(VECTOR_DATA, vectorDataContext())) {
                     assertFalse("below the floor the page cache serves it", input instanceof DirectIOVectorIndexInput);
                     assertArrayEquals("declining on size must not change the bytes", expected, readAll(input));
@@ -646,7 +646,7 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
         try (MMapDirectory delegate = new MMapDirectory(path)) {
             writeFile(delegate, VECTOR_DATA, FILE_BYTES);
             Files.delete(path.resolve(VECTOR_DATA));
-            try (KNNVectorStorageDirectory storage = storageOver(delegate, true)) {
+            try (KNNDirectIODirectory storage = storageOver(delegate, true)) {
                 expectThrows(IOException.class, () -> storage.openInput(VECTOR_DATA, vectorDataContext()));
                 assertEquals("a missing file is not a size decline or a chain decline", 1, storage.declinedMissing());
                 assertEquals(0, storage.declinedTooSmall());
@@ -678,7 +678,7 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
             // A chain decline: no FSDirectory underneath.
             try (ByteBuffersDirectory noPath = new ByteBuffersDirectory()) {
                 writeFile(noPath, VECTOR_DATA, FILE_BYTES);
-                try (KNNVectorStorageDirectory storage = storageOver(noPath, true)) {
+                try (KNNDirectIODirectory storage = storageOver(noPath, true)) {
                     storage.openInput(VECTOR_DATA, vectorDataContext()).close();
                     assertEquals("the per-segment counter", 1, storage.declinedChain());
                 }
@@ -686,13 +686,13 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
             assertEquals("and the node-wide one", 1L, DirectIOVectorIndexInput.STATS.declinedChain());
 
             // A size decline, then a routed open, on a real filesystem. One directory, because closing a
-            // KNNVectorStorageDirectory closes its delegate -- which is exactly why routeVectorData never
+            // KNNDirectIODirectory closes its delegate -- which is exactly why routeVectorData never
             // closes the wrapper it builds.
             final Path path = createTempDir();
             try (MMapDirectory delegate = new MMapDirectory(path)) {
                 writeFile(delegate, VECTOR_DATA, FILE_BYTES);
                 final long[] floor = { FILE_BYTES + 1 };
-                try (KNNVectorStorageDirectory storage = new KNNVectorStorageDirectory(delegate, "_0", () -> true, () -> floor[0])) {
+                try (KNNDirectIODirectory storage = new KNNDirectIODirectory(delegate, "_0", () -> true, () -> floor[0])) {
                     storage.openInput(VECTOR_DATA, vectorDataContext()).close();
                     assertEquals(1L, DirectIOVectorIndexInput.STATS.declinedTooSmall());
 
@@ -725,12 +725,10 @@ public class KNNVectorStorageDirectoryTests extends KNNTestCase {
      * {@code KnnVectorsFormat#getName()}, so a drift in either format's name would silently stop routing.
      */
     public void testThePredicateMatchesTheNamesTheRealFormatsProduce() {
-        assertTrue(KNNVectorStorageDirectory.isFaissVectorData("_7_" + new NativeEngines990KnnVectorsFormat(0).getName() + "_0.vec"));
-        assertTrue(
-            KNNVectorStorageDirectory.isFaissVectorData("_7_" + new Faiss1040ScalarQuantizedKnnVectorsFormat().getName() + "_0.vec")
-        );
-        assertFalse(KNNVectorStorageDirectory.isFaissVectorData("_7_Lucene99HnswVectorsFormat_0.vec"));
-        assertFalse(KNNVectorStorageDirectory.isFaissVectorData("_7_" + NativeEngines990KnnVectorsFormat.FORMAT_NAME + "_0.veq"));
-        assertFalse(KNNVectorStorageDirectory.isFaissVectorData(null));
+        assertTrue(KNNDirectIODirectory.isFaissVectorData("_7_" + new NativeEngines990KnnVectorsFormat(0).getName() + "_0.vec"));
+        assertTrue(KNNDirectIODirectory.isFaissVectorData("_7_" + new Faiss1040ScalarQuantizedKnnVectorsFormat().getName() + "_0.vec"));
+        assertFalse(KNNDirectIODirectory.isFaissVectorData("_7_Lucene99HnswVectorsFormat_0.vec"));
+        assertFalse(KNNDirectIODirectory.isFaissVectorData("_7_" + NativeEngines990KnnVectorsFormat.FORMAT_NAME + "_0.veq"));
+        assertFalse(KNNDirectIODirectory.isFaissVectorData(null));
     }
 }

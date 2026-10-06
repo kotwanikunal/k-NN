@@ -119,7 +119,7 @@ import java.util.function.LongSupplier;
  * outlives every index that set it. This class keeps bounded counters and no static state at all.
  */
 @Log4j2
-public final class KNNVectorStorageDirectory extends FilterDirectory {
+public final class KNNDirectIODirectory extends FilterDirectory {
 
     /** Lucene's flat full-precision vector data — the only file this routes. */
     static final String VECTOR_DATA_EXTENSION = ".vec";
@@ -198,12 +198,12 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
     private final AtomicLong declinedTooSmall = new AtomicLong();
     private final AtomicLong declinedOpenFailed = new AtomicLong();
 
-    public KNNVectorStorageDirectory(final Directory delegate, final String segmentName) {
+    public KNNDirectIODirectory(final Directory delegate, final String segmentName) {
         this(delegate, segmentName, KNNSettings::isDirectIORescoreEnabled, () -> KNNSettings.getDirectIOMinFileSize().getBytes());
     }
 
     /** Visible for testing, so a test can drive the rule without a cluster service. */
-    KNNVectorStorageDirectory(
+    KNNDirectIODirectory(
         final Directory delegate,
         final String segmentName,
         final BooleanSupplier directIORescoreEnabled,
@@ -232,7 +232,7 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
             if (direct != null) {
                 routedOpens.incrementAndGet();
                 DirectIOVectorIndexInput.STATS.recordRoutedOpen();
-                log.debug("k-NN vector storage [{}]: serving [{}] with O_DIRECT", segmentName, name);
+                log.debug("k-NN Direct I/O [{}]: serving [{}] with O_DIRECT", segmentName, name);
                 return direct;
             }
         }
@@ -256,7 +256,7 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
         if (in instanceof CompoundDirectory) {
             decline(declinedCompound, DirectIOVectorIndexInput.DeclineReason.COMPOUND);
             log.debug(
-                "k-NN vector storage [{}]: [{}] is an entry in a compound segment, which has no file of its "
+                "k-NN Direct I/O [{}]: [{}] is an entry in a compound segment, which has no file of its "
                     + "own; the compound reader's mmap slice serves it",
                 segmentName,
                 name
@@ -272,7 +272,7 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
             // allowlist" and the only useful question is which. The last entry is the layer that stopped
             // the walk.
             log.debug(
-                "k-NN vector storage [{}]: [{}] has no resolvable filesystem path; the delegate chain is {}, "
+                "k-NN Direct I/O [{}]: [{}] has no resolvable filesystem path; the delegate chain is {}, "
                     + "and the known byte-passthrough layers are {}",
                 segmentName,
                 name,
@@ -289,7 +289,7 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
             if (bytes < minBytes) {
                 decline(declinedTooSmall, DirectIOVectorIndexInput.DeclineReason.TOO_SMALL);
                 log.debug(
-                    "k-NN vector storage [{}]: [{}] is {} B, below knn.direct_io.min_file_size of {} B; serving it from the page cache",
+                    "k-NN Direct I/O [{}]: [{}] is {} B, below knn.direct_io.min_file_size of {} B; serving it from the page cache",
                     segmentName,
                     name,
                     bytes,
@@ -299,11 +299,11 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
             }
         } catch (NoSuchFileException e) {
             decline(declinedMissing, DirectIOVectorIndexInput.DeclineReason.MISSING);
-            log.debug("k-NN vector storage [{}]: [{}] does not exist at [{}]", segmentName, name, path);
+            log.debug("k-NN Direct I/O [{}]: [{}] does not exist at [{}]", segmentName, name, path);
             return null;
         } catch (IOException | RuntimeException e) {
             decline(declinedMissing, DirectIOVectorIndexInput.DeclineReason.MISSING);
-            log.warn("k-NN vector storage [{}]: could not size [{}]", segmentName, path, e);
+            log.warn("k-NN Direct I/O [{}]: could not size [{}]", segmentName, path, e);
             return null;
         }
         // (6) the open, which is the last thing that can decline and the only one that touches the device.
@@ -311,12 +311,12 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
             final DirectIOVectorIndexInput direct = DirectIOVectorIndexInput.open(path);
             if (direct == null) {
                 decline(declinedOpenFailed, DirectIOVectorIndexInput.DeclineReason.OPEN_FAILED);
-                log.warn("k-NN vector storage [{}]: Direct I/O is not available for [{}]", segmentName, path);
+                log.warn("k-NN Direct I/O [{}]: Direct I/O is not available for [{}]", segmentName, path);
             }
             return direct;
         } catch (RuntimeException e) {
             decline(declinedOpenFailed, DirectIOVectorIndexInput.DeclineReason.OPEN_FAILED);
-            log.warn("k-NN vector storage [{}]: could not open [{}] with Direct I/O", segmentName, path, e);
+            log.warn("k-NN Direct I/O [{}]: could not open [{}] with Direct I/O", segmentName, path, e);
             return null;
         }
     }
@@ -497,7 +497,7 @@ public final class KNNVectorStorageDirectory extends FilterDirectory {
             return state;
         }
         return new SegmentReadState(
-            new KNNVectorStorageDirectory(state.directory, state.segmentInfo.name),
+            new KNNDirectIODirectory(state.directory, state.segmentInfo.name),
             state.segmentInfo,
             state.fieldInfos,
             state.context,

@@ -45,7 +45,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * {@link KNNVectorStorageDirectory#routeVectorData}, the codec-level seam — since phase 14 the plugin's
+ * {@link KNNDirectIODirectory#routeVectorData}, the codec-level seam — since phase 14 the plugin's
  * <b>only</b> Direct I/O engagement point, reaching the {@code .vec} open with no index setting at all.
  *
  * <p>Three properties, because three things can go wrong with a seam placed here rather than at the store:
@@ -56,7 +56,7 @@ import static org.mockito.Mockito.when;
  * structural" is exactly the claim being made.
  */
 @ThreadLeakFilters(defaultFilters = true, filters = { DirectIOReadPoolTests.ReadPoolThreadFilter.class })
-public class KNNVectorStorageCodecSeamTests extends KNNTestCase {
+public class KNNDirectIOCodecSeamTests extends KNNTestCase {
 
     /** A native-engine (faiss / MOS) fp32 flat file: the shape the rule routes. */
     private static final String VECTOR_DATA = "_0_" + NativeEngines990KnnVectorsFormat.FORMAT_NAME + "_0.vec";
@@ -80,7 +80,7 @@ public class KNNVectorStorageCodecSeamTests extends KNNTestCase {
      * The node settings this seam is gated on. The size floor is set to {@code 0b} because the fixture here
      * is a 16 KiB file and the property under test is the <em>engagement</em> — that the codec seam reaches
      * k-NN's dispatch with no index setting — not the floor, which is pinned where it belongs in
-     * {@link KNNVectorStorageDirectoryTests#testAFileBelowTheSizeFloorIsNotRouted}. Reset by
+     * {@link KNNDirectIODirectoryTests#testAFileBelowTheSizeFloorIsNotRouted}. Reset by
      * {@code tearDown}.
      */
     private void enableDirectIORouting() {
@@ -180,7 +180,7 @@ public class KNNVectorStorageCodecSeamTests extends KNNTestCase {
             assertSame(
                 "the seam must be inert, not merely harmless, when the feature is off",
                 state,
-                KNNVectorStorageDirectory.routeVectorData(state)
+                KNNDirectIODirectory.routeVectorData(state)
             );
         }
     }
@@ -200,7 +200,7 @@ public class KNNVectorStorageCodecSeamTests extends KNNTestCase {
             final SegmentInfo info = segmentInfoOver(directory, false, Set.of(VECTOR_DATA));
             final SegmentReadState state = readStateOver(directory, info);
 
-            final SegmentReadState derived = KNNVectorStorageDirectory.routeVectorData(state);
+            final SegmentReadState derived = KNNDirectIODirectory.routeVectorData(state);
             assertNotSame(state, derived);
             assertSame("the segment info must be carried through", state.segmentInfo, derived.segmentInfo);
             assertSame("the field infos must be carried through", state.fieldInfos, derived.fieldInfos);
@@ -209,9 +209,9 @@ public class KNNVectorStorageCodecSeamTests extends KNNTestCase {
 
             assertTrue(
                 "the derived state's directory must be k-NN's, got " + derived.directory.getClass().getName(),
-                derived.directory instanceof KNNVectorStorageDirectory
+                derived.directory instanceof KNNDirectIODirectory
             );
-            final KNNVectorStorageDirectory storage = (KNNVectorStorageDirectory) derived.directory;
+            final KNNDirectIODirectory storage = (KNNDirectIODirectory) derived.directory;
             assertSame("it must wrap the caller's directory, not replace it", directory, storage.getDelegate());
             assertEquals("the directory names the segment it serves, not an index", info.name, storage.segmentName());
 
@@ -258,8 +258,8 @@ public class KNNVectorStorageCodecSeamTests extends KNNTestCase {
 
             try (CompoundDirectory compound = new Lucene90CompoundFormat().getCompoundReader(directory, info)) {
                 final SegmentReadState state = readStateOver(compound, info);
-                final SegmentReadState derived = KNNVectorStorageDirectory.routeVectorData(state);
-                final KNNVectorStorageDirectory storage = (KNNVectorStorageDirectory) derived.directory;
+                final SegmentReadState derived = KNNDirectIODirectory.routeVectorData(state);
+                final KNNDirectIODirectory storage = (KNNDirectIODirectory) derived.directory;
 
                 try (IndexInput entry = derived.directory.openInput(VECTOR_DATA, vectorDataContext())) {
                     assertFalse(

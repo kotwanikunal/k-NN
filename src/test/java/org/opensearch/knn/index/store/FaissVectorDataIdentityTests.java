@@ -43,7 +43,7 @@ import java.util.Random;
 
 /**
  * The identity proof for the design, end to end, with nothing mocked between the codec and the kernel:
- * a real native-engine segment read through a {@link KNNVectorStorageDirectory} has its {@code .vec}
+ * a real native-engine segment read through a {@link KNNDirectIODirectory} has its {@code .vec}
  * served with {@code O_DIRECT}, and the vectors and the scores that come back are bit-for-bit the ones
  * the ordinary memory-mapped reader returns.
  *
@@ -110,7 +110,7 @@ public class FaissVectorDataIdentityTests extends KNNTestCase {
     /**
      * One non-compound segment, so the {@code .vec} arrives at the directory's own {@code openInput} —
      * the only dispatch point there is. A compound segment declines by construction, which is asserted in
-     * {@link KNNVectorStorageCodecSeamTests#testACompoundSegmentDeclinesAndStillReadsTheRightBytes}.
+     * {@link KNNDirectIOCodecSeamTests#testACompoundSegmentDeclinesAndStillReadsTheRightBytes}.
      */
     private static void writeSegment(final MMapDirectory directory) throws IOException {
         final IndexWriterConfig config = new IndexWriterConfig();
@@ -161,7 +161,7 @@ public class FaissVectorDataIdentityTests extends KNNTestCase {
             }
             assertEquals(DOCS, expected.size());
 
-            try (KNNVectorStorageDirectory storage = new KNNVectorStorageDirectory(delegate, "_0", () -> true, () -> 0L)) {
+            try (KNNDirectIODirectory storage = new KNNDirectIODirectory(delegate, "_0", () -> true, () -> 0L)) {
                 final List<float[]> actual;
                 try (DirectoryReader routedReader = DirectoryReader.open(storage)) {
                     assertEquals(
@@ -202,7 +202,7 @@ public class FaissVectorDataIdentityTests extends KNNTestCase {
             try (
                 MMapDirectory control = new MMapDirectory(path);
                 DirectoryReader mmapReader = DirectoryReader.open(control);
-                KNNVectorStorageDirectory storage = new KNNVectorStorageDirectory(delegate, "_0", () -> true, () -> 0L);
+                KNNDirectIODirectory storage = new KNNDirectIODirectory(delegate, "_0", () -> true, () -> 0L);
                 DirectoryReader routedReader = DirectoryReader.open(storage)
             ) {
                 assertEquals(1, storage.routedOpens());
@@ -241,7 +241,7 @@ public class FaissVectorDataIdentityTests extends KNNTestCase {
                 expected = readAll(onlyLeafValues(mmapReader));
             }
 
-            try (KNNVectorStorageDirectory storage = new KNNVectorStorageDirectory(delegate, "_0", () -> false, () -> 0L)) {
+            try (KNNDirectIODirectory storage = new KNNDirectIODirectory(delegate, "_0", () -> false, () -> 0L)) {
                 try (DirectoryReader reader = DirectoryReader.open(storage)) {
                     assertEquals(0, storage.routedOpens());
                     assertEquals("declining on the gate is not a Direct I/O failure", 0, storage.declinedOpens());

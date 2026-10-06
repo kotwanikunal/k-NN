@@ -17,7 +17,7 @@ import org.apache.lucene.util.quantization.QuantizedByteVectorValues.ScalarEncod
 import org.opensearch.knn.common.FieldInfoExtractor;
 import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactory;
 import org.opensearch.knn.index.engine.KNNEngine;
-import org.opensearch.knn.index.store.KNNVectorStorageDirectory;
+import org.opensearch.knn.index.store.KNNDirectIODirectory;
 
 import java.io.IOException;
 import java.util.Locale;
@@ -60,7 +60,7 @@ public class Faiss1040ScalarQuantizedKnnVectorsFormat extends KnnVectorsFormat {
     /**
      * The per-field format name. Public because {@code PerFieldKnnVectorsFormat} puts it in the segment
      * suffix of every file this format writes, which is how
-     * {@link org.opensearch.knn.index.store.KNNVectorStorageDirectory} recognises a faiss
+     * {@link org.opensearch.knn.index.store.KNNDirectIODirectory} recognises a faiss
      * scalar-quantized {@code .vec} by name.
      */
     public static final String FORMAT_NAME = "Faiss1040ScalarQuantizedKnnVectorsFormat";
@@ -162,7 +162,7 @@ public class Faiss1040ScalarQuantizedKnnVectorsFormat extends KnnVectorsFormat {
      */
     /**
      * <p>The flat reader is built over a
-     * {@link KNNVectorStorageDirectory#routeVectorData derived read state}, so that its {@code .vec} open
+     * {@link KNNDirectIODirectory#routeVectorData derived read state}, so that its {@code .vec} open
      * goes through k-NN's Direct I/O dispatch with <b>no index setting</b>. Inert when
      * {@code knn.direct_io.rescore.enabled} is off.
      */
@@ -170,7 +170,7 @@ public class Faiss1040ScalarQuantizedKnnVectorsFormat extends KnnVectorsFormat {
     public KnnVectorsReader fieldsReader(SegmentReadState state) throws IOException {
         return new Faiss1040ScalarQuantizedKnnVectorsReader(
             state,
-            new Faiss1040ScalarQuantizedFlatVectorsReader(flatFormatFor().fieldsReader(KNNVectorStorageDirectory.routeVectorData(state)))
+            new Faiss1040ScalarQuantizedFlatVectorsReader(flatFormatFor().fieldsReader(KNNDirectIODirectory.routeVectorData(state)))
         );
     }
 

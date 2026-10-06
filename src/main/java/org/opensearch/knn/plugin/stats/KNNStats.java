@@ -94,7 +94,7 @@ public class KNNStats {
      * The Direct I/O read path's node-wide counters, at {@code _plugins/_knn/stats} under
      * {@code direct_io_stats}. This is the k-NN-shaped place for them: {@code KNNStats} is already how every
      * other node-level k-NN counter reaches an operator, and the alternative — the per-segment
-     * {@code KNNVectorStorageDirectory} the codec seam creates — is discarded with its reader and so can
+     * {@code KNNDirectIODirectory} the codec seam creates — is discarded with its reader and so can
      * never be read over REST.
      *
      * <p>Two groups, because they answer two different questions.

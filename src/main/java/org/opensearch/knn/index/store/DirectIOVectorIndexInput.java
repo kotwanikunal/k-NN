@@ -235,7 +235,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * block-aligned request except at end of file.
      *
      * <h2>The dispatch counters, and why they live here</h2>
-     * {@link #routedOpens} and the four decline reasons are {@link KNNVectorStorageDirectory}'s, not this
+     * {@link #routedOpens} and the four decline reasons are {@link KNNDirectIODirectory}'s, not this
      * class's. They are aggregated here because the directory is created <b>per segment per reader</b> by
      * the codec seam and is discarded with that reader, so its own instance counters are unreachable from
      * a REST API by construction — which phase 13's re-proof notes recorded as a gap. This object is the
@@ -363,7 +363,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
         /**
          * Counts one {@code .vec} open the dispatch rule routed to {@code O_DIRECT}. Called by
-         * {@link KNNVectorStorageDirectory}, which owns the rule; see the class javadoc for why the
+         * {@link KNNDirectIODirectory}, which owns the rule; see the class javadoc for why the
          * node-wide tally is here.
          */
         void recordRoutedOpen() {

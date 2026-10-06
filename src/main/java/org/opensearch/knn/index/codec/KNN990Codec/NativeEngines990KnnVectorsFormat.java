@@ -25,7 +25,7 @@ import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactor
 import org.opensearch.knn.index.codec.scorer.NativeEngines990KnnVectorsScorer;
 import org.opensearch.knn.index.codec.scorer.PrefetchableFlatVectorScorer;
 import org.opensearch.knn.index.engine.KNNEngine;
-import org.opensearch.knn.index.store.KNNVectorStorageDirectory;
+import org.opensearch.knn.index.store.KNNDirectIODirectory;
 
 import java.io.IOException;
 
@@ -42,7 +42,7 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
     /**
      * The per-field format name. Public because {@code PerFieldKnnVectorsFormat} puts it in the segment
      * suffix of every file this format writes, which is how
-     * {@link org.opensearch.knn.index.store.KNNVectorStorageDirectory} recognises a native-engine
+     * {@link org.opensearch.knn.index.store.KNNDirectIODirectory} recognises a native-engine
      * {@code .vec} by name.
      */
     public static final String FORMAT_NAME = "NativeEngines990KnnVectorsFormat";
@@ -84,7 +84,7 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
     /**
      * Returns a {@link KnnVectorsReader} to read the vectors from the index.
      *
-     * <p>The flat reader is built over a {@link KNNVectorStorageDirectory#routeVectorData derived read
+     * <p>The flat reader is built over a {@link KNNDirectIODirectory#routeVectorData derived read
      * state}, so that its {@code .vec} open goes through k-NN's Direct I/O dispatch when
      * {@code knn.direct_io.rescore.enabled} is on. This is the plugin's only Direct I/O engagement point
      * and it needs <b>no index setting</b>; it is inert when the node setting is off. Only the flat
@@ -95,10 +95,7 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
      */
     @Override
     public KnnVectorsReader fieldsReader(final SegmentReadState state) throws IOException {
-        return new NativeEngines990KnnVectorsReader(
-            state,
-            flatVectorsFormat.fieldsReader(KNNVectorStorageDirectory.routeVectorData(state))
-        );
+        return new NativeEngines990KnnVectorsReader(state, flatVectorsFormat.fieldsReader(KNNDirectIODirectory.routeVectorData(state)));
     }
 
     /**

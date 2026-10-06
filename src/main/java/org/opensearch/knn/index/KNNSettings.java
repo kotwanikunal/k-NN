@@ -129,7 +129,7 @@ public class KNNSettings {
     public static final String KNN_DYNAMIC_MAPPING_ENABLED = "knn.dynamic_mapping.enabled";
 
     // Node level gate for routing faiss/MOS full-precision vector data to Direct I/O. Off by default:
-    // with it off KNNVectorStorageDirectory returns the delegate's own input, so every read is byte for
+    // with it off KNNDirectIODirectory returns the delegate's own input, so every read is byte for
     // byte what it is without this code. Read at every dispatch, so flipping it takes effect on the next
     // reader or values object with no index or node restart.
     public static final String KNN_DIRECT_IO_RESCORE_ENABLED = "knn.direct_io.rescore.enabled";
@@ -157,7 +157,7 @@ public class KNNSettings {
     public static final ByteSizeValue KNN_DIRECT_IO_MIN_FILE_SIZE_DEFAULT_VALUE = new ByteSizeValue(10, ByteSizeUnit.MB);
 
     // Direct I/O prefetch settings. These are only consulted once Direct I/O is already engaged, i.e.
-    // knn.direct_io.rescore.enabled is on and KNNVectorStorageDirectory routed a .vec through
+    // knn.direct_io.rescore.enabled is on and KNNDirectIODirectory routed a .vec through
     // DirectIOVectorIndexInput, so on a node with that setting off none of them has any effect.
     // Upper bound on in-flight reads across the whole node, not per segment: per-leaf scoring tasks run
     // concurrently, so total in-flight is segments x window, and a per-segment bound oversaturates the
@@ -541,12 +541,12 @@ public class KNNSettings {
 
     /**
      * Node level switch for reading faiss and memory-optimized-search full-precision vectors with Direct
-     * I/O, at the storage layer in {@link org.opensearch.knn.index.store.KNNVectorStorageDirectory}. Read
+     * I/O, at the storage layer in {@link org.opensearch.knn.index.store.KNNDirectIODirectory}. Read
      * at every dispatch and needs no index close and reopen, so flipping it takes effect on the next
      * reader or values object.
      * <p>
      * This is the <b>whole</b> opt-in since phase 14: engagement is the codec seam
-     * ({@code KNNVectorStorageDirectory#routeVectorData}) and there is no per-index setting to set. Off by
+     * ({@code KNNDirectIODirectory#routeVectorData}) and there is no per-index setting to set. Off by
      * default, and with it off every read is the one every existing measurement was taken against, byte
      * for byte.
      */
@@ -559,7 +559,7 @@ public class KNNSettings {
 
     /**
      * The size a faiss/MOS {@code .vec} must reach before it is routed to Direct I/O — condition (iii) of
-     * {@code KNNVectorStorageDirectory}'s guard. Node scoped and dynamic, read at every dispatch, so it
+     * {@code KNNDirectIODirectory}'s guard. Node scoped and dynamic, read at every dispatch, so it
      * takes effect on the next reader.
      * <p>
      * Phase 13's audit called the absence of this term the one unambiguous defect in the design:
