@@ -278,6 +278,9 @@ public class KNNPlugin extends Plugin
         NativeMemoryLoadStrategy.TrainingLoadStrategy.initialize(vectorReader);
 
         KNNSettings.state().initialize(client, clusterService);
+        // Only so that the Direct I/O queue capacity can be derived from the real search and index_searcher
+        // pool sizes rather than from the formulas; see KNNSettings#getDirectIORescoreBurstThreads.
+        KNNSettings.state().setThreadPool(threadPool);
         KNNClusterUtil.instance().initialize(clusterService, indexNameExpressionResolver);
         ModelDao.OpenSearchKNNModelDao.initialize(client, clusterService, environment.settings());
         ModelCache.initialize(ModelDao.OpenSearchKNNModelDao.getInstance(), clusterService);

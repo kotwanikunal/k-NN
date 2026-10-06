@@ -255,6 +255,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         private final AtomicLong readaheadDeclined = new AtomicLong();
         private final AtomicLong readaheadArmed = new AtomicLong();
         private final AtomicLong stagedWaitTimeouts = new AtomicLong();
+        private final AtomicLong queuePeak = new AtomicLong();
+        private final AtomicLong poolRebuilds = new AtomicLong();
 
         private void recordInFlightPeak() {
             final long now = inFlightNow.get();
@@ -262,6 +264,40 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             while (now > peak && inFlightPeak.compareAndSet(peak, now) == false) {
                 peak = inFlightPeak.get();
             }
+        }
+
+        /**
+         * Raises the queue-occupancy high-water mark. Sampled by {@link DirectIOReadPool#sampleQueueDepth}
+         * immediately after a submit, so that the derived default capacity can be validated against what a
+         * real burst offers rather than against its own formula.
+         */
+        void recordQueuePeak(final int occupancy) {
+            long peak = queuePeak.get();
+            while (occupancy > peak && queuePeak.compareAndSet(peak, occupancy) == false) {
+                peak = queuePeak.get();
+            }
+        }
+
+        /** Counts one pool swap, i.e. one capacity change applied without a restart. */
+        void recordPoolRebuild() {
+            poolRebuilds.incrementAndGet();
+        }
+
+        /**
+         * The high-water mark of reads waiting behind the pool. Against
+         * {@code knn.direct_io.rescore.prefetch.queue_capacity} this says whether the queue ever came near
+         * filling, which is the question the node's 0-declines-at-both-1024-and-4096 result left open.
+         */
+        public long queuePeak() {
+            return queuePeak.get();
+        }
+
+        /**
+         * Times the pool was rebuilt because {@code queue_capacity} changed. {@code 0} on a node that has
+         * never retuned it; each increment is one live capacity change that actually took effect.
+         */
+        public long poolRebuilds() {
+            return poolRebuilds.get();
         }
 
         /**
@@ -424,6 +460,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             readaheadDeclined.set(0);
             readaheadArmed.set(0);
             stagedWaitTimeouts.set(0);
+            queuePeak.set(0);
+            poolRebuilds.set(0);
         }
 
         @Override
@@ -438,7 +476,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                     + "blockingReads=%d stagedReads=%d stagedHits=%d stageDeclined=%d prefetchCalls=%d inFlightPeak=%d "
                     + "stagedBytes=%d blockingBytes=%d servedBytes=%d declinedSpanBytes=%d "
                     + "readaheadReads=%d readaheadBytes=%d readaheadHits=%d readaheadDeclined=%d readaheadArmed=%d "
-                    + "stagedWaitTimeouts=%d amplification=%.3f",
+                    + "stagedWaitTimeouts=%d queuePeak=%d poolRebuilds=%d amplification=%.3f",
                 routedOpens.get(),
                 declinedChain.get(),
                 declinedMissing.get(),
@@ -460,6 +498,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 readaheadDeclined.get(),
                 readaheadArmed.get(),
                 stagedWaitTimeouts.get(),
+                queuePeak.get(),
+                poolRebuilds.get(),
                 served == 0 ? 0.0 : (double) read / served
             );
         }
@@ -573,6 +613,11 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      */
     private ByteBuffer stagingArena;
     private int stagedCount;
+    /**
+     * The pool this burst's staged reads are submitted to, acquired by {@link #ensureStagingTable} and
+     * cleared by {@link #resetStaging}, so it is never held across a burst boundary. The read-ahead ring
+     * does not use this field; see {@link #refillReadahead}.
+     */
     private ExecutorService pool;
     /** Whether a read has happened since the last {@link #prefetch}, which is how a burst's end is found. */
     private boolean readSincePrefetch;
@@ -978,24 +1023,39 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             log.debug("The Direct I/O read pool refused a prefetch of {}; reads will block", handle.path);
             return;
         }
+        DirectIOReadPool.sampleQueueDepth(pool);
         staged[slot] = range;
         stagedCount++;
     }
 
-    /** Allocates the burst table once. @return false when there is no pool, so reads must block */
+    /**
+     * Acquires the pool for this burst and allocates the burst table once.
+     *
+     * <p><b>Acquired per burst, which is what makes a live capacity change reach this input.</b> Before
+     * phase 15 this method returned early on {@code staged != null} and so read {@link #pool} once per input
+     * and then held that reference for the input's whole life — and an input lives as long as the values
+     * object Lucene built it for, which on the merge path is the whole merge. A capacity change swaps the
+     * pool, so a stale reference would keep submitting to the retired one until it was shut down and then
+     * decline every prefetch. Re-acquiring at the burst boundary ({@link #resetStaging} clears the field)
+     * bounds staleness to one burst, and costs one settings read per burst rather than one per
+     * {@link #prefetch} call — there are up to {@code staged_ranges} of those in a burst.
+     *
+     * @return false when there is no pool, so reads must block
+     */
     private boolean ensureStagingTable() {
-        if (staged != null) {
-            return pool != null;
+        if (pool == null) {
+            final ExecutorService acquired = DirectIOReadPool.executor();
+            if (acquired == null) {
+                return false;
+            }
+            pool = acquired;
         }
-        final ExecutorService acquired = DirectIOReadPool.executor();
-        if (acquired == null) {
-            return false;
+        if (staged == null) {
+            staged = new StagedRange[maxStagedRanges];
+            stagedBuffers = new ByteBuffer[maxStagedRanges];
+            stagedFloats = new FloatBuffer[maxStagedRanges];
+            stagingArena = carveArena(maxStagedRanges, arenaSlotBytes(), stagedBuffers, stagedFloats);
         }
-        staged = new StagedRange[maxStagedRanges];
-        stagedBuffers = new ByteBuffer[maxStagedRanges];
-        stagedFloats = new FloatBuffer[maxStagedRanges];
-        stagingArena = carveArena(maxStagedRanges, arenaSlotBytes(), stagedBuffers, stagedFloats);
-        pool = acquired;
         return true;
     }
 
@@ -1075,6 +1135,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
         stagedCount = 0;
         readSincePrefetch = false;
+        // The burst boundary is also where the pool reference is dropped, so the next burst picks up a pool
+        // rebuilt by a capacity change. See ensureStagingTable.
+        pool = null;
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -1413,17 +1476,23 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * this input's own region. Stands down when a prefetch burst is active ({@code stagedCount > 0}): the
      * rescore scorer then owns the input and its access is random, not sequential, so the ring issues no
      * speculative reads. Allocates the ring lazily on the first call that reaches here.
+     *
+     * <p>The pool is acquired into a <b>local</b> here rather than kept in {@link #pool}, which the burst
+     * path owns and clears at each burst boundary. The ring has no burst boundary to re-acquire at — it
+     * lives for the length of a scan — so re-reading it on every refill is what makes a live capacity change
+     * reach the ring too. A refill happens once per window served, i.e. once per
+     * {@link #readaheadWindowBytes} (64 KiB by default), so the settings read is not on a per-vector path.
      */
     private void refillReadahead() {
         if (stagedCount > 0) {
             return;
         }
+        final ExecutorService executor = DirectIOReadPool.executor();
+        if (executor == null) {
+            STATS.readaheadDeclined.incrementAndGet();
+            return;
+        }
         if (readaheadRing == null) {
-            final ExecutorService acquired = DirectIOReadPool.executor();
-            if (acquired == null) {
-                STATS.readaheadDeclined.incrementAndGet();
-                return;
-            }
             readaheadRing = new StagedRange[readaheadWindows];
             readaheadBuffers = new ByteBuffer[readaheadWindows];
             readaheadFloats = new FloatBuffer[readaheadWindows];
@@ -1431,7 +1500,6 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             // rather than at the burst table's arenaSlotBytes() and never needs the per-slot fall-back the
             // burst table keeps for a wide group.
             readaheadArena = carveArena(readaheadWindows, readaheadWindowBytes, readaheadBuffers, readaheadFloats);
-            pool = acquired;
         }
         final long regionEnd = offset + length;
         while (readaheadCount < readaheadWindows && readaheadNext < regionEnd) {
@@ -1454,12 +1522,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 STATS.readaheadBytes
             );
             try {
-                range.future = pool.submit(range);
+                range.future = executor.submit(range);
             } catch (RejectedExecutionException e) {
                 STATS.readaheadDeclined.incrementAndGet();
                 log.debug("The Direct I/O read pool refused a read-ahead of {}; reads will block", handle.path);
                 return;
             }
+            DirectIOReadPool.sampleQueueDepth(executor);
             readaheadRing[slot] = range;
             readaheadCount++;
             readaheadNext += readaheadWindowBytes;

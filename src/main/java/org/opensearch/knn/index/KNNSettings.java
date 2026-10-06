@@ -39,6 +39,7 @@ import org.opensearch.transport.client.Client;
 
 import java.security.InvalidParameterException;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
+import org.opensearch.threadpool.ThreadPool;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -225,22 +226,21 @@ public class KNNSettings {
     public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES = "knn.direct_io.rescore.prefetch.staged_ranges";
     public static final int KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_DEFAULT_VALUE = 64;
 
-    // How many reads may WAIT behind the shared pool. Phase 13 audit row 7 measured this as the binding
-    // constraint at concurrent-scorer load, and phase 14 S3 reproduced it independently: at 16 scorers with
-    // the derived default capacity of max(64, 8 * threads) = 128, stageDeclined/stagedReads is 43.8% and
-    // 43.9% in two arms, against the audit's 44% -- i.e. nearly half of every declared read is refused,
-    // because 16 scorers x 64 staged ranges want 1,024 slots and 128 exist.
+    // How many reads may WAIT behind the shared pool. Phase 13 audit row 7 and phase 14 S3 both measured
+    // this as the binding constraint at concurrent-scorer load, and the Oct 4-5 node sweep settled it: at an
+    // effective capacity of 64 the node refused 46-52% of staged reads and made 783k device reads per 5,000
+    // queries at p50/p90/p99 777/1069/1322 ms; at 1,024 it refused 0% and made 707k at 650/877/954. The
+    // declined bursts were falling back to individual blocking reads. Phase 14's claim that declining is the
+    // cheaper fallback is WITHDRAWN on that evidence.
     //
-    // A refused submit is CORRECT and is the cheaper fallback -- the bytes are served by blocking reads of
-    // only the blocks a vector occupies, where caller-running the submit would read the whole span inline --
-    // so this is a tuning question and not a bug. But it is one the DESKTOP cannot answer for the node: the
-    // trade is queue depth against wait, and both sides depend on the device and the core count. So it
-    // becomes a setting the node can sweep without a rebuild, and THE DEFAULT DOES NOT MOVE.
+    // 0 means "derive", and since phase 15 the derivation is BURST DEMAND rather than pool size:
+    // max(256, nextPowerOfTwo((search_max + index_searcher_max) * staged_ranges)) in DirectIOReadPool --
+    // 1,024 on a 4-vCPU node, 4,096 at 16. Any positive value is taken literally and still wins.
     //
-    // 0 means "derive", which is the shipped behaviour: max(MIN_QUEUE_CAPACITY, QUEUED_READS_PER_THREAD *
-    // threads) in DirectIOReadPool. Any positive value is taken literally. Read once, when the pool is
-    // created, because ArrayBlockingQueue has no resize; changing it takes effect on the next node restart
-    // or after the pool has been idle long enough to be dropped.
+    // DYNAMIC AND LIVE. ArrayBlockingQueue has no resize, so DirectIOReadPool SWAPS the executor when this
+    // changes: a new pool at the new capacity is published and the old one is shutdown() so its queued reads
+    // drain. Applied on the next pool acquisition, which is once per prefetch burst. Before phase 15 a change
+    // to this key silently did nothing until a node restart.
     public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY = "knn.direct_io.rescore.prefetch.queue_capacity";
     public static final int KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_DEFAULT_VALUE = 0;
 
@@ -913,6 +913,13 @@ public class KNNSettings {
 
     private ClusterService clusterService;
     private Client client;
+    /**
+     * The node's thread pools, for {@link #getDirectIORescoreBurstThreads()} only. Nullable: a unit test and
+     * any call before {@code KNNPlugin#createComponents} has none, and that case falls back to the formulas
+     * rather than failing — this must never be the reason a shard cannot open a {@code .vec}.
+     */
+    @Setter
+    private ThreadPool threadPool;
     @Setter
     private Optional<String> nodeCbAttribute;
 
@@ -1239,6 +1246,60 @@ public class KNNSettings {
      */
     public static int getDirectIORescorePrefetchQueueCapacity() {
         return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING);
+    }
+
+    /**
+     * How many threads can be inside a rescore at the same time, which is what the Direct I/O queue has to
+     * absorb one {@code staged_ranges} burst from each of. The {@code search} pool answers the query and,
+     * under concurrent segment search, {@code NativeEngineKnnVectorQuery} dispatches one task per leaf onto
+     * the {@code index_searcher} pool through {@code getTaskExecutor().invokeAll}, so both can hold a scorer.
+     *
+     * <p><b>Read from the live {@link ThreadPool} when there is one</b>, because that honours an operator's
+     * explicit {@code thread_pool.search.size} / {@code thread_pool.index_searcher.size} where re-deriving
+     * the formula would not. {@code ThreadPool.Info} for a {@code RESIZABLE} pool carries
+     * {@code min == max == size} ({@code ResizableExecutorBuilder.java:99-106}) and
+     * {@code ThreadPool#info(String)} returns the holder's own {@code Info}
+     * ({@code ThreadPool.java:448-454}). It reflects the size the pool was <em>built</em> at: the dynamic
+     * {@code cluster.threadpool.*.size} path resizes the executor in place without replacing that
+     * {@code Info} ({@code ThreadPool.java:512+}), so a node that resizes its search pool at runtime should
+     * set {@code knn.direct_io.rescore.prefetch.queue_capacity} explicitly.
+     *
+     * <p>With no {@code ThreadPool} — a unit test, or any call before {@code createComponents} — the same two
+     * formulas are applied to the configured allocated processors: {@code searchThreadPoolSize(p)} is
+     * {@code ((p * 3) / 2) + 1} ({@code ThreadPool.java:787-789}) and {@code index_searcher} is
+     * {@code boundedBy(2 * p, 2, MAX_VALUE)} ({@code ThreadPool.java:783-785}, used at {@code :348-357}).
+     *
+     * @return {@code search_max + index_searcher_max}, never below 2
+     */
+    public static int getDirectIORescoreBurstThreads() {
+        final ThreadPool pool = state().threadPool;
+        if (pool != null) {
+            final ThreadPool.Info search = pool.info(ThreadPool.Names.SEARCH);
+            final ThreadPool.Info indexSearcher = pool.info(ThreadPool.Names.INDEX_SEARCHER);
+            if (search != null && indexSearcher != null) {
+                return Math.max(2, search.getMax() + indexSearcher.getMax());
+            }
+        }
+        return burstThreadsFor(allocatedProcessors());
+    }
+
+    /**
+     * {@code search_max + index_searcher_max} for {@code allocatedProcessors}, using the formulas
+     * {@code ThreadPool} itself uses. Visible so the derived queue capacity can be pinned at a processor
+     * count this host does not have.
+     */
+    public static int burstThreadsFor(final int allocatedProcessors) {
+        final int search = ThreadPool.searchThreadPoolSize(allocatedProcessors);
+        // twiceAllocatedProcessors is package private in OpenSearch, so the one line is restated here.
+        final int indexSearcher = Math.max(2, 2 * allocatedProcessors);
+        return Math.max(2, search + indexSearcher);
+    }
+
+    /** The configured allocated processors, which is what every {@code ThreadPool} builder is sized from. */
+    private static int allocatedProcessors() {
+        final ClusterService currentClusterService = state().clusterService;
+        final Settings settings = currentClusterService == null ? Settings.EMPTY : currentClusterService.getSettings();
+        return OpenSearchExecutors.allocatedProcessors(settings);
     }
 
     /**

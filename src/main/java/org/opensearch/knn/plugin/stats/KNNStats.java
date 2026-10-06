@@ -105,8 +105,11 @@ public class KNNStats {
      *   <li><b>reads</b> — once engaged, what is it doing? The staged/blocking/read-ahead channels and the
      *       byte counters behind the amplification ratio. {@code stage_declined} against
      *       {@code staged_reads} is the queue-capacity decline rate phase 13's audit row 7 measured as the
-     *       binding constraint at concurrent load, and is why
-     *       {@code knn.direct_io.rescore.prefetch.queue_capacity} is a setting.</li>
+     *       binding constraint at concurrent load, and the Oct 4-5 node sweep then measured 46-52% declines
+     *       and 783k device reads per 5,000 queries at an effective capacity of 64 against 0% and 707k at
+     *       1,024. {@code queue_peak} is the occupancy high-water mark the derived default is validated
+     *       against, and {@code pool_rebuilds} is how an operator sees that a live capacity change took
+     *       effect.</li>
      * </ul>
      *
      * <p>Node level rather than cluster level, and cumulative since node start, because every counter is a
@@ -145,6 +148,8 @@ public class KNNStats {
         reads.put("readahead_bytes", stats.readaheadBytes());
         reads.put("served_bytes", stats.servedBytes());
         reads.put("declined_span_bytes", stats.declinedSpanBytes());
+        reads.put("queue_peak", stats.queuePeak());
+        reads.put("pool_rebuilds", stats.poolRebuilds());
 
         final Map<String, Map<String, Object>> directIOStats = new HashMap<>();
         directIOStats.put("dispatch", dispatch);

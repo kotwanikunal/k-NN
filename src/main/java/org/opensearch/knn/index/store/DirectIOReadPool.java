@@ -53,18 +53,30 @@ import java.util.concurrent.atomic.AtomicInteger;
  *       about thirteen others, on a search thread, with no bound.</li>
  * </ul>
  *
- * So the queue is an {@link ArrayBlockingQueue} of {@link #queueCapacity}, and a submit past it is
+ * So the queue is an {@link ArrayBlockingQueue} of {@link #queueCapacity()}, and a submit past it is
  * refused with the default abort policy. That is not a new failure mode: both submit sites already catch
  * {@link java.util.concurrent.RejectedExecutionException} and fall back — {@code prefetch} counts
  * {@code stageDeclined} and lets the bytes be served by a blocking read, {@code refillReadahead} counts
  * {@code readaheadDeclined} and leaves the scan at queue depth one. Bounding the queue makes those
- * already-written paths reachable rather than adding anything. Declining is also the <em>cheaper</em>
- * fallback: a declined prefetch span is replaced by blocking reads of only the blocks a vector actually
- * occupies, where caller-running the submit would read the whole span inline.
+ * already-written paths reachable rather than adding anything.
  *
- * <p>Resizing is live: a change to the setting is applied on the next {@link #executor()} call, which
- * happens once per scorer, so the pool follows the setting without a restart. Shrinking is honoured the
- * way {@code ThreadPoolExecutor} honours it — threads above the new bound exit as they go idle.
+ * <p><b>Declining is not the cheaper fallback, and the node measured it.</b> Phase 14 recorded the opposite
+ * here as a design claim. On the Oct 4-5 sweep (r7g.xlarge, 4 vCPU, gp3 3000 IOPS, 16 clients, k=100, 5,000
+ * queries) the same jar at an effective capacity of 64 declined 46-52% of staged reads and ran
+ * 769-777 / 1060-1069 / 1322-1428 ms at 16.7-17.4 qps against <b>783k</b> device reads; at a capacity of
+ * 1,024 it declined <b>0%</b> and ran 634-650 / 877-896 / 954-970 at 17.4-19.5 qps against <b>707k</b>. The
+ * 76k extra device reads are the declined bursts falling back to individual blocking reads. The claim is
+ * withdrawn and the default is derived from burst demand — see {@link #queueCapacity()}.
+ *
+ * <h2>Both settings are live, and the queue is swapped rather than resized</h2>
+ * A changed thread count resizes the pool in place ({@link #resize}). A changed capacity cannot —
+ * {@link ArrayBlockingQueue} has no resize — so {@link #rebuild} builds a <em>new</em> executor at the new
+ * capacity, publishes it so every later submit goes there, and {@code shutdown()}s the old one so reads
+ * already queued on it run to completion on its own threads. Nothing waits on the old pool, and no read is
+ * lost or run twice. Phase 14's JAR.md said a capacity change applied "on the next node restart or after
+ * the pool has idled out"; the second half was false, and on the node a dynamic setting silently did
+ * nothing. Now it applies on the next {@link #executor()} call, which
+ * {@code DirectIOVectorIndexInput#ensureStagingTable} makes once per prefetch burst.
  */
 @Log4j2
 final class DirectIOReadPool {
@@ -73,19 +85,14 @@ final class DirectIOReadPool {
     static final long KEEP_ALIVE_SECONDS = 60L;
 
     /**
-     * Reads one reader thread may have waiting behind it. Past about this depth a queued read costs more to
-     * wait for than to issue on the calling thread, and more than that to wait for than to decline.
+     * Floor on the queue. Four whole prefetch bursts, where a burst is {@code PrefetchHelper}'s 64-ordinal
+     * Lucene bulk batch: task-15 measured that a table which declines the tail of every burst makes 5.4
+     * blocking reads per query and a paced p99 of 30 ms where one that holds the burst makes 0.0 and 11 ms,
+     * so one burst is the hard minimum and the floor is above it because a single-processor host still
+     * answers several leaves at once. Raised from 64 in phase 15: at 64 the node declined 46-52% of staged
+     * reads (see the class javadoc).
      */
-    static final int QUEUED_READS_PER_THREAD = 8;
-
-    /**
-     * Floor on the queue, so that one whole prefetch burst from one scorer always fits. This is a
-     * compatibility bound rather than a tuning one: {@code PrefetchHelper} is driven by Lucene's
-     * 64-ordinal bulk batch, and task-15 measured that a table which declines the tail of every burst
-     * makes 5.4 blocking reads per query and a paced p99 of 30 ms where one that holds the burst makes 0.0
-     * and 11 ms. A queue that could not hold a burst would reintroduce exactly that.
-     */
-    static final int MIN_QUEUE_CAPACITY = 64;
+    static final int MIN_QUEUE_CAPACITY = 256;
 
     /** Reader threads are named from this so that a thread dump attributes the read to this seam. */
     static final String THREAD_NAME_PREFIX = "knn-direct-io-rescore-";
@@ -100,41 +107,62 @@ final class DirectIOReadPool {
         return thread;
     };
 
-    private static volatile ThreadPoolExecutor executor;
+    /**
+     * The live pool together with the capacity its queue was built at, because that capacity cannot be read
+     * back from an {@link ArrayBlockingQueue} once work is in it ({@code remainingCapacity() + size()} races
+     * with the pool's own threads) and it is what {@link #executor()} compares against to decide a rebuild.
+     */
+    private record Pool(ThreadPoolExecutor executor, int capacity) {
+    }
+
+    private static volatile Pool pool;
 
     private DirectIOReadPool() {}
 
     /**
-     * The shared pool, resized to the current setting, or {@code null} when it cannot be provided — in
-     * which case the caller must read synchronously rather than fail the query.
+     * The shared pool, resized to the current thread setting and rebuilt if the capacity setting has moved,
+     * or {@code null} when it cannot be provided — in which case the caller must read synchronously rather
+     * than fail the query.
      */
     static ExecutorService executor() {
         final int threads;
+        final int capacity;
         try {
             threads = KNNSettings.getDirectIORescorePrefetchThreads();
+            capacity = queueCapacity();
         } catch (Exception e) {
-            log.debug("Could not read knn.direct_io.rescore.prefetch_threads; reading without prefetch", e);
+            log.debug("Could not read the Direct I/O rescore pool settings; reading without prefetch", e);
             return null;
         }
         try {
-            final ThreadPoolExecutor current = executor;
-            if (current != null) {
-                resize(current, threads);
-                return current;
+            final Pool current = pool;
+            if (current != null && current.capacity == capacity) {
+                resize(current.executor, threads);
+                return current.executor;
             }
-            return create(threads);
+            return rebuild(threads, capacity).executor;
         } catch (Exception e) {
             log.warn("Could not provide the Direct I/O rescore read pool; reading without prefetch", e);
             return null;
         }
     }
 
-    private static synchronized ThreadPoolExecutor create(final int threads) {
-        if (executor != null) {
-            resize(executor, threads);
-            return executor;
+    /**
+     * Builds a pool at {@code capacity} and retires the one it replaces, under this class's lock so that two
+     * concurrent {@link #executor()} callers during a capacity change create exactly one pool between them.
+     *
+     * <p><b>{@code shutdown()}, never {@code shutdownNow()}.</b> The old pool's queue holds reads that a
+     * search thread is already waiting on in {@code DirectIOVectorIndexInput#await}; interrupting them would
+     * turn a settings change into a burst of bounded-wait timeouts. {@code shutdown()} refuses new submits
+     * and runs the queue out on the old pool's own threads, which then exit. Nothing joins it, and nothing
+     * needs to: the futures the waiting threads hold are the old pool's and complete normally.
+     */
+    private static synchronized Pool rebuild(final int threads, final int capacity) {
+        final Pool current = pool;
+        if (current != null && current.capacity == capacity) {
+            resize(current.executor, threads);
+            return current;
         }
-        final int capacity = queueCapacity(threads);
         final ThreadPoolExecutor created = new ThreadPoolExecutor(
             threads,
             threads,
@@ -144,38 +172,90 @@ final class DirectIOReadPool {
             THREAD_FACTORY
         );
         created.allowCoreThreadTimeOut(true);
+        final Pool replacement = new Pool(created, capacity);
+        // Publish before retiring, so there is no window in which a submit can reach a shut-down pool.
+        pool = replacement;
+        if (current != null) {
+            current.executor.shutdown();
+            DirectIOVectorIndexInput.STATS.recordPoolRebuild();
+        }
+        // The operator's only verification that a capacity change took effect, which is why it is emitted on
+        // every rebuild and not only at startup: the sweep cron greps for exactly this line.
         log.info("Direct I/O rescore reads will run on a shared pool of up to {} threads with at most {} reads queued", threads, capacity);
-        executor = created;
-        return created;
+        return replacement;
     }
 
     /**
-     * How many reads may wait behind the pool: {@code knn.direct_io.rescore.prefetch.queue_capacity} when
-     * an operator has set it, and otherwise {@code max(64, 8 x threads)} derived from the size the pool is
-     * created at. Not resized when either setting changes, because {@link ArrayBlockingQueue} has no resize
-     * and because the safe direction is the one that happens anyway: growing the pool leaves the queue
-     * relatively shallower.
+     * How many reads may wait behind the pool: {@code knn.direct_io.rescore.prefetch.queue_capacity} when an
+     * operator has set it to anything positive, and otherwise the derived default below. A setting that
+     * cannot be read falls back to the derived value, the same contract every other Direct I/O setting has.
      *
-     * <p><b>The default is unchanged by design.</b> Phase 13's audit row 7 and phase 14's S3 both measured
-     * this as the binding constraint at concurrent-scorer load — 44%, 43.8% and 43.9% of declared reads
-     * refused at 16 scorers, because 16 scorers x 64 staged ranges want 1,024 slots and the derived
-     * capacity is 128 — but the right value is a trade of queue depth against wait on a specific device and
-     * core count, which this desktop cannot settle for the node. So the knob exists and the shipped
-     * behaviour does not move. A setting that cannot be read falls back to the derived value, the same
-     * contract every other Direct I/O setting has.
+     * <h4>The default is derived from burst demand, not from the pool size</h4>
+     * It used to be {@code max(64, 8 x pool_threads)}, which was <b>the wrong variable</b>. Pool threads set
+     * the drain <em>rate</em>; the queue has to absorb the peak <em>burst</em>, and a burst is
+     * {@code staged_ranges} ranges submitted by one scorer before it reads any of them. So the demand is
+     * {@code (threads that can be inside a rescore at once) x staged_ranges}, and those threads are the
+     * {@code search} pool plus — under concurrent segment search, where
+     * {@code NativeEngineKnnVectorQuery} dispatches one task per leaf through
+     * {@code getTaskExecutor().invokeAll} — the {@code index_searcher} pool. This method's own earlier
+     * Javadoc already stated the demand correctly ("16 scorers x 64 staged ranges want 1,024 slots") while
+     * the code computed {@code 8 x 16 = 128}.
+     *
+     * <p>Rounded up to a power of two and floored at {@link #MIN_QUEUE_CAPACITY}, because excess capacity is
+     * free: a submit past capacity is refused immediately (default abort policy) rather than waited on, so a
+     * queue that never fills costs only the task references it does not hold. The node measured 0 declines at
+     * both 1,024 and 4,096, i.e. the queue filled at neither, and the p99 difference between those two arms
+     * is therefore not a queue effect. Buffer bytes are bounded separately by
+     * {@code knn.direct_io.direct_memory_budget}.
+     *
+     * <p>On the 4-vCPU node this is {@code (7 + 8) x 64 = 960 -> 1024}, which is the value the sweep measured
+     * as best. On a 16-vCPU host it is {@code (25 + 32) x 64 = 3648 -> 4096}.
      */
-    static int queueCapacity(final int threads) {
-        final int configured;
+    static int queueCapacity() {
         try {
-            configured = KNNSettings.getDirectIORescorePrefetchQueueCapacity();
+            final int configured = KNNSettings.getDirectIORescorePrefetchQueueCapacity();
+            if (configured > 0) {
+                return configured;
+            }
         } catch (Exception e) {
             log.debug("Could not read knn.direct_io.rescore.prefetch.queue_capacity; deriving the capacity", e);
-            return Math.max(MIN_QUEUE_CAPACITY, QUEUED_READS_PER_THREAD * threads);
         }
-        if (configured > 0) {
-            return configured;
+        try {
+            return derivedQueueCapacity(KNNSettings.getDirectIORescoreBurstThreads(), KNNSettings.getDirectIORescorePrefetchStagedRanges());
+        } catch (Exception e) {
+            log.debug("Could not derive the Direct I/O queue capacity from the thread pools; using the floor", e);
+            return MIN_QUEUE_CAPACITY;
         }
-        return Math.max(MIN_QUEUE_CAPACITY, QUEUED_READS_PER_THREAD * threads);
+    }
+
+    /**
+     * {@code max(MIN_QUEUE_CAPACITY, nextPowerOfTwo(burstThreads x stagedRanges))}. Pure, so that the
+     * formula can be pinned at a processor count this host does not have.
+     */
+    static int derivedQueueCapacity(final int burstThreads, final int stagedRanges) {
+        final long want = (long) Math.max(1, burstThreads) * Math.max(1, stagedRanges);
+        if (want >= Integer.MAX_VALUE / 2) {
+            return Integer.MAX_VALUE / 2;
+        }
+        return Math.max(MIN_QUEUE_CAPACITY, Integer.highestOneBit(Math.toIntExact(want) - 1) << 1);
+    }
+
+    /** Pool rebuilds since node start — the counter that makes a live capacity change visible. */
+    static long poolRebuilds() {
+        return DirectIOVectorIndexInput.STATS.poolRebuilds();
+    }
+
+    /**
+     * Samples {@code executor}'s queue occupancy into the node-wide high-water mark, so that the derived
+     * capacity above can be validated against what a real burst actually offers rather than against a
+     * formula. Called by both submit sites immediately after a successful submit, which is the only moment
+     * occupancy is known to be at least one. Costs one {@link ArrayBlockingQueue} lock acquisition — the same
+     * lock the submit just released — against a device read of ~100 us.
+     */
+    static void sampleQueueDepth(final ExecutorService executor) {
+        if (executor instanceof ThreadPoolExecutor threadPool) {
+            DirectIOVectorIndexInput.STATS.recordQueuePeak(threadPool.getQueue().size());
+        }
     }
 
     /**
@@ -203,10 +283,24 @@ final class DirectIOReadPool {
 
     /** Test seam: drops the pool so that a test can observe it being created with a different size. */
     static synchronized void resetForTesting() {
-        final ThreadPoolExecutor current = executor;
-        executor = null;
+        final Pool current = pool;
+        pool = null;
         if (current != null) {
-            current.shutdown();
+            current.executor.shutdown();
         }
+    }
+
+    /**
+     * Test seam: drives {@link #rebuild} at an explicit capacity, because a unit test has no cluster service
+     * to change the setting through and the swap is the behaviour under test rather than the setting read.
+     */
+    static ThreadPoolExecutor rebuildForTesting(final int threads, final int capacity) {
+        return rebuild(threads, capacity).executor;
+    }
+
+    /** Test seam: the capacity the live pool's queue was built at, or 0 when there is no pool. */
+    static int liveCapacityForTesting() {
+        final Pool current = pool;
+        return current == null ? 0 : current.capacity;
     }
 }

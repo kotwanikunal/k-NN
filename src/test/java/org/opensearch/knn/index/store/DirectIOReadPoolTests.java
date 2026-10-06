@@ -107,7 +107,7 @@ public class DirectIOReadPoolTests extends KNNTestCase {
      */
     public void testTheQueueIsBounded() {
         final ThreadPoolExecutor pool = (ThreadPoolExecutor) DirectIOReadPool.executor();
-        final int expected = DirectIOReadPool.queueCapacity(org.opensearch.knn.index.KNNSettings.getDirectIORescorePrefetchThreads());
+        final int expected = DirectIOReadPool.queueCapacity();
         assertEquals(
             "an unbounded queue is the thing this bound exists to prevent",
             expected,
@@ -119,28 +119,33 @@ public class DirectIOReadPoolTests extends KNNTestCase {
      * The floor matters for a reason that is not about safety: one prefetch burst is Lucene's 64-ordinal
      * bulk batch, and task-15 measured that a staging path which declines the tail of every burst makes
      * 5.4 blocking reads per query and a paced p99 of 30 ms against 0.0 and 11 ms for one that holds it.
-     * So the queue must hold a whole burst however small the pool is.
+     * So the queue must hold several whole bursts however small the host is.
      */
     public void testTheQueueAlwaysHoldsAWholeBurst() {
-        assertEquals(DirectIOReadPool.MIN_QUEUE_CAPACITY, DirectIOReadPool.queueCapacity(1));
-        assertEquals(DirectIOReadPool.MIN_QUEUE_CAPACITY, DirectIOReadPool.queueCapacity(8));
-        assertEquals(8 * DirectIOReadPool.QUEUED_READS_PER_THREAD, DirectIOReadPool.queueCapacity(8));
-        assertEquals(64 * DirectIOReadPool.QUEUED_READS_PER_THREAD, DirectIOReadPool.queueCapacity(64));
+        assertEquals(256, DirectIOReadPool.MIN_QUEUE_CAPACITY);
+        assertEquals(DirectIOReadPool.MIN_QUEUE_CAPACITY, DirectIOReadPool.derivedQueueCapacity(1, 64));
+        assertEquals(DirectIOReadPool.MIN_QUEUE_CAPACITY, DirectIOReadPool.derivedQueueCapacity(2, 64));
+        assertTrue(
+            "the floor must hold at least one burst at the shipped staged_ranges",
+            DirectIOReadPool.MIN_QUEUE_CAPACITY >= DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGES
+        );
     }
 
     /**
-     * S4: the capacity is a setting, and <b>the default does not move</b>. Phase 13's audit row 7 and phase
-     * 14's S3 both measured this as the binding constraint at concurrent-scorer load — 44%, 43.8% and 43.9%
-     * of declared reads refused at 16 scorers, because 16 scorers × 64 staged ranges want 1,024 slots and
-     * the derived capacity is {@code max(64, 8 × 16) = 128}. But the right value trades queue depth against
-     * wait on a specific device and core count, which this desktop cannot settle, so what phase 14 ships is
-     * the <em>knob</em>: the node sweeps 128 / 512 / 1024 / 4096 without a rebuild and the shipped
-     * behaviour is byte for byte what it was.
+     * D1(b): the capacity is a setting, and its <b>default is derived from burst demand</b> —
+     * {@code max(256, nextPowerOfTwo((search_max + index_searcher_max) × staged_ranges))}.
      *
-     * <p>With no cluster service the setting reads its default of {@code 0}, which means derive — so these
-     * assertions are simultaneously "the default is unchanged" and "0 means derive".
+     * <p>The old derivation was {@code max(64, 8 × pool_threads)}, which used the wrong variable: pool
+     * threads set the drain rate, while the queue has to absorb the peak burst. The Oct 4-5 node sweep
+     * measured the cost — at the effective capacity of 64 that formula gave the 4-vCPU node, 46-52% of
+     * staged reads were refused and the node made 783k device reads per 5,000 queries at
+     * p50/p90/p99 777/1069/1322 ms; at 1,024 it refused 0% and made 707k at 650/877/954.
+     *
+     * <p>Pinned at the two processor counts the decision was taken for. The formulas are OpenSearch's own:
+     * {@code searchThreadPoolSize(p) = ((p × 3) / 2) + 1} ({@code ThreadPool.java:787-789}) and
+     * {@code index_searcher = boundedBy(2p, 2, MAX)} ({@code ThreadPool.java:783-785}).
      */
-    public void testTheQueueCapacityIsASettingWhoseDefaultDoesNotMoveTheBehaviour() {
+    public void testTheDefaultQueueCapacityIsDerivedFromBurstDemand() {
         assertEquals(
             "0 is the shipped default and means derive",
             0,
@@ -154,10 +159,168 @@ public class DirectIOReadPoolTests extends KNNTestCase {
             "the node has to sweep this without a rebuild",
             org.opensearch.knn.index.KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING.isDynamic()
         );
-        // Unset, every value is the formula the pool has always used -- including the 128 the audit measured.
-        assertEquals(64, DirectIOReadPool.queueCapacity(2));
-        assertEquals("the capacity audit row 7 measured 44% declines at", 128, DirectIOReadPool.queueCapacity(16));
-        assertEquals(512, DirectIOReadPool.queueCapacity(64));
+
+        // The 4-vCPU bench node: search 7, index_searcher 8, 15 x 64 = 960 -> 1024, which is the capacity
+        // the sweep measured as best.
+        assertEquals("search(4) + index_searcher(4)", 15, org.opensearch.knn.index.KNNSettings.burstThreadsFor(4));
+        assertEquals(1024, DirectIOReadPool.derivedQueueCapacity(15, 64));
+
+        // 16 allocated processors: search 25, index_searcher 32, 57 x 64 = 3648 -> 4096.
+        assertEquals("search(16) + index_searcher(16)", 57, org.opensearch.knn.index.KNNSettings.burstThreadsFor(16));
+        assertEquals(4096, DirectIOReadPool.derivedQueueCapacity(57, 64));
+
+        // 64 processors, the shape the formula has to stay sane at: 97 + 128 = 225, x 64 = 14400 -> 16384.
+        assertEquals(225, org.opensearch.knn.index.KNNSettings.burstThreadsFor(64));
+        assertEquals(16384, DirectIOReadPool.derivedQueueCapacity(225, 64));
+
+        // Exactly a power of two stays put rather than doubling.
+        assertEquals(1024, DirectIOReadPool.derivedQueueCapacity(16, 64));
+    }
+
+    /**
+     * D1(a): a changed capacity is applied to the live pool without a restart, which is the bug the node
+     * found — {@code queue_capacity} was registered dynamic and read once, so a change silently did nothing
+     * until a JVM restart.
+     *
+     * <p>Driven through {@link DirectIOReadPool#queueCapacity()}'s own input rather than through a cluster
+     * service, because a unit test has none: the capacity is taken from the setting, so the test asserts on
+     * the three things a rebuild must do — the new pool is a different object, {@code pool_rebuilds}
+     * increments, and the old pool terminates after its queue drains rather than being interrupted.
+     */
+    @SneakyThrows
+    public void testACapacityChangeRebuildsTheLivePoolWithoutLosingQueuedReads() {
+        DirectIOVectorIndexInput.STATS.reset();
+        final ThreadPoolExecutor first = (ThreadPoolExecutor) DirectIOReadPool.executor();
+        assertNotNull(first);
+        assertEquals("the first creation is not a rebuild", 0L, DirectIOVectorIndexInput.STATS.poolRebuilds());
+        final int initialCapacity = DirectIOReadPool.liveCapacityForTesting();
+        assertEquals(DirectIOReadPool.queueCapacity(), initialCapacity);
+
+        // A read already queued on the old pool, held until after the swap so that the swap has something to
+        // drain. One task per thread occupies the pool, the next one sits in the queue.
+        final CountDownLatch release = new CountDownLatch(1);
+        final CountDownLatch running = new CountDownLatch(first.getMaximumPoolSize());
+        final List<Future<?>> inFlight = new ArrayList<>();
+        for (int i = 0; i < first.getMaximumPoolSize(); i++) {
+            inFlight.add(first.submit(() -> {
+                running.countDown();
+                release.await();
+                return null;
+            }));
+        }
+        assertTrue(running.await(10, TimeUnit.SECONDS));
+        final Future<?> queued = first.submit(() -> 7);
+
+        // The swap, driven by a capacity the current pool was not built at.
+        final ThreadPoolExecutor second = DirectIOReadPool.rebuildForTesting(first.getMaximumPoolSize(), initialCapacity * 2);
+        assertNotSame("a capacity change must publish a new pool, not resize the old queue", first, second);
+        assertEquals(1L, DirectIOVectorIndexInput.STATS.poolRebuilds());
+        assertEquals(initialCapacity * 2, DirectIOReadPool.liveCapacityForTesting());
+        assertSame(
+            "and an acquisition at the same capacity reuses it rather than rebuilding again",
+            second,
+            DirectIOReadPool.rebuildForTesting(first.getMaximumPoolSize(), initialCapacity * 2)
+        );
+        assertEquals("one capacity change, one rebuild", 1L, DirectIOVectorIndexInput.STATS.poolRebuilds());
+        assertEquals(
+            "the new queue really is deeper",
+            initialCapacity * 2,
+            second.getQueue().remainingCapacity() + second.getQueue().size()
+        );
+
+        // shutdown(), not shutdownNow(): the old pool must still run what it had, including the queued task.
+        assertTrue("the old pool is retired", first.isShutdown());
+        release.countDown();
+        for (final Future<?> future : inFlight) {
+            future.get(10, TimeUnit.SECONDS);
+        }
+        assertEquals("a read queued before the swap still completes", 7, queued.get(10, TimeUnit.SECONDS));
+        assertTrue("and the old pool terminates once drained", first.awaitTermination(10, TimeUnit.SECONDS));
+    }
+
+    /** Two concurrent acquisitions across a capacity change create exactly one pool between them. */
+    @SneakyThrows
+    public void testConcurrentAcquisitionsDuringASwapCreateExactlyOnePool() {
+        DirectIOVectorIndexInput.STATS.reset();
+        final ThreadPoolExecutor first = (ThreadPoolExecutor) DirectIOReadPool.executor();
+        final int threads = first.getMaximumPoolSize();
+        final int capacity = DirectIOReadPool.liveCapacityForTesting() * 2;
+
+        final int callers = 8;
+        final CountDownLatch start = new CountDownLatch(1);
+        final List<Thread> racers = new ArrayList<>();
+        final ThreadPoolExecutor[] seen = new ThreadPoolExecutor[callers];
+        for (int i = 0; i < callers; i++) {
+            final int slot = i;
+            final Thread thread = new Thread(() -> {
+                try {
+                    start.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                seen[slot] = DirectIOReadPool.rebuildForTesting(threads, capacity);
+            }, "swap-racer-" + i);
+            racers.add(thread);
+            thread.start();
+        }
+        start.countDown();
+        for (final Thread thread : racers) {
+            thread.join(10_000);
+        }
+        for (int i = 0; i < callers; i++) {
+            assertNotNull("caller " + i + " got no pool", seen[i]);
+            assertSame("every caller must see the same pool", seen[0], seen[i]);
+            assertFalse("and a usable one", seen[i].isShutdown());
+        }
+        assertEquals("exactly one rebuild", 1L, DirectIOVectorIndexInput.STATS.poolRebuilds());
+    }
+
+    /**
+     * {@code queue_peak} is the occupancy high-water mark the derived default is validated against on the
+     * node, which is why it exists: the sweep saw 0 declines at both 1,024 and 4,096 and could not tell
+     * whether the queue had come near filling at either.
+     */
+    @SneakyThrows
+    public void testQueuePeakRecordsOccupancyAtSubmit() {
+        DirectIOVectorIndexInput.STATS.reset();
+        assertEquals(0L, DirectIOVectorIndexInput.STATS.queuePeak());
+        final ThreadPoolExecutor pool = (ThreadPoolExecutor) DirectIOReadPool.executor();
+        final CountDownLatch release = new CountDownLatch(1);
+        final CountDownLatch running = new CountDownLatch(pool.getMaximumPoolSize());
+        try {
+            for (int i = 0; i < pool.getMaximumPoolSize(); i++) {
+                pool.submit(() -> {
+                    running.countDown();
+                    release.await();
+                    return null;
+                });
+            }
+            assertTrue(running.await(10, TimeUnit.SECONDS));
+            // Every thread is busy, so these three go to the queue and the peak must reach three.
+            for (int i = 0; i < 3; i++) {
+                pool.submit(() -> null);
+                DirectIOReadPool.sampleQueueDepth(pool);
+            }
+            assertEquals(3L, DirectIOVectorIndexInput.STATS.queuePeak());
+        } finally {
+            release.countDown();
+        }
+        // A high-water mark never falls back.
+        DirectIOReadPool.sampleQueueDepth(pool);
+        assertEquals(3L, DirectIOVectorIndexInput.STATS.queuePeak());
+    }
+
+    /** A setting that cannot be read must keep a usable capacity rather than fail a read. */
+    public void testAnUnreadableSettingStillYieldsAUsableCapacity() {
+        assertTrue(DirectIOReadPool.queueCapacity() >= DirectIOReadPool.MIN_QUEUE_CAPACITY);
+        assertTrue(DirectIOReadPool.derivedQueueCapacity(0, 0) >= DirectIOReadPool.MIN_QUEUE_CAPACITY);
+        assertTrue(DirectIOReadPool.derivedQueueCapacity(-5, -5) >= DirectIOReadPool.MIN_QUEUE_CAPACITY);
+        assertEquals(
+            "and an absurd demand is clamped rather than overflowed",
+            Integer.MAX_VALUE / 2,
+            DirectIOReadPool.derivedQueueCapacity(Integer.MAX_VALUE, 64)
+        );
     }
 
     /**
