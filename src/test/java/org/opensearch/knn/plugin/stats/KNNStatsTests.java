@@ -98,13 +98,18 @@ public class KNNStatsTests extends KNNTestCase {
         );
 
         final Map<String, Map<String, Object>> directIO = (Map<String, Map<String, Object>>) stat.getValue();
-        assertEquals(Set.of("dispatch", "reads", "memory"), directIO.keySet());
+        assertEquals(Set.of("dispatch", "reads", "memory", "cache"), directIO.keySet());
         for (final String required : new String[] { "live_bytes", "peak_bytes", "declined_budget", "budget_bytes" }) {
             assertTrue(
                 "memory." + required + " must be exposed, saw " + directIO.get("memory").keySet(),
                 directIO.get("memory").containsKey(required)
             );
         }
+        assertEquals(Set.of("hits", "misses", "evictions", "bytes", "entries", "max_bytes"), directIO.get("cache").keySet());
+        // The cache is off by default, so every one of its counters must read zero on a node that has not
+        // set knn.direct_io.rescore.cache.max_bytes -- which is what makes "off" distinguishable from
+        // "on and missing".
+        directIO.get("cache").forEach((name, value) -> assertEquals("cache." + name + " must start at zero", 0L, (long) (Long) value));
 
         assertEquals(
             Set.of(

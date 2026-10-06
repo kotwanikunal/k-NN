@@ -11,6 +11,7 @@ import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManager;
+import org.opensearch.knn.index.store.DirectIOVectorCache;
 import org.opensearch.knn.index.store.DirectIOVectorIndexInput;
 import org.opensearch.knn.indices.ModelCache;
 import org.opensearch.knn.indices.ModelDao;
@@ -118,6 +119,13 @@ public class KNNStats {
      *       budget refused. The node sat at 1.69 GB of live direct buffers against a 2g
      *       {@code MaxDirectMemorySize} before this section existed, which is the measurement that made it
      *       necessary.</li>
+     *   <li><b>cache</b> — the node-wide vector cache, {@code 0} throughout while
+     *       {@code knn.direct_io.rescore.cache.max_bytes} is at its default of {@code 0b}.
+     *       {@code hits / (hits + misses)} is the hit rate and is directly comparable with the 40.3%
+     *       measured at 16 MB on 10M vectors; the absolute counts are <b>twice</b> the vectors served,
+     *       because a vector is looked up once in {@code prefetch} (where a hit saves the device read) and
+     *       once in {@code readFloats} (where a hit serves the bytes). See
+     *       {@link DirectIOVectorCache#lookupsPerVector()}.</li>
      * </ul>
      *
      * <p>Node level rather than cluster level, and cumulative since node start, because every counter is a
@@ -168,10 +176,19 @@ public class KNNStats {
         memory.put("declined_budget", stats.declinedBudget());
         memory.put("budget_bytes", KNNSettings.getDirectIODirectMemoryBudget().getBytes());
 
+        final Map<String, Object> cache = new HashMap<>();
+        cache.put("hits", DirectIOVectorCache.hits());
+        cache.put("misses", DirectIOVectorCache.misses());
+        cache.put("evictions", DirectIOVectorCache.evictions());
+        cache.put("bytes", DirectIOVectorCache.bytes());
+        cache.put("entries", DirectIOVectorCache.entries());
+        cache.put("max_bytes", DirectIOVectorCache.maxBytes());
+
         final Map<String, Map<String, Object>> directIOStats = new HashMap<>();
         directIOStats.put("dispatch", dispatch);
         directIOStats.put("reads", reads);
         directIOStats.put("memory", memory);
+        directIOStats.put("cache", cache);
         return directIOStats;
     }
 

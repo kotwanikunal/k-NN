@@ -266,6 +266,25 @@ public class KNNSettings {
         ByteSizeUnit.BYTES
     );
 
+    // Node-wide cache of individual vectors on the Direct I/O random rescore path, in bytes of on-heap
+    // payload plus per-entry overhead. 0b = OFF, which is the shipped default in phase 15: the mechanism and
+    // its correctness proof ship, and the node arm decides the value.
+    //
+    // MEASURED 2026-10-05 on dio-10m, exact LRU stack-distance replay of 5,000 real OSB queries against the
+    // exact rescore candidate set (1,000,000 refs over 544,060 unique vectors, a 1.70 GB working set):
+    // steady hit rate 40.3% at 16mb, 40.9% at 64mb, 41.4% at 128mb, 42.3% at 256mb, 48.1% at 1gb, against a
+    // ceiling of 45.6%. 16mb captures 84% of the achievable reuse, and replaying the same queries 3x does not
+    // inflate it (128mb: 39.8% every pass), so it is inner-product HNSW hub reuse and not an artefact.
+    //
+    // The value is ON HEAP, deliberately: it therefore stays out of knn.direct_io.direct_memory_budget and
+    // out of MaxDirectMemorySize, and is bounded by Guava's maximumWeight rather than by a GC.
+    //
+    // Dynamic, applied on the next prefetch burst. A change REBUILDS the cache (Guava fixes maximumWeight at
+    // build time), so the entries are dropped and it warms again -- unlike the queue capacity, retuning this
+    // is not free.
+    public static final String KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES = "knn.direct_io.rescore.cache.max_bytes";
+    public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_DEFAULT_VALUE = new ByteSizeValue(0, ByteSizeUnit.BYTES);
+
     public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN = "knn.direct_io.rescore.prefetch.max_span_bytes";
     public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_DEFAULT_VALUE = new ByteSizeValue(
         128 * 1024 + 4096,
@@ -637,6 +656,32 @@ public class KNNSettings {
     public static final Setting<ByteSizeValue> KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING = Setting.byteSizeSetting(
         KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET,
         KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_DEFAULT_VALUE,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
+     * The node-wide cache of individual vectors on the Direct I/O random rescore path. <b>Default
+     * {@code 0b}, i.e. off.</b>
+     *
+     * <p>The gate for building it at all was measured before it was built: 5,000 real OSB queries replayed
+     * against the exact rescore candidate set at 10M vectors give a steady hit rate of <b>40.3% at 16 MB</b>
+     * and 41.4% at 128 MB, against a ceiling of 45.6%, and replaying the same queries three times does not
+     * inflate it. Every phase 12-14 arm ran with no cache at all, including the store-factory arm they were
+     * compared against, so this is new information rather than a restoration.
+     *
+     * <p>Off by default because the shipped value is the node arm's to decide; this phase ships the
+     * mechanism and the correctness proof (the re-proof is 8/8 identical with the cache on and off).
+     *
+     * <p>The cached bytes are <b>on heap</b>, so they are outside
+     * {@code knn.direct_io.direct_memory_budget} and outside {@code MaxDirectMemorySize}, and are bounded by
+     * Guava's {@code maximumWeight} rather than by a collection. Applied on the next prefetch burst; a
+     * change <b>rebuilds</b> the cache, because Guava fixes {@code maximumWeight} at build time, so the
+     * entries are dropped and it warms again.
+     */
+    public static final Setting<ByteSizeValue> KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_SETTING = Setting.byteSizeSetting(
+        KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES,
+        KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_DEFAULT_VALUE,
         NodeScope,
         Dynamic
     );
@@ -1148,6 +1193,10 @@ public class KNNSettings {
             return KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING;
         }
 
+        if (KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES.equals(key)) {
+            return KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_SETTING;
+        }
+
         if (KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN.equals(key)) {
             return KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING;
         }
@@ -1218,6 +1267,7 @@ public class KNNSettings {
             KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING,
             KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING,
             KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING,
+            KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_SETTING,
             // Sequential read-ahead ring: window and arm trigger
             KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING,
             KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_SETTING,
@@ -1358,6 +1408,15 @@ public class KNNSettings {
      */
     public static ByteSizeValue getDirectIODirectMemoryBudget() {
         return getNodeSettingValueOrDefault(KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING);
+    }
+
+    /**
+     * The node-wide vector cache's budget on the Direct I/O rescore path; {@code 0b} off.
+     *
+     * @return the cache's maximum weight in bytes
+     */
+    public static ByteSizeValue getDirectIORescoreCacheMaxBytes() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_SETTING);
     }
 
     /**
