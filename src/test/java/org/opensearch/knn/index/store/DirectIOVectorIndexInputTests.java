@@ -1543,4 +1543,179 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
         assertNotNull("dropping one queued task must free exactly one slot", pool.getQueue().poll());
         return pool;
     }
+
+    // -----------------------------------------------------------------------------------------------
+    // 8. Phase 15 D3: the direct-memory budget (phase 13 audit FIX 3)
+    // -----------------------------------------------------------------------------------------------
+
+    /**
+     * Past {@code knn.direct_io.direct_memory_budget} a prefetch declines and the bytes are served by
+     * blocking reads — <b>and the reads are still right</b>, which is the only property that may not be
+     * traded for a bound. Phase 13's audit called this the one unambiguous structural defect in the design:
+     * {@code OffHeapFloatVectorValues} is not {@code Closeable}, so a staging table lives until the GC
+     * reclaims it, and the node sat at 1.69 GB of live direct buffers against a 2g
+     * {@code MaxDirectMemorySize} with nothing bounding it.
+     *
+     * <p>Driven with a budget of {@code 1b}, which no allocation can fit, so the first table is refused —
+     * "declines after N tables" with N = 0, because N is a function of the budget and the interesting value
+     * of N is the smallest one. The budget is then raised live and the same input is asked again, which is
+     * the half that matters operationally: a node that has hit the budget must recover when given more,
+     * without a restart.
+     */
+    @SneakyThrows
+    public void testTheDirectMemoryBudgetDeclinesPrefetchAndTheReadsAreStillCorrect() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(2000);
+        final Path path = writeVectorFile(dir, vectors);
+        final int[] ords = scatteredOrds(24, vectors.length);
+        final float[] scratch = new float[DIMENSION];
+
+        // A budget no allocation can fit. The ring is off so that this measures the burst table alone.
+        withNodeSettings(
+            Settings.builder()
+                .put(KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET, "1b")
+                .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
+                .build()
+        );
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+            assertNotNull(input);
+            for (final int ord : ords) {
+                input.prefetch(HEADER_LENGTH + (long) ord * VECTOR_BYTES, VECTOR_BYTES);
+            }
+            assertNull("no staging table may be allocated under a budget of one byte", input.stagingArena());
+            assertEquals("every prefetch in the burst must be declined", ords.length, DirectIOVectorIndexInput.STATS.stageDeclined());
+            assertEquals("and the reason must be the budget", ords.length, DirectIOVectorIndexInput.STATS.declinedBudget());
+            assertEquals("so nothing was staged", 0L, DirectIOVectorIndexInput.STATS.stagedReads());
+
+            // The property the bound may not cost: the bytes.
+            for (final int ord : ords) {
+                input.seek(HEADER_LENGTH + (long) ord * VECTOR_BYTES);
+                input.readFloats(scratch, 0, DIMENSION);
+                assertArrayEquals("a declined prefetch must not change a single byte", vectors[ord], scratch, 0.0f);
+            }
+            assertTrue("the bytes came from blocking reads instead", DirectIOVectorIndexInput.STATS.blockingReads() > 0);
+            assertEquals(
+                "servedBytes is still exactly the vectors handed out",
+                (long) ords.length * VECTOR_BYTES,
+                DirectIOVectorIndexInput.STATS.servedBytes()
+            );
+            // The blocking path's own buffer is one bufferSize per input and is tracked but never declined --
+            // it is what every other decline falls back to, so declining it would leave nothing to read with.
+            assertTrue("the blocking window is accounted for", DirectIOVectorIndexInput.STATS.directMemoryLive() > 0);
+        }
+
+        // Raised live. The same input class, a fresh input, no restart: prefetch must resume.
+        withNodeSettings(
+            Settings.builder()
+                .put(KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET, "64mb")
+                .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
+                .build()
+        );
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+            assertNotNull(input);
+            for (final int ord : ords) {
+                input.prefetch(HEADER_LENGTH + (long) ord * VECTOR_BYTES, VECTOR_BYTES);
+            }
+            assertNotNull("with budget to spare the table must be allocated", input.stagingArena());
+            assertEquals("and nothing may be declined on the budget", 0L, DirectIOVectorIndexInput.STATS.declinedBudget());
+            assertEquals("nothing is declined at all", 0L, DirectIOVectorIndexInput.STATS.stageDeclined());
+            for (final int ord : ords) {
+                input.seek(HEADER_LENGTH + (long) ord * VECTOR_BYTES);
+                input.readFloats(scratch, 0, DIMENSION);
+                assertArrayEquals(vectors[ord], scratch, 0.0f);
+            }
+            // stagedHits is the one assertion that forces the staged reads to have actually run: a hit only
+            // happens after await() retires the future. Asserting stagedReads before any read would race the
+            // pool.
+            assertTrue("and served out of the table", DirectIOVectorIndexInput.STATS.stagedHits() > 0);
+            assertTrue("so reads really were staged", DirectIOVectorIndexInput.STATS.stagedReads() > 0);
+        }
+    }
+
+    /**
+     * The accounting itself: a staging table charges exactly what it allocates, and the peak follows the
+     * live gauge up. Without this the budget is a number compared against a number nobody checked.
+     */
+    @SneakyThrows
+    public void testDirectMemoryAccountingChargesWhatItAllocates() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(500);
+        final Path path = writeVectorFile(dir, vectors);
+
+        withNodeSettings(Settings.builder().put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0).build());
+        DirectIOVectorIndexInput.STATS.reset();
+        // Earlier tests in this JVM left charged buffers that are unreachable but not yet drained, and a
+        // drain during this test would lower the baseline under it. So: collect and drain until two
+        // consecutive drains agree, then measure. Enqueueing a phantom reference is asynchronous with the
+        // collection that made it unreachable, so one System.gc() plus one reclaim() is not enough and a
+        // single pass was observed to miss 1.5 MB. This is the one test where forcing a collection earns its
+        // keep, because the thing under test is a reachability-driven counter.
+        long settled = -1;
+        for (int attempt = 0; attempt < 20 && settled != DirectIOVectorIndexInput.reclaim(); attempt++) {
+            settled = DirectIOVectorIndexInput.STATS.directMemoryLive();
+            System.gc();
+            Thread.sleep(20);
+        }
+        final long before = DirectIOVectorIndexInput.reclaim();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+            assertNotNull(input);
+            input.prefetch(HEADER_LENGTH, VECTOR_BYTES);
+            final ByteBuffer arena = input.stagingArena();
+            assertNotNull(arena);
+
+            // The arena is over-allocated by blockSize - 1 so that a block-aligned slice exists inside it,
+            // and the charge is the allocation rather than the aligned slice, because the allocation is what
+            // the JVM counts against MaxDirectMemorySize.
+            final long expectedArena = (long) input.maxStagedRanges() * input.arenaSlotBytes() + input.blockSize() - 1;
+            assertEquals(
+                "the staging table must charge its whole allocation",
+                before + expectedArena,
+                DirectIOVectorIndexInput.STATS.directMemoryLive()
+            );
+            assertTrue(
+                "and the peak must have followed it up",
+                DirectIOVectorIndexInput.STATS.directMemoryPeak() >= before + expectedArena
+            );
+        }
+    }
+
+    /**
+     * A budget of {@code 0b} is off, which is the pre-phase-15 behaviour and must stay reachable: an
+     * operator whose workload the budget mis-serves has to be able to turn it off without downgrading.
+     */
+    @SneakyThrows
+    public void testAZeroBudgetIsOff() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final Path path = writeVectorFile(dir, randomVectors(500));
+
+        withNodeSettings(Settings.builder().put(KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET, "0b").build());
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+            assertNotNull(input);
+            input.prefetch(HEADER_LENGTH, VECTOR_BYTES);
+            assertNotNull("0b must not bound anything", input.stagingArena());
+            assertEquals(0L, DirectIOVectorIndexInput.STATS.declinedBudget());
+        }
+    }
+
+    /**
+     * The shipped default is half the JVM's direct-memory wall, because the wall is
+     * {@code heapSize / 2} when the operator has not set it
+     * ({@code distribution/tools/launchers/.../JvmErgonomics.java:72-76}) and this plugin is not its only
+     * user. Pinned because it is the one number in D3 that is a judgement rather than a measurement.
+     */
+    public void testTheBudgetDefaultIsHalfTheDirectMemoryWall() {
+        assertEquals("knn.direct_io.direct_memory_budget", KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING.getKey());
+        assertTrue("it has to be tunable on a live node", KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING.isDynamic());
+        assertEquals(
+            "Runtime.maxMemory() / 4 = half of MaxDirectMemorySize's heapSize/2 default",
+            Runtime.getRuntime().maxMemory() / 4,
+            KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_DEFAULT_VALUE.getBytes()
+        );
+    }
 }

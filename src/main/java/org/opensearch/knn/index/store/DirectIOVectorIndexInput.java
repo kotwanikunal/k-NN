@@ -12,6 +12,9 @@ import org.opensearch.knn.index.KNNSettings;
 
 import java.io.EOFException;
 import java.io.IOException;
+import java.lang.ref.PhantomReference;
+import java.lang.ref.Reference;
+import java.lang.ref.ReferenceQueue;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
@@ -21,7 +24,9 @@ import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
@@ -258,6 +263,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         private final AtomicLong stagedWaitTimeouts = new AtomicLong();
         private final AtomicLong queuePeak = new AtomicLong();
         private final AtomicLong poolRebuilds = new AtomicLong();
+        private final AtomicLong directMemoryLive = new AtomicLong();
+        private final AtomicLong directMemoryPeak = new AtomicLong();
+        private final AtomicLong declinedBudget = new AtomicLong();
 
         private void recordInFlightPeak() {
             final long now = inFlightNow.get();
@@ -282,6 +290,51 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         /** Counts one pool swap, i.e. one capacity change applied without a restart. */
         void recordPoolRebuild() {
             poolRebuilds.incrementAndGet();
+        }
+
+        /** Charges {@code bytes} of direct buffer to the budget and raises the peak. */
+        void recordDirectAllocation(final long bytes) {
+            final long now = directMemoryLive.addAndGet(bytes);
+            long peak = directMemoryPeak.get();
+            while (now > peak && directMemoryPeak.compareAndSet(peak, now) == false) {
+                peak = directMemoryPeak.get();
+            }
+        }
+
+        /** Returns {@code bytes} to the budget, when the buffer holding them has been reclaimed. */
+        void recordDirectFree(final long bytes) {
+            directMemoryLive.addAndGet(-bytes);
+        }
+
+        /** Counts one prefetch declined because the direct-memory budget was reached. */
+        void recordDeclinedBudget() {
+            declinedBudget.incrementAndGet();
+        }
+
+        /**
+         * Direct-buffer bytes the Direct I/O read path holds right now: staging arenas, read-ahead arenas,
+         * the per-slot buffers a wide prefetch group needs, and one blocking window per input. Charged on
+         * allocation and returned when the buffer is reclaimed — see
+         * {@link DirectIOVectorIndexInput#reclaim()} for why that is reachability and not
+         * {@link DirectIOVectorIndexInput#close()}.
+         */
+        public long directMemoryLive() {
+            return directMemoryLive.get();
+        }
+
+        /** The high-water mark of {@link #directMemoryLive()} since node start. */
+        public long directMemoryPeak() {
+            return directMemoryPeak.get();
+        }
+
+        /**
+         * Prefetches declined because {@code knn.direct_io.direct_memory_budget} was reached. Each one costs
+         * read-ahead for one burst and leaves the query correct, because the bytes are then served by
+         * blocking reads — the same fallback a queue-capacity decline takes. Non-zero means the node is
+         * holding as much direct memory for vector reads as it has been allowed to.
+         */
+        public long declinedBudget() {
+            return declinedBudget.get();
         }
 
         /**
@@ -481,6 +534,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             stagedWaitTimeouts.set(0);
             queuePeak.set(0);
             poolRebuilds.set(0);
+            declinedBudget.set(0);
+            directMemoryPeak.set(0);
+            // directMemoryLive is NOT reset: it is a live gauge, not a counter, and zeroing it while buffers
+            // are still held would make the budget let through exactly as much again.
         }
 
         @Override
@@ -495,7 +552,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                     + "blockingReads=%d stagedReads=%d stagedHits=%d stageDeclined=%d prefetchCalls=%d inFlightPeak=%d "
                     + "stagedBytes=%d blockingBytes=%d servedBytes=%d declinedSpanBytes=%d "
                     + "readaheadReads=%d readaheadBytes=%d readaheadHits=%d readaheadDeclined=%d readaheadArmed=%d "
-                    + "stagedWaitTimeouts=%d queuePeak=%d poolRebuilds=%d amplification=%.3f",
+                    + "stagedWaitTimeouts=%d queuePeak=%d poolRebuilds=%d "
+                    + "directMemoryLive=%d directMemoryPeak=%d declinedBudget=%d amplification=%.3f",
                 routedOpens.get(),
                 declinedCompound.get(),
                 declinedChain.get(),
@@ -520,6 +578,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 stagedWaitTimeouts.get(),
                 queuePeak.get(),
                 poolRebuilds.get(),
+                directMemoryLive.get(),
+                directMemoryPeak.get(),
+                declinedBudget.get(),
                 served == 0 ? 0.0 : (double) read / served
             );
         }
@@ -545,6 +606,30 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     }
 
     public static final Stats STATS = new Stats();
+
+    /**
+     * Where a charged buffer announces that it has been reclaimed. See {@link #reclaim()} for why the
+     * accounting hangs on reachability rather than on {@link #close()}, and why it is drained on the calling
+     * thread rather than by a {@link java.lang.ref.Cleaner}.
+     */
+    private static final ReferenceQueue<ByteBuffer> RECLAIMED = new ReferenceQueue<>();
+
+    /**
+     * A charged buffer's entry in {@link #RECLAIMED}: a phantom reference that remembers what its buffer was
+     * charged, so the charge can be returned once the buffer is unreachable. Held in {@link #CHARGES} until
+     * it is drained, because a {@link PhantomReference} that becomes unreachable itself is never enqueued.
+     */
+    private static final class Charge extends PhantomReference<ByteBuffer> {
+        private final int bytes;
+
+        private Charge(final ByteBuffer buffer, final int bytes) {
+            super(buffer, RECLAIMED);
+            this.bytes = bytes;
+        }
+    }
+
+    /** One entry per charged buffer that has not yet been reclaimed — bounded by what the budget bounds. */
+    private static final Set<Charge> CHARGES = ConcurrentHashMap.newKeySet();
 
     /**
      * Default ranges a single prefetch burst may hold in flight: the size of Lucene's bulk batch, because
@@ -1026,10 +1111,19 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         if (stagedBuffers[slot] == null || stagedBuffers[slot].capacity() < alignedLength) {
             // Wider than a slot, or a slot given up after a timeout: this one range gets its own
             // allocation, exactly as every range used to. See arenaSlotBytes() for why that is the
-            // uncommon case.
-            stagedBuffers[slot] = ByteBuffer.allocateDirect(alignedLength + blockSize - 1)
-                .alignedSlice(blockSize)
-                .order(ByteOrder.LITTLE_ENDIAN);
+            // uncommon case. Budget checked here too, because this is the other allocation a burst can
+            // make and it is the larger of the two per range (up to max_span_bytes, 132 KiB).
+            if (fitsBudget(alignedLength) == false) {
+                STATS.recordDeclinedBudget();
+                STATS.stageDeclined.incrementAndGet();
+                log.debug(
+                    "knn.direct_io.direct_memory_budget reached ({} B live); a wide prefetch range of {} declines",
+                    STATS.directMemoryLive(),
+                    handle.path
+                );
+                return;
+            }
+            stagedBuffers[slot] = trackedAllocate(alignedLength, blockSize);
             stagedFloats[slot] = stagedBuffers[slot].asFloatBuffer();
         }
         final StagedRange range = new StagedRange(
@@ -1077,6 +1171,19 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             pool = acquired;
         }
         if (staged == null) {
+            // D3: the one place a whole staging table is committed, and so the one place the node-wide
+            // direct-memory budget is checked. Past it this returns false, prefetch counts stageDeclined and
+            // declinedBudget, and the bytes are served by blockingSource -- the same fallback a
+            // queue-capacity decline takes, already exercised on every arm.
+            if (fitsBudget(maxStagedRanges * arenaSlotBytes()) == false) {
+                STATS.recordDeclinedBudget();
+                log.debug(
+                    "knn.direct_io.direct_memory_budget reached ({} B live); prefetch of {} declines and reads will block",
+                    STATS.directMemoryLive(),
+                    handle.path
+                );
+                return false;
+            }
             staged = new StagedRange[maxStagedRanges];
             stagedBuffers = new ByteBuffer[maxStagedRanges];
             stagedFloats = new FloatBuffer[maxStagedRanges];
@@ -1130,12 +1237,85 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         // multiples of a slot: the base is aligned and a slot is a whole number of blocks, so every slot is
         // aligned too and needs no slack of its own. O_DIRECT needs the buffer address, the file offset and
         // the length all block aligned.
-        final ByteBuffer arena = ByteBuffer.allocateDirect(slots * slotBytes + blockSize - 1).alignedSlice(blockSize);
+        final ByteBuffer arena = trackedAllocate(slots * slotBytes, blockSize);
         for (int slot = 0; slot < slots; slot++) {
             buffers[slot] = arena.slice(slot * slotBytes, slotBytes).order(ByteOrder.LITTLE_ENDIAN);
             floats[slot] = buffers[slot].asFloatBuffer();
         }
         return arena;
+    }
+
+    /** Bytes {@link #trackedAllocate} actually reserves for a request of {@code usableBytes}. */
+    private static int allocationBytes(final int usableBytes, final int blockSize) {
+        return usableBytes + blockSize - 1;
+    }
+
+    /**
+     * One block-aligned direct buffer of at least {@code usableBytes}, charged to
+     * {@code knn.direct_io.direct_memory_budget}'s accounting.
+     *
+     * <p>The charge is the <em>allocation</em>, not the aligned slice returned: the allocation is what the
+     * JVM counts against {@code MaxDirectMemorySize}, and the {@code blockSize - 1} of alignment slack is
+     * as real as the rest of it.
+     */
+    private static ByteBuffer trackedAllocate(final int usableBytes, final int blockSize) {
+        final int bytes = allocationBytes(usableBytes, blockSize);
+        final ByteBuffer buffer = ByteBuffer.allocateDirect(bytes).alignedSlice(blockSize).order(ByteOrder.LITTLE_ENDIAN);
+        STATS.recordDirectAllocation(bytes);
+        CHARGES.add(new Charge(buffer, bytes));
+        return buffer;
+    }
+
+    /**
+     * Returns the charges of every buffer reclaimed since the last call, and answers the current live total.
+     *
+     * <h4>Why the accounting hangs on reachability and not on {@link #close()}</h4>
+     * Lucene's {@code OffHeapFloatVectorValues} is not {@code Closeable}, so {@link #close()} never runs on
+     * the per-query slice that owns a staging table — which is exactly the condition phase 13's audit FIX 3
+     * recorded and the node then measured as 1.69 GB of live direct buffers. A counter decremented only in
+     * {@link #close()} would therefore rise monotonically and, after enough queries, decline every prefetch
+     * forever: the budget would <em>wedge</em> the feature rather than bound it. The buffers are in fact
+     * reclaimed — by the JDK's own cleaner, once the {@link ByteBuffer} is unreachable — so the accounting
+     * is hung on that same event, which makes {@code live_bytes} direct memory that is genuinely still
+     * reachable. That is the only definition of "live" that is true here.
+     *
+     * <h4>Why it is drained here and not on a cleaner thread</h4>
+     * A {@link java.lang.ref.Cleaner} owns a thread, and a node-wide cleaner thread for this is both
+     * unnecessary and visible: it leaks out of every test suite that loads this class. Draining on the
+     * calling thread costs a non-blocking {@link ReferenceQueue#poll()} loop and happens at the only two
+     * moments the number is used — just before an allocation is decided, and when an operator reads it.
+     * Nothing waits for a GC that has not happened; an un-drained charge simply keeps the budget
+     * conservative, which is the safe direction.
+     */
+    public static long reclaim() {
+        Reference<? extends ByteBuffer> reference;
+        while ((reference = RECLAIMED.poll()) != null) {
+            final Charge charge = (Charge) reference;
+            if (CHARGES.remove(charge)) {
+                STATS.recordDirectFree(charge.bytes);
+            }
+        }
+        return STATS.directMemoryLive();
+    }
+
+    /**
+     * Whether {@code usableBytes} more of direct buffer fits under
+     * {@code knn.direct_io.direct_memory_budget}. A budget of {@code 0b} is off, and a setting that cannot
+     * be read is treated as off — a budget must never be the reason a shard cannot read its vectors.
+     */
+    private boolean fitsBudget(final int usableBytes) {
+        final long budget;
+        try {
+            final ByteSizeValue configured = KNNSettings.getDirectIODirectMemoryBudget();
+            budget = configured == null ? 0L : configured.getBytes();
+        } catch (RuntimeException e) {
+            log.debug("Could not read knn.direct_io.direct_memory_budget; not bounding this allocation", e);
+            return true;
+        }
+        if (budget <= 0) {
+            return true;
+        }
+        return reclaim() + allocationBytes(usableBytes, handle.blockSize) <= budget;
     }
 
     /**
@@ -1358,14 +1538,28 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
     }
 
-    /** One blocking {@code pread} of the block-aligned window holding {@code absolute}, when not already held. */
+    /**
+     * One blocking {@code pread} of the block-aligned window holding {@code absolute}, when not already held.
+     *
+     * <h4>This path's own buffer is bounded, and the budget deliberately does not decline it</h4>
+     * It is <b>exactly one</b> buffer of {@link #bufferSize} (8 KiB at the shipped default, two filesystem
+     * blocks) per input, allocated on the first blocking read and then reused for the life of the input: the
+     * {@code syncStart}/{@code syncValid} window check above serves every later read that falls inside the
+     * window it already holds, and a read outside it re-reads into the <em>same</em> buffer rather than
+     * allocating. It is never grown and never allocated per read. So the blocking channel's whole direct
+     * footprint is {@code bufferSize x live inputs} — against a staging table's
+     * {@code staged_ranges x arenaSlotBytes} = 64 x 8 KiB = 512 KiB, i.e. 64x smaller per input.
+     *
+     * <p>It is charged to {@code knn.direct_io.direct_memory_budget}'s accounting (so {@code live_bytes} is
+     * the truth about this class's direct memory) but is <b>never declined</b> by it, and that is forced
+     * rather than chosen: this is the path every other decline falls back <em>to</em>. Declining it would
+     * leave a read with nothing to read with, which is a failed query rather than a bounded one.
+     */
     private Source blockingSource(final long absolute, final int needed) throws IOException {
         if (syncBuffer == null) {
             // Over-allocate by a block so a block-aligned slice exists inside the allocation: O_DIRECT
             // needs the buffer address, the file offset and the length all block aligned.
-            syncBuffer = ByteBuffer.allocateDirect(bufferSize + handle.blockSize - 1)
-                .alignedSlice(handle.blockSize)
-                .order(ByteOrder.LITTLE_ENDIAN);
+            syncBuffer = trackedAllocate(bufferSize, handle.blockSize);
             syncFloats = syncBuffer.asFloatBuffer();
         }
         if (syncStart >= 0 && absolute >= syncStart && absolute + needed <= syncStart + syncValid) {
@@ -1519,6 +1713,18 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             return;
         }
         if (readaheadRing == null) {
+            // The ring is direct memory too, so it is charged to the same budget. Declining it leaves the
+            // scan at queue depth one, which is readaheadDeclined's existing meaning.
+            if (fitsBudget(readaheadWindows * readaheadWindowBytes) == false) {
+                STATS.recordDeclinedBudget();
+                STATS.readaheadDeclined.incrementAndGet();
+                log.debug(
+                    "knn.direct_io.direct_memory_budget reached ({} B live); the read-ahead ring of {} is not armed",
+                    STATS.directMemoryLive(),
+                    handle.path
+                );
+                return;
+            }
             readaheadRing = new StagedRange[readaheadWindows];
             readaheadBuffers = new ByteBuffer[readaheadWindows];
             readaheadFloats = new FloatBuffer[readaheadWindows];
@@ -1532,9 +1738,12 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             final int slot = (readaheadHead + readaheadCount) % readaheadWindows;
             if (readaheadBuffers[slot] == null) {
                 // Only reachable for a slot given up after a bounded wait timed out (see retireHead).
-                readaheadBuffers[slot] = ByteBuffer.allocateDirect(readaheadWindowBytes + handle.blockSize - 1)
-                    .alignedSlice(handle.blockSize)
-                    .order(ByteOrder.LITTLE_ENDIAN);
+                if (fitsBudget(readaheadWindowBytes) == false) {
+                    STATS.recordDeclinedBudget();
+                    STATS.readaheadDeclined.incrementAndGet();
+                    return;
+                }
+                readaheadBuffers[slot] = trackedAllocate(readaheadWindowBytes, handle.blockSize);
                 readaheadFloats[slot] = readaheadBuffers[slot].asFloatBuffer();
             }
             final StagedRange range = new StagedRange(

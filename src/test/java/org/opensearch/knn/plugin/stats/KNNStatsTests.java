@@ -98,7 +98,13 @@ public class KNNStatsTests extends KNNTestCase {
         );
 
         final Map<String, Map<String, Object>> directIO = (Map<String, Map<String, Object>>) stat.getValue();
-        assertEquals(Set.of("dispatch", "reads"), directIO.keySet());
+        assertEquals(Set.of("dispatch", "reads", "memory"), directIO.keySet());
+        for (final String required : new String[] { "live_bytes", "peak_bytes", "declined_budget", "budget_bytes" }) {
+            assertTrue(
+                "memory." + required + " must be exposed, saw " + directIO.get("memory").keySet(),
+                directIO.get("memory").containsKey(required)
+            );
+        }
 
         assertEquals(
             Set.of(

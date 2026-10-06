@@ -244,6 +244,28 @@ public class KNNSettings {
     public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY = "knn.direct_io.rescore.prefetch.queue_capacity";
     public static final int KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_DEFAULT_VALUE = 0;
 
+    // Node-wide ceiling on the direct (off-heap) buffers the Direct I/O read path holds at once. Phase 13's
+    // audit FIX 3, carried through phases 14 and 15: Lucene's OffHeapFloatVectorValues is not Closeable, so
+    // close() never runs on a per-query slice and a staging table lives until the GC's Cleaner reclaims it.
+    // There is no end-of-life signal to return a buffer at, so the footprint is proportional to live slices
+    // with nothing bounding it. MEASURED on the bench node: 1.69 GB of live direct buffers against a
+    // MaxDirectMemorySize of 2g.
+    //
+    // DEFAULT = Runtime.maxMemory() / 4, i.e. HALF the direct-memory wall, because OpenSearch's launcher sets
+    // -XX:MaxDirectMemorySize to heapSize / 2 when the operator has not
+    // (distribution/tools/launchers/.../JvmErgonomics.java:72-76). Half of the wall rather than all of it,
+    // because this plugin is not the only user of it -- the transport layer's netty buffers and any other
+    // plugin's direct allocations come out of the same budget, and a ceiling AT the wall would turn a
+    // contained decline into a hard OutOfMemoryError: Direct buffer memory for whoever allocated next.
+    //
+    // Past the budget prefetch DECLINES and the bytes are served by blocking reads, which is a path the
+    // design already exercises on every queue-capacity decline. 0b disables the budget.
+    public static final String KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET = "knn.direct_io.direct_memory_budget";
+    public static final ByteSizeValue KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_DEFAULT_VALUE = new ByteSizeValue(
+        Runtime.getRuntime().maxMemory() / 4,
+        ByteSizeUnit.BYTES
+    );
+
     public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN = "knn.direct_io.rescore.prefetch.max_span_bytes";
     public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_DEFAULT_VALUE = new ByteSizeValue(
         128 * 1024 + 4096,
@@ -593,6 +615,28 @@ public class KNNSettings {
     public static final Setting<ByteSizeValue> KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING = Setting.byteSizeSetting(
         KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN,
         KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_DEFAULT_VALUE,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
+     * The node-wide ceiling on direct buffers the Direct I/O read path holds at once, past which a prefetch
+     * declines and the bytes are served by blocking reads. Phase 13's audit FIX 3.
+     *
+     * <p><b>Why {@code Runtime.maxMemory() / 4}.</b> OpenSearch's launcher sets
+     * {@code -XX:MaxDirectMemorySize} to {@code heapSize / 2} when the operator has not
+     * ({@code distribution/tools/launchers/.../JvmErgonomics.java:72-76}), so the JVM-wide direct-memory
+     * wall is half the heap. This budget is half of <em>that</em>, because the wall is shared: the transport
+     * layer's netty buffers and any other plugin's direct allocations are charged to the same
+     * {@code MaxDirectMemorySize}, and a ceiling set at the wall would convert a contained decline here into
+     * an {@code OutOfMemoryError: Direct buffer memory} for whoever allocated next. MEASURED on the bench
+     * node before this existed: 1.69 GB live against a 2g wall.
+     *
+     * <p>{@code 0b} disables the budget, which is the pre-phase-15 behaviour.
+     */
+    public static final Setting<ByteSizeValue> KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING = Setting.byteSizeSetting(
+        KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET,
+        KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_DEFAULT_VALUE,
         NodeScope,
         Dynamic
     );
@@ -1100,6 +1144,10 @@ public class KNNSettings {
             return KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING;
         }
 
+        if (KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET.equals(key)) {
+            return KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING;
+        }
+
         if (KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN.equals(key)) {
             return KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING;
         }
@@ -1169,6 +1217,7 @@ public class KNNSettings {
             KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_SETTING,
             KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING,
             KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING,
+            KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING,
             // Sequential read-ahead ring: window and arm trigger
             KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING,
             KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_SETTING,
@@ -1300,6 +1349,15 @@ public class KNNSettings {
         final ClusterService currentClusterService = state().clusterService;
         final Settings settings = currentClusterService == null ? Settings.EMPTY : currentClusterService.getSettings();
         return OpenSearchExecutors.allocatedProcessors(settings);
+    }
+
+    /**
+     * The node-wide ceiling on direct buffers the Direct I/O read path may hold at once; {@code 0b} off.
+     *
+     * @return the direct-memory budget
+     */
+    public static ByteSizeValue getDirectIODirectMemoryBudget() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING);
     }
 
     /**

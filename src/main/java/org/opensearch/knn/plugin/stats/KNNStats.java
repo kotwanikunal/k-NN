@@ -8,6 +8,7 @@ package org.opensearch.knn.plugin.stats;
 import com.google.common.cache.CacheStats;
 import com.google.common.collect.ImmutableMap;
 import org.opensearch.knn.common.KNNConstants;
+import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManager;
 import org.opensearch.knn.index.store.DirectIOVectorIndexInput;
@@ -111,6 +112,12 @@ public class KNNStats {
      *       1,024. {@code queue_peak} is the occupancy high-water mark the derived default is validated
      *       against, and {@code pool_rebuilds} is how an operator sees that a live capacity change took
      *       effect.</li>
+     *   <li><b>memory</b> — how much off-heap is it holding, and is the budget biting? {@code live_bytes}
+     *       against {@code budget_bytes} (the setting, echoed so one GET answers both halves),
+     *       {@code peak_bytes} for the high-water mark, and {@code declined_budget} for prefetches the
+     *       budget refused. The node sat at 1.69 GB of live direct buffers against a 2g
+     *       {@code MaxDirectMemorySize} before this section existed, which is the measurement that made it
+     *       necessary.</li>
      * </ul>
      *
      * <p>Node level rather than cluster level, and cumulative since node start, because every counter is a
@@ -153,9 +160,18 @@ public class KNNStats {
         reads.put("queue_peak", stats.queuePeak());
         reads.put("pool_rebuilds", stats.poolRebuilds());
 
+        final Map<String, Object> memory = new HashMap<>();
+        // Drain first, so the number an operator reads is not stale by however long it has been since the
+        // last allocation decided to drain it. See DirectIOVectorIndexInput#reclaim.
+        memory.put("live_bytes", DirectIOVectorIndexInput.reclaim());
+        memory.put("peak_bytes", stats.directMemoryPeak());
+        memory.put("declined_budget", stats.declinedBudget());
+        memory.put("budget_bytes", KNNSettings.getDirectIODirectMemoryBudget().getBytes());
+
         final Map<String, Map<String, Object>> directIOStats = new HashMap<>();
         directIOStats.put("dispatch", dispatch);
         directIOStats.put("reads", reads);
+        directIOStats.put("memory", memory);
         return directIOStats;
     }
 
