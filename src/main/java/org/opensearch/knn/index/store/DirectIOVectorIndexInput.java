@@ -132,7 +132,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * started read runs on, so a read abandoned before it began is skipped by the claim and one that has
      * begun is waited out.
      */
-    private static final class StagedRange implements Callable<Void> {
+    static final class StagedRange implements Callable<Void> {
         private final FileChannel channel;
         private final Path path;
         private final ByteBuffer buffer;
@@ -208,8 +208,44 @@ public final class DirectIOVectorIndexInput extends IndexInput {
          * it</em>. An abandoned range covers nothing: the check lives here rather than at the three call
          * sites so that the read path, the read-ahead ring and {@link #prefetch}'s dedupe all agree.
          */
-        private boolean covers(final long absolute, final int needed) {
+        boolean covers(final long absolute, final int needed) {
             return abandoned == false && absolute >= alignedStart && absolute + needed <= alignedStart + alignedLength;
+        }
+
+        /**
+         * Quiesces this range within {@link #STAGED_READ_WAIT_MILLIS} and reports whether its buffer is safe
+         * to reuse. False means a read may still be writing into it, so the buffer — and, since D3c, the
+         * whole arena it was carved from — must be retired rather than handed to the next burst.
+         *
+         * <p>Lives here rather than on the input because the thread taking a lease back is quiescing ranges
+         * the <em>previous holder</em> staged, and that holder may be a different input that nothing holds a
+         * reference to any more.
+         */
+        boolean quiesce() {
+            if (abandoned) {
+                return false;
+            }
+            if (skipIfNotStarted()) {
+                // It will now never run, so nothing can write into the buffer.
+                return true;
+            }
+            try {
+                future.get(STAGED_READ_WAIT_MILLIS, TimeUnit.MILLISECONDS);
+                return true;
+            } catch (TimeoutException e) {
+                abandoned = true;
+                STATS.stagedWaitTimeouts.incrementAndGet();
+                log.debug("Gave up after {} ms quiescing a Direct I/O read of {}", STAGED_READ_WAIT_MILLIS, path);
+                return false;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            } catch (ExecutionException e) {
+                // The read failed, so it is not going to write anything either -- a closed channel is the
+                // common cause, and the buffer is safe.
+                log.debug("Abandoned a staged Direct I/O read of {}", path);
+                return true;
+            }
         }
 
         @Override
@@ -273,6 +309,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         private final AtomicLong directMemoryLive = new AtomicLong();
         private final AtomicLong directMemoryPeak = new AtomicLong();
         private final AtomicLong declinedBudget = new AtomicLong();
+        private final AtomicLong arenasAllocated = new AtomicLong();
+        private final AtomicLong arenasReused = new AtomicLong();
+        private final AtomicLong arenasRetired = new AtomicLong();
+        private final AtomicLong foreignThreadReads = new AtomicLong();
 
         private void recordInFlightPeak() {
             final long now = inFlightNow.get();
@@ -318,6 +358,26 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             declinedBudget.incrementAndGet();
         }
 
+        /** Counts one staging arena carved by a {@link DirectIOStagingLease}. */
+        void recordArenaAllocated() {
+            arenasAllocated.incrementAndGet();
+        }
+
+        /** Counts one burst that took its thread's existing arena back instead of carving one. */
+        void recordArenaReused() {
+            arenasReused.incrementAndGet();
+        }
+
+        /** Counts one arena dropped rather than reused — see {@link #arenasRetired()} for the two reasons. */
+        void recordArenaRetired() {
+            arenasRetired.incrementAndGet();
+        }
+
+        /** Counts one read that skipped the staged table because it was not on the lease's owner thread. */
+        void recordForeignThreadRead() {
+            foreignThreadReads.incrementAndGet();
+        }
+
         /**
          * Direct-buffer bytes the Direct I/O read path holds right now: staging arenas, read-ahead arenas,
          * the per-slot buffers a wide prefetch group needs, and one blocking window per input. Charged on
@@ -326,12 +386,74 @@ public final class DirectIOVectorIndexInput extends IndexInput {
          * {@link DirectIOVectorIndexInput#close()}.
          */
         public long directMemoryLive() {
-            return directMemoryLive.get();
+            return clampToWall(directMemoryLive.get());
         }
 
         /** The high-water mark of {@link #directMemoryLive()} since node start. */
         public long directMemoryPeak() {
-            return directMemoryPeak.get();
+            return clampToWall(directMemoryPeak.get());
+        }
+
+        /**
+         * Caps a reported figure at the JVM's direct-memory wall, because a number above it is not a fact
+         * about this node.
+         *
+         * <p>MEASURED on the node 2026-10-06 with the budget off: {@code peak_bytes} read <b>7,457,394,721</b>
+         * — and later 9.0 GB and 28 GB — against {@code -XX:MaxDirectMemorySize=2g}. The raw counter is
+         * "charged minus proven reclaimed", and with the budget off nothing drained the phantom queue outside
+         * a stats read, so it ratcheted past the physical limit while the JDK's own
+         * {@code java.nio.Bits.reserveMemory} kept freeing buffers behind it. D3c fixes the drain (it now runs
+         * on every {@link DirectIOVectorIndexInput#trackedAllocate}) and clamps the report, which are two
+         * different fixes for the same defect: the drain makes the number smaller, the clamp makes it
+         * impossible for it to be absurd.
+         */
+        private static long clampToWall(final long bytes) {
+            final long wall = KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES;
+            return wall > 0 ? Math.min(bytes, wall) : bytes;
+        }
+
+        /**
+         * Staging arenas carved since node start, one per thread that has run a prefetch burst — plus one per
+         * {@link #arenasRetired()}. <b>This is the number D3c exists to flatten.</b> Before it, every
+         * per-query {@code OffHeapFloatVectorValues} slice carved its own, so arenas were allocated at
+         * roughly {@code QPS x segments} per second (9-13 MiB/s of direct buffer on the node) and the gauge
+         * measured churn awaiting a collection rather than memory in use.
+         */
+        public long arenasAllocated() {
+            return arenasAllocated.get();
+        }
+
+        /**
+         * Bursts that took their thread's existing arena back rather than carving one. On a healthy node this
+         * is almost every burst: {@code arenas_reused} should be orders of magnitude above
+         * {@code arenas_allocated}, and the ratio is the whole claim of the lease model expressed as one
+         * division.
+         */
+        public long arenasReused() {
+            return arenasReused.get();
+        }
+
+        /**
+         * Arenas dropped rather than reused, for one of two reasons: a range the previous burst left staged
+         * would not quiesce within {@link #STAGED_READ_WAIT_MILLIS} (so a pool read may still write into its
+         * buffers — see {@code staged_wait_timeouts}, which moves with it), or the next burst wanted a
+         * different geometry. The first is pathology and the second is a configuration change, so on a
+         * settled node this stays flat.
+         */
+        public long arenasRetired() {
+            return arenasRetired.get();
+        }
+
+        /**
+         * Reads that skipped the staged table because they arrived on a thread other than the one that holds
+         * the lease, and were served by a blocking read instead. <b>~0 on a healthy node</b>, because the
+         * rescore path prefetches and reads a burst on one thread (FINDINGS.md D3c(a)). Non-zero means some
+         * caller hands a prefetched input to another thread, which costs that read its read-ahead and
+         * nothing else — the bytes are identical either way, because the owner-confinement rule is what
+         * makes the lease's generation check race free rather than an optimisation.
+         */
+        public long foreignThreadReads() {
+            return foreignThreadReads.get();
         }
 
         /**
@@ -543,6 +665,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             poolRebuilds.set(0);
             declinedBudget.set(0);
             directMemoryPeak.set(0);
+            arenasAllocated.set(0);
+            arenasReused.set(0);
+            arenasRetired.set(0);
+            foreignThreadReads.set(0);
             // directMemoryLive is NOT reset: it is a live gauge, not a counter, and zeroing it while buffers
             // are still held would make the budget let through exactly as much again.
         }
@@ -560,7 +686,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                     + "stagedBytes=%d blockingBytes=%d servedBytes=%d declinedSpanBytes=%d "
                     + "readaheadReads=%d readaheadBytes=%d readaheadHits=%d readaheadDeclined=%d readaheadArmed=%d "
                     + "stagedWaitTimeouts=%d queuePeak=%d poolRebuilds=%d "
-                    + "directMemoryLive=%d directMemoryPeak=%d declinedBudget=%d amplification=%.3f",
+                    + "directMemoryLive=%d directMemoryPeak=%d declinedBudget=%d "
+                    + "arenasAllocated=%d arenasReused=%d arenasRetired=%d foreignThreadReads=%d amplification=%.3f",
                 routedOpens.get(),
                 declinedCompound.get(),
                 declinedChain.get(),
@@ -585,9 +712,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 stagedWaitTimeouts.get(),
                 queuePeak.get(),
                 poolRebuilds.get(),
-                directMemoryLive.get(),
-                directMemoryPeak.get(),
+                directMemoryLive(),
+                directMemoryPeak(),
                 declinedBudget.get(),
+                arenasAllocated.get(),
+                arenasReused.get(),
+                arenasRetired.get(),
+                foreignThreadReads.get(),
                 served == 0 ? 0.0 : (double) read / served
             );
         }
@@ -669,6 +800,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      */
     static final long STAGED_READ_WAIT_MILLIS = 1000L;
 
+    /** Hands out {@link #inputId}. Node wide, because a lease is per thread and meets inputs from anywhere. */
+    private static final AtomicLong INPUT_IDS = new AtomicLong();
+
     private final Handle handle;
     /** Absolute file offset of this input's byte zero, so a slice needs no other translation. */
     private final long offset;
@@ -713,27 +847,31 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     private long filePointer;
     private boolean closed;
 
-    /** Buffer for reads not served from a staged range. Allocated on the first such read. */
-    private ByteBuffer syncBuffer;
-    private FloatBuffer syncFloats;
-    private long syncStart = -1;
-    private int syncValid;
-
-    /** The current burst's staged ranges, or null before the first {@link #prefetch}. */
-    private StagedRange[] staged;
-    private ByteBuffer[] stagedBuffers;
-    private FloatBuffer[] stagedFloats;
     /**
-     * The one allocation {@link #stagedBuffers} is carved from. Held for this input's whole life, never
-     * re-carved: a slot given up because a read may still be writing into it (see {@link #resetStaging})
-     * leaves that read writing into this allocation, so it must stay reachable even though nothing reads it
+     * This input's identity in its thread's {@link DirectIOStagingLease}, used to decide whether the shared
+     * blocking window still holds <em>this</em> input's bytes. A counter and not {@code this}, so that a
+     * lease never holds a reference to an input and so never pins a {@link Handle} or a channel.
+     */
+    private final long inputId = INPUT_IDS.incrementAndGet();
+
+    /**
+     * The lease generation this input's burst was given, or {@code -1} when it holds no lease. Equality with
+     * the live generation of {@link DirectIOStagingLease#current()} is what makes the staged table readable;
+     * a mismatch means the next burst on this thread took the arena back and this input must read blocking.
+     */
+    private long leaseGeneration = -1;
+    /**
+     * The thread that took {@link #leaseGeneration}. Compared before the generation so that a read arriving
+     * on another thread is counted as what it is ({@code foreign_thread_reads}) rather than as a revocation,
+     * and so that nothing consults a table it does not own. A thread id may be reused after a thread dies,
+     * which cannot make this check wrongly pass: the generation of a dead thread's burst is never current
      * again.
      */
-    private ByteBuffer stagingArena;
-    private int stagedCount;
+    private long leaseThreadId = -1;
+
     /**
      * The pool this burst's staged reads are submitted to, acquired by {@link #ensureStagingTable} and
-     * cleared by {@link #resetStaging}, so it is never held across a burst boundary. The read-ahead ring
+     * cleared by {@link #endBurst}, so it is never held across a burst boundary. The read-ahead ring
      * does not use this field; see {@link #refillReadahead}.
      */
     private ExecutorService pool;
@@ -1035,9 +1173,30 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         return readaheadTrigger;
     }
 
-    /** The burst table's single backing allocation, or null before the first {@link #prefetch}. */
+    /**
+     * The burst table's single backing allocation while this input holds its thread's lease, or null when it
+     * does not — before its first {@link #prefetch}, after the next burst on this thread took the arena
+     * back, or when the budget refused one.
+     */
     ByteBuffer stagingArena() {
-        return stagingArena;
+        final DirectIOStagingLease lease = heldLease();
+        return lease == null ? null : lease.arena();
+    }
+
+    /**
+     * This thread's lease if this input still holds it, else null.
+     *
+     * <p>Two conditions, in this order: the read is on the thread that took the lease, and the lease still
+     * carries the generation this input was given. The thread check comes first because a foreign thread's
+     * {@link DirectIOStagingLease#current()} is a different object whose generation this input must not even
+     * read as a comparison — see {@link #leaseThreadId}.
+     */
+    private DirectIOStagingLease heldLease() {
+        if (leaseGeneration < 0 || Thread.currentThread().threadId() != leaseThreadId) {
+            return null;
+        }
+        final DirectIOStagingLease lease = DirectIOStagingLease.current();
+        return lease.generation() == leaseGeneration ? lease : null;
     }
 
     /** The read-ahead ring's single backing allocation, or null before the ring first arms. */
@@ -1090,10 +1249,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         // A burst has no explicit boundary, so it is recovered: the first prefetch after any read ends the
         // previous burst. Same move the rescore seam's stage() made by calling abandonBatch() on entry.
         if (readSincePrefetch) {
-            resetStaging();
+            endBurst();
         }
         if (pool == null) {
-            // Exactly once per burst, which is the burst boundary resetStaging just established (or the
+            // Exactly once per burst, which is the burst boundary endBurst just established (or the
             // input's first prefetch). Same cadence and same contract as DirectIOReadPool.executor(): an
             // operator's change to knn.direct_io.rescore.cache.max_bytes takes effect on the next burst.
             DirectIOVectorCache.applyConfiguredSize();
@@ -1113,43 +1272,39 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             STATS.declinedSpanBytes.addAndGet(length);
             return;
         }
-        if (staged != null) {
-            for (int i = 0; i < stagedCount; i++) {
-                if (staged[i].covers(absolute, Math.toIntExact(length))) {
-                    // Already in flight from an earlier call in this burst. PrefetchHelper's grouping makes
-                    // this common rather than exceptional: one group covers every vector inside it.
-                    return;
-                }
-            }
-        }
-        if (ensureStagingTable() == false || stagedCount == maxStagedRanges) {
+        final DirectIOStagingLease lease = ensureStagingTable();
+        if (lease == null) {
             STATS.stageDeclined.incrementAndGet();
             return;
         }
-        final int slot = stagedCount;
-        if (stagedBuffers[slot] == null || stagedBuffers[slot].capacity() < alignedLength) {
-            // Wider than a slot, or a slot given up after a timeout: this one range gets its own
-            // allocation, exactly as every range used to. See arenaSlotBytes() for why that is the
-            // uncommon case. Budget checked here too, because this is the other allocation a burst can
-            // make and it is the larger of the two per range (up to max_span_bytes, 132 KiB).
-            if (fitsBudget(alignedLength) == false) {
-                STATS.recordDeclinedBudget();
-                STATS.stageDeclined.incrementAndGet();
-                log.debug(
-                    "knn.direct_io.direct_memory_budget reached ({} B live); a wide prefetch range of {} declines",
-                    STATS.directMemoryLive(),
-                    handle.path
-                );
-                return;
-            }
-            stagedBuffers[slot] = trackedAllocate(alignedLength, blockSize);
-            stagedFloats[slot] = stagedBuffers[slot].asFloatBuffer();
+        if (lease.covering(absolute, Math.toIntExact(length)) != null) {
+            // Already in flight from an earlier call in this burst. PrefetchHelper's grouping makes this
+            // common rather than exceptional: one group covers every vector inside it.
+            return;
+        }
+        if (lease.isFull()) {
+            STATS.stageDeclined.incrementAndGet();
+            return;
+        }
+        final ByteBuffer buffer = lease.bufferFor(alignedLength);
+        if (buffer == null) {
+            // Only reachable for a coalesced group wider than an arena slot, which needs a buffer of its own
+            // (up to max_span_bytes, 132 KiB) and is therefore the one per-range allocation a burst can still
+            // make. See arenaSlotBytes() for why that is the uncommon case.
+            STATS.recordDeclinedBudget();
+            STATS.stageDeclined.incrementAndGet();
+            log.debug(
+                "knn.direct_io.direct_memory_budget reached ({} B live); a wide prefetch range of {} declines",
+                STATS.directMemoryLive(),
+                handle.path
+            );
+            return;
         }
         final StagedRange range = new StagedRange(
             handle.channel,
             handle.path,
-            stagedBuffers[slot],
-            stagedFloats[slot],
+            buffer,
+            lease.floatsFor(alignedLength),
             alignedStart,
             alignedLength,
             STATS.stagedReads,
@@ -1163,8 +1318,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             return;
         }
         DirectIOReadPool.sampleQueueDepth(pool);
-        staged[slot] = range;
-        stagedCount++;
+        lease.record(range);
     }
 
     /**
@@ -1175,40 +1329,55 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * and then held that reference for the input's whole life — and an input lives as long as the values
      * object Lucene built it for, which on the merge path is the whole merge. A capacity change swaps the
      * pool, so a stale reference would keep submitting to the retired one until it was shut down and then
-     * decline every prefetch. Re-acquiring at the burst boundary ({@link #resetStaging} clears the field)
+     * decline every prefetch. Re-acquiring at the burst boundary ({@link #endBurst} clears the field)
      * bounds staleness to one burst, and costs one settings read per burst rather than one per
      * {@link #prefetch} call — there are up to {@code staged_ranges} of those in a burst.
      *
-     * @return false when there is no pool, so reads must block
+     * <p><b>And it is where this input takes its thread's staging arena (D3c).</b> The first
+     * {@link #prefetch} of a burst calls {@link DirectIOStagingLease#take}, which quiesces whatever the
+     * previous holder left staged and then reuses that thread's arena or, if a read may still be writing into
+     * it, retires it and carves one. Before D3c every input carved its own and held it until a collection
+     * found the input, which on the per-query slices Lucene's flat reader creates meant arenas churned at
+     * {@code QPS x segments x 516 KiB/s} — 9-13 MiB/s on the node — while the memory actually in use was
+     * about {@code 16 concurrent bursts x 516 KiB}. That churn is what the direct-memory budget was
+     * measuring, and why at its 1 GB default it wedged the feature between collections.
+     *
+     * @return this thread's lease, or null when there is no pool or the budget refused an arena, in which
+     *         case reads must block
      */
-    private boolean ensureStagingTable() {
-        if (pool == null) {
-            final ExecutorService acquired = DirectIOReadPool.executor();
-            if (acquired == null) {
-                return false;
-            }
-            pool = acquired;
+    private DirectIOStagingLease ensureStagingTable() {
+        final DirectIOStagingLease lease = heldLease();
+        if (lease != null) {
+            return lease;
         }
-        if (staged == null) {
-            // D3: the one place a whole staging table is committed, and so the one place the node-wide
-            // direct-memory budget is checked. Past it this returns false, prefetch counts stageDeclined and
-            // declinedBudget, and the bytes are served by blockingSource -- the same fallback a
+        // Past here this is a NEW burst, whether or not endBurst ran -- an input that prefetched, never read,
+        // and was then revoked by another burst arrives here with a stale pool reference still set. Dropping
+        // it is what bounds pool staleness to one burst in that case too, which is the whole point of
+        // acquiring per burst (D1).
+        pool = null;
+        final ExecutorService acquired = DirectIOReadPool.executor();
+        if (acquired == null) {
+            return null;
+        }
+        pool = acquired;
+        final DirectIOStagingLease taken = DirectIOStagingLease.current();
+        final long generation = taken.take(maxStagedRanges, arenaSlotBytes(), handle.blockSize);
+        if (generation < 0) {
+            // D3's decline, now reached only when a lease has to carve: a burst that reuses its thread's
+            // arena cannot raise the node's footprint, so there is nothing to decline it for. Past here
+            // prefetch counts stageDeclined and the bytes are served by blockingSource -- the same fallback a
             // queue-capacity decline takes, already exercised on every arm.
-            if (fitsBudget(maxStagedRanges * arenaSlotBytes()) == false) {
-                STATS.recordDeclinedBudget();
-                log.debug(
-                    "knn.direct_io.direct_memory_budget reached ({} B live); prefetch of {} declines and reads will block",
-                    STATS.directMemoryLive(),
-                    handle.path
-                );
-                return false;
-            }
-            staged = new StagedRange[maxStagedRanges];
-            stagedBuffers = new ByteBuffer[maxStagedRanges];
-            stagedFloats = new FloatBuffer[maxStagedRanges];
-            stagingArena = carveArena(maxStagedRanges, arenaSlotBytes(), stagedBuffers, stagedFloats);
+            STATS.recordDeclinedBudget();
+            log.debug(
+                "knn.direct_io.direct_memory_budget reached ({} B live); prefetch of {} declines and reads will block",
+                STATS.directMemoryLive(),
+                handle.path
+            );
+            return null;
         }
-        return true;
+        leaseGeneration = generation;
+        leaseThreadId = Thread.currentThread().threadId();
+        return taken;
     }
 
     /**
@@ -1250,8 +1419,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * never shrinks. {@code MALLOC_ARENA_MAX} remains the operational lever for that. The claim here is only
      * fewer and smaller allocations, which is measurable as peak direct-buffer capacity.
      */
-    private ByteBuffer carveArena(final int slots, final int slotBytes, final ByteBuffer[] buffers, final FloatBuffer[] floats) {
-        final int blockSize = handle.blockSize;
+    static ByteBuffer carveArena(
+        final int slots,
+        final int slotBytes,
+        final int blockSize,
+        final ByteBuffer[] buffers,
+        final FloatBuffer[] floats
+    ) {
         // Over-allocate by a block so a block-aligned slice exists inside the allocation, then carve at
         // multiples of a slot: the base is aligned and a slot is a whole number of blocks, so every slot is
         // aligned too and needs no slack of its own. O_DIRECT needs the buffer address, the file offset and
@@ -1265,7 +1439,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     }
 
     /** Bytes {@link #trackedAllocate} actually reserves for a request of {@code usableBytes}. */
-    private static int allocationBytes(final int usableBytes, final int blockSize) {
+    private static long allocationBytes(final long usableBytes, final int blockSize) {
         return usableBytes + blockSize - 1;
     }
 
@@ -1277,8 +1451,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * JVM counts against {@code MaxDirectMemorySize}, and the {@code blockSize - 1} of alignment slack is
      * as real as the rest of it.
      */
-    private static ByteBuffer trackedAllocate(final int usableBytes, final int blockSize) {
-        final int bytes = allocationBytes(usableBytes, blockSize);
+    static ByteBuffer trackedAllocate(final int usableBytes, final int blockSize) {
+        // D3c: drain here, on every allocation, and not only from fitsBudget. With the budget off fitsBudget
+        // short-circuits, which left the phantom queue draining on stats reads alone -- and the node then
+        // reported peak_bytes of 7.46 GB, 9.0 GB and 28 GB against a 2 GB wall. The drain is a non-blocking
+        // poll loop against an allocateDirect that is orders of magnitude dearer.
+        reclaim();
+        final int bytes = Math.toIntExact(allocationBytes(usableBytes, blockSize));
         final ByteBuffer buffer = ByteBuffer.allocateDirect(bytes).alignedSlice(blockSize).order(ByteOrder.LITTLE_ENDIAN);
         STATS.recordDirectAllocation(bytes);
         CHARGES.add(new Charge(buffer, bytes));
@@ -1321,8 +1500,14 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * Whether {@code usableBytes} more of direct buffer fits under
      * {@code knn.direct_io.direct_memory_budget}. A budget of {@code 0b} is off, and a setting that cannot
      * be read is treated as off — a budget must never be the reason a shard cannot read its vectors.
+     *
+     * <p>Since D3c this is consulted only where a {@link DirectIOStagingLease} must carve: a new arena, a new
+     * wide-group buffer, or a read-ahead ring. A burst that takes its thread's arena back allocates nothing
+     * and so cannot be declined, which is why {@code declined_budget} should now read 0 on a loaded node
+     * where before it read 373k-614k at the same 1 GB default.
      */
-    private boolean fitsBudget(final int usableBytes) {
+    static boolean fitsBudget(final long usableBytes, final int blockSize) {
+        final long live = reclaim();
         final long budget;
         try {
             final ByteSizeValue configured = KNNSettings.getDirectIODirectMemoryBudget();
@@ -1334,31 +1519,21 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         if (budget <= 0) {
             return true;
         }
-        return reclaim() + allocationBytes(usableBytes, handle.blockSize) <= budget;
+        return live + allocationBytes(usableBytes, blockSize) <= budget;
     }
 
     /**
-     * Quiesces every range the current burst still has in flight and forgets them, keeping the buffers for
-     * the next burst. A buffer is only reusable once no read can still write into it, which is what the
-     * claim in {@link StagedRange#skipIfNotStarted} establishes.
+     * Ends this input's burst: it stops consulting the staged table and stops holding the pool.
+     *
+     * <p><b>It does not quiesce anything, and that is the D3c change.</b> The ranges stay staged in the
+     * thread's lease until the next burst on that thread takes the arena back and quiesces them there — which
+     * is the only boundary that can be relied on, because a per-query input usually never prefetches twice.
+     * Letting go of the generation is enough to make the table unreadable: {@link #heldLease} will not match
+     * again until this input takes a new lease.
      */
-    private void resetStaging() {
-        if (staged != null) {
-            for (int i = 0; i < stagedCount; i++) {
-                final StagedRange range = staged[i];
-                staged[i] = null;
-                if (range == null) {
-                    continue;
-                }
-                if (quiesce(range) == false) {
-                    // A read may still be writing into this slot's buffer, so the slot gives it up and the
-                    // next burst allocates a fresh one. Bounded: at most one buffer per slot per timeout.
-                    stagedBuffers[i] = null;
-                    stagedFloats[i] = null;
-                }
-            }
-        }
-        stagedCount = 0;
+    private void endBurst() {
+        leaseGeneration = -1;
+        leaseThreadId = -1;
         readSincePrefetch = false;
         // The burst boundary is also where the pool reference is dropped, so the next burst picks up a pool
         // rebuilt by a capacity change. See ensureStagingTable.
@@ -1483,6 +1658,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * random), then the sequential read-ahead ring (inferred from a forward run), then one blocking
      * {@code pread}. The two staging mechanisms are independent — neither resets the other, and the burst
      * table is scanned first because a {@link #prefetch} is a stronger signal than a detected run.
+     *
+     * <p>Since D3c the burst table belongs to the <em>thread</em>, so it is consulted only when this input
+     * still holds its thread's lease. Two ways it may not, both of which fall through to a blocking read with
+     * identical bytes: another burst on this thread took the arena back (the generation moved on), or this
+     * read arrived on a different thread from the one that prefetched, which is counted as
+     * {@code foreign_thread_reads} because it is the premise of the lease model being violated rather than
+     * the lease model working.
      */
     private Source source(final int needed) throws IOException {
         ensureOpen();
@@ -1491,24 +1673,20 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
         final long absolute = offset + filePointer;
         readSincePrefetch = true;
-        if (staged != null) {
-            for (int i = 0; i < stagedCount; i++) {
-                final StagedRange range = staged[i];
-                if (range == null || range.covers(absolute, needed) == false) {
-                    continue;
-                }
-                if (await(range) == false) {
-                    // The bounded wait gave up. Same fall-through as the short read below.
-                    break;
-                }
+        if (leaseGeneration >= 0 && Thread.currentThread().threadId() != leaseThreadId) {
+            STATS.recordForeignThreadRead();
+        }
+        final DirectIOStagingLease lease = heldLease();
+        if (lease != null) {
+            final StagedRange range = lease.covering(absolute, needed);
+            if (range != null && await(range)) {
                 final int position = Math.toIntExact(absolute - range.alignedStart);
-                if (position + needed > range.valid) {
-                    // The read came up short of these bytes, which can only happen at end of file. Fall
-                    // through to a blocking read rather than decode whatever the buffer last held.
-                    break;
+                // A read that came up short of these bytes can only have done so at end of file. Fall
+                // through to a blocking read rather than decode whatever the buffer last held.
+                if (position + needed <= range.valid) {
+                    STATS.stagedHits.incrementAndGet();
+                    return new Source(range.buffer, range.floats, position, range.valid - position, true);
                 }
-                STATS.stagedHits.incrementAndGet();
-                return new Source(range.buffer, range.floats, position, range.valid - position, true);
             }
         }
         if (readaheadWindows > 0 && readaheadRing != null) {
@@ -1570,45 +1748,22 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     }
 
     /**
-     * Quiesces a range being forgotten, within the same bound {@link #await} uses, and reports whether its
-     * buffer is safe to reuse. False means a read may still be writing into it.
-     */
-    private boolean quiesce(final StagedRange range) {
-        if (range.abandoned) {
-            return false;
-        }
-        if (range.skipIfNotStarted()) {
-            // It will now never run, so nothing can write into the buffer.
-            return true;
-        }
-        try {
-            range.future.get(STAGED_READ_WAIT_MILLIS, TimeUnit.MILLISECONDS);
-            return true;
-        } catch (TimeoutException e) {
-            range.abandoned = true;
-            STATS.stagedWaitTimeouts.incrementAndGet();
-            log.debug("Gave up after {} ms quiescing a Direct I/O read of {}", STAGED_READ_WAIT_MILLIS, handle.path);
-            return false;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return false;
-        } catch (ExecutionException e) {
-            log.debug("Abandoned a staged Direct I/O read of {}", handle.path);
-            return true;
-        }
-    }
-
-    /**
      * One blocking {@code pread} of the block-aligned window holding {@code absolute}, when not already held.
      *
      * <h4>This path's own buffer is bounded, and the budget deliberately does not decline it</h4>
      * It is <b>exactly one</b> buffer of {@link #bufferSize} (8 KiB at the shipped default, two filesystem
-     * blocks) per input, allocated on the first blocking read and then reused for the life of the input: the
-     * {@code syncStart}/{@code syncValid} window check above serves every later read that falls inside the
-     * window it already holds, and a read outside it re-reads into the <em>same</em> buffer rather than
-     * allocating. It is never grown and never allocated per read. So the blocking channel's whole direct
-     * footprint is {@code bufferSize x live inputs} — against a staging table's
-     * {@code staged_ranges x arenaSlotBytes} = 64 x 8 KiB = 512 KiB, i.e. 64x smaller per input.
+     * blocks) per <b>thread</b> since D3c — it was one per input — allocated on that thread's first blocking
+     * read and then reused: the window check below serves every later read that falls inside the window it
+     * already holds, and a read outside it re-reads into the <em>same</em> buffer rather than allocating. It
+     * is never grown and never allocated per read. So the blocking channel's whole direct footprint is
+     * {@code bufferSize x live threads}, where before it was {@code bufferSize x live inputs} and inputs
+     * outlive their queries.
+     *
+     * <p>Sharing it is safe because the bytes are consumed before the next read on that thread: the caller
+     * copies out of the returned {@link Source} inside the same {@code readFloats} or {@code readBytes}
+     * iteration. What is <em>not</em> safe to share is the belief that the window still holds a given range,
+     * so the lease remembers which input filled it ({@link DirectIOStagingLease#windowPosition}) and will not
+     * answer a cached position to any other.
      *
      * <p>It is charged to {@code knn.direct_io.direct_memory_budget}'s accounting (so {@code live_bytes} is
      * the truth about this class's direct memory) but is <b>never declined</b> by it, and that is forced
@@ -1616,15 +1771,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * leave a read with nothing to read with, which is a failed query rather than a bounded one.
      */
     private Source blockingSource(final long absolute, final int needed) throws IOException {
-        if (syncBuffer == null) {
-            // Over-allocate by a block so a block-aligned slice exists inside the allocation: O_DIRECT
-            // needs the buffer address, the file offset and the length all block aligned.
-            syncBuffer = trackedAllocate(bufferSize, handle.blockSize);
-            syncFloats = syncBuffer.asFloatBuffer();
-        }
-        if (syncStart >= 0 && absolute >= syncStart && absolute + needed <= syncStart + syncValid) {
-            final int position = Math.toIntExact(absolute - syncStart);
-            return new Source(syncBuffer, syncFloats, position, syncValid - position);
+        final DirectIOStagingLease lease = DirectIOStagingLease.current();
+        // Over-allocate by a block so a block-aligned slice exists inside the allocation: O_DIRECT needs the
+        // buffer address, the file offset and the length all block aligned.
+        final ByteBuffer syncBuffer = lease.window(bufferSize, handle.blockSize);
+        final int cached = lease.windowPosition(inputId, absolute, needed);
+        if (cached >= 0) {
+            return new Source(syncBuffer, lease.windowFloats(), cached, lease.windowValid() - cached);
         }
         final int blockSize = handle.blockSize;
         final long alignedStart = absolute - Math.floorMod(absolute, (long) blockSize);
@@ -1632,8 +1785,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final int read = handle.channel.read(syncBuffer, alignedStart);
         STATS.blockingReads.incrementAndGet();
         STATS.blockingBytes.addAndGet(Math.max(read, 0));
-        syncStart = alignedStart;
-        syncValid = Math.max(read, 0);
+        final int syncValid = Math.max(read, 0);
+        lease.windowFilled(inputId, alignedStart, syncValid);
         // Detection runs on the device read, not the sync-window hit above: a hit means no new device read
         // and so no advance of the file-order frontier. With read-ahead off this is a no-op (gated inside).
         noteBlockingRead(alignedStart);
@@ -1650,7 +1803,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 )
             );
         }
-        return new Source(syncBuffer, syncFloats, position, syncValid - position);
+        return new Source(syncBuffer, lease.windowFloats(), position, syncValid - position);
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -1753,7 +1906,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
     /**
      * Submits windows until {@link #readaheadWindows} are in flight ahead of {@link #readaheadNext}, within
-     * this input's own region. Stands down when a prefetch burst is active ({@code stagedCount > 0}): the
+     * this inputs own region. Stands down while this input holds a live burst on this thread: the
      * rescore scorer then owns the input and its access is random, not sequential, so the ring issues no
      * speculative reads. Allocates the ring lazily on the first call that reaches here.
      *
@@ -1764,7 +1917,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * {@link #readaheadWindowBytes} (64 KiB by default), so the settings read is not on a per-vector path.
      */
     private void refillReadahead() {
-        if (stagedCount > 0) {
+        final DirectIOStagingLease held = heldLease();
+        if (held != null && held.count() > 0) {
             return;
         }
         final ExecutorService executor = DirectIOReadPool.executor();
@@ -1775,7 +1929,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         if (readaheadRing == null) {
             // The ring is direct memory too, so it is charged to the same budget. Declining it leaves the
             // scan at queue depth one, which is readaheadDeclined's existing meaning.
-            if (fitsBudget(readaheadWindows * readaheadWindowBytes) == false) {
+            if (fitsBudget((long) readaheadWindows * readaheadWindowBytes, handle.blockSize) == false) {
                 STATS.recordDeclinedBudget();
                 STATS.readaheadDeclined.incrementAndGet();
                 log.debug(
@@ -1791,14 +1945,14 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             // Every ring window is exactly readaheadWindowBytes, so the ring carves its arena at that size
             // rather than at the burst table's arenaSlotBytes() and never needs the per-slot fall-back the
             // burst table keeps for a wide group.
-            readaheadArena = carveArena(readaheadWindows, readaheadWindowBytes, readaheadBuffers, readaheadFloats);
+            readaheadArena = carveArena(readaheadWindows, readaheadWindowBytes, handle.blockSize, readaheadBuffers, readaheadFloats);
         }
         final long regionEnd = offset + length;
         while (readaheadCount < readaheadWindows && readaheadNext < regionEnd) {
             final int slot = (readaheadHead + readaheadCount) % readaheadWindows;
             if (readaheadBuffers[slot] == null) {
                 // Only reachable for a slot given up after a bounded wait timed out (see retireHead).
-                if (fitsBudget(readaheadWindowBytes) == false) {
+                if (fitsBudget(readaheadWindowBytes, handle.blockSize) == false) {
                     STATS.recordDeclinedBudget();
                     STATS.readaheadDeclined.incrementAndGet();
                     return;
@@ -1838,7 +1992,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     private void retireHead() {
         final StagedRange head = readaheadRing[readaheadHead];
         readaheadRing[readaheadHead] = null;
-        if (head != null && quiesce(head) == false) {
+        if (head != null && head.quiesce() == false) {
             readaheadBuffers[readaheadHead] = null;
             readaheadFloats[readaheadHead] = null;
         }
@@ -1848,7 +2002,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
     /**
      * Quiesces every window the ring still has in flight and forgets them, keeping the buffers. Mirrors
-     * {@link #resetStaging} for the burst table, and like it does not touch the other mechanism's state —
+     * {@link #endBurst} for the burst table, and like it does not touch the other mechanisms state —
      * the run counter and frontier are left to the caller ({@link #noteBlockingRead} resets the run; a
      * close just drops everything).
      */
@@ -1953,7 +2107,11 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             return;
         }
         closed = true;
-        resetStaging();
+        // Quiesce before the channel goes, if this input still holds its thread's lease. A range left staged
+        // by an input that already gave the lease up is quiesced by the next take instead, and a read that
+        // finds a closed channel fails rather than writing -- which StagedRange#quiesce treats as safe.
+        DirectIOStagingLease.current().releaseIfHeldBy(leaseGeneration);
+        endBurst();
         quiesceReadahead();
         if (ownsHandle) {
             handle.channel.close();

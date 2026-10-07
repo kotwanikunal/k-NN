@@ -79,6 +79,17 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
     /** Deliberately not a multiple of the block size or of {@code gcd(vectorBytes, blockSize)}. */
     private static final int HEADER_LENGTH = 44;
 
+    /**
+     * The staging arena belongs to the <b>thread</b> since D3c, and a test method runs on the same thread as
+     * the one before it, so without this one test would inherit the previous test's arena — and the
+     * accounting tests, which assert what an allocation charges, would measure a reuse instead.
+     */
+    @Override
+    public void setUp() throws Exception {
+        super.setUp();
+        DirectIOStagingLease.resetForTesting();
+    }
+
     @SneakyThrows
     private void assumeDirectIOWorksHere() {
         final OpenOption direct = DirectIOVectorIndexInput.directOpenOption();
@@ -1407,12 +1418,20 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
     }
 
     /**
-     * A slice gets its own arena rather than sharing one, because a slice reads independently and a staged
-     * read writes into its slot from a pool thread. Sharing would be a data race, and the footprint fix must
-     * not have introduced one.
+     * <b>Re-pinned by D3c, and the inversion is the deliverable.</b> This test used to assert that two
+     * slices each carved their own arena ("two slices must not share one arena"), which was true and was
+     * precisely the defect: a per-query {@code OffHeapFloatVectorValues} slice carved ~516 KiB on its first
+     * prefetch and held it until a collection found the input, so arenas churned at
+     * {@code QPS x segments x 516 KiB/s} — 9-13 MiB/s on the node — against about 8 MiB genuinely in use.
+     * The arena now belongs to the thread, so two slices interleaving bursts on one thread take it from each
+     * other.
+     *
+     * <p>What may not change is the bytes. The revoked slice's staged table is void, so its reads fall back
+     * to the blocking path and return exactly the same vectors — which is the property the sharing is only
+     * acceptable because of.
      */
     @SneakyThrows
-    public void testASliceCarvesItsOwnArena() {
+    public void testTwoSlicesOnOneThreadShareTheThreadsArenaAndTheRevokedOneStillReadsCorrectly() {
         assumeDirectIOWorksHere();
         final Path dir = createTempDir();
         final float[][] vectors = randomVectors(2000);
@@ -1429,21 +1448,30 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
         ) {
             for (int ord = 0; ord < 32; ord++) {
                 first.prefetch((long) ord * VECTOR_BYTES, VECTOR_BYTES);
+            }
+            final ByteBuffer arena = first.stagingArena();
+            assertNotNull("the first burst on this thread carves the thread's arena", arena);
+
+            // The second slice's first prefetch is a new burst on the same thread, so it takes the arena.
+            for (int ord = 0; ord < 32; ord++) {
                 second.prefetch((long) ord * VECTOR_BYTES, VECTOR_BYTES);
             }
-            assertNotNull(first.stagingArena());
-            assertNotNull(second.stagingArena());
-            assertNotSame("two slices must not share one arena", first.stagingArena(), second.stagingArena());
-            assertNull("the parent prefetched nothing, so it carved nothing", input.stagingArena());
+            assertSame("the second slice must take the same arena, not carve a second one", arena, second.stagingArena());
+            assertNull("and the first slice's table is void once revoked", first.stagingArena());
+            assertNull("the parent never prefetched, so it holds nothing", input.stagingArena());
+            assertEquals("one arena for this thread, however many slices used it", 1L, DirectIOVectorIndexInput.STATS.arenasAllocated());
+            assertEquals("the second burst reused it", 1L, DirectIOVectorIndexInput.STATS.arenasReused());
+            assertEquals("and nothing had to be retired", 0L, DirectIOVectorIndexInput.STATS.arenasRetired());
 
             for (int ord = 0; ord < 32; ord++) {
                 first.seek((long) ord * VECTOR_BYTES);
                 first.readFloats(scratch, 0, DIMENSION);
-                assertArrayEquals("first slice ordinal " + ord, vectors[ord], scratch, 0.0f);
+                assertArrayEquals("revoked slice ordinal " + ord, vectors[ord], scratch, 0.0f);
                 second.seek((long) ord * VECTOR_BYTES);
                 second.readFloats(scratch, 0, DIMENSION);
-                assertArrayEquals("second slice ordinal " + ord, vectors[ord], scratch, 0.0f);
+                assertArrayEquals("holding slice ordinal " + ord, vectors[ord], scratch, 0.0f);
             }
+            assertEquals("reads on the owner thread are never foreign", 0L, DirectIOVectorIndexInput.STATS.foreignThreadReads());
         }
     }
 
@@ -1716,6 +1744,424 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
             KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_DEFAULT_VALUE.getBytes()
         );
         assertTrue("and it is a positive number on this JVM", KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_DEFAULT_VALUE.getBytes() > 0);
+    }
+
+    // -----------------------------------------------------------------------------------------------
+    // 9. Phase 15b D3c: the staging arena belongs to the thread, so live direct memory is bounded by
+    // concurrent bursts rather than by when the collector next runs.
+    //
+    // The node measured the defect twice on 2026-10-06 with jar 4a8cf9e9 (16 clients, -Xmx24g,
+    // -XX:MaxDirectMemorySize=2g): at the 1 GB default budget live_bytes reached 1,068-1,087 MB within two
+    // minutes, staged_reads froze at 159,137, declined_budget ran to 614k and twenty seconds later
+    // live_bytes fell to 0 in one step on a young collection -- the budget wedging the feature between
+    // collections rather than bounding it; and with the budget off, peak_bytes ratcheted to 7.46 GB against
+    // a 2 GB wall because the phantom queue drained only on stats reads. The cause was that every slice()
+    // and clone() carved its own ~516 KiB arena and held it for the input's life, which on a per-query
+    // OffHeapFloatVectorValues slice ends only when a collection finds it. These tests assert the fix.
+    // -----------------------------------------------------------------------------------------------
+
+    /** Drains the phantom queue until two consecutive drains agree, so a baseline is not moving under a test. */
+    @SneakyThrows
+    private long settledDirectMemory() {
+        long settled = -1;
+        for (int attempt = 0; attempt < 20 && settled != DirectIOVectorIndexInput.reclaim(); attempt++) {
+            settled = DirectIOVectorIndexInput.STATS.directMemoryLive();
+            System.gc();
+            Thread.sleep(20);
+        }
+        return DirectIOVectorIndexInput.reclaim();
+    }
+
+    /**
+     * <b>The deliverable, as one assertion.</b> Twenty thousand short-lived inputs that each run exactly one
+     * burst and are never closed — the production shape, because Lucene's {@code OffHeapFloatVectorValues}
+     * is not {@code Closeable} — spread over a fixed set of four threads, must allocate at most
+     * {@code 4 + arenas_retired} arenas. Before D3c this would have been 20,000 of them, which at
+     * ~516 KiB each is the 9-13 MiB/s of direct-buffer churn the node measured and the budget then declined
+     * on.
+     *
+     * <p>The budget is set to four arenas plus slack <em>above the settled baseline</em>, so that
+     * {@code declined_budget} staying at 0 means something: a budget that bounds only four arenas cannot be
+     * satisfied by 20,000 of them, and the only way to pass is to reuse.
+     */
+    @SneakyThrows
+    public void testTwentyThousandSingleBurstInputsOnFourThreadsAllocateFourArenas() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(2000);
+        final Path path = writeVectorFile(dir, vectors);
+        final long region = (long) vectors.length * VECTOR_BYTES;
+        final int threads = 4;
+        final int inputsPerThread = 5000;
+
+        DirectIOReadPool.resetForTesting();
+        DirectIOStagingLease.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+
+        // One arena is staged_ranges x arenaSlotBytes plus a block of alignment slack; a thread also holds
+        // one blocking window. Four of each, plus a megabyte of slack for the wide-group buffers a coalesced
+        // group may need, is the whole footprint this test may use.
+        try (DirectIOVectorIndexInput probe = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 0, 2)) {
+            assertNotNull(probe);
+            final long perThread = (long) probe.maxStagedRanges() * probe.arenaSlotBytes() + probe.blockSize() - 1 + probe.bufferSize()
+                + probe.blockSize() - 1;
+            final long budget = settledDirectMemory() + threads * perThread + (1L << 20);
+            withNodeSettings(
+                Settings.builder()
+                    .put(KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET, budget + "b")
+                    .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
+                    .build()
+            );
+            DirectIOVectorIndexInput.STATS.reset();
+
+            final CountDownLatch start = new CountDownLatch(1);
+            final Thread[] workers = new Thread[threads];
+            final Throwable[] failures = new Throwable[threads];
+            for (int t = 0; t < threads; t++) {
+                final int worker = t;
+                workers[t] = new Thread(() -> {
+                    try {
+                        start.await();
+                        // One channel per thread, then one slice per "query": slice() opens no file
+                        // descriptor, which is exactly why the production path creates them per query per
+                        // segment and exactly why their arenas were the problem.
+                        final DirectIOVectorIndexInput owner = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 0, 2);
+                        assertNotNull(owner);
+                        final float[] scratch = new float[DIMENSION];
+                        for (int i = 0; i < inputsPerThread; i++) {
+                            // Deliberately NOT closed, and deliberately dropped on the floor after one
+                            // burst. This is the lifecycle the fix is for.
+                            final DirectIOVectorIndexInput perQuery = owner.slice("q" + worker + "-" + i, HEADER_LENGTH, region);
+                            final int ord = (worker * inputsPerThread + i) % vectors.length;
+                            perQuery.prefetch((long) ord * VECTOR_BYTES, VECTOR_BYTES);
+                            perQuery.seek((long) ord * VECTOR_BYTES);
+                            perQuery.readFloats(scratch, 0, DIMENSION);
+                            assertArrayEquals("worker " + worker + " input " + i, vectors[ord], scratch, 0.0f);
+                        }
+                        owner.close();
+                    } catch (Throwable e) {
+                        failures[worker] = e;
+                    }
+                }, "d3c-worker-" + t);
+                workers[t].start();
+            }
+            start.countDown();
+            for (final Thread w : workers) {
+                w.join();
+            }
+            for (int t = 0; t < threads; t++) {
+                if (failures[t] != null) {
+                    throw new AssertionError("worker " + t + " failed", failures[t]);
+                }
+            }
+
+            final long allocated = DirectIOVectorIndexInput.STATS.arenasAllocated();
+            final long retired = DirectIOVectorIndexInput.STATS.arenasRetired();
+            final long reused = DirectIOVectorIndexInput.STATS.arenasReused();
+            assertTrue(
+                "an arena per thread, not per input: allocated="
+                    + allocated
+                    + " retired="
+                    + retired
+                    + ", "
+                    + DirectIOVectorIndexInput.STATS,
+                allocated <= threads + retired
+            );
+            assertEquals(
+                "every other burst must have taken its thread's arena back, " + DirectIOVectorIndexInput.STATS,
+                (long) threads * inputsPerThread - allocated,
+                reused
+            );
+            assertEquals(
+                "and a budget of four arenas must never bind, " + DirectIOVectorIndexInput.STATS,
+                0L,
+                DirectIOVectorIndexInput.STATS.declinedBudget()
+            );
+            assertEquals("each burst read on the thread that staged it", 0L, DirectIOVectorIndexInput.STATS.foreignThreadReads());
+            assertTrue("the reads were really staged, " + DirectIOVectorIndexInput.STATS, DirectIOVectorIndexInput.STATS.stagedHits() > 0);
+        }
+    }
+
+    /**
+     * Takeback correctness. Thread T bursts on input A, then bursts on input B, then reads a range A
+     * staged: A's read must take the blocking path and return A's bytes from the file — never whatever B's
+     * burst has since put in that buffer.
+     *
+     * <p>A and B are given <b>the same slot</b> deliberately: both stage their first range into arena slot
+     * 0, so if the generation check were missing A's read would decode B's vector and the assertion would
+     * fail with a vector that exists rather than with garbage.
+     */
+    @SneakyThrows
+    public void testAReadAfterItsLeaseWasTakenBackGetsItsOwnBytesAndNotTheNextBursts() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(2000);
+        final Path path = writeVectorFile(dir, vectors);
+        final long region = (long) vectors.length * VECTOR_BYTES;
+        final float[] scratch = new float[DIMENSION];
+        final int ordA = 11;
+        final int ordB = 1511;
+
+        DirectIOReadPool.resetForTesting();
+        DirectIOStagingLease.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+        try (
+            DirectIOVectorIndexInput owner = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 0, 2);
+            DirectIOVectorIndexInput a = owner.slice("a", HEADER_LENGTH, region);
+            DirectIOVectorIndexInput b = owner.slice("b", HEADER_LENGTH, region)
+        ) {
+            a.prefetch((long) ordA * VECTOR_BYTES, VECTOR_BYTES);
+            assertNotNull("A holds the lease", a.stagingArena());
+
+            b.prefetch((long) ordB * VECTOR_BYTES, VECTOR_BYTES);
+            assertNull("B's burst revoked A's table", a.stagingArena());
+            assertNotNull("and B now holds the same arena", b.stagingArena());
+
+            final long blockingBefore = DirectIOVectorIndexInput.STATS.blockingReads();
+            a.seek((long) ordA * VECTOR_BYTES);
+            a.readFloats(scratch, 0, DIMENSION);
+            assertArrayEquals("the revoked read must return A's own vector", vectors[ordA], scratch, 0.0f);
+            assertFalse("and must not be B's", java.util.Arrays.equals(vectors[ordB], scratch));
+            assertTrue(
+                "it must have come from a blocking read, not from the arena",
+                DirectIOVectorIndexInput.STATS.blockingReads() > blockingBefore
+            );
+
+            b.seek((long) ordB * VECTOR_BYTES);
+            b.readFloats(scratch, 0, DIMENSION);
+            assertArrayEquals("and the holder still reads out of the arena correctly", vectors[ordB], scratch, 0.0f);
+        }
+    }
+
+    /**
+     * A range that would not quiesce retires the whole arena, because a read that may still be writing into
+     * one slot is a read that may still be writing into the allocation every slot is carved from. The next
+     * burst must get a fresh arena, the late write must land only in the retired one, and every read must be
+     * right throughout.
+     *
+     * <p>The stuck read is produced by saturating the pool rather than by a stubbed {@code FileChannel}:
+     * {@link DirectIOVectorIndexInput.Handle} is built inside {@code open()}, and a channel-injection seam
+     * for one test is more surface than the test is worth when the saturated pool is the <em>measured</em>
+     * production route to this state ({@code staged_wait_timeouts}, phase 13 audit). The latch is released at
+     * the end, which is when the queued read actually runs and writes into the retired buffer.
+     */
+    @SneakyThrows
+    public void testARangeThatWillNotQuiesceRetiresTheArenaAndTheLateWriteHarmsNothing() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(2000);
+        final Path path = writeVectorFile(dir, vectors);
+        final float[] scratch = new float[DIMENSION];
+
+        DirectIOReadPool.resetForTesting();
+        DirectIOStagingLease.resetForTesting();
+        final CountDownLatch release = new CountDownLatch(1);
+        saturatePoolLeavingOneSlot(release);
+
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 0, 2)) {
+            assertNotNull(input);
+            final long offsetA = (long) 5 * VECTOR_BYTES;
+            input.prefetch(HEADER_LENGTH + offsetA, VECTOR_BYTES);
+            assumeTrue("the pool refused the prefetch", DirectIOVectorIndexInput.STATS.stageDeclined() == 0);
+            final ByteBuffer first = input.stagingArena();
+            assertNotNull(first);
+            assertEquals(1L, DirectIOVectorIndexInput.STATS.arenasAllocated());
+
+            // The bounded wait gives up, which abandons the range: from here its buffer may still be written.
+            input.seek(HEADER_LENGTH + offsetA);
+            input.readFloats(scratch, 0, DIMENSION);
+            assertArrayEquals(vectors[5], scratch, 0.0f);
+            assertEquals("the wait must have been given up on", 1L, DirectIOVectorIndexInput.STATS.stagedWaitTimeouts());
+
+            // The next burst on this thread cannot reuse that arena.
+            input.prefetch(HEADER_LENGTH + (long) 9 * VECTOR_BYTES, VECTOR_BYTES);
+            assertEquals("the abandoned range must retire the arena", 1L, DirectIOVectorIndexInput.STATS.arenasRetired());
+            assertEquals("so the next burst carves a fresh one", 2L, DirectIOVectorIndexInput.STATS.arenasAllocated());
+            assertEquals("and nothing was reused", 0L, DirectIOVectorIndexInput.STATS.arenasReused());
+            assertNotSame("the fresh arena must not be the retired one", first, input.stagingArena());
+
+            // Let the stuck read run. It writes into the retired buffer, which nothing reads from again.
+            release.countDown();
+            Thread.sleep(200);
+            for (int ord = 0; ord < 40; ord++) {
+                input.seek(HEADER_LENGTH + (long) ord * VECTOR_BYTES);
+                input.readFloats(scratch, 0, DIMENSION);
+                assertArrayEquals("after the late write, ordinal " + ord, vectors[ord], scratch, 0.0f);
+            }
+        } finally {
+            release.countDown();
+            DirectIOReadPool.resetForTesting();
+        }
+    }
+
+    /**
+     * Owner confinement: a read arriving on a thread other than the one that staged the burst does not look
+     * at the table at all. It takes the blocking path, returns the right bytes, and is counted — because it
+     * is the premise of the lease model being violated rather than the lease model working, and an operator
+     * should be able to see that.
+     *
+     * <p>This is also the rule that makes the generation check race free without a seqlock: the one thread
+     * that can observe a stale generation is the one thread that cannot concurrently change it.
+     */
+    @SneakyThrows
+    public void testAReadFromAForeignThreadTakesTheBlockingPathAndIsCounted() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(2000);
+        final Path path = writeVectorFile(dir, vectors);
+        final float[] scratch = new float[DIMENSION];
+        final int ord = 777;
+
+        DirectIOReadPool.resetForTesting();
+        DirectIOStagingLease.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 0, 2)) {
+            assertNotNull(input);
+            final Throwable[] failure = new Throwable[1];
+            final Thread stager = new Thread(() -> {
+                try {
+                    input.prefetch(HEADER_LENGTH + (long) ord * VECTOR_BYTES, VECTOR_BYTES);
+                } catch (Throwable e) {
+                    failure[0] = e;
+                }
+            }, "d3c-stager");
+            stager.start();
+            stager.join();
+            if (failure[0] != null) {
+                throw new AssertionError("the staging thread failed", failure[0]);
+            }
+            assumeTrue(
+                "the prefetch was declined, so there is no table to be foreign to",
+                DirectIOVectorIndexInput.STATS.stageDeclined() == 0
+            );
+
+            // This thread is not the lease owner, so the table is not consulted.
+            final long blockingBefore = DirectIOVectorIndexInput.STATS.blockingReads();
+            input.seek(HEADER_LENGTH + (long) ord * VECTOR_BYTES);
+            input.readFloats(scratch, 0, DIMENSION);
+            assertArrayEquals("a foreign read must still be exactly right", vectors[ord], scratch, 0.0f);
+            assertTrue("it must be counted, " + DirectIOVectorIndexInput.STATS, DirectIOVectorIndexInput.STATS.foreignThreadReads() > 0);
+            assertTrue("and served by a blocking read", DirectIOVectorIndexInput.STATS.blockingReads() > blockingBefore);
+            assertEquals("nothing may have been served out of the foreign table", 0L, DirectIOVectorIndexInput.STATS.stagedHits());
+        }
+    }
+
+    /**
+     * The blocking window is one buffer per thread since D3c, so two inputs on one thread share it — and the
+     * cached-range check therefore cannot hang on the lease generation alone. <b>It hangs on which input
+     * last filled the window</b>, because two inputs doing nothing but blocking reads never move the
+     * generation: the merge path, the faiss first pass and an exact search with prefetch off are all that
+     * shape. Without the owner token, A's second read would be served B's bytes.
+     */
+    @SneakyThrows
+    public void testTwoInputsSharingAThreadsBlockingWindowNeverServeEachOthersBytes() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final float[][] vectors = randomVectors(2000);
+        final Path path = writeVectorFile(dir, vectors);
+        final long region = (long) vectors.length * VECTOR_BYTES;
+        final float[] scratch = new float[DIMENSION];
+        // Far apart, so each sits in a different block-aligned window and the second read evicts the first.
+        final int ordA = 3;
+        final int ordB = 1900;
+
+        DirectIOReadPool.resetForTesting();
+        DirectIOStagingLease.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+        // The ring off and no prefetch at all: every read here is a blocking read, which is the shape that
+        // never moves the lease generation.
+        withNodeSettings(Settings.builder().put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0).build());
+        try (
+            DirectIOVectorIndexInput owner = DirectIOVectorIndexInput.open(path);
+            DirectIOVectorIndexInput a = owner.slice("a", HEADER_LENGTH, region);
+            DirectIOVectorIndexInput b = owner.slice("b", HEADER_LENGTH, region)
+        ) {
+            for (int repeat = 0; repeat < 20; repeat++) {
+                a.seek((long) ordA * VECTOR_BYTES);
+                a.readFloats(scratch, 0, DIMENSION);
+                assertArrayEquals("A on repeat " + repeat, vectors[ordA], scratch, 0.0f);
+
+                b.seek((long) ordB * VECTOR_BYTES);
+                b.readFloats(scratch, 0, DIMENSION);
+                assertArrayEquals("B on repeat " + repeat, vectors[ordB], scratch, 0.0f);
+
+                // A again, from the same position: the window now holds B's bytes, so A must re-read rather
+                // than be served the range it cached.
+                a.seek((long) ordA * VECTOR_BYTES);
+                a.readFloats(scratch, 0, DIMENSION);
+                assertArrayEquals("A re-read on repeat " + repeat, vectors[ordA], scratch, 0.0f);
+            }
+            assertEquals("the ring must not have armed on this access shape", 0L, DirectIOVectorIndexInput.STATS.readaheadReads());
+        }
+    }
+
+    /**
+     * Two defects the node found with {@code direct_memory_budget=0b}, as one test.
+     *
+     * <ol>
+     *   <li>{@code reclaim()} ran only inside {@code fitsBudget}, which short-circuits when the budget is
+     *       off, so the phantom queue drained on stats reads alone and {@code peak_bytes} ratcheted to
+     *       <b>7.46 GB, 9.0 GB and 28 GB</b> against a 2 GB wall. It now drains on every allocation: a
+     *       charge made unreachable and collected is returned by the next {@code trackedAllocate} with no
+     *       stats read in between.</li>
+     *   <li>Neither gauge may be reported above the JVM's wall, whatever the raw counter says.</li>
+     * </ol>
+     */
+    @SneakyThrows
+    public void testWithTheBudgetOffTheGaugeStillDrainsOnAllocationAndIsNeverAboveTheWall() {
+        assumeDirectIOWorksHere();
+        final Path dir = createTempDir();
+        final Path path = writeVectorFile(dir, randomVectors(500));
+
+        withNodeSettings(
+            Settings.builder()
+                .put(KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET, "0b")
+                .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
+                .build()
+        );
+        DirectIOStagingLease.resetForTesting();
+        DirectIOVectorIndexInput.STATS.reset();
+
+        // Charge something and then make it unreachable, so there is a charge waiting to be returned.
+        final long baseline = settledDirectMemory();
+        try (DirectIOVectorIndexInput doomed = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 0, 2)) {
+            doomed.prefetch(HEADER_LENGTH, VECTOR_BYTES);
+            assertNotNull("the budget is off, so nothing may be declined", doomed.stagingArena());
+        }
+        DirectIOStagingLease.resetForTesting();
+        final long charged = DirectIOVectorIndexInput.STATS.directMemoryLive();
+        assertTrue("the arena must have been charged, " + charged + " vs baseline " + baseline, charged > baseline);
+        for (int attempt = 0; attempt < 20 && DirectIOVectorIndexInput.STATS.directMemoryLive() >= charged; attempt++) {
+            System.gc();
+            Thread.sleep(20);
+        }
+        // Still charged as far as the gauge is concerned: nothing has drained the queue yet, and the point is
+        // that no stats read is allowed to be what drains it.
+        assumeTrue(
+            "the collector has not enqueued the charge yet, so there is nothing for an allocation to drain",
+            DirectIOVectorIndexInput.STATS.directMemoryLive() >= charged
+        );
+
+        try (DirectIOVectorIndexInput next = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 0, 2)) {
+            // One allocation, no stats read, no reclaim() call: the drain has to happen inside it.
+            next.prefetch(HEADER_LENGTH, VECTOR_BYTES);
+            assertNotNull(next.stagingArena());
+            assertTrue(
+                "an allocation must drain the queue even with the budget off, live=" + DirectIOVectorIndexInput.STATS.directMemoryLive(),
+                DirectIOVectorIndexInput.STATS.directMemoryLive() < charged + (long) next.maxStagedRanges() * next.arenaSlotBytes()
+            );
+        }
+
+        assertTrue(
+            "live_bytes may never be reported above the wall",
+            DirectIOVectorIndexInput.STATS.directMemoryLive() <= KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES
+        );
+        assertTrue(
+            "nor may peak_bytes -- the node read 7.46 GB against a 2 GB wall",
+            DirectIOVectorIndexInput.STATS.directMemoryPeak() <= KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES
+        );
+        assertEquals("and 0b must still decline nothing", 0L, DirectIOVectorIndexInput.STATS.declinedBudget());
     }
 
 }

@@ -121,7 +121,17 @@ public class KNNStats {
      *       necessary. {@code wall_bytes} is the JVM-wide direct-memory wall the budget was derived from —
      *       the operator's explicit {@code -XX:MaxDirectMemorySize} when they pinned one, else
      *       {@code heapSize / 2} — reported beside {@code budget_bytes} so that "is this ceiling actually
-     *       below the wall" is one GET rather than an SSH to read the command line.</li>
+     *       below the wall" is one GET rather than an SSH to read the command line. Neither
+     *       {@code live_bytes} nor {@code peak_bytes} is ever reported above {@code wall_bytes}: the node
+     *       read a {@code peak_bytes} of 7.46 GB against a 2 GB wall before D3c, which was arithmetic rather
+     *       than memory.
+     *       <p>{@code arenas_allocated} / {@code arenas_reused} / {@code arenas_retired} are the lease
+     *       model's own numbers (D3c). A healthy node allocates one arena per reader thread and reuses it
+     *       for every burst after, so {@code arenas_reused} should be orders of magnitude above
+     *       {@code arenas_allocated} and {@code arenas_retired} should stay flat — it moves only when a
+     *       staged read would not quiesce (watch {@code staged_wait_timeouts} with it) or when the burst
+     *       geometry changed. {@code foreign_thread_reads} is ~0 unless some caller prefetches an input on
+     *       one thread and reads it on another, which costs that read its read-ahead and nothing else.</li>
      *   <li><b>cache</b> — the node-wide vector cache, {@code 0} throughout while
      *       {@code knn.direct_io.rescore.cache.max_bytes} is at its default of {@code 0b}.
      *       {@code hits / (hits + misses)} is the hit rate and is directly comparable with the 40.3%
@@ -179,6 +189,10 @@ public class KNNStats {
         memory.put("declined_budget", stats.declinedBudget());
         memory.put("budget_bytes", KNNSettings.getDirectIODirectMemoryBudget().getBytes());
         memory.put("wall_bytes", KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES);
+        memory.put("arenas_allocated", stats.arenasAllocated());
+        memory.put("arenas_reused", stats.arenasReused());
+        memory.put("arenas_retired", stats.arenasRetired());
+        memory.put("foreign_thread_reads", stats.foreignThreadReads());
 
         final Map<String, Object> cache = new HashMap<>();
         cache.put("hits", DirectIOVectorCache.hits());
