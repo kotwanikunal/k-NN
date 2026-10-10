@@ -81,6 +81,21 @@ public class NativeMemoryCacheManager implements Closeable {
     /** Bytes of vector cache slab granted, in KB. Not part of {@link #cacheSizeInKb}; see the javadoc. */
     private final AtomicLong slabSizeInKb = new AtomicLong();
 
+    /**
+     * Non-slab bytes that are in flight, in KB: an entry that has been sized and is being loaded but has not
+     * landed in {@link #cacheSizeInKb} yet.
+     *
+     * <p>Without it the two counters disagree for the length of a graph load, and the vector cache is the
+     * party that reads them. {@link #cacheSizeInKb} rises only when a load completes, so a prefetch burst
+     * that recomputes the cache's target while a graph is loading would see the room that load is about to
+     * take as free, grant slabs into it, and leave graphs plus slabs over the limit once the load lands. A
+     * reservation is taken before {@link #makeRoomForNonSlab} and released when the load lands or fails, so
+     * the figure {@link #applyVectorCacheTarget} and {@code ManagedSlabSource#acquire} work from is never
+     * lower than what k-NN is committed to. It double counts for the instant between the load landing and
+     * the reservation being dropped, which is the safe direction.
+     */
+    private final AtomicLong reservedNonSlabKb = new AtomicLong();
+
     /** The slabs this manager has granted, by address, so that it can free them when it is closed. */
     private final ConcurrentHashMap<Long, NativeMemoryAllocation.VectorCacheSlabAllocation> grantedSlabs = new ConcurrentHashMap<>();
 
@@ -362,6 +377,19 @@ public class NativeMemoryCacheManager implements Closeable {
         return grantedSlabs.size();
     }
 
+    /** Non-slab bytes in flight right now, in KB. See {@link #reservedNonSlabKb}. */
+    public long getReservedNonSlabSizeInKilobytes() {
+        return reservedNonSlabKb.get();
+    }
+
+    /**
+     * Everything that is not a slab and is already k-NN's: cache entries plus the loads in flight. This is
+     * the figure the vector cache's budget is subtracted from.
+     */
+    private long nonSlabSizeInKilobytes() {
+        return cacheSizeInKb.get() + reservedNonSlabKb.get();
+    }
+
     /**
      * Sets the vector cache's target to {@code min(knn.direct_io.rescore.cache.max_bytes, the native budget
      * minus everything that is not a slab)} and resizes it to match.
@@ -376,20 +404,21 @@ public class NativeMemoryCacheManager implements Closeable {
      * same choice {@code DirectIOVectorCache#applyConfiguredSize} makes for the same reason.
      */
     public void updateVectorCacheTarget() {
-        applyVectorCacheTarget(cacheSizeInKb.get());
+        applyVectorCacheTarget(nonSlabSizeInKilobytes());
     }
 
     /**
-     * Shrinks the vector cache so that {@code neededKb} of non-slab allocation will fit beside what is
-     * already there, and returns whether it had to.
+     * Shrinks the vector cache so that the non-slab allocation k-NN is committed to, including the loads in
+     * flight, fits beside the slabs, and returns whether it had to.
      *
      * <p>This is rule two of the four the design note asks for: when a graph needs room, vector cache slabs
      * go first and graphs are evicted only if that is not enough. It runs before every path in {@link #get}
-     * that could evict or refuse, so by the time Guava weighs the cache or the force-evict loop walks the
-     * recency queue, the slabs have already been handed back.
+     * that could evict or refuse, and after the caller has reserved the entry it is about to load, so by the
+     * time Guava weighs the cache or the force-evict loop walks the recency queue the slabs have already been
+     * handed back.
      */
-    private boolean makeRoomForNonSlab(final long neededKb) {
-        final long nonSlab = cacheSizeInKb.get() + neededKb;
+    private boolean makeRoomForNonSlab() {
+        final long nonSlab = nonSlabSizeInKilobytes();
         if (slabSizeInKb.get() == 0 || nonSlab + slabSizeInKb.get() <= maxWeight) {
             return false;
         }
@@ -433,7 +462,7 @@ public class NativeMemoryCacheManager implements Closeable {
             final long kb = bytes / 1024L;
             while (true) {
                 final long granted = slabSizeInKb.get();
-                if (cacheSizeInKb.get() + granted + kb > maxWeight) {
+                if (nonSlabSizeInKilobytes() + granted + kb > maxWeight) {
                     // The budget moved under the cache's target, which a concurrent graph load can do.
                     // Declining is the whole protocol: the cache keeps what it has and fills no further.
                     return null;
@@ -557,19 +586,48 @@ public class NativeMemoryCacheManager implements Closeable {
      */
     public NativeMemoryAllocation get(NativeMemoryEntryContext<?> nativeMemoryEntryContext, boolean isAbleToTriggerEviction)
         throws ExecutionException {
-        // Vector cache slabs go back before anything else is weighed, evicted or refused, so that a graph
-        // never loses its place to a cache of full-precision vectors. Rule two of the design note's four.
-        // Nothing below has to account for the slabs that remain: after this returns they fit in whatever
-        // the limit has left once this entry is in, which is what the target it sets means.
-        makeRoomForNonSlab(nativeMemoryEntryContext.calculateSizeInKB());
+        // An entry that is already cached needs no room and no size: its bytes are in cacheSizeInKb, so
+        // asking for room for it would count it twice, and with the vector cache at its budget-bound target
+        // that is a graph's worth of slabs released on every query against a field whose graphs live here.
+        // Not sizing it also saves the directory.fileLength that an index allocation's calculateSizeInKB is.
+        final boolean alreadyCached = cache.asMap().containsKey(nativeMemoryEntryContext.getKey());
+        final long neededKb = alreadyCached ? 0L : nativeMemoryEntryContext.calculateSizeInKB();
+        if (alreadyCached == false) {
+            // The reservation makes this load visible to the vector cache for as long as it takes, and it
+            // comes first so that the room is already spoken for by the time the target is recomputed.
+            reservedNonSlabKb.addAndGet(neededKb);
+            // Vector cache slabs go back before anything else is weighed, evicted or refused, so that a
+            // graph never loses its place to a cache of full-precision vectors. Rule two of the four.
+            // Nothing below has to account for the slabs that remain: after this returns they fit in
+            // whatever the limit has left once this entry is in, which is what the target it sets means.
+            makeRoomForNonSlab();
+        }
+        try {
+            return getAfterMakingRoom(nativeMemoryEntryContext, isAbleToTriggerEviction, alreadyCached, neededKb);
+        } finally {
+            if (alreadyCached == false) {
+                reservedNonSlabKb.addAndGet(-neededKb);
+            }
+        }
+    }
 
-        if (!isAbleToTriggerEviction
-            && (maxWeight - getCacheSizeInKilobytes() - nativeMemoryEntryContext.calculateSizeInKB()) <= 0
-            && !cache.asMap().containsKey(nativeMemoryEntryContext.getKey())) {
+    /**
+     * {@link #get}'s body, once the slabs have yielded and the load has been reserved.
+     *
+     * @param alreadyCached whether the entry was in the cache before the reservation was taken
+     * @param neededKb the entry's size, or zero if it was already cached and so was never sized
+     */
+    private NativeMemoryAllocation getAfterMakingRoom(
+        NativeMemoryEntryContext<?> nativeMemoryEntryContext,
+        boolean isAbleToTriggerEviction,
+        boolean alreadyCached,
+        long neededKb
+    ) throws ExecutionException {
+        if (!isAbleToTriggerEviction && !alreadyCached && (maxWeight - getCacheSizeInKilobytes() - neededKb) <= 0) {
             throw new OutOfNativeMemoryException(
                 "Entry cannot be loaded into cache because it would not fit. "
                     + "Entry size: "
-                    + nativeMemoryEntryContext.calculateSizeInKB()
+                    + neededKb
                     + " KB "
                     + "Current Cache Size: "
                     + getCacheSizeInKilobytes()
@@ -607,10 +665,12 @@ public class NativeMemoryCacheManager implements Closeable {
                 if (result != null) {
                     return result;
                 }
-                if (getCacheSizeInKilobytes() + nativeMemoryEntryContext.calculateSizeInKB() >= maxWeight) {
+                // Sized once above, unless the entry was cached when this get started and has been evicted
+                // since, which is a race this loop would otherwise under-evict for.
+                final long sizeKb = alreadyCached ? nativeMemoryEntryContext.calculateSizeInKB() : neededKb;
+                if (getCacheSizeInKilobytes() + sizeKb >= maxWeight) {
                     Iterator<String> lruIterator = accessRecencyQueue.iterator();
-                    while (lruIterator.hasNext()
-                        && (getCacheSizeInKilobytes() + nativeMemoryEntryContext.calculateSizeInKB() >= maxWeight)) {
+                    while (lruIterator.hasNext() && (getCacheSizeInKilobytes() + sizeKb >= maxWeight)) {
 
                         String keyToRemove = lruIterator.next();
                         NativeMemoryAllocation allocationToRemove = cache.getIfPresent(keyToRemove);

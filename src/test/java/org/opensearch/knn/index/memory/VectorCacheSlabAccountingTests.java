@@ -25,7 +25,10 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import static org.mockito.Mockito.mock;
@@ -280,6 +283,99 @@ public class VectorCacheSlabAccountingTests extends OpenSearchSingleNodeTestCase
     }
 
     // ---------------------------------------------------------------------------------------------------
+    // A hit costs nothing: it is neither sized nor given room
+    // ---------------------------------------------------------------------------------------------------
+
+    /**
+     * A get of an entry that is already in the cache must not ask the slabs for room, because its bytes are
+     * in {@code cacheSizeInKb} already and asking would count them twice. With the cache at its budget-bound
+     * target, which is D2's steady state, that double count is a graph's worth of slabs released on every
+     * query against a field whose graphs live in this manager.
+     */
+    public void testGettingACachedGraphReleasesNoSlabAndSizesNothing() throws ExecutionException {
+        final SlabVectorCache cache = manager.getVectorCache();
+        final long limit = manager.getMaxCacheSizeInKilobytes();
+        setConfiguredCacheSize(limit + "kb");
+
+        // One graph of a slab's worth, and then the cache takes the rest of the budget.
+        final CountingEntryContext graph = new CountingEntryContext("graph-hot", (int) SLAB_KB);
+        manager.get(graph, true);
+        manager.updateVectorCacheTarget();
+        fillSlabs(cache, (int) (limit / SLAB_KB));
+        final int slabsBefore = manager.getVectorCacheSlabCount();
+        final long entriesBefore = cache.entries();
+        assertTrue("the cache should hold the leftover budget, it holds " + slabsBefore + " slabs", slabsBefore > 0);
+        assertEquals("the budget should be full", limit, manager.getTotalNativeMemoryInKilobytes());
+
+        graph.sizeCalls.set(0);
+        for (int i = 0; i < 1000; i++) {
+            assertNotNull(manager.get(graph, true));
+        }
+
+        assertEquals("a cached graph must not be sized at all", 0, graph.sizeCalls.get());
+        assertEquals("a cached graph must release no slab", slabsBefore, manager.getVectorCacheSlabCount());
+        assertEquals("and so must drop no vector", entriesBefore, cache.entries());
+        assertEquals("nothing is in flight", 0L, manager.getReservedNonSlabSizeInKilobytes());
+        assertEquals(SLAB_KB, manager.getCacheSizeInKilobytes());
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // In-flight loads: counted before they land
+    // ---------------------------------------------------------------------------------------------------
+
+    /**
+     * {@code cacheSizeInKb} rises only when a load completes, so a prefetch burst that recomputes the
+     * cache's target while a graph is loading would otherwise see the room that load is about to take as
+     * free. Graphs plus slabs plus the loads in flight have to stay inside the limit at every step.
+     */
+    public void testAnInFlightGraphLoadIsCountedBeforeItLands() throws Exception {
+        final SlabVectorCache cache = manager.getVectorCache();
+        final long limit = manager.getMaxCacheSizeInKilobytes();
+        setConfiguredCacheSize(limit + "kb");
+        final int affordable = (int) (limit / SLAB_KB);
+        assertTrue("this test needs a limit of at least four slabs, got " + limit + " KB", affordable >= 4);
+
+        final CountDownLatch inLoad = new CountDownLatch(1);
+        final CountDownLatch finishLoad = new CountDownLatch(1);
+        final BlockingEntryContext slow = new BlockingEntryContext("graph-slow", (int) (3 * SLAB_KB), inLoad, finishLoad);
+        final Thread loader = new Thread(() -> {
+            try {
+                manager.get(slow, true);
+            } catch (ExecutionException e) {
+                throw new AssertionError(e);
+            }
+        }, "slow-graph-load");
+        loader.start();
+        try {
+            assertTrue("the load never started", inLoad.await(30, TimeUnit.SECONDS));
+            assertEquals("the load must be reserved while it runs", 3 * SLAB_KB, manager.getReservedNonSlabSizeInKilobytes());
+
+            // Five prefetch bursts' worth of target refresh and fill, against a load that has not landed.
+            for (int round = 0; round < 5; round++) {
+                manager.updateVectorCacheTarget();
+                fillSlabs(cache, affordable);
+                assertWithinLimit("during round " + round, limit);
+            }
+            assertEquals("the cache may only have the slab the load does not need", 1, manager.getVectorCacheSlabCount());
+        } finally {
+            finishLoad.countDown();
+            loader.join(TimeUnit.SECONDS.toMillis(30));
+        }
+        assertFalse("the load did not finish", loader.isAlive());
+
+        assertEquals("the reservation is released when the load lands", 0L, manager.getReservedNonSlabSizeInKilobytes());
+        assertEquals("and the graph is accounted instead", 3 * SLAB_KB, manager.getCacheSizeInKilobytes());
+        assertWithinLimit("after the load landed", limit);
+        cache.checkInvariantsForTesting();
+    }
+
+    private void assertWithinLimit(final String when, final long limit) {
+        final long held = manager.getCacheSizeInKilobytes() + manager.getVectorCacheSlabSizeInKilobytes() + manager
+            .getReservedNonSlabSizeInKilobytes();
+        assertTrue("graphs + slabs + reservations must stay inside the limit " + when + ", got " + held + " of " + limit, held <= limit);
+    }
+
+    // ---------------------------------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------------------------------
 
@@ -355,6 +451,67 @@ public class VectorCacheSlabAccountingTests extends OpenSearchSingleNodeTestCase
 
         @Override
         public SizedAllocation load() throws IOException {
+            return new SizedAllocation(sizeKb);
+        }
+    }
+
+    /** A graph that counts how often the manager sizes it. Sizing an index allocation is a file length. */
+    private static final class CountingEntryContext extends NativeMemoryEntryContext<SizedAllocation> {
+        private final int sizeKb;
+        private final AtomicInteger sizeCalls = new AtomicInteger();
+
+        private CountingEntryContext(final String key, final int sizeKb) {
+            super(key);
+            this.sizeKb = sizeKb;
+        }
+
+        @Override
+        public Integer calculateSizeInKB() {
+            sizeCalls.incrementAndGet();
+            return sizeKb;
+        }
+
+        @Override
+        public void open() {}
+
+        @Override
+        public SizedAllocation load() throws IOException {
+            return new SizedAllocation(sizeKb);
+        }
+    }
+
+    /** A graph whose load stops half way through, so that a test can act while it is in flight. */
+    private static final class BlockingEntryContext extends NativeMemoryEntryContext<SizedAllocation> {
+        private final int sizeKb;
+        private final CountDownLatch inLoad;
+        private final CountDownLatch finishLoad;
+
+        private BlockingEntryContext(final String key, final int sizeKb, final CountDownLatch inLoad, final CountDownLatch finishLoad) {
+            super(key);
+            this.sizeKb = sizeKb;
+            this.inLoad = inLoad;
+            this.finishLoad = finishLoad;
+        }
+
+        @Override
+        public Integer calculateSizeInKB() {
+            return sizeKb;
+        }
+
+        @Override
+        public void open() {}
+
+        @Override
+        public SizedAllocation load() throws IOException {
+            inLoad.countDown();
+            try {
+                if (finishLoad.await(30, TimeUnit.SECONDS) == false) {
+                    throw new IOException("the test never released the load");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException(e);
+            }
             return new SizedAllocation(sizeKb);
         }
     }
