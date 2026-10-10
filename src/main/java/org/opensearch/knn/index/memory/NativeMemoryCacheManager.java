@@ -45,6 +45,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.LongSupplier;
 
 /**
  * Manages native memory allocations made by JNI.
@@ -666,7 +667,8 @@ public class NativeMemoryCacheManager implements Closeable {
                     return result;
                 }
                 // Sized once above, unless the entry was cached when this get started and has been evicted
-                // since, which is a race this loop would otherwise under-evict for.
+                // since, which is a race this loop would otherwise under-evict for. The same race is why
+                // the load below reserves for itself when this get did not.
                 final long sizeKb = alreadyCached ? nativeMemoryEntryContext.calculateSizeInKB() : neededKb;
                 if (getCacheSizeInKilobytes() + sizeKb >= maxWeight) {
                     Iterator<String> lruIterator = accessRecencyQueue.iterator();
@@ -682,7 +684,7 @@ public class NativeMemoryCacheManager implements Closeable {
                     }
                 }
 
-                result = loadIntoCache(key, nativeMemoryEntryContext::load);
+                result = loadIntoCache(key, alreadyCached ? () -> sizeKb : null, nativeMemoryEntryContext::load);
                 accessRecencyQueue.addLast(key);
 
                 return result;
@@ -693,7 +695,7 @@ public class NativeMemoryCacheManager implements Closeable {
                 // if we already have the allocation we should not open file again as this will cause slowdown in
                 // heavy throughput cases, since open() function do locking while opening and mapping the graph file to
                 // memory.
-                return loadIntoCache(key, () -> {
+                return loadIntoCache(key, alreadyCached ? nativeMemoryEntryContext::calculateSizeInKB : null, () -> {
                     // open graphFile before load
                     open(key, nativeMemoryEntryContext);
                     return nativeMemoryEntryContext.load();
@@ -703,23 +705,56 @@ public class NativeMemoryCacheManager implements Closeable {
     }
 
     /**
-     * {@code cache.get(key, loader)}, plus the running size counter.
+     * {@code cache.get(key, loader)}, plus the running size counter and, when {@link #get} did not take
+     * one, the reservation for the load this call is about to make.
      *
      * <p>The counter is adjusted only when the loader actually ran, so a hit on an entry another thread
      * loaded does not count twice. {@link #onRemoval} is the other side of it.
+     *
+     * <p>THE RESERVATION. {@link #get} decides whether an entry is cached, and reserves and makes room
+     * only when it is not, before it calls Guava. An entry that was cached at that moment can be evicted
+     * before Guava is asked for it, and then the loader below is a real load that nothing reserved and
+     * that no slab made room for: graphs plus slabs can end a graph's worth over the limit until the next
+     * miss puts them back. So when the caller reserved nothing, the loader reserves for itself, and it is
+     * the right place because Guava runs it exactly once per real load, under the per-key lock, which is
+     * the one point in this class that knows a load is actually happening.
+     *
+     * <p>{@code reloadSizeInKb} is a supplier rather than a size because it must not be called on the path
+     * where the entry really is cached: sizing an index allocation is a {@code directory.fileLength}, and
+     * keeping it off every hit is the reason {@link #get} does not size a cached entry at all.
+     *
+     * @param reloadSizeInKb the entry's size, consulted only if the loader runs, or null when the caller
+     *                       has already reserved this load
      */
-    private NativeMemoryAllocation loadIntoCache(final String key, final Callable<NativeMemoryAllocation> loader)
-        throws ExecutionException {
+    private NativeMemoryAllocation loadIntoCache(
+        final String key,
+        final LongSupplier reloadSizeInKb,
+        final Callable<NativeMemoryAllocation> loader
+    ) throws ExecutionException {
         final boolean[] loaded = new boolean[1];
-        final NativeMemoryAllocation allocation = cache.get(key, () -> {
-            final NativeMemoryAllocation value = loader.call();
-            loaded[0] = true;
-            return value;
-        });
-        if (loaded[0]) {
-            cacheSizeInKb.addAndGet(allocation.getSizeInKB());
+        final long[] reserved = new long[1];
+        try {
+            final NativeMemoryAllocation allocation = cache.get(key, () -> {
+                if (reloadSizeInKb != null) {
+                    reserved[0] = reloadSizeInKb.getAsLong();
+                    reservedNonSlabKb.addAndGet(reserved[0]);
+                    makeRoomForNonSlab();
+                }
+                final NativeMemoryAllocation value = loader.call();
+                loaded[0] = true;
+                return value;
+            });
+            if (loaded[0]) {
+                cacheSizeInKb.addAndGet(allocation.getSizeInKB());
+            }
+            return allocation;
+        } finally {
+            // After the counter, never before: a reservation dropped first would leave the bytes counted
+            // nowhere for the instant in between, which is the direction that over-grants.
+            if (reserved[0] != 0) {
+                reservedNonSlabKb.addAndGet(-reserved[0]);
+            }
         }
-        return allocation;
     }
 
     /**

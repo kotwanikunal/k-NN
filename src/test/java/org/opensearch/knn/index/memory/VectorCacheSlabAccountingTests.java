@@ -28,6 +28,7 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
@@ -419,6 +420,71 @@ public class VectorCacheSlabAccountingTests extends OpenSearchSingleNodeTestCase
         cache.checkInvariantsForTesting();
     }
 
+    /**
+     * The other half of the same race, and the half {@code get} cannot see. {@code get} decides whether the
+     * entry is cached and reserves only when it is not; if the entry is evicted between that decision and
+     * Guava being asked for it, the load that follows is a real load with no reservation behind it and no
+     * slab asked to yield. The reservation therefore has to be taken inside the loader as well, which is
+     * the one place that knows a load is really happening.
+     *
+     * <p>The eviction is forced on the second call to {@code getKey()}, which is after the cached check and
+     * before the Guava get in both of {@code get}'s branches, so the window is hit deterministically rather
+     * than raced for.
+     */
+    public void testAReloadBetweenTheCheckAndTheLoadIsStillReserved() throws Exception {
+        final SlabVectorCache cache = manager.getVectorCache();
+        final long limit = manager.getMaxCacheSizeInKilobytes();
+        setConfiguredCacheSize(limit + "kb");
+        final int affordable = (int) (limit / SLAB_KB);
+        assertTrue("this test needs a limit of at least four slabs, got " + limit + " KB", affordable >= 4);
+
+        // Three slabs' worth of graph, and the cache takes the one slab that is left.
+        manager.get(new SizedEntryContext("graph-reload", (int) (3 * SLAB_KB)), true);
+        manager.updateVectorCacheTarget();
+        fillSlabs(cache, affordable);
+        assertEquals("the cache may only have the slab the graph does not need", 1, manager.getVectorCacheSlabCount());
+        assertWithinLimit("before the reload", limit);
+
+        final CountDownLatch inLoad = new CountDownLatch(1);
+        final CountDownLatch finishLoad = new CountDownLatch(1);
+        final EvictingBlockingEntryContext reload = new EvictingBlockingEntryContext(
+            "graph-reload",
+            (int) (3 * SLAB_KB),
+            () -> manager.invalidate("graph-reload"),
+            inLoad,
+            finishLoad
+        );
+        final Thread loader = new Thread(() -> {
+            try {
+                manager.get(reload, true);
+            } catch (ExecutionException e) {
+                throw new AssertionError(e);
+            }
+        }, "reloaded-graph-load");
+        loader.start();
+        try {
+            assertTrue("the reload never started", inLoad.await(30, TimeUnit.SECONDS));
+            assertTrue("the entry must have been evicted inside the window", reload.evicted.get());
+            assertEquals("the reload must be reserved while it runs", 3 * SLAB_KB, manager.getReservedNonSlabSizeInKilobytes());
+
+            for (int round = 0; round < 5; round++) {
+                manager.updateVectorCacheTarget();
+                fillSlabs(cache, affordable);
+                assertWithinLimit("during round " + round + " of the reload", limit);
+            }
+            assertEquals("the cache may still only have one slab", 1, manager.getVectorCacheSlabCount());
+        } finally {
+            finishLoad.countDown();
+            loader.join(TimeUnit.SECONDS.toMillis(30));
+        }
+        assertFalse("the reload did not finish", loader.isAlive());
+
+        assertEquals("the reservation is released when the reload lands", 0L, manager.getReservedNonSlabSizeInKilobytes());
+        assertEquals("and the graph is accounted instead", 3 * SLAB_KB, manager.getCacheSizeInKilobytes());
+        assertWithinLimit("after the reload landed", limit);
+        cache.checkInvariantsForTesting();
+    }
+
     private void assertWithinLimit(final String when, final long limit) {
         final long held = manager.getCacheSizeInKilobytes() + manager.getVectorCacheSlabSizeInKilobytes() + manager
             .getReservedNonSlabSizeInKilobytes();
@@ -526,6 +592,64 @@ public class VectorCacheSlabAccountingTests extends OpenSearchSingleNodeTestCase
 
         @Override
         public SizedAllocation load() throws IOException {
+            return new SizedAllocation(sizeKb);
+        }
+    }
+
+    /**
+     * A graph that is evicted out from under the get that asked for it, and whose reload then stops half
+     * way through. The eviction runs on the SECOND call to {@code getKey()}: the first is the cached check
+     * at the top of {@code get}, and the second is the one just before Guava is asked, in either branch.
+     */
+    private static final class EvictingBlockingEntryContext extends NativeMemoryEntryContext<SizedAllocation> {
+        private final int sizeKb;
+        private final Runnable evict;
+        private final CountDownLatch inLoad;
+        private final CountDownLatch finishLoad;
+        private final AtomicInteger keyCalls = new AtomicInteger();
+        private final AtomicBoolean evicted = new AtomicBoolean();
+
+        private EvictingBlockingEntryContext(
+            final String key,
+            final int sizeKb,
+            final Runnable evict,
+            final CountDownLatch inLoad,
+            final CountDownLatch finishLoad
+        ) {
+            super(key);
+            this.sizeKb = sizeKb;
+            this.evict = evict;
+            this.inLoad = inLoad;
+            this.finishLoad = finishLoad;
+        }
+
+        @Override
+        public String getKey() {
+            if (keyCalls.incrementAndGet() == 2 && evicted.compareAndSet(false, true)) {
+                evict.run();
+            }
+            return super.getKey();
+        }
+
+        @Override
+        public Integer calculateSizeInKB() {
+            return sizeKb;
+        }
+
+        @Override
+        public void open() {}
+
+        @Override
+        public SizedAllocation load() throws IOException {
+            inLoad.countDown();
+            try {
+                if (finishLoad.await(30, TimeUnit.SECONDS) == false) {
+                    throw new IOException("the test never released the reload");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException(e);
+            }
             return new SizedAllocation(sizeKb);
         }
     }
