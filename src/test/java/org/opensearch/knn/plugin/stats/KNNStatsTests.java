@@ -106,7 +106,23 @@ public class KNNStatsTests extends KNNTestCase {
                 directIO.get("memory").containsKey(required)
             );
         }
-        assertEquals(Set.of("hits", "misses", "evictions", "bytes", "entries", "max_bytes"), directIO.get("cache").keySet());
+        // The first six are the keys the node harness reads and their names and meanings are fixed; from I4
+        // they are the slab cache's rather than the Guava cache's. The last four are the slab mechanism.
+        assertEquals(
+            Set.of(
+                "hits",
+                "misses",
+                "evictions",
+                "bytes",
+                "entries",
+                "max_bytes",
+                "slabs",
+                "slab_bytes",
+                "reclaimed_slabs",
+                "readmissions"
+            ),
+            directIO.get("cache").keySet()
+        );
         // The cache is off by default, so every one of its counters must read zero on a node that has not
         // set knn.direct_io.rescore.cache.max_bytes -- which is what makes "off" distinguishable from
         // "on and missing".

@@ -11,7 +11,8 @@ import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManager;
-import org.opensearch.knn.index.store.DirectIOVectorCache;
+import org.opensearch.knn.index.memory.SlabVectorCache;
+import org.opensearch.knn.index.memory.VectorCacheScope;
 import org.opensearch.knn.index.store.DirectIOVectorIndexInput;
 import org.opensearch.knn.indices.ModelCache;
 import org.opensearch.knn.indices.ModelDao;
@@ -134,11 +135,16 @@ public class KNNStats {
      *       one thread and reads it on another, which costs that read its read-ahead and nothing else.</li>
      *   <li><b>cache</b> — the node-wide vector cache, {@code 0} throughout while
      *       {@code knn.direct_io.rescore.cache.max_bytes} is at its default of {@code 0b}.
-     *       {@code hits / (hits + misses)} is the hit rate and is directly comparable with the 40.3%
-     *       measured at 16 MB on 10M vectors; the absolute counts are <b>twice</b> the vectors served,
-     *       because a vector is looked up once in {@code prefetch} (where a hit saves the device read) and
-     *       once in {@code readFloats} (where a hit serves the bytes). See
-     *       {@link DirectIOVectorCache#lookupsPerVector()}.</li>
+     *       {@code hits / (hits + misses)} is the hit rate, and from I4 it is <b>one lookup per vector</b>
+     *       rather than the two phase 15 made ({@code prefetch} and then {@code readFloats}), because the
+     *       lookup moved up into the scorer: a candidate is looked up once, and only the misses are
+     *       prefetched and read. Compare the rate with the 40.3% measured at 16 MB on 10M vectors, but not
+     *       the absolute counts.
+     *       <p>{@code slabs} and {@code slab_bytes} are the off-heap memory the cache holds under the k-NN
+     *       native budget, {@code reclaimed_slabs} is how many times the FIFO took a slab back to make
+     *       room, and {@code readmissions} is how many vectors a second chance kept when their slab was
+     *       reclaimed. A {@code readmissions} close to half of {@code entries} per reclaim means the
+     *       working set fits; close to zero means the cache is being scanned.</li>
      * </ul>
      *
      * <p>Node level rather than cluster level, and cumulative since node start, because every counter is a
@@ -194,13 +200,23 @@ public class KNNStats {
         memory.put("arenas_retired", stats.arenasRetired());
         memory.put("foreign_thread_reads", stats.foreignThreadReads());
 
+        // The six keys the node harness reads keep their names and their meanings, but from I4 they are the
+        // slab cache's rather than the Guava cache's: the lookup moved into the scorer, so the Guava cache
+        // is no longer on any read path. "evictions" is still vectors that left the cache without being
+        // asked for again, which for a slab cache is the entries a reclaim dropped. The four keys after
+        // them are the slab mechanism, which has no counterpart in the old cache.
         final Map<String, Object> cache = new HashMap<>();
-        cache.put("hits", DirectIOVectorCache.hits());
-        cache.put("misses", DirectIOVectorCache.misses());
-        cache.put("evictions", DirectIOVectorCache.evictions());
-        cache.put("bytes", DirectIOVectorCache.bytes());
-        cache.put("entries", DirectIOVectorCache.entries());
-        cache.put("max_bytes", DirectIOVectorCache.maxBytes());
+        final SlabVectorCache vectorCache = VectorCacheScope.nodeCache();
+        cache.put("hits", vectorCache == null ? 0L : vectorCache.hits());
+        cache.put("misses", vectorCache == null ? 0L : vectorCache.misses());
+        cache.put("evictions", vectorCache == null ? 0L : vectorCache.droppedEntries());
+        cache.put("bytes", vectorCache == null ? 0L : vectorCache.bytes());
+        cache.put("entries", vectorCache == null ? 0L : vectorCache.entries());
+        cache.put("max_bytes", vectorCache == null ? 0L : vectorCache.maxBytes());
+        cache.put("slabs", vectorCache == null ? 0L : (long) vectorCache.slabCount());
+        cache.put("slab_bytes", vectorCache == null ? 0L : vectorCache.slabBytes());
+        cache.put("reclaimed_slabs", vectorCache == null ? 0L : vectorCache.reclaimedSlabs());
+        cache.put("readmissions", vectorCache == null ? 0L : vectorCache.readmissions());
 
         final Map<String, Map<String, Object>> directIOStats = new HashMap<>();
         directIOStats.put("dispatch", dispatch);

@@ -400,6 +400,13 @@ public class NativeMemoryCacheManager implements Closeable {
     private void applyVectorCacheTarget(final long nonSlabKb) {
         final long configuredBytes;
         try {
+            if (KNNSettings.isDirectIORescoreEnabled() == false) {
+                // D2: the cache is the Direct I/O read path's cache, so turning that path off empties it and
+                // returns every slab. There is no automatic switching in either direction; this is the
+                // operator's lever and it is the same one.
+                vectorCache.configure(0L);
+                return;
+            }
             final org.opensearch.core.common.unit.ByteSizeValue configured = KNNSettings.getDirectIORescoreCacheMaxBytes();
             configuredBytes = configured == null ? 0L : configured.getBytes();
         } catch (RuntimeException e) {

@@ -10,6 +10,7 @@ import lombok.Builder;
 import lombok.Value;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.index.VectorSimilarityFunction;
@@ -28,6 +29,7 @@ import org.opensearch.common.lucene.Lucene;
 import org.opensearch.knn.common.FieldInfoExtractor;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
+import org.opensearch.knn.index.memory.VectorCacheScope;
 import org.opensearch.knn.index.query.SegmentLevelQuantizationInfo;
 import org.opensearch.knn.index.query.SegmentLevelQuantizationUtil;
 import org.opensearch.knn.index.engine.KNNEngine;
@@ -310,6 +312,28 @@ public class ExactSearcher {
      * @throws IOException if an I/O error occurs while reading vector values or quantization metadata
      */
     private VectorScorer createVectorScorer(
+        final SegmentReader reader,
+        final FieldInfo fieldInfo,
+        final LeafReaderContext leafReaderContext,
+        final ExactSearcherContext context
+    ) throws IOException {
+        // The vector cache is keyed by (segment core identity, field, ordinal) and this is the only frame
+        // that has the first two: the scorer is built several frames down, inside Lucene, which has no
+        // parameter to carry them on. See VectorCacheScope for why the handoff looks like this.
+        final IndexReader.CacheHelper coreCache = reader.getCoreCacheHelper();
+        if (coreCache == null || coreCache.getKey() == null) {
+            return buildVectorScorer(reader, fieldInfo, leafReaderContext, context);
+        }
+        VectorCacheScope.registerRelease(coreCache);
+        VectorCacheScope.open(coreCache.getKey(), fieldInfo.number);
+        try {
+            return buildVectorScorer(reader, fieldInfo, leafReaderContext, context);
+        } finally {
+            VectorCacheScope.clear();
+        }
+    }
+
+    private VectorScorer buildVectorScorer(
         final SegmentReader reader,
         final FieldInfo fieldInfo,
         final LeafReaderContext leafReaderContext,

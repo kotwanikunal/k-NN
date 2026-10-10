@@ -50,15 +50,16 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * Evicting one vector at a time would need a recency structure per vector, which is the per-entry cost the
  * design note rejected. Instead the slabs form a FIFO queue and the oldest slab is the eviction unit. A
  * vector that has been read since it was written carries a hit flag, and when its slab comes up for eviction
- * it is re-admitted rather than dropped: the survivors are compacted to the front of the evicted slab, which
- * is then reopened for the same vector length and appended to behind them.
+ * it is re-admitted rather than dropped: the survivors <em>stay exactly where they are</em>, the slots of the
+ * vectors that were never read become free slots in that same slab, and the slab is reopened for the same
+ * vector length and appended to through its free list.
  *
- * <p>That the destination is the evicted slab itself is not a special case, it is nearly the only case, and
- * the reason is worth stating because it was not obvious. A fill asks for another slab exactly when the slab
- * it was appending to has filled up, so at the moment of an eviction "the current slab" has no room by
- * definition; the slab that <em>does</em> have room, once its cold half is dropped, is the one being evicted.
- * The one exception is an eviction that reopens a slab for a <em>different</em> vector length, where the old
- * length may still have a partly filled slab to copy the survivors into.
+ * <p>A free list per slab rather than a bump pointer alone is what makes that possible, and it is the one
+ * thing I4 changed about this policy. I2 compacted the survivors to the front of the slab so that appends
+ * could stay a bump pointer, and MEASURED that copy at 1.7 to 4.8 ms with the write lock held throughout,
+ * which is a stall of every search thread every few seconds. Nothing needed the survivors to be contiguous.
+ * Leaving them in place makes a reclaim a scan of the slot table with no byte copying and no index update
+ * for any survivor, since a survivor's {@code (slab, slot)} does not change.
  *
  * <p>Re-admission is capped at half a slab's slots, which is what makes an eviction always yield room and the
  * algorithm terminate in one step: a fully hot slab cannot re-admit itself whole and so cannot deadlock the
@@ -66,16 +67,28 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * There is no admission filter: scan resistance is undecided (agenda item 4) and exact search fills this
  * cache exactly as rescore does.
  *
+ * <p>A slab reopened for a <em>different</em> vector length is the one case with no second chance: its slot
+ * layout changes, so there is nowhere for a survivor to stay. Those entries are dropped. A copy into another
+ * slab of the old length would be the only alternative and it would put a copy back under the write lock,
+ * which is the thing this policy exists to avoid; the case needs two vector lengths competing for the same
+ * slabs, which is rare, and costs a refill rather than an answer.
+ *
  * <h2>One lock, and why the read path can still be concurrent</h2>
- * A reader must not be shown a slot while another thread is moving or overwriting it, and the index must not
- * be read half-rebuilt. Both are solved by one {@link ReentrantReadWriteLock} over the whole cache: a
- * lookup takes the read lock, and everything structural (insert, eviction, compaction, release, resize)
- * takes the write lock. Lookups therefore run concurrently with each other, which is what the hot path
- * needs, and never concurrently with a mutation, which is what lets the index be plain {@link HashMap}s and
- * {@link OrdinalSlotMap}s with no per-entry synchronisation at all. Inserts serialise against each other,
- * and that is affordable because an insert only ever follows a read miss, so its rate is bounded by the
- * device rather than by the CPU. It is also why this class does not take {@link VectorCacheSlab#readLock()}
- * on the read path: a slab is only ever closed under this cache's write lock, which a reader excludes.
+ * A reader must not be shown a slot while another thread is overwriting it, and the index must not be read
+ * half-rebuilt. Both are solved by one {@link ReentrantReadWriteLock} over the whole cache: a lookup takes
+ * the read lock, and everything structural (insert, eviction, release, resize) takes the write lock. Lookups
+ * therefore run concurrently with each other, which is what the hot path needs, and never concurrently with
+ * a mutation, which is what lets the index be plain {@link HashMap}s and {@link OrdinalSlotMap}s with no
+ * per-entry synchronisation at all. Inserts serialise against each other, and that is affordable because an
+ * insert only ever follows a read miss, so its rate is bounded by the device rather than by the CPU. It is
+ * also why this class does not take {@link VectorCacheSlab#readLock()} on the read path: a slab is only ever
+ * closed under this cache's write lock, which a reader excludes.
+ *
+ * <p>A lookup copies the vector out into the caller's array while it holds the read lock, and hands back no
+ * view of slab memory at all. That is what makes a use after free unreachable rather than merely unlikely:
+ * there is no buffer for a caller to stash and read after the lock is dropped, which is the one failure mode
+ * a JNI slab gives the JVM no way to reject. {@link #lookupBatch} is the form the scorer uses, and it takes
+ * the read lock once for a whole Lucene batch of 64 ordinals rather than once per vector.
  *
  * <h2>Off is off</h2>
  * With {@link #configure(long)} at zero there are no slabs, and {@link #get} and {@link #put} return on a
@@ -87,24 +100,26 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * <table>
  *   <caption>throughput and per-operation cost</caption>
  *   <tr><th></th><th>1 thread</th><th>8 threads</th></tr>
- *   <tr><td>lookups/s, every key cached</td><td>1,575,499</td><td><b>3,332,545</b></td></tr>
- *   <tr><td>per hit, p50 / p99</td><td>559 / 823 ns</td><td>2,162 / 4,581 ns</td></tr>
- *   <tr><td>operations/s, 76% of them fills</td><td>1,582,568</td><td>437,378</td></tr>
- *   <tr><td>index bytes per cached vector</td><td colspan="2">33.0 to 35.8 B, against the 200 B the Guava
+ *   <tr><td>lookups/s, {@link #lookupBatch}, every key cached</td><td>2,200,577</td>
+ *       <td><b>14,746,083</b></td></tr>
+ *   <tr><td>per hit, p50 / p99</td><td>436 / 538 ns</td><td>505 / 670 ns</td></tr>
+ *   <tr><td>lookups/s, one acquisition per vector (I2's form)</td><td>1,592,673</td><td>3,716,721</td></tr>
+ *   <tr><td>operations/s, 76% of them fills</td><td>1,901,863</td><td>445,671</td></tr>
+ *   <tr><td>write lock held per slab reclaim</td><td colspan="2">26,513 ns p50, 715,358 ns for the first
+ *       one in a JVM, where the path is still interpreted</td></tr>
+ *   <tr><td>index bytes per cached vector</td><td colspan="2">37.0 to 40.2 B, against the 200 B the Guava
  *       cache charged</td></tr>
  * </table>
  *
- * The read path scales to 2.1x on eight threads and the fill path does not scale at all, both for the same
- * reason: the lock is taken once per vector, and Lucene hands this cache 64 of them at a time. One
- * acquisition per batch is the fix and it belongs where the batch is, in the scorer (I4). It is affordable
- * to leave because a fill only ever follows a read miss, so a node's fill rate is its device's IOPS, around
- * 3,000/s on the pilot volume against the 190,000/s this measurement drives.
+ * The read path scales 4.0x off the per-vector form because of the batch acquisition alone. The fill path
+ * still takes the lock once per vector and does not scale, and that is left as it is: a fill only ever
+ * follows a read miss, so a node's fill rate is its device's IOPS, around 3,000/s on the pilot volume
+ * against the 190,000/s this measurement drives, and the scorer has one miss at a time to give it.
  *
  * <p>Against an exact LRU of the same byte budget on a trace fitted to the phase 15 reuse measurement, this
  * policy is within <b>0.2 points</b> of LRU's hit rate at 64, 128 and 256 MB, with the LRU charged nothing
- * for its own index. A slab reclaim costs 1.7 to 4.8 ms and holds the write lock throughout, which is the
- * copy of half a slab; at a device-bound fill rate that is one stall every few seconds. Both are written up
- * with the numbers in output/bench/i2/README-i2.md.
+ * for its own index. Written up with the numbers in output/bench/i2/README-i2.md and
+ * output/bench/i4/README-i4.md.
  */
 @Log4j2
 public final class SlabVectorCache {
@@ -152,12 +167,18 @@ public final class SlabVectorCache {
         private final VectorCacheSlab memory;
         private int slotBytes;
         private int slotCount;
-        /** Bump pointer: slots {@code [0, used)} have been written since the slab was opened. */
+        /** High-water mark: slots {@code [0, used)} have been written since the slab was opened. */
         private int used;
         private OrdinalSlotMap[] owner;
         private int[] ordinal;
         /** 1 once the slot has been read, which is what buys it a second chance. */
         private byte[] hit;
+        /**
+         * Slots below {@link #used} that a reclaim freed, so that a survivor can stay where it is instead of
+         * being copied to the front. {@code [0, freeCount)} is the live part of the stack.
+         */
+        private int[] free;
+        private int freeCount;
 
         private Slab(final int id, final VectorCacheSlab memory) {
             this.id = id;
@@ -171,16 +192,26 @@ public final class SlabVectorCache {
                 owner = new OrdinalSlotMap[count];
                 ordinal = new int[count];
                 hit = new byte[count];
+                free = new int[count];
             } else {
                 Arrays.fill(owner, null);
             }
             slotBytes = bytes;
             slotCount = count;
             used = 0;
+            freeCount = 0;
+        }
+
+        /** A slot to write a vector into, or {@code -1} when the slab is full. */
+        private int allocSlot() {
+            if (freeCount > 0) {
+                return free[--freeCount];
+            }
+            return used < slotCount ? used++ : -1;
         }
 
         private int freeSlots() {
-            return slotCount - used;
+            return freeCount + (slotCount - used);
         }
     }
 
@@ -214,9 +245,8 @@ public final class SlabVectorCache {
     private final LongAdder reclaimedSlabs = new LongAdder();
     private final LongAdder readmissions = new LongAdder();
     private final LongAdder droppedEntries = new LongAdder();
-
-    /** Scratch for an in-place compaction move, which must not read and write one slot at a time. */
-    private byte[] moveBuffer = new byte[0];
+    /** Write-lock time spent reclaiming slabs, which is the figure I4 had to bring down. */
+    private final LongAdder reclaimNanos = new LongAdder();
 
     /**
      * @param source where slabs come from and go back to
@@ -252,37 +282,127 @@ public final class SlabVectorCache {
         lock.readLock().lock();
         try {
             final OrdinalSlotMap map = index.get(new FieldKey(core, field));
-            if (map == null) {
+            final boolean hit = map != null && copyOut(map, ordinal, vectorBytes, destination, 0);
+            if (hit) {
+                hits.increment();
+            } else {
                 misses.increment();
-                return false;
             }
-            final int cell = map.find(ordinal);
-            if (cell < 0) {
-                misses.increment();
-                return false;
-            }
-            final int slabId = map.slabIdAt(cell);
-            final int slot = map.slotAt(cell);
-            // The slot's back pointer is the proof. A cell can outlive the slot it names, because eviction
-            // does not walk the index; see OrdinalSlotMap's javadoc.
-            if (slotHolds(map, ordinal, slabId, slot) == false) {
-                misses.increment();
-                return false;
-            }
-            final Slab slab = slabsById[slabId];
-            if (slab.slotBytes != vectorBytes) {
-                misses.increment();
-                return false;
-            }
-            slab.memory.floats().get((slot * slab.slotBytes) >> 2, destination, 0, vectorBytes >> 2);
-            // A plain write, and a lost one only costs a second chance. Readers run concurrently with each
-            // other but never with the eviction that reads this, which holds the write lock.
-            slab.hit[slot] = 1;
-            hits.increment();
-            return true;
+            return hit;
         } finally {
             lock.readLock().unlock();
         }
+    }
+
+    /**
+     * What a batch lookup hands each hit to while the read lock is still held.
+     *
+     * <p>The contract is narrow on purpose, because this runs under the cache's read lock: an implementation
+     * must not read a file, take a lock, or keep a reference to {@code vector}, which is one buffer reused
+     * for every hit in the batch. It exists so that a hit can be scored out of the buffer the cache just
+     * filled, which is what lets a whole batch share one acquisition and one buffer instead of needing an
+     * array per candidate. See {@code VectorCacheBatchScorer}.
+     */
+    public interface HitVisitor {
+        /**
+         * @param index the position in the batch's {@code ordinals} array
+         * @param vector the cached vector, valid only for the duration of this call
+         */
+        void onHit(int index, float[] vector);
+    }
+
+    /**
+     * Looks up a whole batch of ordinals of one segment field under a single read-lock acquisition, copying
+     * each hit into {@code buffer}, handing it to {@code visitor}, and recording in {@code hit[i]} whether
+     * ordinal {@code i} was cached.
+     *
+     * <p>This is the form the scorer uses, and the reason it exists is MEASURED rather than tidiness. I2
+     * took the lock once per vector and reached only 2.1x on eight threads, because Lucene hands a scorer 64
+     * ordinals at a time (FINDINGS I0.2) and 64 acquisitions per batch put every search thread through the
+     * same lock 64 times as often as it needed to be.
+     *
+     * @param core the segment core identity the vectors belong to
+     * @param field the field number
+     * @param ordinals the ordinals to look up, {@code [0, count)} of which are read
+     * @param count how many ordinals to look up
+     * @param vectorBytes the vector length in bytes, the same for every ordinal of one field
+     * @param buffer at least {@code vectorBytes / 4} floats, overwritten once per hit
+     * @param hit at least {@code count} entries; set for every ordinal, true where it was cached
+     * @param visitor told about each hit, or {@code null} for a caller that only wants {@code hit}
+     * @return how many of the {@code count} ordinals were cached
+     */
+    public int lookupBatch(
+        final Object core,
+        final int field,
+        final int[] ordinals,
+        final int count,
+        final int vectorBytes,
+        final float[] buffer,
+        final boolean[] hit,
+        final HitVisitor visitor
+    ) {
+        if (maxSlabs == 0 || count <= 0) {
+            Arrays.fill(hit, 0, Math.max(0, count), false);
+            return 0;
+        }
+        int found = 0;
+        lock.readLock().lock();
+        try {
+            final OrdinalSlotMap map = index.get(new FieldKey(core, field));
+            if (map == null) {
+                Arrays.fill(hit, 0, count, false);
+                misses.add(count);
+                return 0;
+            }
+            for (int i = 0; i < count; i++) {
+                final boolean cached = copyOut(map, ordinals[i], vectorBytes, buffer, 0);
+                hit[i] = cached;
+                if (cached) {
+                    found++;
+                    if (visitor != null) {
+                        visitor.onHit(i, buffer);
+                    }
+                }
+            }
+        } finally {
+            lock.readLock().unlock();
+        }
+        hits.add(found);
+        misses.add(count - found);
+        return found;
+    }
+
+    /**
+     * Copies one ordinal's vector into {@code destination} at {@code destinationOffset} floats, or returns
+     * false. Called with the read lock held.
+     */
+    private boolean copyOut(
+        final OrdinalSlotMap map,
+        final int ordinal,
+        final int vectorBytes,
+        final float[] destination,
+        final int destinationOffset
+    ) {
+        final int cell = map.find(ordinal);
+        if (cell < 0) {
+            return false;
+        }
+        final int slabId = map.slabIdAt(cell);
+        final int slot = map.slotAt(cell);
+        // The slot's back pointer is the proof. A cell can outlive the slot it names, because eviction
+        // does not walk the index; see OrdinalSlotMap's javadoc.
+        if (slotHolds(map, ordinal, slabId, slot) == false) {
+            return false;
+        }
+        final Slab slab = slabsById[slabId];
+        if (slab.slotBytes != vectorBytes) {
+            return false;
+        }
+        slab.memory.floats().get((slot * slab.slotBytes) >> 2, destination, destinationOffset, vectorBytes >> 2);
+        // A plain write, and a lost one only costs a second chance. Readers run concurrently with each
+        // other but never with the eviction that reads this, which holds the write lock.
+        slab.hit[slot] = 1;
+        return true;
     }
 
     /** Whether a lookup can succeed at all, so a caller can skip the work of asking. */
@@ -307,33 +427,79 @@ public final class SlabVectorCache {
         }
         lock.writeLock().lock();
         try {
-            if (maxSlabs == 0) {
+            final Placement placement = place(core, field, ordinal, length);
+            if (placement == null) {
                 return;
             }
-            final FieldKey key = new FieldKey(core, field);
-            OrdinalSlotMap map = index.get(key);
-            if (map == null) {
-                map = new OrdinalSlotMap();
-                index.put(key, map);
-            }
-            if (map.needsCompaction()) {
-                final OrdinalSlotMap compacting = map;
-                map.compact((o, slabId, slot) -> slotHolds(compacting, o, slabId, slot));
-            }
-            Slab slab = openSlabs.get(length);
-            if (slab == null || slab.freeSlots() == 0) {
-                slab = obtainSlab(length);
-            }
-            if (slab == null || slab.freeSlots() == 0) {
-                return;
-            }
-            final int slot = slab.used++;
-            slab.memory.bytes().put(slot * length, source, position, length);
-            attach(slab, slot, map, ordinal);
-            insertions.increment();
+            placement.slab.memory.bytes().put(placement.slot * length, source, position, length);
+            commit(placement, ordinal);
         } finally {
             lock.writeLock().unlock();
         }
+    }
+
+    /**
+     * Caches {@code length} bytes worth of {@code vector} as the vector at {@code ordinal}. The form the
+     * scorer fills from, because what it has after a miss is the {@code float[]} the segment's
+     * {@code IndexInput} decoded into, not the bytes behind it.
+     *
+     * <p>Silently does nothing on the same terms as {@link #put(Object, int, int, ByteBuffer, int, int)}.
+     */
+    public void put(final Object core, final int field, final int ordinal, final float[] vector, final int length) {
+        if (maxSlabs == 0 || length <= 0 || (length & 3) != 0 || ordinal < 0 || length > slabBytes || vector.length < (length >> 2)) {
+            return;
+        }
+        lock.writeLock().lock();
+        try {
+            final Placement placement = place(core, field, ordinal, length);
+            if (placement == null) {
+                return;
+            }
+            placement.slab.memory.floats().put((placement.slot * length) >> 2, vector, 0, length >> 2);
+            commit(placement, ordinal);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /** Where a fill is about to write: the field's index, a slab and a slot in it. */
+    private record Placement(OrdinalSlotMap map, Slab slab, int slot) {
+    }
+
+    /**
+     * Finds room for one vector of {@code length} bytes, evicting a slab if that is what it takes, and
+     * returns where to write it or {@code null} when there is nowhere. Called under the write lock; the
+     * caller writes the bytes and then calls {@link #commit}.
+     */
+    private Placement place(final Object core, final int field, final int ordinal, final int length) {
+        if (maxSlabs == 0) {
+            return null;
+        }
+        final FieldKey key = new FieldKey(core, field);
+        OrdinalSlotMap map = index.get(key);
+        if (map == null) {
+            map = new OrdinalSlotMap();
+            index.put(key, map);
+        }
+        if (map.needsCompaction()) {
+            final OrdinalSlotMap compacting = map;
+            map.compact((o, slabId, slot) -> slotHolds(compacting, o, slabId, slot));
+        }
+        Slab slab = openSlabs.get(length);
+        if (slab == null || slab.freeSlots() == 0) {
+            slab = obtainSlab(length);
+        }
+        if (slab == null) {
+            return null;
+        }
+        final int slot = slab.allocSlot();
+        return slot < 0 ? null : new Placement(map, slab, slot);
+    }
+
+    /** Records a written slot in the index. Called under the write lock, after the bytes are in place. */
+    private void commit(final Placement placement, final int ordinal) {
+        attach(placement.slab, placement.slot, placement.map, ordinal);
+        insertions.increment();
     }
 
     /**
@@ -397,6 +563,12 @@ public final class SlabVectorCache {
      */
     public void configure(final long maxBytes) {
         final int wanted = (int) Math.min(OrdinalSlotMap.MAX_SLABS, Math.max(0, maxBytes) / slabBytes);
+        if (wanted == maxSlabs) {
+            // Before the lock and not after it, because this is called once per prefetch burst from the
+            // read path to pick up a setting change, and in the steady state the answer is always no change.
+            // Taking the write lock to find that out would put every burst through the lock a fill uses.
+            return;
+        }
         lock.writeLock().lock();
         try {
             if (wanted == maxSlabs) {
@@ -451,125 +623,72 @@ public final class SlabVectorCache {
             return null;
         }
         reclaimedSlabs.increment();
+        final long started = System.nanoTime();
         if (oldest.slotBytes == length) {
             // The common case, and the only one in which a second chance can do anything: the evicted slab
-            // is reopened for the same vectors it already holds, so its survivors move to its front and the
-            // room behind them is what this call came for. There is deliberately nowhere else to put them.
-            // The slab a fill was appending to is always full at the moment it asks for another one, so a
-            // copy into "the current slab" could only ever mean a copy into this one.
-            compactInPlace(oldest);
+            // is reopened for the vectors it already holds, so the ones that were read stay in their slots
+            // and the rest become the free slots this call came for.
+            reclaimInPlace(oldest);
             openSlabs.put(length, oldest);
-            fifo.add(oldest);
-            return oldest;
+        } else {
+            // Reopened for a different vector length, so the slot layout changes and a survivor has nowhere
+            // to stay. See the class javadoc for why they are dropped rather than copied.
+            dropAll(oldest);
+            openSlabs.remove(oldest.slotBytes, oldest);
+            open(oldest, length);
         }
-        // Reopened for a different vector length. Its own length may still have a partly filled open slab,
-        // which is the one case where survivors can be copied out; otherwise they go with the rest.
-        readmitInto(oldest, openSlabs.get(oldest.slotBytes));
-        dropAll(oldest);
-        openSlabs.remove(oldest.slotBytes, oldest);
-        open(oldest, length);
         fifo.add(oldest);
+        reclaimNanos.add(System.nanoTime() - started);
         return oldest;
     }
 
     /**
-     * Compacts {@code slab}'s hit slots to its front, keeping at most half of them, and frees the rest.
-     * The destination slot index is never above the source's, so the two never overlap, but the move still
-     * goes through {@link #moveBuffer} rather than slot to slot inside one buffer.
+     * Gives {@code slab}'s second chance: the slots that have been read since they were written keep both
+     * their vector and their slot, up to half the slab, and every other slot joins the free list. No byte
+     * moves and no index entry changes, which is what keeps the write lock hold off the millisecond scale.
      */
-    private void compactInPlace(final Slab slab) {
+    private void reclaimInPlace(final Slab slab) {
         // Half the slots, rounded down, so that a slab with a single slot keeps nothing and the caller is
         // always handed room for the vector it came to write.
         final int keep = slab.slotCount / 2;
-        final ByteBuffer bytes = slab.memory.bytes();
-        if (moveBuffer.length < slab.slotBytes) {
-            moveBuffer = new byte[slab.slotBytes];
-        }
-        int destination = 0;
+        int kept = 0;
+        int dropped = 0;
+        slab.freeCount = 0;
+        final OrdinalSlotMap[] owners = slab.owner;
+        final byte[] hits = slab.hit;
+        final int[] free = slab.free;
+        int freeCount = 0;
         for (int slot = 0; slot < slab.used; slot++) {
-            final OrdinalSlotMap owner = slab.owner[slot];
+            final OrdinalSlotMap owner = owners[slot];
             if (owner == null) {
+                free[freeCount++] = slot;
                 continue;
             }
-            final int ordinal = slab.ordinal[slot];
-            if (!pointsBack(owner, ordinal, slab.id, slot)) {
-                // The vector was re-cached elsewhere, so this slot is already dead and the live copy must
-                // not be touched.
-                slab.owner[slot] = null;
+            if (hits[slot] == 0 || kept >= keep) {
+                // The bookkeeping of detach(), with the counters accumulated rather than published per
+                // slot: the two LongAdder writes per slot were a measurable part of the write-lock hold on
+                // a slab with ten thousand of them.
+                owners[slot] = null;
+                owner.noteInvalidated();
+                dropped++;
+                free[freeCount++] = slot;
                 continue;
             }
-            if (slab.hit[slot] == 0 || destination >= keep) {
-                detach(slab, slot, true);
-                continue;
-            }
-            if (destination != slot) {
-                bytes.get(slot * slab.slotBytes, moveBuffer, 0, slab.slotBytes);
-                bytes.put(destination * slab.slotBytes, moveBuffer, 0, slab.slotBytes);
-                slab.owner[destination] = owner;
-                slab.ordinal[destination] = ordinal;
-                slab.owner[slot] = null;
-                owner.put(ordinal, slab.id, destination);
-            }
-            slab.hit[destination] = 0;
-            destination++;
-            readmissions.increment();
+            hits[slot] = 0;
+            kept++;
         }
-        slab.used = destination;
-    }
-
-    /**
-     * Copies {@code from}'s hit slots into {@code to}, which is the open slab for the same vector length,
-     * capped at half a slab and at whatever room {@code to} has. {@code to} may be {@code null}, when the
-     * length has no open slab, and then nothing is re-admitted.
-     */
-    private void readmitInto(final Slab from, final Slab to) {
-        if (to == null || to == from) {
-            return;
-        }
-        int budget = Math.min(from.slotCount / 2, to.freeSlots());
-        if (budget <= 0) {
-            return;
-        }
-        final ByteBuffer source = from.memory.bytes();
-        final ByteBuffer destination = to.memory.bytes();
-        if (moveBuffer.length < from.slotBytes) {
-            moveBuffer = new byte[from.slotBytes];
-        }
-        for (int slot = 0; slot < from.used && budget > 0; slot++) {
-            final OrdinalSlotMap owner = from.owner[slot];
-            if (owner == null || from.hit[slot] == 0) {
-                continue;
-            }
-            final int ordinal = from.ordinal[slot];
-            if (!pointsBack(owner, ordinal, from.id, slot)) {
-                from.owner[slot] = null;
-                continue;
-            }
-            final int target = to.used++;
-            source.get(slot * from.slotBytes, moveBuffer, 0, from.slotBytes);
-            destination.put(target * to.slotBytes, moveBuffer, 0, to.slotBytes);
-            to.owner[target] = owner;
-            to.ordinal[target] = ordinal;
-            to.hit[target] = 0;
-            from.owner[slot] = null;
-            owner.put(ordinal, to.id, target);
-            budget--;
-            readmissions.increment();
-        }
+        slab.freeCount = freeCount;
+        liveEntries -= dropped;
+        liveEntryBytes -= (long) dropped * slab.slotBytes;
+        droppedEntries.add(dropped);
+        readmissions.add(kept);
     }
 
     /** Frees every live slot of {@code slab} and empties it. Called under the write lock. */
     private void dropAll(final Slab slab) {
+        slab.freeCount = 0;
         for (int slot = 0; slot < slab.used; slot++) {
-            final OrdinalSlotMap owner = slab.owner[slot];
-            if (owner == null) {
-                continue;
-            }
-            if (pointsBack(owner, slab.ordinal[slot], slab.id, slot)) {
-                detach(slab, slot, true);
-            } else {
-                slab.owner[slot] = null;
-            }
+            detach(slab, slot, true);
         }
         slab.used = 0;
     }
@@ -614,8 +733,15 @@ public final class SlabVectorCache {
 
     /**
      * Whether {@code map}'s index entry for {@code ordinal} is exactly {@code (slabId, slot)}: the index
-     * direction, which is what eviction asks, because eviction starts from a slot and needs to know whether
-     * the vector in it is still the live copy or one superseded by a later fill elsewhere.
+     * direction, which starts from a slot and asks whether the vector in it is still the live copy.
+     *
+     * <p>Only {@link #checkInvariantsForTesting} asks any more, and that is the point of it. I2's eviction
+     * asked it per slot, which cost one hash probe per slot of the slab being reclaimed and MEASURED at
+     * 1.23 ms of write lock for a 10,922-slot slab, nearly all of it random access into the field's index.
+     * It was redundant: {@link #attach} clears the previous slot's owner pointer the moment an ordinal is
+     * re-cached elsewhere, and nothing else overwrites an index cell, so {@code owner != null} already means
+     * "this slot is the live copy". Rather than trust that in a comment, the invariant check re-derives it
+     * for every slot of every slab and every test that mutates the cache calls it.
      */
     private boolean pointsBack(final OrdinalSlotMap map, final int ordinal, final int slabId, final int slot) {
         final int cell = map.find(ordinal);
@@ -736,6 +862,11 @@ public final class SlabVectorCache {
         return readmissions.sum();
     }
 
+    /** Nanoseconds spent inside a slab reclaim, which is write-lock time. */
+    public long reclaimNanos() {
+        return reclaimNanos.sum();
+    }
+
     /** Vectors dropped: evicted without a second chance, or released with their segment. */
     public long droppedEntries() {
         return droppedEntries.sum();
@@ -752,6 +883,7 @@ public final class SlabVectorCache {
             for (final Slab slab : fifo) {
                 if (slab.owner != null) {
                     total += 48 + 4L * slab.owner.length + 16 + 4L * slab.ordinal.length + 16 + slab.hit.length;
+                    total += 16 + 4L * slab.free.length;
                 }
             }
             return total;
@@ -769,6 +901,7 @@ public final class SlabVectorCache {
         reclaimedSlabs.reset();
         readmissions.reset();
         droppedEntries.reset();
+        reclaimNanos.reset();
     }
 
     /**
@@ -797,6 +930,13 @@ public final class SlabVectorCache {
                     }
                     entries++;
                     entryBytes += slab.slotBytes;
+                }
+                for (int i = 0; i < slab.freeCount; i++) {
+                    // A slot on the free list and still live would be handed to a fill that overwrites a
+                    // vector the index still names, which is the one way the free list could corrupt a read.
+                    if (slab.owner[slab.free[i]] != null) {
+                        throw new IllegalStateException("slab " + slab.id + " slot " + slab.free[i] + " is both free and live");
+                    }
                 }
             }
             if (entries != liveEntries) {

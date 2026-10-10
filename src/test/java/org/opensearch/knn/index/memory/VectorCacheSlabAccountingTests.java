@@ -74,10 +74,14 @@ public class VectorCacheSlabAccountingTests extends OpenSearchSingleNodeTestCase
      * Sets {@code knn.direct_io.rescore.cache.max_bytes}, and pins the circuit breaker limit at four slabs,
      * as the manager reads them: through {@code ClusterService#getClusterSettings}. The cache setting
      * defaults to {@code 0b}, so a test that wants the manager to give the cache a target has to say so.
+     *
+     * <p>{@code knn.direct_io.rescore.enabled} is set with it, because from I4 the cache is the Direct I/O
+     * read path's cache: with that switch off the manager's target is zero whatever the budget says (D2).
      */
     private void setConfiguredCacheSize(final String size) {
         final Settings settings = Settings.builder()
             .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, size)
+            .put(KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED, true)
             .put(KNNSettings.KNN_MEMORY_CIRCUIT_BREAKER_CLUSTER_LIMIT, (4 * SLAB_KB) + "kb")
             .build();
         when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(settings, registeredSettings));

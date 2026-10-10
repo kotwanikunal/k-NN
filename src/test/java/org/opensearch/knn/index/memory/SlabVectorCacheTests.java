@@ -555,6 +555,131 @@ public class SlabVectorCacheTests extends KNNTestCase {
     }
 
     // ---------------------------------------------------------------------------------------------------
+    // I4: the batch lookup, and a reclaim that moves no bytes
+    // ---------------------------------------------------------------------------------------------------
+
+    /** A batch of hits and misses: every hit visited once, in order, with its own bytes. */
+    public void testTheBatchLookupVisitsEveryHitWithItsOwnVector() {
+        final SlabVectorCache cache = cacheOf(4);
+        final Object core = new Object();
+        final int dimension = 128;
+        final int bytes = dimension * Float.BYTES;
+        for (int ordinal = 0; ordinal < 32; ordinal += 2) {
+            put(cache, core, 0, ordinal, dimension);
+        }
+
+        final int[] ordinals = new int[32];
+        for (int i = 0; i < 32; i++) {
+            ordinals[i] = i;
+        }
+        final boolean[] hit = new boolean[32];
+        final float[] buffer = new float[dimension];
+        final List<Integer> visited = new ArrayList<>();
+        final AtomicReference<String> wrong = new AtomicReference<>();
+
+        final int found = cache.lookupBatch(core, 0, ordinals, 32, bytes, buffer, hit, (index, vector) -> {
+            visited.add(index);
+            if (java.util.Arrays.equals(vector, vector(core, 0, ordinals[index], dimension)) == false) {
+                wrong.compareAndSet(null, "ordinal " + ordinals[index] + " was visited with another vector");
+            }
+        });
+
+        assertNull(wrong.get(), wrong.get());
+        assertEquals("the even ordinals are cached", 16, found);
+        assertEquals(16, visited.size());
+        for (int i = 0; i < 32; i++) {
+            assertEquals("ordinal " + i, i % 2 == 0, hit[i]);
+        }
+        for (int i = 0; i < visited.size(); i++) {
+            assertEquals("visited in batch order", Integer.valueOf(2 * i), visited.get(i));
+        }
+        assertEquals(16, cache.hits());
+        assertEquals(16, cache.misses());
+    }
+
+    /** A batch against a field with nothing cached is all misses and no visits. */
+    public void testTheBatchLookupOnAnUnknownFieldIsAllMisses() {
+        final SlabVectorCache cache = cacheOf(2);
+        final Object core = new Object();
+        final boolean[] hit = new boolean[4];
+        java.util.Arrays.fill(hit, true);
+        final int found = cache.lookupBatch(core, 9, new int[] { 0, 1, 2, 3 }, 4, 512, new float[128], hit, (index, vector) -> {
+            throw new AssertionError("nothing is cached, so nothing can be visited");
+        });
+        assertEquals(0, found);
+        for (final boolean one : hit) {
+            assertFalse("every entry must be cleared, not left as the caller found it", one);
+        }
+        assertEquals(4, cache.misses());
+    }
+
+    /** Off is off for the batch form too: no lock, no counter, every entry false. */
+    public void testTheBatchLookupHoldsNothingWhenOff() {
+        final SlabVectorCache cache = cacheOf(0);
+        final boolean[] hit = new boolean[] { true, true };
+        assertEquals(0, cache.lookupBatch(new Object(), 0, new int[] { 0, 1 }, 2, 512, new float[128], hit, null));
+        assertFalse(hit[0]);
+        assertFalse(hit[1]);
+        assertEquals(0, cache.misses());
+    }
+
+    /**
+     * The I4 reclaim: a survivor keeps its slot, so the index entry that names it is untouched and no bytes
+     * move. Asserted the only way the outside can see it, which is that the cache stays correct and the
+     * reclaim's write-lock time stays off the millisecond scale even on a full slab.
+     */
+    public void testAReclaimKeepsSurvivorsWhereTheyAre() {
+        final SlabVectorCache cache = cacheOf(1);
+        final Object core = new Object();
+        final int slots = cache.slotsPerSlab(512);
+        for (int ordinal = 0; ordinal < slots; ordinal++) {
+            put(cache, core, 0, ordinal, 128);
+        }
+        final float[] read = new float[128];
+        // Every slot read, so every one of them wants a second chance and the cap decides.
+        for (int ordinal = 0; ordinal < slots; ordinal++) {
+            assertTrue(cache.get(core, 0, ordinal, 512, read));
+        }
+
+        put(cache, core, 0, slots, 128);
+
+        assertEquals(1, cache.reclaimedSlabs());
+        assertEquals("the cap is half the slots", slots / 2, cache.readmissions());
+        assertEquals(slots / 2 + 1, cache.entries());
+        int survivors = 0;
+        for (int ordinal = 0; ordinal < slots; ordinal++) {
+            if (cache.get(core, 0, ordinal, 512, read)) {
+                assertArrayEquals("a survivor's bytes must be its own", vector(core, 0, ordinal, 128), read, 0.0f);
+                survivors++;
+            }
+        }
+        assertEquals(slots / 2, survivors);
+        // The free slots the reclaim produced are usable, one at a time, and the slab fills up again.
+        for (int ordinal = slots + 1; ordinal < slots + slots / 2; ordinal++) {
+            put(cache, core, 0, ordinal, 128);
+            assertTrue(cache.get(core, 0, ordinal, 512, read));
+        }
+        assertEquals("no second reclaim was needed to place them", 1, cache.reclaimedSlabs());
+        cache.checkInvariantsForTesting();
+        logger.info("one reclaim of a {}-slot slab held the write lock for {} ns", slots, cache.reclaimNanos());
+    }
+
+    /** The float form of the fill, which is what the scorer has after a miss. */
+    public void testTheFloatArrayFillRoundTrips() {
+        final SlabVectorCache cache = cacheOf(1);
+        final Object core = new Object();
+        final float[] written = vector(core, 0, 5, 128);
+        cache.put(core, 0, 5, written, 512);
+        final float[] read = new float[128];
+        assertTrue(cache.get(core, 0, 5, 512, read));
+        assertArrayEquals(written, read, 0.0f);
+        assertFalse("a short array must be refused rather than read past", cache.get(core, 0, 6, 512, read));
+        cache.put(core, 0, 6, new float[64], 512);
+        assertFalse("and must not have been cached", cache.get(core, 0, 6, 512, read));
+        cache.checkInvariantsForTesting();
+    }
+
+    // ---------------------------------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------------------------------
 

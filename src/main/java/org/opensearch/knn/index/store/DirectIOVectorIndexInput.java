@@ -9,6 +9,7 @@ import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.knn.index.KNNSettings;
+import org.opensearch.knn.index.memory.VectorCacheScope;
 
 import java.io.EOFException;
 import java.io.IOException;
@@ -108,19 +109,12 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         private final FileChannel channel;
         private final int blockSize;
         private final long fileLength;
-        /**
-         * This file's identity in {@link DirectIOVectorCache}, built once per open rather than per lookup.
-         * Deliberately a value and not this {@code Handle}'s identity — see that class's javadoc for why
-         * two opens of one {@code .vec} have to share entries.
-         */
-        private final String fileId;
 
         private Handle(final Path path, final FileChannel channel, final int blockSize, final long fileLength) {
             this.path = path;
             this.channel = channel;
             this.blockSize = blockSize;
             this.fileLength = fileLength;
-            this.fileId = DirectIOVectorCache.fileId(path, fileLength);
         }
     }
 
@@ -1255,16 +1249,15 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             // Exactly once per burst, which is the burst boundary endBurst just established (or the
             // input's first prefetch). Same cadence and same contract as DirectIOReadPool.executor(): an
             // operator's change to knn.direct_io.rescore.cache.max_bytes takes effect on the next burst.
-            DirectIOVectorCache.applyConfiguredSize();
+            // From I4 the cache this reaches is the node's slab cache, and the target it recomputes is
+            // min(that setting, the native budget minus everything that is not a slab).
+            VectorCacheScope.refreshNodeCacheTarget();
         }
         final long absolute = this.offset + offset;
         final int blockSize = handle.blockSize;
-        // The cache lookup comes BEFORE the submit, so a hit costs the device nothing: the range is simply
-        // not added to the burst, and readFloats will find the same entry when it consumes the vector. This
-        // is where the 707k -> ~420k device reads per 5,000 queries would come from.
-        if (DirectIOVectorCache.isOn() && DirectIOVectorCache.get(handle.fileId, absolute, Math.toIntExact(length)) != null) {
-            return;
-        }
+        // There is no cache lookup here any more, and that is D1: the lookup moved up into the scorer
+        // (VectorCacheBatchScorer), which declares only the candidates it missed on, so a hit never reaches
+        // this method at all. What is left of this input is a read path.
         final long alignedStart = absolute - Math.floorMod(absolute, (long) blockSize);
         final int alignedLength = alignUp(Math.toIntExact(absolute + length - alignedStart), blockSize);
         if (alignedLength > maxStagedRangeBytes) {
@@ -1578,26 +1571,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     @Override
     public void readFloats(final float[] destination, final int destinationOffset, final int count) throws IOException {
         final int requested = count * Float.BYTES;
-        final long runStart = offset + filePointer;
-        if (DirectIOVectorCache.isOn()) {
-            // The second lookup. The first was in prefetch, where a hit kept the range out of the burst; this
-            // is the one that actually serves the bytes, and it is also the one that serves a vector nobody
-            // declared (the exact-search path reads some ordinals without a prefetch).
-            final byte[] cached = DirectIOVectorCache.get(handle.fileId, runStart, requested);
-            if (cached != null) {
-                ensureOpen();
-                if (filePointer + requested > length) {
-                    throw new EOFException("read past EOF: " + this);
-                }
-                ByteBuffer.wrap(cached).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(0, destination, destinationOffset, count);
-                filePointer += requested;
-                // A cache hit is still a read, so the burst boundary is found exactly as before: without
-                // this, a burst every vector of which was cached would never be quiesced.
-                readSincePrefetch = true;
-                STATS.servedBytes.addAndGet(requested);
-                return;
-            }
-        }
+        // No cache lookup and no cache fill here any more: both moved into the scorer with D1, so this
+        // method reads what the scorer could not serve and nothing else.
         int written = 0;
         while (written < count) {
             // Ask for one float: whatever buffer holds it will usually hold the rest of the vector too, and
@@ -1611,14 +1586,6 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                     destination[destinationOffset + written + i] = source.buffer.getFloat(source.position + (i << 2));
                 }
             }
-            // Populate on consume, and only from a staged read that covered the whole run in one buffer.
-            // Whole-run because an entry must be exactly the vector the next lookup will ask for; staged
-            // because that is the random rescore channel -- the ring is sequential, where a cache buys
-            // nothing and would evict the random path's working set, and a blocking read is already the
-            // fallback this is trying to avoid.
-            if (written == 0 && usableFloats == count && source.staged) {
-                DirectIOVectorCache.put(handle.fileId, runStart, source.buffer, source.position, requested);
-            }
             filePointer += (long) usableFloats * Float.BYTES;
             written += usableFloats;
         }
@@ -1631,24 +1598,12 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         private final FloatBuffer floats;
         private final int position;
         private final int available;
-        /**
-         * Whether these bytes came from the prefetch burst table, i.e. from the random rescore channel.
-         * Only that channel populates {@link DirectIOVectorCache}: the ring is sequential, where a cache
-         * buys nothing and would evict the random path's working set, and a blocking read is the fallback
-         * the cache exists to avoid rather than a thing to remember.
-         */
-        private final boolean staged;
 
         private Source(final ByteBuffer buffer, final FloatBuffer floats, final int position, final int available) {
-            this(buffer, floats, position, available, false);
-        }
-
-        private Source(final ByteBuffer buffer, final FloatBuffer floats, final int position, final int available, final boolean staged) {
             this.buffer = buffer;
             this.floats = floats;
             this.position = position;
             this.available = available;
-            this.staged = staged;
         }
     }
 
@@ -1685,7 +1640,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 // through to a blocking read rather than decode whatever the buffer last held.
                 if (position + needed <= range.valid) {
                     STATS.stagedHits.incrementAndGet();
-                    return new Source(range.buffer, range.floats, position, range.valid - position, true);
+                    return new Source(range.buffer, range.floats, position, range.valid - position);
                 }
             }
         }

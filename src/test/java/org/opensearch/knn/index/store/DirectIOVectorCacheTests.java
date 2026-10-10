@@ -27,12 +27,20 @@ import java.util.Set;
 import static org.mockito.Mockito.when;
 
 /**
- * The node-wide vector cache on the Direct I/O rescore path (phase 15 D4).
+ * The phase 15 node-wide vector cache (D4), tested on its own API.
  *
- * <p>What has to be true of it, in the order it would hurt if it were not: the accounting is honest, the
- * weigher really bounds the heap, two readers of one file share entries (which is the whole of the measured
- * reuse), two different files never collide (which would serve one file's bytes for another's), and with the
- * cache off nothing in the read path touches it.
+ * <p><b>What changed in I4, and why these tests look different.</b> D1 moved the vector lookup out of
+ * {@link DirectIOVectorIndexInput} and up into the scorer, where the key is the segment rather than the
+ * file, so this class is no longer on any read path: nothing in {@code prefetch} or {@code readFloats}
+ * consults it. The six tests that drove it through a real input were therefore testing a path that no longer
+ * exists, and they were replaced by tests of the same properties on this class's own API: honest
+ * accounting, a weigher that really bounds the heap, a key that shares between two readers of one file and
+ * never collides between two files, and a size change that takes effect. The one input-driven test kept is
+ * the one that now asserts the removal itself: a read through the input must not touch this cache at all.
+ *
+ * <p>The class stays one phase, with its setting key, because a persisted
+ * {@code knn.direct_io.rescore.cache.max_bytes} must keep resolving on a live node; from I4 that setting is
+ * the slab cache's budget. See {@code SlabVectorCache} and {@code VectorCacheBatchScorer}.
  */
 @ThreadLeakFilters(defaultFilters = true, filters = { DirectIOVectorCacheTests.ReadPoolThreadFilter.class })
 public class DirectIOVectorCacheTests extends KNNTestCase {
@@ -83,17 +91,6 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
         KNNSettings.state().setClusterService(clusterService);
     }
 
-    /** The cache on at {@code maxBytes} and the read-ahead ring off, so the burst table is the only channel. */
-    private void cacheOn(final long maxBytes) {
-        withNodeSettings(
-            Settings.builder()
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, maxBytes + "b")
-                .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
-                .build()
-        );
-        DirectIOVectorCache.configure(maxBytes);
-    }
-
     @SneakyThrows
     private float[][] randomVectors(final long seed) {
         final Random random = new Random(seed);
@@ -132,145 +129,74 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
         input.readFloats(into, 0, DIMENSION);
     }
 
+    /** {@code bytes} of {@code vector}, as a staged read would hand them over. */
+    private ByteBuffer vectorBytes(final float[] vector) {
+        final ByteBuffer buffer = ByteBuffer.allocate(vector.length * Float.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+        for (final float value : vector) {
+            buffer.putFloat(value);
+        }
+        return buffer;
+    }
+
     // -----------------------------------------------------------------------------------------------
 
-    /**
-     * Hit, miss and eviction accounting, and the weigher that makes {@code max_bytes} mean something.
-     *
-     * <p>Two lookups happen per vector — one in {@code prefetch}, one in {@code readFloats} — so the counts
-     * are asserted in pairs. That is documented in {@link DirectIOVectorCache#lookupsPerVector()} rather
-     * than hidden, because an operator comparing the absolute numbers against a query count would otherwise
-     * conclude the cache was being consulted twice as often as it should be. It is, and on purpose.
-     */
-    @SneakyThrows
+    /** Hit, miss and eviction accounting, and the weigher that makes {@code max_bytes} mean something. */
     public void testHitAndMissAccountingAndTheWeigher() {
-        assumeDirectIOWorksHere();
         final float[][] vectors = randomVectors(1L);
-        final Path path = writeVectorFile(createTempDir(), "a.vec", vectors);
-
-        // A budget far larger than this test's working set, so nothing evicts and the counts are exact.
         final int entryWeight = VECTOR_BYTES + DirectIOVectorCache.ENTRY_OVERHEAD_BYTES;
-        cacheOn(1 << 20);
-        final float[] scratch = new float[DIMENSION];
+        DirectIOVectorCache.configure(1 << 20);
+        assertTrue(DirectIOVectorCache.isOn());
 
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
-            assertNotNull(input);
-            assertEquals(2, DirectIOVectorCache.lookupsPerVector());
+        assertNull("cold", DirectIOVectorCache.get("a", 0, VECTOR_BYTES));
+        assertEquals(0L, DirectIOVectorCache.hits());
+        assertEquals(1L, DirectIOVectorCache.misses());
 
-            readVector(input, 0, scratch);
-            assertArrayEquals(vectors[0], scratch, 0.0f);
-            assertEquals("cold: both lookups miss", 0L, DirectIOVectorCache.hits());
-            assertEquals(2L, DirectIOVectorCache.misses());
-            assertEquals("and the vector is now held", 1L, DirectIOVectorCache.entries());
-            assertEquals("weighed as its bytes plus the entry's own cost", entryWeight, DirectIOVectorCache.bytes());
+        DirectIOVectorCache.put("a", 0, vectorBytes(vectors[0]), 0, VECTOR_BYTES);
+        assertEquals("the vector is now held", 1L, DirectIOVectorCache.entries());
+        assertEquals("weighed as its bytes plus the entry's own cost", entryWeight, DirectIOVectorCache.bytes());
 
-            readVector(input, 0, scratch);
-            assertArrayEquals("a hit must return the same bytes", vectors[0], scratch, 0.0f);
-            assertEquals("warm: both lookups hit", 2L, DirectIOVectorCache.hits());
-            assertEquals(2L, DirectIOVectorCache.misses());
-            assertEquals("and nothing new is held", 1L, DirectIOVectorCache.entries());
-            assertEquals("re-reading must not double-charge", entryWeight, DirectIOVectorCache.bytes());
+        final byte[] served = DirectIOVectorCache.get("a", 0, VECTOR_BYTES);
+        assertNotNull("warm", served);
+        final ByteBuffer expected = vectorBytes(vectors[0]);
+        assertArrayEquals("a hit must return the same bytes", expected.array(), served);
+        assertEquals(1L, DirectIOVectorCache.hits());
 
-            readVector(input, 1, scratch);
-            readVector(input, 2, scratch);
-            assertEquals(3L, DirectIOVectorCache.entries());
-            assertEquals("the weigher is exactly bytes + overhead per entry", 3L * entryWeight, DirectIOVectorCache.bytes());
-            assertEquals("and with budget to spare nothing is evicted", 0L, DirectIOVectorCache.evictions());
-        }
+        DirectIOVectorCache.put("a", VECTOR_BYTES, vectorBytes(vectors[1]), 0, VECTOR_BYTES);
+        DirectIOVectorCache.put("a", 2L * VECTOR_BYTES, vectorBytes(vectors[2]), 0, VECTOR_BYTES);
+        assertEquals(3L, DirectIOVectorCache.entries());
+        assertEquals("the weigher is exactly bytes + overhead per entry", 3L * entryWeight, DirectIOVectorCache.bytes());
+        assertEquals("and with budget to spare nothing is evicted", 0L, DirectIOVectorCache.evictions());
     }
 
     /**
      * Eviction, and the thing it is there to guarantee: the charged weight never exceeds {@code max_bytes}.
      *
      * <p><b>Not asserted as "N entries fit in N entries' worth of budget", because that is false.</b>
-     * MEASURED while writing this test: a budget of three entries' weight holds <b>zero</b> entries. Guava's
-     * {@code LocalCache} splits {@code maximumWeight} across {@code concurrencyLevel} segments and evicts
-     * against the per-segment share, so an entry heavier than {@code max_bytes / concurrencyLevel} is
-     * inserted and immediately evicted again. At the sizes the reuse gate measured (16 MB and up) that
-     * division is immaterial; at a handful of entries it is the whole behaviour. So what is pinned here is
-     * the invariant that actually matters to a node — the bound holds, and the reads stay correct across
-     * eviction — rather than a per-entry count that depends on Guava's hashing.
+     * MEASURED while writing the phase 15 version of this test: a budget of three entries' weight holds
+     * <b>zero</b> entries, because Guava's {@code LocalCache} splits {@code maximumWeight} across
+     * {@code concurrencyLevel} segments and evicts against the per-segment share.
      */
-    @SneakyThrows
     public void testEvictionKeepsTheChargedWeightUnderTheBudget() {
-        assumeDirectIOWorksHere();
         final float[][] vectors = randomVectors(7L);
-        final Path path = writeVectorFile(createTempDir(), "evict.vec", vectors);
-
         final int entryWeight = VECTOR_BYTES + DirectIOVectorCache.ENTRY_OVERHEAD_BYTES;
-        final long budget = 16L * entryWeight;
-        cacheOn(budget);
-        final float[] scratch = new float[DIMENSION];
+        final long budget = 40L * entryWeight;
+        DirectIOVectorCache.configure(budget);
 
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
-            assertNotNull(input);
-            for (int ord = 0; ord < 120; ord++) {
-                readVector(input, ord, scratch);
-                assertArrayEquals("eviction must never change a byte", vectors[ord], scratch, 0.0f);
-            }
-            assertTrue("120 distinct vectors into a 16-entry budget must evict", DirectIOVectorCache.evictions() > 0);
-            assertTrue(
-                "and the charged weight must stay under max_bytes, which is the point: " + DirectIOVectorCache.bytes() + " > " + budget,
-                DirectIOVectorCache.bytes() <= budget
-            );
-            assertEquals(
-                "the weight is always entries x entryWeight, so the weigher and the listener agree",
-                DirectIOVectorCache.entries() * entryWeight,
-                DirectIOVectorCache.bytes()
-            );
-
-            // Re-reading an evicted vector is a miss that reaches the device and repopulates: correctness
-            // does not depend on an entry still being there.
-            final long missesBefore = DirectIOVectorCache.misses();
-            readVector(input, 0, scratch);
-            assertArrayEquals(vectors[0], scratch, 0.0f);
-            assertTrue("an evicted vector must be re-read, not mis-served", DirectIOVectorCache.misses() > missesBefore);
+        for (int i = 0; i < vectors.length; i++) {
+            DirectIOVectorCache.put("a", (long) i * VECTOR_BYTES, vectorBytes(vectors[i]), 0, VECTOR_BYTES);
+            assertTrue("the bound must hold at every step", DirectIOVectorCache.bytes() <= budget);
         }
+        assertTrue("400 entries into 40 entries' worth of budget has to evict", DirectIOVectorCache.evictions() > 0);
+        assertTrue("and something must still be held", DirectIOVectorCache.entries() > 0);
     }
 
     /**
-     * Two inputs over the same file must share entries. This is not a nicety: the codec seam opens a
-     * {@code .vec} once per reader, so if file identity were the {@code Handle}'s object identity, two
-     * readers of one segment would never share and the 40.3%-at-16-MB cross-query reuse the gate measured
-     * would be unreachable by construction.
+     * The key: two readers of one file share an entry, and two different files never collide even at the
+     * same offset with <b>byte-identical content</b>, which is the case that would hide the bug because the
+     * read would return the right answer for the wrong reason.
      */
     @SneakyThrows
-    public void testTwoInputsOverOneFileShareEntries() {
-        assumeDirectIOWorksHere();
-        final float[][] vectors = randomVectors(2L);
-        final Path path = writeVectorFile(createTempDir(), "shared.vec", vectors);
-        cacheOn(1 << 20);
-        final float[] scratch = new float[DIMENSION];
-
-        try (DirectIOVectorIndexInput first = DirectIOVectorIndexInput.open(path)) {
-            assertNotNull(first);
-            readVector(first, 7, scratch);
-            assertArrayEquals(vectors[7], scratch, 0.0f);
-        }
-        final long hitsAfterPopulate = DirectIOVectorCache.hits();
-        final long missesAfterPopulate = DirectIOVectorCache.misses();
-        assertEquals(1L, DirectIOVectorCache.entries());
-
-        // A SECOND open of the same path, which is a different Handle over a different FileChannel -- which
-        // is exactly why identity would not do as the key's file part.
-        try (DirectIOVectorIndexInput second = DirectIOVectorIndexInput.open(path)) {
-            assertNotNull(second);
-            readVector(second, 7, scratch);
-            assertArrayEquals("the second reader must get the right bytes", vectors[7], scratch, 0.0f);
-        }
-        assertEquals("both of the second reader's lookups must hit", hitsAfterPopulate + 2, DirectIOVectorCache.hits());
-        assertEquals("and neither may miss", missesAfterPopulate, DirectIOVectorCache.misses());
-        assertEquals("sharing means one entry, not two", 1L, DirectIOVectorCache.entries());
-    }
-
-    /**
-     * Two different files must never collide, even at the same offset with <b>byte-identical content</b> —
-     * which is the case that would hide the bug, because the read would return the right answer for the
-     * wrong reason. Asserted on the counters: the second file's lookups must <em>miss</em>.
-     */
-    @SneakyThrows
-    public void testTwoFilesNeverCollide() {
-        assumeDirectIOWorksHere();
+    public void testTheKeySharesWithinAFileAndNeverCollidesAcrossFiles() {
         final Path dir = createTempDir();
         final float[][] vectors = randomVectors(3L);
         final Path a = writeVectorFile(dir, "a.vec", vectors);
@@ -278,134 +204,70 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
         assertEquals("the two files are byte identical, which is the hard case", Files.size(a), Files.size(b));
         assertArrayEquals(Files.readAllBytes(a), Files.readAllBytes(b));
 
-        cacheOn(1 << 20);
-        final float[] scratch = new float[DIMENSION];
+        final String idA = DirectIOVectorCache.fileId(a, Files.size(a));
+        final String idB = DirectIOVectorCache.fileId(b, Files.size(b));
+        assertEquals(
+            "a second open of one file must produce the same id, so the two opens share",
+            idA,
+            DirectIOVectorCache.fileId(a, Files.size(a))
+        );
+        assertNotEquals(idA, idB);
 
-        try (DirectIOVectorIndexInput inputA = DirectIOVectorIndexInput.open(a)) {
-            assertNotNull(inputA);
-            readVector(inputA, 11, scratch);
-        }
-        final long missesAfterA = DirectIOVectorCache.misses();
-        assertEquals(1L, DirectIOVectorCache.entries());
-
-        try (DirectIOVectorIndexInput inputB = DirectIOVectorIndexInput.open(b)) {
-            assertNotNull(inputB);
-            readVector(inputB, 11, scratch);
-            assertArrayEquals(vectors[11], scratch, 0.0f);
-        }
-        assertEquals("the other file's entry must not be served", missesAfterA + 2, DirectIOVectorCache.misses());
-        assertEquals("each file gets its own entry", 2L, DirectIOVectorCache.entries());
+        DirectIOVectorCache.configure(1 << 20);
+        DirectIOVectorCache.put(idA, 64L, vectorBytes(vectors[11]), 0, VECTOR_BYTES);
+        assertNotNull("the same file at the same offset hits", DirectIOVectorCache.get(idA, 64L, VECTOR_BYTES));
+        assertNull("the other file's entry must not be served", DirectIOVectorCache.get(idB, 64L, VECTOR_BYTES));
+        assertNull("nor another offset of the same file", DirectIOVectorCache.get(idA, 128L, VECTOR_BYTES));
     }
 
     /**
-     * Cache off — the shipped default — must be a path that does not exist. No entry, no counter, and in
-     * particular no key allocated: {@code isOn()} is one volatile read and both call sites are behind it.
+     * The removal itself: a read through the input must not touch this cache, whatever its budget. That is
+     * D1, and it is what the scorer-level lookup replaced.
      */
     @SneakyThrows
-    public void testCacheOffIsAZeroOverheadPath() {
+    public void testTheReadPathNoLongerConsultsThisCache() {
         assumeDirectIOWorksHere();
         final float[][] vectors = randomVectors(4L);
         final Path path = writeVectorFile(createTempDir(), "off.vec", vectors);
 
         withNodeSettings(Settings.builder().put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0).build());
-        DirectIOVectorCache.resetForTesting();
-        assertFalse("0b is the shipped default", DirectIOVectorCache.isOn());
-        assertEquals(0L, DirectIOVectorCache.maxBytes());
+        // On, deliberately: the point is that the read path does not consult it even when it could.
+        DirectIOVectorCache.configure(1 << 20);
 
         final float[] scratch = new float[DIMENSION];
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
             for (int ord = 0; ord < 20; ord++) {
                 readVector(input, ord, scratch);
-                assertArrayEquals("off must not change a byte", vectors[ord], scratch, 0.0f);
+                assertArrayEquals("every read must be exact", vectors[ord], scratch, 0.0f);
+            }
+            for (int ord = 0; ord < 20; ord++) {
+                readVector(input, ord, scratch);
+                assertArrayEquals(vectors[ord], scratch, 0.0f);
             }
         }
-        assertFalse("and the burst must not have turned it on", DirectIOVectorCache.isOn());
-        assertEquals(0L, DirectIOVectorCache.hits());
-        assertEquals("not even a miss: a lookup that cannot succeed is not made", 0L, DirectIOVectorCache.misses());
-        assertEquals(0L, DirectIOVectorCache.entries());
+        assertEquals("no lookup", 0L, DirectIOVectorCache.hits());
+        assertEquals("not even a miss", 0L, DirectIOVectorCache.misses());
+        assertEquals("and no fill", 0L, DirectIOVectorCache.entries());
         assertEquals(0L, DirectIOVectorCache.bytes());
     }
 
-    /**
-     * A live change is applied at the next prefetch burst, and a change of size <b>rebuilds</b> rather than
-     * resizing — Guava fixes {@code maximumWeight} at build time. So the entries go, which is a real cost of
-     * retuning this knob and is why it is asserted rather than assumed.
-     */
-    @SneakyThrows
+    /** A size change rebuilds, which is the behaviour the slab cache deliberately does not copy. */
     public void testALiveSizeChangeRebuildsAndDropsTheEntries() {
-        assumeDirectIOWorksHere();
         final float[][] vectors = randomVectors(5L);
-        final Path path = writeVectorFile(createTempDir(), "live.vec", vectors);
-        final float[] scratch = new float[DIMENSION];
+        DirectIOVectorCache.configure(1 << 20);
+        DirectIOVectorCache.put("a", 0L, vectorBytes(vectors[1]), 0, VECTOR_BYTES);
+        assertEquals(1L, DirectIOVectorCache.entries());
+        assertTrue(DirectIOVectorCache.bytes() > 0);
 
-        cacheOn(1 << 20);
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
-            assertNotNull(input);
-            readVector(input, 1, scratch);
-            assertEquals(1L, DirectIOVectorCache.entries());
-            assertTrue(DirectIOVectorCache.bytes() > 0);
+        DirectIOVectorCache.configure(4L * 1024 * 1024);
+        assertEquals("the new budget is live", 4L * 1024 * 1024, DirectIOVectorCache.maxBytes());
+        assertEquals("a rebuild drops what was held", 0L, DirectIOVectorCache.entries());
 
-            // The operator raises it. applyConfiguredSize runs at the next burst boundary, which the next
-            // prefetch after a read establishes.
-            withNodeSettings(
-                Settings.builder()
-                    .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, "4mb")
-                    .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
-                    .build()
-            );
-            readVector(input, 2, scratch);
-            assertEquals("the new budget is live", 4L * 1024 * 1024, DirectIOVectorCache.maxBytes());
-            assertEquals("a rebuild drops what was held, then re-populates from this burst", 1L, DirectIOVectorCache.entries());
-            assertArrayEquals(vectors[2], scratch, 0.0f);
-
-            // And off again, live.
-            withNodeSettings(
-                Settings.builder()
-                    .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, "0b")
-                    .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
-                    .build()
-            );
-            readVector(input, 3, scratch);
-            assertArrayEquals("turning it off must not change a byte either", vectors[3], scratch, 0.0f);
-            assertFalse(DirectIOVectorCache.isOn());
-            assertEquals(0L, DirectIOVectorCache.entries());
-            assertEquals(0L, DirectIOVectorCache.bytes());
-        }
-    }
-
-    /**
-     * A cache hit must not cost a device read, which is the entire point: on the node the expected effect is
-     * {@code .vec} reads per 5,000 queries falling from 707k to ~420k. Asserted from inside the process on
-     * the counters that attribute reads to this path.
-     */
-    @SneakyThrows
-    public void testAHitCostsNoDeviceRead() {
-        assumeDirectIOWorksHere();
-        final float[][] vectors = randomVectors(6L);
-        final Path path = writeVectorFile(createTempDir(), "iops.vec", vectors);
-        cacheOn(1 << 20);
-        final float[] scratch = new float[DIMENSION];
-
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
-            assertNotNull(input);
-            readVector(input, 5, scratch);
-            final long stagedAfterCold = DirectIOVectorIndexInput.STATS.stagedReads();
-            final long blockingAfterCold = DirectIOVectorIndexInput.STATS.blockingReads();
-            assertTrue("the cold read had to reach the device", stagedAfterCold + blockingAfterCold > 0);
-
-            for (int repeat = 0; repeat < 10; repeat++) {
-                readVector(input, 5, scratch);
-                assertArrayEquals(vectors[5], scratch, 0.0f);
-            }
-            assertEquals("ten warm reads, no staged read", stagedAfterCold, DirectIOVectorIndexInput.STATS.stagedReads());
-            assertEquals("and no blocking read", blockingAfterCold, DirectIOVectorIndexInput.STATS.blockingReads());
-            assertEquals(
-                "the prefetches were not even declined -- they were satisfied",
-                0L,
-                DirectIOVectorIndexInput.STATS.stageDeclined()
-            );
-        }
+        DirectIOVectorCache.configure(0L);
+        assertFalse(DirectIOVectorCache.isOn());
+        assertEquals(0L, DirectIOVectorCache.entries());
+        assertEquals(0L, DirectIOVectorCache.bytes());
     }
 
     /** The setting itself: key, default, and that it can be changed on a live node. */
