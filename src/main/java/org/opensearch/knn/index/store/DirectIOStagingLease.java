@@ -122,7 +122,7 @@ final class DirectIOStagingLease {
      *
      * <p>{@code staged_ranges} of them at {@code max_span_bytes} each is 8.25 MiB per thread at the
      * defaults, with no bound on the number of leases, so D3d gives them a node-wide sub-budget of the
-     * direct-memory budget: see {@code DirectIOVectorIndexInput#fitsWideBufferBudget}, which
+     * direct-memory budget: see {@code DirectIOVectorIndexInput#allocateWideBuffer}, which
      * {@link #bufferFor} asks before it grows one.
      */
     private ByteBuffer[] wideBuffers;

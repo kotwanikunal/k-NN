@@ -937,7 +937,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
     /**
      * The share of {@code knn.direct_io.direct_memory_budget} the wide-group buffers get when their own
-     * setting is at its {@code 0b} default: one in {@value}. See {@link #fitsWideBufferBudget}.
+     * setting is at its {@code 0b} default: one in {@value}. See {@link #allocateWideBuffer}.
      */
     static final int WIDE_BUFFER_BUDGET_SHARE = 4;
 
