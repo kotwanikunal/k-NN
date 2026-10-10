@@ -336,7 +336,7 @@ public class NativeMemoryCacheManager implements Closeable {
      * Bytes of vector cache slab granted right now, in KB.
      *
      * <p>Deliberately not part of {@link #getCacheSizeInKilobytes()}, and the reason is the circuit breaker
-     * rather than bookkeeping. {@link KNNCircuitBreaker} clears a tripped breaker only when the cache is at
+     * rather than bookkeeping. {@code KNNCircuitBreaker} clears a tripped breaker only when the cache is at
      * or below the unset percentage of the limit, so if a full vector cache counted towards that figure a
      * breaker tripped by a graph eviction could never be cleared and k-NN indexing would stay rejected
      * cluster-wide for as long as the cache stayed full. The budget is still respected, because the cache's

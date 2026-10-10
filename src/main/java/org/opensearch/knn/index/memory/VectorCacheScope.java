@@ -44,7 +44,12 @@ public final class VectorCacheScope {
 
     private VectorCacheScope() {}
 
-    /** One segment field: what {@link SlabVectorCache} takes as the first two parts of its key. */
+    /**
+     * One segment field: what {@link SlabVectorCache} takes as the first two parts of its key.
+     *
+     * @param core the segment core identity, whose equality is identity
+     * @param field the field number
+     */
     public record Key(Object core, int field) {
     }
 
