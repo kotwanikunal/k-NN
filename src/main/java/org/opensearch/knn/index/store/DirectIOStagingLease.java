@@ -264,6 +264,14 @@ final class DirectIOStagingLease {
         return count;
     }
 
+    /**
+     * Range {@code i} of the current burst's table, or null where the slot is empty. For span fill (F5),
+     * which walks the burst's spans rather than looking one range up by the bytes it wants.
+     */
+    DirectIOVectorIndexInput.StagedRange rangeAt(final int i) {
+        return table == null || i < 0 || i >= count ? null : table[i];
+    }
+
     /** Whether the burst table is full, i.e. this burst may stage nothing more. */
     boolean isFull() {
         return count == slots;

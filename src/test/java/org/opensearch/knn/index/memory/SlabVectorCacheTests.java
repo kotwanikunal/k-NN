@@ -680,8 +680,157 @@ public class SlabVectorCacheTests extends KNNTestCase {
     }
 
     // ---------------------------------------------------------------------------------------------------
+    // F5: span fill, the admission side
+    // ---------------------------------------------------------------------------------------------------
+
+    /** A run of consecutive vectors goes in under one call, and every one of them is readable afterwards. */
+    public void testPutRunAdmitsEveryVectorOfTheRun() {
+        final SlabVectorCache cache = cacheOf(2);
+        final Object core = new Object();
+        final int dimension = 128;
+        final int bytes = dimension * Float.BYTES;
+        final ByteBuffer span = runOf(core, 0, 10, 6, dimension);
+
+        assertEquals(6, cache.putRun(core, 0, 10, 6, span, 0, bytes));
+        assertEquals("the counter must name them as span fills", 6L, cache.spanFills());
+
+        final float[] read = new float[dimension];
+        for (int ordinal = 10; ordinal < 16; ordinal++) {
+            assertTrue("ordinal " + ordinal, cache.get(core, 0, ordinal, bytes, read));
+            assertArrayEquals(vector(core, 0, ordinal, dimension), read, 0.0f);
+        }
+        assertFalse("and nothing outside the run", cache.get(core, 0, 16, bytes, read));
+        assertFalse(cache.get(core, 0, 9, bytes, read));
+        cache.checkInvariantsForTesting();
+    }
+
+    /** A vector the cache already holds is skipped rather than given a second slot. */
+    public void testPutRunSkipsWhatIsAlreadyCached() {
+        final SlabVectorCache cache = cacheOf(2);
+        final Object core = new Object();
+        final int dimension = 128;
+        final int bytes = dimension * Float.BYTES;
+        put(cache, core, 0, 11, dimension);
+        final long entriesBefore = cache.entries();
+
+        assertEquals("one of the four was already in", 3, cache.putRun(core, 0, 10, 4, runOf(core, 0, 10, 4, dimension), 0, bytes));
+        assertEquals(entriesBefore + 3, cache.entries());
+
+        final float[] read = new float[dimension];
+        for (int ordinal = 10; ordinal < 14; ordinal++) {
+            assertTrue(cache.get(core, 0, ordinal, bytes, read));
+            assertArrayEquals(vector(core, 0, ordinal, dimension), read, 0.0f);
+        }
+        cache.checkInvariantsForTesting();
+    }
+
+    /**
+     * The rule span fill is bounded by: at or above the slab target it admits nothing and evicts nothing.
+     * A requested fill still evicts, which is unchanged; this is the admission that must not.
+     */
+    public void testPutRunAdmitsNothingAtTheTargetAndEvictsNothing() {
+        final SlabVectorCache cache = cacheOf(1);
+        final Object core = new Object();
+        final int dimension = 128;
+        final int bytes = dimension * Float.BYTES;
+        final int slots = cache.slotsPerSlab(bytes);
+
+        // Requested fills until the one slab the target allows is full.
+        for (int ordinal = 0; ordinal < slots; ordinal++) {
+            put(cache, core, 0, ordinal, dimension);
+        }
+        assertFalse("the cache is at its target now", cache.belowSlabTarget());
+        final long entriesBefore = cache.entries();
+        final long evictedBefore = cache.droppedEntries();
+        final long reclaimedBefore = cache.reclaimedSlabs();
+
+        assertEquals(0, cache.putRun(core, 0, slots, 8, runOf(core, 0, slots, 8, dimension), 0, bytes));
+        assertEquals("nothing may be admitted", entriesBefore, cache.entries());
+        assertEquals("and nothing evicted", evictedBefore, cache.droppedEntries());
+        assertEquals("and no slab reclaimed", reclaimedBefore, cache.reclaimedSlabs());
+        assertEquals(0L, cache.spanFills());
+        assertEquals(1, cache.slabCount());
+
+        final float[] read = new float[dimension];
+        assertFalse(cache.get(core, 0, slots, bytes, read));
+        assertTrue("and the vectors that were there are still there", cache.get(core, 0, 0, bytes, read));
+        cache.checkInvariantsForTesting();
+    }
+
+    /**
+     * The target is the bound, not the free slots of the open slab: a run stops at the point where the next
+     * vector would need a slab the target does not allow, and the slab it was filling keeps what it took.
+     */
+    public void testPutRunStopsWhenTheTargetIsReachedMidRun() {
+        final SlabVectorCache cache = cacheOf(1);
+        final Object core = new Object();
+        final int dimension = 1024;
+        final int bytes = dimension * Float.BYTES;
+        final int slots = cache.slotsPerSlab(bytes);
+        assertTrue("this test needs several slots in a slab, it has " + slots, slots >= 4);
+
+        final int offered = slots + 4;
+        final int admitted = cache.putRun(core, 0, 0, offered, runOf(core, 0, 0, offered, dimension), 0, bytes);
+        assertEquals("exactly the slab's worth", slots, admitted);
+        assertEquals(1, cache.slabCount());
+        assertEquals(0L, cache.reclaimedSlabs());
+
+        final float[] read = new float[dimension];
+        assertTrue(cache.get(core, 0, 0, bytes, read));
+        assertArrayEquals(vector(core, 0, 0, dimension), read, 0.0f);
+        assertTrue(cache.get(core, 0, slots - 1, bytes, read));
+        assertFalse("and the rest of the run was refused rather than evicting anything", cache.get(core, 0, slots, bytes, read));
+        cache.checkInvariantsForTesting();
+    }
+
+    /** Span-filled entries belong to their segment like any other, so a close releases them. */
+    public void testSegmentCloseReleasesSpanFilledEntries() {
+        final SlabVectorCache cache = cacheOf(2);
+        final Object core = new Object();
+        final Object otherCore = new Object();
+        final int dimension = 128;
+        final int bytes = dimension * Float.BYTES;
+        cache.putRun(core, 0, 0, 8, runOf(core, 0, 0, 8, dimension), 0, bytes);
+        cache.putRun(otherCore, 0, 0, 8, runOf(otherCore, 0, 0, 8, dimension), 0, bytes);
+        assertEquals(16L, cache.entries());
+
+        cache.releaseSegment(core);
+
+        final float[] read = new float[dimension];
+        for (int ordinal = 0; ordinal < 8; ordinal++) {
+            assertFalse("released ordinal " + ordinal, cache.get(core, 0, ordinal, bytes, read));
+            assertTrue("the other segment keeps its own", cache.get(otherCore, 0, ordinal, bytes, read));
+        }
+        assertEquals(8L, cache.entries());
+        cache.checkInvariantsForTesting();
+    }
+
+    /** With the cache off there is no admission and no counter movement. */
+    public void testPutRunHoldsNothingWhenOff() {
+        final SlabVectorCache cache = cacheOf(0);
+        final Object core = new Object();
+        assertEquals(0, cache.putRun(core, 0, 0, 8, runOf(core, 0, 0, 8, 128), 0, 512));
+        assertEquals(0L, cache.entries());
+        assertEquals(0L, cache.spanFills());
+        assertFalse(cache.belowSlabTarget());
+    }
+
+    // ---------------------------------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------------------------------
+
+    /** The bytes of {@code count} consecutive vectors, laid out as a staged span holds them. */
+    private static ByteBuffer runOf(final Object core, final int field, final int firstOrdinal, final int count, final int dimension) {
+        final int bytes = dimension * Float.BYTES;
+        final ByteBuffer span = ByteBuffer.allocate(count * bytes).order(ByteOrder.LITTLE_ENDIAN);
+        for (int i = 0; i < count; i++) {
+            final float[] vector = vector(core, field, firstOrdinal + i, dimension);
+            for (int component = 0; component < dimension; component++) {
+                span.putFloat(i * bytes + component * Float.BYTES, vector[component]);
+            }
+        }
+        return span;
+    }
 
     private static void put(final SlabVectorCache cache, final Object core, final int field, final int ordinal, final int dimension) {
         final ByteBuffer staging = ByteBuffer.allocate(dimension * Float.BYTES).order(ByteOrder.LITTLE_ENDIAN);

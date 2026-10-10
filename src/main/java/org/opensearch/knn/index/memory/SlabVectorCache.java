@@ -245,6 +245,8 @@ public final class SlabVectorCache {
     private final LongAdder reclaimedSlabs = new LongAdder();
     private final LongAdder readmissions = new LongAdder();
     private final LongAdder droppedEntries = new LongAdder();
+    /** Vectors admitted by span fill rather than because a candidate asked for them. F5. */
+    private final LongAdder spanFills = new LongAdder();
     /** Write-lock time spent reclaiming slabs, which is the figure I4 had to bring down. */
     private final LongAdder reclaimNanos = new LongAdder();
 
@@ -462,6 +464,109 @@ public final class SlabVectorCache {
         }
     }
 
+    /**
+     * Whether the cache would take another slab if a fill asked for one, i.e. whether it is still below its
+     * slab target. This is the condition span fill admits under: see
+     * {@link #putRun(Object, int, int, int, ByteBuffer, int, int)}.
+     *
+     * <p>A volatile read of each of two ints and no lock, because the caller is the read path asking once
+     * per batch whether to bother, and the answer is advisory: {@link #putRun} re-checks it under the write
+     * lock, which is where it has to hold.
+     */
+    public boolean belowSlabTarget() {
+        return maxSlabs != 0 && liveSlabs < maxSlabs;
+    }
+
+    /**
+     * Admits the consecutive vectors {@code [firstOrdinal, firstOrdinal + count)} of one segment field from
+     * {@code source}, under <b>one</b> write-lock acquisition, and only while the cache is below its slab
+     * target. F5's span fill.
+     *
+     * <p><b>Three rules, and each of them is a thing this must not do rather than a thing it does.</b>
+     * <ul>
+     *   <li><b>It never evicts, and never takes a slab the target does not allow.</b> It places through
+     *       {@link #place} with eviction refused, so the moment the cache is at its slab target this admits
+     *       nothing and the admission policy is back to the requested vectors alone. That is what keeps a
+     *       span fill from being a scan that pushes out the working set, which is the open agenda item
+     *       (item 4) this phase is not deciding.</li>
+     *   <li><b>It skips an ordinal that is already cached.</b> A requested fill has just put the batch's
+     *       misses in, and the spans those reads were staged for contain them; admitting them again would
+     *       spend a slot on a vector the cache already holds.</li>
+     *   <li><b>It stops at the first refusal.</b> Once {@link #place} has nowhere to put a vector it has
+     *       nowhere to put the next one either, so walking the rest of the run would be a scan of the index
+     *       under the write lock for nothing.</li>
+     * </ul>
+     *
+     * <p>One acquisition per run rather than per vector is the lock rule the I4 criterion asks of the fill
+     * path. A run is the whole vectors of one staged span, which is about two at the measured mean span of
+     * 7,310 B for a 3,072 B vector and at most {@code max_span_bytes / length} (43 at the defaults), so the
+     * hold is bounded by one span's worth of copying.
+     *
+     * @param core the segment core identity the vectors belong to
+     * @param field the field number
+     * @param firstOrdinal the ordinal of the first vector in the run
+     * @param count how many consecutive vectors the run holds
+     * @param source the staged bytes; copied out, never retained
+     * @param position where in {@code source} the first vector starts
+     * @param length one vector's length in bytes
+     * @return how many vectors were admitted
+     */
+    public int putRun(
+        final Object core,
+        final int field,
+        final int firstOrdinal,
+        final int count,
+        final ByteBuffer source,
+        final int position,
+        final int length
+    ) {
+        if (maxSlabs == 0 || count <= 0 || length <= 0 || (length & 3) != 0 || firstOrdinal < 0 || length > slabBytes) {
+            return 0;
+        }
+        int admitted = 0;
+        lock.writeLock().lock();
+        try {
+            if (belowSlabTarget() == false) {
+                return 0;
+            }
+            for (int i = 0; i < count; i++) {
+                final int ordinal = firstOrdinal + i;
+                if (ordinal < 0) {
+                    break;
+                }
+                if (isCached(core, field, ordinal, length)) {
+                    continue;
+                }
+                final Placement placement = place(core, field, ordinal, length, false);
+                if (placement == null) {
+                    break;
+                }
+                placement.slab.memory.bytes().put(placement.slot * length, source, position + i * length, length);
+                commit(placement, ordinal);
+                admitted++;
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+        spanFills.add(admitted);
+        return admitted;
+    }
+
+    /** Whether this ordinal is already held at this length. Called under either lock. */
+    private boolean isCached(final Object core, final int field, final int ordinal, final int length) {
+        final OrdinalSlotMap map = index.get(new FieldKey(core, field));
+        if (map == null) {
+            return false;
+        }
+        final int cell = map.find(ordinal);
+        if (cell < 0) {
+            return false;
+        }
+        final int slabId = map.slabIdAt(cell);
+        final int slot = map.slotAt(cell);
+        return slotHolds(map, ordinal, slabId, slot) && slabsById[slabId].slotBytes == length;
+    }
+
     /** Where a fill is about to write: the field's index, a slab and a slot in it. */
     private record Placement(OrdinalSlotMap map, Slab slab, int slot) {
     }
@@ -472,6 +577,15 @@ public final class SlabVectorCache {
      * caller writes the bytes and then calls {@link #commit}.
      */
     private Placement place(final Object core, final int field, final int ordinal, final int length) {
+        return place(core, field, ordinal, length, true);
+    }
+
+    /**
+     * As above, with {@code allowEviction} false for a fill that must not displace anything: it may use a
+     * free slot of the slab already open for this length, or a slab the target still allows, and nothing
+     * else.
+     */
+    private Placement place(final Object core, final int field, final int ordinal, final int length, final boolean allowEviction) {
         if (maxSlabs == 0) {
             return null;
         }
@@ -487,7 +601,7 @@ public final class SlabVectorCache {
         }
         Slab slab = openSlabs.get(length);
         if (slab == null || slab.freeSlots() == 0) {
-            slab = obtainSlab(length);
+            slab = allowEviction ? obtainSlab(length) : growSlabs(length);
         }
         if (slab == null) {
             return null;
@@ -610,13 +724,9 @@ public final class SlabVectorCache {
      * there was nothing to evict. Called under the write lock.
      */
     private Slab obtainSlab(final int length) {
-        if (liveSlabs < maxSlabs) {
-            final VectorCacheSlab memory = source.acquire(slabBytes);
-            if (memory != null) {
-                final Slab fresh = register(memory);
-                open(fresh, length);
-                return fresh;
-            }
+        final Slab grown = growSlabs(length);
+        if (grown != null) {
+            return grown;
         }
         final Slab oldest = fifo.poll();
         if (oldest == null) {
@@ -640,6 +750,24 @@ public final class SlabVectorCache {
         fifo.add(oldest);
         reclaimNanos.add(System.nanoTime() - started);
         return oldest;
+    }
+
+    /**
+     * A fresh slab opened for {@code length}-byte vectors while the cache is below its target, or
+     * {@code null} when it is at the target or the source declined. The half of {@link #obtainSlab} that
+     * displaces nothing, which is the only half span fill is allowed. Called under the write lock.
+     */
+    private Slab growSlabs(final int length) {
+        if (liveSlabs >= maxSlabs) {
+            return null;
+        }
+        final VectorCacheSlab memory = source.acquire(slabBytes);
+        if (memory == null) {
+            return null;
+        }
+        final Slab fresh = register(memory);
+        open(fresh, length);
+        return fresh;
     }
 
     /**
@@ -862,6 +990,15 @@ public final class SlabVectorCache {
         return readmissions.sum();
     }
 
+    /**
+     * Vectors admitted because they happened to lie inside a span a batch staged, rather than because a
+     * candidate asked for them. F5; zero while {@code knn.direct_io.rescore.cache.span_fill} is false and
+     * zero once the cache reaches its slab target.
+     */
+    public long spanFills() {
+        return spanFills.sum();
+    }
+
     /** Nanoseconds spent inside a slab reclaim, which is write-lock time. */
     public long reclaimNanos() {
         return reclaimNanos.sum();
@@ -902,6 +1039,7 @@ public final class SlabVectorCache {
         readmissions.reset();
         droppedEntries.reset();
         reclaimNanos.reset();
+        spanFills.reset();
     }
 
     /**

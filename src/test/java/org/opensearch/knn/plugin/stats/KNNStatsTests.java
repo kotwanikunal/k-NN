@@ -107,7 +107,8 @@ public class KNNStatsTests extends KNNTestCase {
             );
         }
         // The first six are the keys the node harness reads and their names and meanings are fixed; from I4
-        // they are the slab cache's rather than the Guava cache's. The last four are the slab mechanism.
+        // they are the slab cache's rather than the Guava cache's. The next four are the slab mechanism, and
+        // span_fills is F5's admission policy.
         assertEquals(
             Set.of(
                 "hits",
@@ -119,7 +120,8 @@ public class KNNStatsTests extends KNNTestCase {
                 "slabs",
                 "slab_bytes",
                 "reclaimed_slabs",
-                "readmissions"
+                "readmissions",
+                "span_fills"
             ),
             directIO.get("cache").keySet()
         );

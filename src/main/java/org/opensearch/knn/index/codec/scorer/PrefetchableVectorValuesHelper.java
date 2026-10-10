@@ -10,6 +10,9 @@ import lombok.NoArgsConstructor;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.codecs.lucene95.HasIndexSlice;
 import org.apache.lucene.index.KnnVectorValues;
+import org.apache.lucene.store.IndexInput;
+import org.opensearch.knn.index.store.DirectIOVectorIndexInput;
+
 import java.io.IOException;
 
 /**
@@ -53,23 +56,52 @@ class PrefetchableVectorValuesHelper {
      * @throws IOException if an I/O error occurs during prefetching
      */
     public static void doPrefetch(final KnnVectorValues vectorValues, final int[] nodes, final int numNodes) throws IOException {
+        final KnnVectorValues sliced = withSlice(vectorValues);
+        if (sliced == null) {
+            log.warn("Not able to do prefetch on instance {}", vectorValues.getClass().getSimpleName());
+            return;
+        }
+        // passing base offset as 0, since the index input is a slice and its base offset is 0.
+        PrefetchHelper.prefetch(((HasIndexSlice) sliced).getSlice(), 0, sliced.getVectorByteLength(), nodes, numNodes);
+    }
+
+    /**
+     * The values in {@code vectorValues}' unwrap chain that expose a slice, or {@code null} when none does.
+     *
+     * <p>Factored out of {@link #doPrefetch} so that span fill (F5) reaches the <em>same</em> input the
+     * prefetch staged into. Two rules that differed would be a defect that only showed as a cache that
+     * admitted nothing, so they are one rule.
+     */
+    static KnnVectorValues withSlice(final KnnVectorValues vectorValues) {
         KnnVectorValues candidate = vectorValues;
         for (int depth = 0; depth < MAX_UNWRAP_DEPTH && candidate != null; depth++) {
             if (candidate instanceof HasIndexSlice vectorValuesWithSlice && vectorValuesWithSlice.getSlice() != null) {
-                // passing base offset as 0, since the index input is a slice and its base offset is 0.
-                PrefetchHelper.prefetch(vectorValuesWithSlice.getSlice(), 0, candidate.getVectorByteLength(), nodes, numNodes);
-                return;
+                return candidate;
             }
             if (candidate instanceof HasFullPrecisionVectorValues == false) {
-                break;
+                return null;
             }
             final KnnVectorValues fullPrecision = ((HasFullPrecisionVectorValues) candidate).getFullPrecisionVectorValues();
             if (fullPrecision == candidate) {
-                break;
+                return null;
             }
             candidate = fullPrecision;
         }
-        log.warn("Not able to do prefetch on instance {}", vectorValues.getClass().getSimpleName());
+        return null;
+    }
+
+    /**
+     * The {@link DirectIOVectorIndexInput} the given values read through, or {@code null} when they read
+     * through anything else. Span fill is for staged spans only, so values served by mmap answer null here
+     * and nothing about their admission changes.
+     */
+    static DirectIOVectorIndexInput directIOSliceOrNull(final KnnVectorValues vectorValues) {
+        final KnnVectorValues sliced = withSlice(vectorValues);
+        if (sliced == null) {
+            return null;
+        }
+        final IndexInput slice = ((HasIndexSlice) sliced).getSlice();
+        return slice instanceof DirectIOVectorIndexInput ? (DirectIOVectorIndexInput) slice : null;
     }
 
 }

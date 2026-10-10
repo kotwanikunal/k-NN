@@ -10,8 +10,10 @@ import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
+import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.memory.SlabVectorCache;
 import org.opensearch.knn.index.memory.VectorCacheScope;
+import org.opensearch.knn.index.store.DirectIOVectorIndexInput;
 
 import java.io.IOException;
 
@@ -93,6 +95,14 @@ final class VectorCacheBatchScorer {
      */
     private boolean targetRefreshed;
 
+    /**
+     * Whether span fill is on, re-read with the target on the same cadence and for the same reason: it is a
+     * dynamic node setting, so a batch has to be able to see a change without a reopen. Read in
+     * {@link #engages} rather than in {@link #spanFill} so that it is one settings read per batch and not
+     * one per span. Starts false, so a scorer that never reaches {@link #engages} never span fills.
+     */
+    private boolean spanFillEnabled;
+
     private VectorCacheBatchScorer(
         final SlabVectorCache cache,
         final VectorCacheScope.Key key,
@@ -166,6 +176,7 @@ final class VectorCacheBatchScorer {
             // failures in turn.
             targetRefreshed = true;
             VectorCacheScope.refreshNodeCacheTarget();
+            spanFillEnabled = readSpanFillSetting();
         }
         if (cache.isOn() == false) {
             return false;
@@ -216,7 +227,50 @@ final class VectorCacheBatchScorer {
             max = Math.max(max, score);
             cache.put(core, field, node, vector, vectorBytes);
         }
+        spanFill();
         return max;
+    }
+
+    /**
+     * F5: while the cache is below its slab target, also admits the whole vectors that happen to lie inside
+     * the spans this batch staged.
+     *
+     * <p><b>The measurement this exists for</b> (ref/PILOT-REPORT.md section 4, MEASURED): on dio-1m with a
+     * 4 GB cache, room for every vector in the file, 16% of candidates still missed after a 10,000-query
+     * warm-up, and in that warm-up Direct I/O read 2.01 MB per query in about 40 KB spans, 6.5 times the
+     * whole file, while caching only the requested vectors. mmap's page cache kept every page it read and
+     * ended holding 95% of the file. The cache was paying for the reads and keeping a fraction of what they
+     * delivered.
+     *
+     * <p><b>After the misses have been read and filled, not before</b>, for two reasons. The requested
+     * vectors get their slots first, so the candidates this query actually asked for are the ones that
+     * survive if the target is reached half way through; and the staged bytes are still valid here, because
+     * the burst ends at the next {@code prefetch} on this thread and nothing between the read loop and this
+     * call prefetches.
+     *
+     * <p>Silent about everything it cannot do: values read through mmap have no staged spans, a batch whose
+     * prefetch was declined has none either, and a cache at its target admits nothing. All three are a
+     * future hit forgone and nothing else.
+     */
+    private void spanFill() throws IOException {
+        if (spanFillEnabled == false || cache.belowSlabTarget() == false) {
+            return;
+        }
+        final DirectIOVectorIndexInput input = PrefetchableVectorValuesHelper.directIOSliceOrNull(values);
+        if (input == null) {
+            return;
+        }
+        // Outside the cache's lock, because this is the call that may wait for a staged read.
+        if (input.prepareStagedSpans() == 0) {
+            return;
+        }
+        input.visitStagedSpanVectors(vectorBytes, (buffer, position, firstOrdinal, count) -> {
+            cache.putRun(core, field, firstOrdinal, count, buffer, position, vectorBytes);
+            // Carry on only while there is still room the target allows. A run that admitted fewer than it
+            // offered may simply have found them cached already, so the target and not the count is what
+            // says whether the next span is worth walking.
+            return cache.belowSlabTarget();
+        });
     }
 
     /**
@@ -232,6 +286,21 @@ final class VectorCacheBatchScorer {
         final float score = similarity.compare(target, vector);
         cache.put(core, field, node, vector, vectorBytes);
         return score;
+    }
+
+    /**
+     * {@code knn.direct_io.rescore.cache.span_fill}, or false if it cannot be read. A setting that cannot be
+     * read leaves span fill off rather than guessing it on, which is the same direction every other
+     * unreadable setting on this path takes: the behaviour without it is the behaviour every earlier
+     * measurement was taken against.
+     */
+    private static boolean readSpanFillSetting() {
+        try {
+            return KNNSettings.isDirectIORescoreCacheSpanFillEnabled();
+        } catch (RuntimeException e) {
+            log.debug("Could not read knn.direct_io.rescore.cache.span_fill; span fill stays off", e);
+            return false;
+        }
     }
 
     /** Collects the hits' scores while the cache holds its read lock. See {@link SlabVectorCache.HitVisitor}. */

@@ -156,7 +156,13 @@ public class KNNStats {
      *       native budget, {@code reclaimed_slabs} is how many times the FIFO took a slab back to make
      *       room, and {@code readmissions} is how many vectors a second chance kept when their slab was
      *       reclaimed. A {@code readmissions} close to half of {@code entries} per reclaim means the
-     *       working set fits; close to zero means the cache is being scanned.</li>
+     *       working set fits; close to zero means the cache is being scanned.
+     *       <p>{@code span_fills} is F5: vectors admitted because they happened to lie inside a span a
+     *       batch staged, rather than because a candidate asked for them. It rises only while the cache is
+     *       below its slab target and only while
+     *       {@code knn.direct_io.rescore.cache.span_fill} is true, so once the cache is full it stops
+     *       moving and admission is the requested candidates alone. {@code span_fills} against
+     *       {@code entries} says how much of the cache the reads delivered for free.</li>
      * </ul>
      *
      * <p>Node level rather than cluster level, and cumulative since node start, because every counter is a
@@ -237,6 +243,7 @@ public class KNNStats {
         cache.put("slab_bytes", vectorCache == null ? 0L : vectorCache.slabBytes());
         cache.put("reclaimed_slabs", vectorCache == null ? 0L : vectorCache.reclaimedSlabs());
         cache.put("readmissions", vectorCache == null ? 0L : vectorCache.readmissions());
+        cache.put("span_fills", vectorCache == null ? 0L : vectorCache.spanFills());
 
         final Map<String, Map<String, Object>> directIOStats = new HashMap<>();
         directIOStats.put("dispatch", dispatch);

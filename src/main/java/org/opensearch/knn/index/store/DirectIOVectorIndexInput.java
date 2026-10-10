@@ -1876,6 +1876,149 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
     }
 
+    // ---------------------------------------------------------------------------------------------------
+    // Staged spans, for span fill (F5)
+    // ---------------------------------------------------------------------------------------------------
+
+    /**
+     * Told about each run of whole vectors a staged span holds, while the span's bytes are still valid.
+     *
+     * <p>The contract is narrow for the same reason {@code SlabVectorCache.HitVisitor}'s is: the bytes are a
+     * staging buffer that the next burst on this thread reuses, so an implementation must copy what it wants
+     * and must not retain {@code buffer}. It must also not read a file or prefetch, because that would end
+     * the burst it is being told about.
+     */
+    public interface SpanVectorVisitor {
+        /**
+         * @param buffer the staged bytes
+         * @param position where in {@code buffer} the vector at {@code firstOrdinal} starts
+         * @param firstOrdinal the ordinal of the first whole vector in this span
+         * @param count how many consecutive whole vectors follow it inside the span
+         * @return true to carry on to the next span, false to stop the walk
+         */
+        boolean onSpanVectors(ByteBuffer buffer, int position, int firstOrdinal, int count);
+    }
+
+    /** Per-span readiness for the burst named by {@link #spanReadyGeneration}. See {@link #prepareStagedSpans}. */
+    private boolean[] spanReady = new boolean[0];
+    private int spanReadyCount;
+    private long spanReadyGeneration = -1;
+
+    /**
+     * Waits for the current burst's staged reads and reports how many of its spans can then be walked by
+     * {@link #visitStagedSpanVectors}.
+     *
+     * <p><b>Two calls rather than one, and the split is the whole safety argument.</b> This one may block,
+     * for at most {@link #STAGED_READ_WAIT_MILLIS} per range and in practice not at all, because the batch's
+     * misses have already been read out of these same ranges and so have already awaited them. The walk may
+     * not block, because the caller holds the vector cache's write lock while it runs: a wait for a device
+     * read under that lock would put every thread filling the cache behind one device. So the waiting is
+     * done here, outside any lock, and the walk only visits what this call found ready.
+     *
+     * <p>Zero when there is no burst to walk: this input does not hold its thread's lease, the route is mmap,
+     * or it is closed. Zero is not a failure; a span fill that does not happen costs a future hit.
+     *
+     * @return how many spans are ready
+     * @throws IOException if a staged read failed
+     */
+    public int prepareStagedSpans() throws IOException {
+        spanReadyCount = 0;
+        spanReadyGeneration = -1;
+        if (closed || directIOActive == false) {
+            return 0;
+        }
+        final DirectIOStagingLease lease = heldLease();
+        if (lease == null) {
+            return 0;
+        }
+        final int count = lease.count();
+        if (count == 0) {
+            return 0;
+        }
+        if (spanReady.length < count) {
+            spanReady = new boolean[count];
+        }
+        int ready = 0;
+        for (int i = 0; i < count; i++) {
+            final StagedRange range = lease.rangeAt(i);
+            // await() is the same bounded wait the read path uses, and it marks a range abandoned on timeout,
+            // which makes it serve nothing here as well.
+            final boolean usable = range != null && await(range) && range.abandoned == false && range.valid > 0;
+            spanReady[i] = usable;
+            if (usable) {
+                ready++;
+            }
+        }
+        spanReadyGeneration = lease.generation();
+        spanReadyCount = ready;
+        return ready;
+    }
+
+    /**
+     * Walks the whole vectors of {@code vectorBytes} bytes that this input's ready spans hold, in runs of
+     * consecutive ordinals, and hands each run to {@code visitor}.
+     *
+     * <h4>What it will and will not offer, which is F5's "whole vectors of the requesting field only"</h4>
+     * <ul>
+     *   <li>Only bytes inside <b>this input's own slice</b>. A staged range is block aligned in the whole
+     *       file, so its ends routinely reach outside the field's region, into another field's vectors or
+     *       into the file's header or footer. Both ends are clipped to {@code [offset, offset + length)}
+     *       before any ordinal is computed, so nothing outside the slice is ever offered.</li>
+     *   <li>Only <b>whole</b> vectors, at the field's own vector boundaries. The first ordinal offered is
+     *       the first whose start is at or after the clipped span start, and the last is the last whose end
+     *       is at or before the clipped span end, so a vector straddling either edge is left out rather than
+     *       admitted half read.</li>
+     *   <li>Only bytes the read actually <b>delivered</b>: the span ends at {@code alignedStart + valid},
+     *       not at {@code alignedStart + alignedLength}, so a short read at end of file cannot offer the
+     *       buffer's previous contents.</li>
+     * </ul>
+     *
+     * <p>Must be called on the thread that called {@link #prepareStagedSpans}, with nothing read or
+     * prefetched in between; both are true of the caller it exists for, which calls them as two statements
+     * of one method. A burst that ended in between is detected by the generation and the walk does nothing.
+     *
+     * @param vectorBytes the field's vector length in bytes
+     * @param visitor told about each run
+     * @return how many vectors were offered
+     */
+    public int visitStagedSpanVectors(final int vectorBytes, final SpanVectorVisitor visitor) {
+        if (spanReadyCount == 0 || vectorBytes <= 0 || visitor == null) {
+            return 0;
+        }
+        final DirectIOStagingLease lease = heldLease();
+        if (lease == null || lease.generation() != spanReadyGeneration) {
+            return 0;
+        }
+        final int count = Math.min(lease.count(), spanReady.length);
+        int offered = 0;
+        for (int i = 0; i < count; i++) {
+            if (spanReady[i] == false) {
+                continue;
+            }
+            final StagedRange range = lease.rangeAt(i);
+            if (range == null || range.abandoned) {
+                continue;
+            }
+            final long from = Math.max(range.alignedStart, offset);
+            final long to = Math.min(range.alignedStart + range.valid, offset + length);
+            if (to - from < vectorBytes) {
+                continue;
+            }
+            final long firstOrdinal = (from - offset + vectorBytes - 1) / vectorBytes;
+            final long lastOrdinal = (to - offset) / vectorBytes - 1;
+            if (lastOrdinal < firstOrdinal || firstOrdinal > Integer.MAX_VALUE) {
+                continue;
+            }
+            final int runCount = Math.toIntExact(Math.min(lastOrdinal, Integer.MAX_VALUE) - firstOrdinal + 1);
+            final int position = Math.toIntExact(offset + firstOrdinal * vectorBytes - range.alignedStart);
+            offered += runCount;
+            if (visitor.onSpanVectors(range.buffer, position, Math.toIntExact(firstOrdinal), runCount) == false) {
+                break;
+            }
+        }
+        return offered;
+    }
+
     /**
      * Ends this input's burst: it stops consulting the staged table and stops holding the pool.
      *
@@ -1888,6 +2031,11 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     private void endBurst() {
         leaseGeneration = -1;
         leaseThreadId = -1;
+        // The spans this input prepared belong to the burst that is ending, so they stop being walkable
+        // with it. The generation check in visitStagedSpanVectors would catch it too; clearing the count is
+        // what makes the common case not even look.
+        spanReadyCount = 0;
+        spanReadyGeneration = -1;
         readSincePrefetch = false;
         burstRefreshed = false;
         // The burst boundary is also where the pool reference is dropped, so the next burst picks up a pool

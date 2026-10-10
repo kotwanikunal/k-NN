@@ -304,6 +304,22 @@ public class KNNSettings {
     public static final String KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES = "knn.direct_io.rescore.cache.max_bytes";
     public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_DEFAULT_VALUE = new ByteSizeValue(0, ByteSizeUnit.BYTES);
 
+    // F5, span fill. While the vector cache is below its slab target, a batch also admits every whole vector
+    // that happens to lie inside the spans it staged, not only the candidates it asked for.
+    //
+    // The measurement it exists for (ref/PILOT-REPORT.md section 4, MEASURED): on dio-1m with a 4 GB cache,
+    // room for every vector in the file, Direct I/O's p50 stayed 9.7x mmap's because 16% of candidates still
+    // missed after a 10,000-query warm-up. In that warm-up Direct I/O read 2.01 MB per query in ~40 KB staged
+    // spans (20 GB, 6.5x the file) and cached only the requested vectors, while mmap's page cache kept every
+    // page it read and ended holding 95% of the file. The cache was paying for the reads and keeping a
+    // fraction of what they delivered.
+    //
+    // A boolean rather than a size, because the policy has no magnitude: at or above the target admission is
+    // requested vectors only, exactly as before, so this cannot cause an eviction and cannot take a slab the
+    // cache's target does not already allow. Default true, and a node can measure with and without it.
+    public static final String KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL = "knn.direct_io.rescore.cache.span_fill";
+    public static final boolean KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_DEFAULT_VALUE = true;
+
     public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN = "knn.direct_io.rescore.prefetch.max_span_bytes";
     public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_DEFAULT_VALUE = new ByteSizeValue(
         128 * 1024 + 4096,
@@ -752,6 +768,18 @@ public class KNNSettings {
     public static final Setting<ByteSizeValue> KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_SETTING = Setting.byteSizeSetting(
         KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES,
         KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_DEFAULT_VALUE,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
+     * Whether a batch also admits the whole vectors that happen to lie inside the spans it staged, while the
+     * vector cache is below its slab target. Node scoped and dynamic, read once per scored batch, so it
+     * takes effect on the next batch with no reopen. See the key's declaration for the measurement.
+     */
+    public static final Setting<Boolean> KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_SETTING = Setting.boolSetting(
+        KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL,
+        KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_DEFAULT_VALUE,
         NodeScope,
         Dynamic
     );
@@ -1267,6 +1295,10 @@ public class KNNSettings {
             return KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_SETTING;
         }
 
+        if (KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL.equals(key)) {
+            return KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_SETTING;
+        }
+
         if (KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN.equals(key)) {
             return KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING;
         }
@@ -1343,6 +1375,7 @@ public class KNNSettings {
             KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING,
             KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING,
             KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_SETTING,
+            KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_SETTING,
             // Sequential read-ahead ring: window and arm trigger
             KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING,
             KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_SETTING,
@@ -1558,6 +1591,16 @@ public class KNNSettings {
      */
     public static ByteSizeValue getDirectIORescoreCacheMaxBytes() {
         return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_SETTING);
+    }
+
+    /**
+     * Whether span fill is on: see {@link #KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL} for what it admits and
+     * the measurement it exists for. Read once per scored batch.
+     *
+     * @return true if a batch may also admit the whole vectors inside the spans it staged
+     */
+    public static boolean isDirectIORescoreCacheSpanFillEnabled() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_SETTING);
     }
 
     /**
