@@ -162,7 +162,12 @@ public class KNNStats {
      *       below its slab target and only while
      *       {@code knn.direct_io.rescore.cache.span_fill} is true, so once the cache is full it stops
      *       moving and admission is the requested candidates alone. {@code span_fills} against
-     *       {@code entries} says how much of the cache the reads delivered for free.</li>
+     *       {@code entries} says how much of the cache the reads delivered for free.
+     *       <p>{@code probes} is G1: kernel probes run since node start, each one a vector read through the
+     *       delegate that nothing prefetched. A verdict is shared per segment field, per delegate scorer
+     *       class and similarity function, so this should be a handful per routed segment field per reader
+     *       open. One per query means the sharing is not working, which is what it was before G1 and what
+     *       cost the node about one synchronous 8 KiB read per query.</li>
      * </ul>
      *
      * <p>Node level rather than cluster level, and cumulative since node start, because every counter is a
@@ -244,6 +249,7 @@ public class KNNStats {
         cache.put("reclaimed_slabs", vectorCache == null ? 0L : vectorCache.reclaimedSlabs());
         cache.put("readmissions", vectorCache == null ? 0L : vectorCache.readmissions());
         cache.put("span_fills", vectorCache == null ? 0L : vectorCache.spanFills());
+        cache.put("probes", vectorCache == null ? 0L : vectorCache.kernelProbes());
 
         final Map<String, Map<String, Object>> directIOStats = new HashMap<>();
         directIOStats.put("dispatch", dispatch);

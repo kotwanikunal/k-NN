@@ -247,6 +247,8 @@ public final class SlabVectorCache {
     private final LongAdder droppedEntries = new LongAdder();
     /** Vectors admitted by span fill rather than because a candidate asked for them. F5. */
     private final LongAdder spanFills = new LongAdder();
+    /** G1: the kernel verdict per segment field, so the probe is not run once per query. */
+    private final KernelVerdicts kernelVerdicts = new KernelVerdicts();
     /** Write-lock time spent reclaiming slabs, which is the figure I4 had to bring down. */
     private final LongAdder reclaimNanos = new LongAdder();
 
@@ -622,8 +624,13 @@ public final class SlabVectorCache {
      * <p>Called when a segment's core closes. The slots become free for the FIFO to reuse but the slab is
      * not compacted here: a closed segment's bytes are dead weight only until its slab reaches the head of
      * the queue, and compacting on close would put a scan of the whole cache on the merge path.
+     *
+     * <p>G1's kernel verdicts for the core go with its entries, and they go first: a verdict holds the core
+     * identity as a map key, so it has to be dropped even when the cache is off and there are no entries to
+     * release.
      */
     public void releaseSegment(final Object core) {
+        kernelVerdicts.releaseCore(core);
         if (maxSlabs == 0) {
             return;
         }
@@ -999,6 +1006,21 @@ public final class SlabVectorCache {
         return spanFills.sum();
     }
 
+    /**
+     * G1's shared kernel verdicts: whether this cache's scoring kernel is the delegate's, per segment field.
+     * The scorer asks this before it probes, which is what keeps the probe off the per-query path.
+     *
+     * @return the verdicts, never null
+     */
+    public KernelVerdicts kernelVerdicts() {
+        return kernelVerdicts;
+    }
+
+    /** Kernel probes run since node start. {@code direct_io_stats.cache.probes}. */
+    public long kernelProbes() {
+        return kernelVerdicts.probes();
+    }
+
     /** Nanoseconds spent inside a slab reclaim, which is write-lock time. */
     public long reclaimNanos() {
         return reclaimNanos.sum();
@@ -1040,6 +1062,7 @@ public final class SlabVectorCache {
         droppedEntries.reset();
         reclaimNanos.reset();
         spanFills.reset();
+        kernelVerdicts.reset();
     }
 
     /**

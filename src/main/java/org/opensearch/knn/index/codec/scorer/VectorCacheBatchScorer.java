@@ -11,6 +11,7 @@ import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.opensearch.knn.index.KNNSettings;
+import org.opensearch.knn.index.memory.KernelVerdicts;
 import org.opensearch.knn.index.memory.SlabVectorCache;
 import org.opensearch.knn.index.memory.VectorCacheScope;
 import org.opensearch.knn.index.store.DirectIOVectorIndexInput;
@@ -40,7 +41,13 @@ import java.io.IOException;
  * bytes entirely. Rather than enumerate delegate classes, which would be a guess that a Lucene upgrade could
  * invalidate silently, this asks: it scores one candidate both ways and uses the cache only if the two agree
  * to within {@link #PROBE_TOLERANCE_ULPS}. A delegate that scores anything else declines here and keeps
- * today's behaviour exactly, and the decision costs one vector read per scorer.
+ * today's behaviour exactly.
+ *
+ * <p><b>The answer is shared per segment field (G1)</b>, in {@link KernelVerdicts}, because a scorer is built
+ * per query per segment and a probe reads a vector nothing prefetched: on the node that was about one
+ * synchronous 8 KiB read per query on the critical path, in every regime and at every hit rate. A scorer asks
+ * for the field's verdict first and probes only while there is none; see {@link KernelVerdicts} for the rule
+ * that decides when two probes may be believed.
  *
  * <h2>Locking (the I4 criterion)</h2>
  * The lookup takes the cache's read lock once per batch, not once per vector, and scores each hit while it
@@ -182,9 +189,54 @@ final class VectorCacheBatchScorer {
             return false;
         }
         if (probe == PROBE_PENDING) {
-            probe = kernelMatchesDelegate(probeNode) ? PROBE_PASSED : PROBE_FAILED;
+            probe = resolveKernel(probeNode);
         }
         return probe == PROBE_PASSED;
+    }
+
+    /**
+     * This scorer's verdict on its delegate's kernel: the segment field's shared one where there is one, and
+     * otherwise a probe of its own, which is offered to the field (G1).
+     *
+     * @param node a candidate ordinal to probe with
+     * @return {@link #PROBE_PASSED} or {@link #PROBE_FAILED}
+     * @throws IOException if the probe's read fails
+     */
+    private byte resolveKernel(final int node) throws IOException {
+        final KernelVerdicts verdicts = cache.kernelVerdicts();
+        final Class<?> delegateClass = delegate.getClass();
+        final KernelVerdicts.Verdict shared = verdicts.verdict(core, field, delegateClass, similarity);
+        if (shared == KernelVerdicts.Verdict.PASSED) {
+            return PROBE_PASSED;
+        }
+        if (shared == KernelVerdicts.Verdict.FAILED) {
+            return PROBE_FAILED;
+        }
+        final ProbeResult result = kernelMatchesDelegate(node);
+        // An ordinal the delegate would not score, or a target that cannot tell two kernels apart, decides
+        // this scorer and must not decide the field. See KernelVerdicts.
+        final boolean shareable = result != ProbeResult.UNSCORABLE && targetDistinguishesKernels();
+        verdicts.recordProbe(core, field, delegateClass, similarity, result == ProbeResult.MATCHED, shareable);
+        return result == ProbeResult.MATCHED ? PROBE_PASSED : PROBE_FAILED;
+    }
+
+    /**
+     * Whether a probe with this target says anything about two kernels. An all-zero target scores zero under
+     * any kernel, so it makes a mismatching delegate look like a match, and a target with a NaN or an
+     * infinity in it makes both sides NaN, which compares unequal to itself. Either way the probe decides the
+     * scorer that ran it and nothing beyond it.
+     */
+    private boolean targetDistinguishesKernels() {
+        boolean nonZero = false;
+        for (final float value : target) {
+            if (Float.isFinite(value) == false) {
+                return false;
+            }
+            if (value != 0.0f) {
+                nonZero = true;
+            }
+        }
+        return nonZero;
     }
 
     /**
@@ -320,11 +372,18 @@ final class VectorCacheBatchScorer {
         }
     }
 
+    /** What one probe found. {@code UNSCORABLE} declines the scorer and decides nothing for the field. */
+    private enum ProbeResult {
+        MATCHED,
+        MISMATCHED,
+        UNSCORABLE
+    }
+
     /**
      * Scores one candidate both ways and reports whether the two agree. See the class javadoc for why this
      * is a measurement rather than a list of delegate classes.
      */
-    private boolean kernelMatchesDelegate(final int node) throws IOException {
+    private ProbeResult kernelMatchesDelegate(final int node) throws IOException {
         final float theirs;
         final float ours;
         try {
@@ -333,14 +392,14 @@ final class VectorCacheBatchScorer {
         } catch (IndexOutOfBoundsException e) {
             // An ordinal the delegate will not score is not a verdict on the kernel, so decline this scorer
             // rather than the whole feature.
-            return false;
+            return ProbeResult.UNSCORABLE;
         }
         if (Float.floatToIntBits(theirs) == Float.floatToIntBits(ours)) {
-            return true;
+            return ProbeResult.MATCHED;
         }
         final float allowed = PROBE_TOLERANCE_ULPS * Math.ulp(Math.max(Math.abs(theirs), Math.abs(ours)));
         if (Float.isFinite(theirs) && Float.isFinite(ours) && Math.abs(theirs - ours) <= allowed) {
-            return true;
+            return ProbeResult.MATCHED;
         }
         log.debug(
             "The vector cache declines {}: it scores ordinal {} as {} where this kernel gets {}",
@@ -349,6 +408,6 @@ final class VectorCacheBatchScorer {
             theirs,
             ours
         );
-        return false;
+        return ProbeResult.MISMATCHED;
     }
 }
