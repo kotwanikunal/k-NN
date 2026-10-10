@@ -81,6 +81,18 @@ final class VectorCacheBatchScorer {
 
     private byte probe = PROBE_PENDING;
 
+    /**
+     * Whether the vector cache's target has been recomputed for the batch about to be scored.
+     *
+     * <p>Recomputing is where a change to {@code knn.direct_io.rescore.cache.max_bytes}, to
+     * {@code knn.direct_io.rescore.enabled} or to the native budget reaches the cache, and {@link #engages}
+     * is the hook because it is the one call that runs whether or not the cache is on and whether or not
+     * anything missed. {@link #bulkScore} arms the next one, so the cadence is once per scored batch there
+     * and once per scorer on the nested path, which never reaches it. Two cluster-settings reads per batch,
+     * and {@code SlabVectorCache#configure} returns on a volatile read when the target has not moved.
+     */
+    private boolean targetRefreshed;
+
     private VectorCacheBatchScorer(
         final SlabVectorCache cache,
         final VectorCacheScope.Key key,
@@ -146,6 +158,15 @@ final class VectorCacheBatchScorer {
      * @throws IOException if the probe's read fails
      */
     boolean engages(final int probeNode) throws IOException {
+        if (targetRefreshed == false) {
+            // Before isOn(), and that order is the whole of I6's cache half. This is the only place on the
+            // read path that always runs: a prefetch burst happens only when there are misses to declare,
+            // and bulkScore runs only when the cache is already on, so a refresh at either of those
+            // cadences cannot turn a cache that is off back on. Arm D of the re-proof measured both
+            // failures in turn.
+            targetRefreshed = true;
+            VectorCacheScope.refreshNodeCacheTarget();
+        }
         if (cache.isOn() == false) {
             return false;
         }
@@ -162,6 +183,9 @@ final class VectorCacheBatchScorer {
      * @return the highest score, which is what {@code RandomVectorScorer#bulkScore} returns
      */
     float bulkScore(final int[] nodes, final float[] scores, final int numNodes) throws IOException {
+        // Arms the next batch's refresh. The cadence is one recompute per scored batch for the bulk path
+        // and one per scorer for the nested path, which reaches score(int) and never this method.
+        targetRefreshed = false;
         if (hit.length < numNodes) {
             hit = new boolean[numNodes];
             missNodes = new int[numNodes];

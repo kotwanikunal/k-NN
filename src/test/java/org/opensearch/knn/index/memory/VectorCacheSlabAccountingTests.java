@@ -82,9 +82,14 @@ public class VectorCacheSlabAccountingTests extends OpenSearchSingleNodeTestCase
      * read path's cache: with that switch off the manager's target is zero whatever the budget says (D2).
      */
     private void setConfiguredCacheSize(final String size) {
+        setConfiguredCacheSize(size, true);
+    }
+
+    /** As above, with {@code knn.direct_io.rescore.enabled} chosen, which is D2's lever. */
+    private void setConfiguredCacheSize(final String size, final boolean directIOEnabled) {
         final Settings settings = Settings.builder()
             .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, size)
-            .put(KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED, true)
+            .put(KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED, directIOEnabled)
             .put(KNNSettings.KNN_MEMORY_CIRCUIT_BREAKER_CLUSTER_LIMIT, (4 * SLAB_KB) + "kb")
             .build();
         when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(settings, registeredSettings));
@@ -280,6 +285,51 @@ public class VectorCacheSlabAccountingTests extends OpenSearchSingleNodeTestCase
         assertEquals("no slab should have been granted", 0, manager.getVectorCacheSlabCount());
         assertEquals(0L, cache.entries());
         assertEquals(0L, manager.getVectorCacheSlabSizeInKilobytes());
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // D2: the switch is the cache's lever too
+    // ---------------------------------------------------------------------------------------------------
+
+    /**
+     * I6's cache half. Turning {@code knn.direct_io.rescore.enabled} off empties the vector cache and
+     * returns every slab to the manager at the next target refresh, and turning it back on lets the cache
+     * grow again, with no node restart and no reopen. The read-path half of the same flip is
+     * {@code DirectIORouteSwitchTests}.
+     */
+    public void testTheDirectIOSwitchEmptiesTheCacheAndLetsItGrowBack() {
+        final SlabVectorCache cache = manager.getVectorCache();
+        final long limit = manager.getMaxCacheSizeInKilobytes();
+        setConfiguredCacheSize(limit + "kb");
+        manager.updateVectorCacheTarget();
+        fillSlabs(cache, (int) (limit / SLAB_KB));
+        assertTrue("the cache should have taken slabs", manager.getVectorCacheSlabCount() > 0);
+        assertTrue(cache.entries() > 0);
+
+        // The operator turns Direct I/O off. The next prefetch burst refreshes the target, which is where
+        // the switch reaches the cache.
+        setConfiguredCacheSize(limit + "kb", false);
+        manager.updateVectorCacheTarget();
+        assertEquals("the target must be zero while the switch is off", 0L, cache.maxBytes());
+        assertEquals("every slab must go back", 0, manager.getVectorCacheSlabCount());
+        assertEquals(0L, manager.getVectorCacheSlabSizeInKilobytes());
+        assertEquals(0L, cache.slabBytes());
+        assertEquals("and the cache must be empty", 0L, cache.entries());
+
+        // A fill while it is off takes nothing, so the rollback holds rather than just starting.
+        fillSlabs(cache, 2);
+        assertEquals(0, manager.getVectorCacheSlabCount());
+        assertEquals(0L, cache.entries());
+
+        setConfiguredCacheSize(limit + "kb", true);
+        manager.updateVectorCacheTarget();
+        fillSlabs(cache, (int) (limit / SLAB_KB));
+        assertTrue(
+            "the cache must grow again, it holds " + manager.getVectorCacheSlabCount() + " slabs",
+            manager.getVectorCacheSlabCount() > 0
+        );
+        assertTrue(cache.entries() > 0);
+        cache.checkInvariantsForTesting();
     }
 
     // ---------------------------------------------------------------------------------------------------

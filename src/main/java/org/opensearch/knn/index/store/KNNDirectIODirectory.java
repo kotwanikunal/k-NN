@@ -97,14 +97,29 @@ import java.util.function.LongSupplier;
  * {@code noCFSRatio} ({@code TieredMergePolicyProvider.java:155-157}, {@code :232}), i.e. merged segments.
  *
  * <h2>Dispatch granularity is the open, never the file</h2>
- * The decision is taken once per {@code openInput} and never re-taken per read, and that is forced rather
- * than chosen. Lucene's SIMD float scorer binds by a type test on the {@code IndexInput} and then reads
- * the memory segment directly, so it never calls {@code readBytes} — an input transparent enough to keep
- * SIMD is transparent enough that a re-score read would bypass the Direct I/O staging entirely, and an
- * input opaque enough to route a re-score read also declines SIMD. One {@code .vec} object cannot serve
- * both, and under a name-based rule there is only one object. So a routed file is routed for every reader
- * of it — traversal, merge and warmup included — which is why condition 1 is narrowed to the faiss/MOS
- * files rather than to {@code .vec} as such.
+ * <b>Which object</b> serves a {@code .vec} is decided once per {@code openInput} and never re-decided,
+ * and that is forced rather than chosen. Lucene's SIMD float scorer binds by a type test on the
+ * {@code IndexInput} and then reads the memory segment directly, so it never calls {@code readBytes} — an
+ * input transparent enough to keep SIMD is transparent enough that a re-score read would bypass the Direct
+ * I/O staging entirely, and an input opaque enough to route a re-score read also declines SIMD. One
+ * {@code .vec} object cannot serve both, and under a name-based rule there is only one object. So a routed
+ * file is routed for every reader of it — traversal, merge and warmup included — which is why condition 1
+ * is narrowed to the faiss/MOS files rather than to {@code .vec} as such.
+ *
+ * <p><b>Condition 2 alone is an exception, and that is D2.</b> An operator who turns
+ * {@code knn.direct_io.rescore.enabled} off wants the device traffic to stop now rather than after the next
+ * reader opens, so a routed input carries the delegate's own input beside its {@code O_DIRECT} channel and
+ * chooses between them at every prefetch burst boundary: see {@code DirectIOVectorIndexInput#mmapFallback}.
+ * That changes how the bytes are fetched, which is all condition 2 ever decided, and it changes nothing
+ * about which object is in the reader's hands — so the SIMD argument above still holds in both states, and
+ * the switch costs a routed input one extra file handle.
+ *
+ * <p>The asymmetry that leaves is deliberate. Turning the switch <b>off</b> reaches segments that are
+ * already open. Turning it <b>on</b> reaches only segments opened after it, because
+ * {@link #routeVectorData(SegmentReadState)} and {@link #openInput} both declined while it was off and
+ * there is no second channel to switch to. Making that symmetric would mean opening an {@code O_DIRECT}
+ * channel for every faiss {@code .vec} on every node that has the feature off, which is a cost paid by
+ * everyone for a transition. Rollback is the direction that has to be immediate.
  *
  * <h2>Failure is a fallback</h2>
  * Every way Direct I/O can be unavailable — no {@code ExtendedOpenOption.DIRECT} on this JDK, a
@@ -184,7 +199,9 @@ public final class KNNDirectIODirectory extends FilterDirectory {
 
     /**
      * Condition 2 of the dispatch rule, read at every dispatch rather than captured once, because the
-     * setting is dynamic and a segment's {@code .vec} is opened once per reader.
+     * setting is dynamic and a segment's {@code .vec} is opened once per reader. From I6 the input this
+     * dispatch produces goes on reading it for its whole life, so that turning the switch off reaches a
+     * reader that is already open: see the class javadoc.
      */
     private final BooleanSupplier directIORescoreEnabled;
 
@@ -228,7 +245,7 @@ public final class KNNDirectIODirectory extends FilterDirectory {
         // Conditions 1 and 2 first, and in this order: the name test is a string comparison and the
         // setting read is a map lookup, so a file this never routes costs no filesystem call at all.
         if (isFaissVectorData(name) && directIORescoreEnabled.getAsBoolean()) {
-            final IndexInput direct = directIOInput(name);
+            final IndexInput direct = directIOInput(name, context);
             if (direct != null) {
                 routedOpens.incrementAndGet();
                 DirectIOVectorIndexInput.STATS.recordRoutedOpen();
@@ -245,7 +262,7 @@ public final class KNNDirectIODirectory extends FilterDirectory {
      * closes the input, which is the same ownership {@link Directory#openInput} always has.
      */
     @Nullable
-    private IndexInput directIOInput(final String name) {
+    private IndexInput directIOInput(final String name, final IOContext context) {
         // (3a) the compound case, taken BEFORE the chain walk. A CompoundDirectory is not a FilterDirectory,
         // so the walk below would decline it anyway and count declinedChain -- but that conflates the one
         // decline reason that is EXPECTED with the one that means "a layer nobody has read yet is in the
@@ -307,17 +324,51 @@ public final class KNNDirectIODirectory extends FilterDirectory {
             return null;
         }
         // (6) the open, which is the last thing that can decline and the only one that touches the device.
+        // Two inputs are opened rather than one, and that is D2: the delegate's own input is kept beside the
+        // O_DIRECT channel so that knn.direct_io.rescore.enabled can be turned off under a reader that is
+        // already open and the read path changes at that reader's next prefetch burst, with no reopen. Its
+        // cost is one file handle per routed .vec per reader, and it is paid only by a node that is routing.
+        // The fallback is opened first, because a failure there must leave nothing behind: the O_DIRECT
+        // channel would otherwise have to be closed by hand on a path that has no input to close it with.
+        IndexInput fallback = null;
         try {
-            final DirectIOVectorIndexInput direct = DirectIOVectorIndexInput.open(path);
+            fallback = in.openInput(name, context);
+        } catch (IOException | RuntimeException e) {
+            // Routing without a fallback is still correct, only not switchable: an input with no fallback
+            // stays on O_DIRECT for its life. Declining here instead would give up read-ahead for a reason
+            // the operator never asked about.
+            log.warn(
+                "k-NN Direct I/O [{}]: could not open an mmap fallback for [{}]; the switch will not reach this input",
+                segmentName,
+                name,
+                e
+            );
+        }
+        try {
+            final DirectIOVectorIndexInput direct = DirectIOVectorIndexInput.open(path, fallback, directIORescoreEnabled);
             if (direct == null) {
                 decline(declinedOpenFailed, DirectIOVectorIndexInput.DeclineReason.OPEN_FAILED);
                 log.warn("k-NN Direct I/O [{}]: Direct I/O is not available for [{}]", segmentName, path);
+                closeQuietly(fallback);
             }
             return direct;
         } catch (RuntimeException e) {
             decline(declinedOpenFailed, DirectIOVectorIndexInput.DeclineReason.OPEN_FAILED);
             log.warn("k-NN Direct I/O [{}]: could not open [{}] with Direct I/O", segmentName, path, e);
+            closeQuietly(fallback);
             return null;
+        }
+    }
+
+    /** Closes a fallback that no input took ownership of, because the Direct I/O open declined after it. */
+    private void closeQuietly(@Nullable final IndexInput input) {
+        if (input == null) {
+            return;
+        }
+        try {
+            input.close();
+        } catch (IOException | RuntimeException e) {
+            log.debug("k-NN Direct I/O [{}]: could not close an abandoned mmap fallback", segmentName, e);
         }
     }
 

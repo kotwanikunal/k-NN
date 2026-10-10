@@ -113,7 +113,13 @@ public class KNNStats {
      *       and 783k device reads per 5,000 queries at an effective capacity of 64 against 0% and 707k at
      *       1,024. {@code queue_peak} is the occupancy high-water mark the derived default is validated
      *       against, and {@code pool_rebuilds} is how an operator sees that a live capacity change took
-     *       effect.</li>
+     *       effect.
+     *       <p>{@code fallback_reads} / {@code fallback_bytes} and {@code switched_to_mmap} /
+     *       {@code switched_to_direct} are D2's rollback, and they are how an operator sees that turning
+     *       {@code knn.direct_io.rescore.enabled} off took effect <b>without a reopen</b>: the switch
+     *       counters move once per already-open input at its next prefetch burst, and from then on the
+     *       fallback counters rise while {@code staged_reads} and {@code blocking_reads} stand still. All
+     *       four stay at zero on a node that has never turned the switch off.</li>
      *   <li><b>memory</b> — how much off-heap is it holding, and is the budget biting? {@code live_bytes}
      *       against {@code budget_bytes} (the setting, echoed so one GET answers both halves),
      *       {@code peak_bytes} for the high-water mark, and {@code declined_budget} for prefetches the
@@ -186,6 +192,10 @@ public class KNNStats {
         reads.put("declined_span_bytes", stats.declinedSpanBytes());
         reads.put("queue_peak", stats.queuePeak());
         reads.put("pool_rebuilds", stats.poolRebuilds());
+        reads.put("fallback_reads", stats.fallbackReads());
+        reads.put("fallback_bytes", stats.fallbackBytes());
+        reads.put("switched_to_mmap", stats.switchedToMmap());
+        reads.put("switched_to_direct", stats.switchedToDirect());
 
         final Map<String, Object> memory = new HashMap<>();
         // Drain first, so the number an operator reads is not stale by however long it has been since the

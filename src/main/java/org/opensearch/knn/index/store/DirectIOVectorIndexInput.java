@@ -7,6 +7,7 @@ package org.opensearch.knn.index.store;
 
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.store.IndexInput;
+import org.opensearch.common.Nullable;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.memory.VectorCacheScope;
@@ -36,6 +37,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 
 /**
  * An {@link IndexInput} that fetches with {@code O_DIRECT} and implements {@link #prefetch} by putting
@@ -307,6 +309,21 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         private final AtomicLong arenasReused = new AtomicLong();
         private final AtomicLong arenasRetired = new AtomicLong();
         private final AtomicLong foreignThreadReads = new AtomicLong();
+        private final AtomicLong fallbackReads = new AtomicLong();
+        private final AtomicLong fallbackBytes = new AtomicLong();
+        private final AtomicLong switchedToMmap = new AtomicLong();
+        private final AtomicLong switchedToDirect = new AtomicLong();
+
+        /** Counts one read served by an open input's mmap fallback, with the switch off. D2. */
+        void recordFallbackRead(final long bytes) {
+            fallbackReads.incrementAndGet();
+            fallbackBytes.addAndGet(bytes);
+        }
+
+        /** Counts one already-open input changing read path at a prefetch burst boundary. D2. */
+        void recordSwitch(final boolean toDirectIO) {
+            (toDirectIO ? switchedToDirect : switchedToMmap).incrementAndGet();
+        }
 
         private void recordInFlightPeak() {
             final long now = inFlightNow.get();
@@ -632,6 +649,31 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             return stagedWaitTimeouts.get();
         }
 
+        /**
+         * Reads an already-open routed input served from its mmap fallback because
+         * {@code knn.direct_io.rescore.enabled} was off at the last prefetch burst. The counter an operator
+         * watches to see a rollback take effect without a reopen: it rises while the switch is off and
+         * stops rising when it goes back on. D2.
+         */
+        public long fallbackReads() {
+            return fallbackReads.get();
+        }
+
+        /** Bytes served through the mmap fallback. */
+        public long fallbackBytes() {
+            return fallbackBytes.get();
+        }
+
+        /** Times an already-open input changed over to its mmap fallback at a burst boundary. */
+        public long switchedToMmap() {
+            return switchedToMmap.get();
+        }
+
+        /** Times an already-open input changed back to {@code O_DIRECT} at a burst boundary. */
+        public long switchedToDirect() {
+            return switchedToDirect.get();
+        }
+
         public void reset() {
             routedOpens.set(0);
             declinedCompound.set(0);
@@ -663,6 +705,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             arenasReused.set(0);
             arenasRetired.set(0);
             foreignThreadReads.set(0);
+            fallbackReads.set(0);
+            fallbackBytes.set(0);
+            switchedToMmap.set(0);
+            switchedToDirect.set(0);
             // directMemoryLive is NOT reset: it is a live gauge, not a counter, and zeroing it while buffers
             // are still held would make the budget let through exactly as much again.
         }
@@ -681,7 +727,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                     + "readaheadReads=%d readaheadBytes=%d readaheadHits=%d readaheadDeclined=%d readaheadArmed=%d "
                     + "stagedWaitTimeouts=%d queuePeak=%d poolRebuilds=%d "
                     + "directMemoryLive=%d directMemoryPeak=%d declinedBudget=%d "
-                    + "arenasAllocated=%d arenasReused=%d arenasRetired=%d foreignThreadReads=%d amplification=%.3f",
+                    + "arenasAllocated=%d arenasReused=%d arenasRetired=%d foreignThreadReads=%d "
+                    + "fallbackReads=%d fallbackBytes=%d switchedToMmap=%d switchedToDirect=%d amplification=%.3f",
                 routedOpens.get(),
                 declinedCompound.get(),
                 declinedChain.get(),
@@ -713,6 +760,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 arenasReused.get(),
                 arenasRetired.get(),
                 foreignThreadReads.get(),
+                fallbackReads.get(),
+                fallbackBytes.get(),
+                switchedToMmap.get(),
+                switchedToDirect.get(),
                 served == 0 ? 0.0 : (double) read / served
             );
         }
@@ -798,6 +849,34 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     private static final AtomicLong INPUT_IDS = new AtomicLong();
 
     private final Handle handle;
+    /**
+     * The delegate's own input over the same bytes, kept open beside the {@code O_DIRECT} channel, or
+     * {@code null} when the directory could not open one.
+     *
+     * <p><b>This is D2's rollback half.</b> {@code knn.direct_io.rescore.enabled} has to reach segments that
+     * are already open, because an operator who turns Direct I/O off wants the device traffic to stop now,
+     * not after the next reader opens. The decision cannot be re-taken at the {@code openInput} the class
+     * javadoc describes, because that open has already happened; so the input carries both routes and
+     * chooses between them at every prefetch burst boundary. Its coordinates are this input's: a slice of
+     * this input holds the matching slice of the fallback, so {@link #filePointer} addresses both.
+     *
+     * <p>It is <b>only</b> opened when the switch was on at {@code openInput} time, so the cost of carrying
+     * it is one extra file handle per routed {@code .vec} per reader and nothing on a node with the feature
+     * off, which routes no file and so opens no second input. The asymmetry that leaves is deliberate:
+     * turning the switch off reaches open segments, turning it on from a cold start reaches only segments
+     * opened after it, because the alternative is opening an {@code O_DIRECT} channel for every {@code .vec}
+     * on a node that will never use one.
+     */
+    @Nullable
+    private final IndexInput mmapFallback;
+    /**
+     * Condition 2 of the dispatch rule, re-read once per prefetch burst. It is the supplier
+     * {@link KNNDirectIODirectory} dispatched on rather than a second read of the setting, so that the
+     * directory and the inputs it produced can never disagree about whether the feature is on -- which they
+     * would under the directory's test constructor, and which would be a silent mmap read in a test that
+     * believes it is measuring {@code O_DIRECT}.
+     */
+    private final BooleanSupplier routeEnabled;
     /** Absolute file offset of this input's byte zero, so a slice needs no other translation. */
     private final long offset;
     private final long length;
@@ -840,6 +919,21 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
     private long filePointer;
     private boolean closed;
+
+    /**
+     * Whether this input is reading through {@code O_DIRECT} right now. Set from {@link #routeEnabled} at
+     * construction and re-read from it once per prefetch burst. Not volatile: an {@link IndexInput} is used
+     * by one thread at a time and a clone takes a copy, which is the same ownership every other mutable
+     * field here has.
+     */
+    private boolean directIOActive;
+    /**
+     * Whether this burst has already re-read the settings that are allowed to change under an open input.
+     * Cleared by {@link #endBurst}, so the cadence is once per burst whichever route the burst takes --
+     * which it has to be, because with the switch off no staging table is ever built and {@code pool} can no
+     * longer stand in for "this burst has begun".
+     */
+    private boolean burstRefreshed;
 
     /**
      * This input's identity in its thread's {@link DirectIOStagingLease}, used to decide whether the shared
@@ -897,6 +991,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     private DirectIOVectorIndexInput(
         final String resourceDescription,
         final Handle handle,
+        @Nullable final IndexInput mmapFallback,
+        final BooleanSupplier routeEnabled,
         final long offset,
         final long length,
         final boolean ownsHandle,
@@ -909,6 +1005,14 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     ) {
         super(resourceDescription);
         this.handle = handle;
+        this.mmapFallback = mmapFallback;
+        this.routeEnabled = routeEnabled;
+        // The route a new input starts on is the one the switch names now, not the one it named when the
+        // file was opened. MEASURED: without this, arm D of I6's re-proof still read the device once per
+        // values object with the switch off, because Lucene builds a fresh slice per query and the first
+        // read of a slice arrives before its first prefetch, which is the boundary a route change is taken
+        // at. One supplier call per input object, and none at all for an input with no fallback.
+        this.directIOActive = mmapFallback == null || routeEnabled.getAsBoolean();
         this.offset = offset;
         this.length = length;
         this.ownsHandle = ownsHandle;
@@ -928,8 +1032,34 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * must cost a fall back to the default path, never a failed query.
      */
     public static DirectIOVectorIndexInput open(final Path path) {
+        return open(path, (IndexInput) null);
+    }
+
+    /**
+     * As {@link #open(Path)}, with the delegate's own input over the same file kept beside the
+     * {@code O_DIRECT} channel so that {@code knn.direct_io.rescore.enabled} can be turned off under an
+     * already-open input. The returned input owns {@code mmapFallback} and closes it; a {@code null}
+     * fallback means the input stays on {@code O_DIRECT} whatever the setting says, which is what every
+     * caller that has no second input to give gets. See {@link #mmapFallback}.
+     */
+    public static DirectIOVectorIndexInput open(final Path path, @Nullable final IndexInput mmapFallback) {
+        return open(path, mmapFallback, KNNSettings::isDirectIORescoreEnabled);
+    }
+
+    /**
+     * As {@link #open(Path, IndexInput)}, with the switch the route is re-read from. Production passes
+     * {@link KNNDirectIODirectory}'s own condition-2 supplier, so that the directory and its inputs read
+     * one source; see {@link #routeEnabled}.
+     */
+    public static DirectIOVectorIndexInput open(
+        final Path path,
+        @Nullable final IndexInput mmapFallback,
+        final BooleanSupplier routeEnabled
+    ) {
         return open(
             path,
+            mmapFallback,
+            routeEnabled,
             0,
             configuredMaxStagedRanges(),
             configuredMaxStagedRangeBytes(),
@@ -1084,6 +1214,34 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final int readaheadWindowBytes,
         final int readaheadTrigger
     ) {
+        return open(
+            path,
+            null,
+            KNNSettings::isDirectIORescoreEnabled,
+            bufferSize,
+            maxStagedRanges,
+            maxStagedRangeBytes,
+            readaheadWindows,
+            readaheadWindowBytes,
+            readaheadTrigger
+        );
+    }
+
+    /**
+     * As the seven-argument overload, with the mmap input the switch falls back to. See
+     * {@link #mmapFallback}.
+     */
+    public static DirectIOVectorIndexInput open(
+        final Path path,
+        @Nullable final IndexInput mmapFallback,
+        final BooleanSupplier routeEnabled,
+        final int bufferSize,
+        final int maxStagedRanges,
+        final int maxStagedRangeBytes,
+        final int readaheadWindows,
+        final int readaheadWindowBytes,
+        final int readaheadTrigger
+    ) {
         final OpenOption direct = directOpenOption();
         if (direct == null) {
             log.warn("This JDK does not expose ExtendedOpenOption.DIRECT; a Direct I/O IndexInput cannot be opened");
@@ -1106,6 +1264,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             return new DirectIOVectorIndexInput(
                 "DirectIOVectorIndexInput(" + path + ")",
                 new Handle(path, channel, blockSize, fileLength),
+                mmapFallback,
+                routeEnabled,
                 0L,
                 fileLength,
                 true,
@@ -1130,6 +1290,16 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             log.warn("Direct I/O could not open [{}]", path, e);
             return null;
         }
+    }
+
+    /** Whether this input is reading through {@code O_DIRECT} right now rather than its mmap fallback. */
+    public boolean isDirectIOActive() {
+        return directIOActive;
+    }
+
+    /** Whether this input has an mmap input to fall back to. Visible for testing. */
+    boolean hasMmapFallback() {
+        return mmapFallback != null;
     }
 
     /** The filesystem block size every read of this input is aligned to. */
@@ -1245,13 +1415,27 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         if (readSincePrefetch) {
             endBurst();
         }
-        if (pool == null) {
+        if (burstRefreshed == false) {
             // Exactly once per burst, which is the burst boundary endBurst just established (or the
             // input's first prefetch). Same cadence and same contract as DirectIOReadPool.executor(): an
-            // operator's change to knn.direct_io.rescore.cache.max_bytes takes effect on the next burst.
-            // From I4 the cache this reaches is the node's slab cache, and the target it recomputes is
-            // min(that setting, the native budget minus everything that is not a slab).
-            VectorCacheScope.refreshNodeCacheTarget();
+            // operator's change takes effect on the next burst. This is where
+            // knn.direct_io.rescore.enabled reaches an input that is already open (I6, D2).
+            //
+            // The vector cache's target is NOT refreshed here, and the reason is I6's measurement: the
+            // scorer prefetches only the candidates it missed on, so a burst is a thing that happens when
+            // the cache is cold. With it warm nothing prefetches, and a refresh on this cadence never ran
+            // at all -- arm D of the re-proof turned the switch off against a warm cache and the cache kept
+            // its slab. The target is refreshed once per scored batch instead, in VectorCacheBatchScorer,
+            // which is the only caller that reaches the cache and the only one that always runs.
+            burstRefreshed = true;
+            refreshRoute();
+        }
+        if (directIOActive == false) {
+            // D2: this burst is an mmap burst, so the lookahead is the one the page cache path has.
+            // Lucene's prefetch is madvise(WILLNEED) over the mapped range, and the fallback carries this
+            // input's coordinates, so the arguments pass through unchanged.
+            mmapFallback.prefetch(offset, length);
+            return;
         }
         final long absolute = this.offset + offset;
         final int blockSize = handle.blockSize;
@@ -1528,9 +1712,77 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         leaseGeneration = -1;
         leaseThreadId = -1;
         readSincePrefetch = false;
+        burstRefreshed = false;
         // The burst boundary is also where the pool reference is dropped, so the next burst picks up a pool
         // rebuilt by a capacity change. See ensureStagingTable.
         pool = null;
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // The route, re-decided per burst (D2)
+    // ---------------------------------------------------------------------------------------------------
+
+    /**
+     * Re-reads {@code knn.direct_io.rescore.enabled} and changes this input's route if it has to.
+     *
+     * <p>Called once per prefetch burst, which is the only boundary at which a route may change: within a
+     * burst the staged ranges and the read that consumes them have to be on the same channel, and between
+     * bursts nothing is in flight. An input with no fallback stays on {@code O_DIRECT} whatever the setting
+     * says, because the alternative would be a read with nowhere to go.
+     *
+     * <p>Never throws. A setting that cannot be read leaves the route alone, which is the same choice
+     * {@link VectorCacheScope#refreshNodeCacheTarget} makes and for the same reason: a cluster-state read
+     * must not fail a query.
+     */
+    private void refreshRoute() {
+        if (mmapFallback == null) {
+            return;
+        }
+        final boolean enabled;
+        try {
+            enabled = routeEnabled.getAsBoolean();
+        } catch (RuntimeException | LinkageError e) {
+            log.debug("Could not read knn.direct_io.rescore.enabled; leaving this input on its current route", e);
+            return;
+        }
+        if (enabled == directIOActive) {
+            return;
+        }
+        directIOActive = enabled;
+        STATS.recordSwitch(enabled);
+        if (enabled == false) {
+            // Nothing may be left in flight on a channel this input is about to stop reading: the ring's
+            // windows are quiesced and the burst's lease is given up, exactly as close() does.
+            quiesceReadahead();
+            DirectIOStagingLease.current().releaseIfHeldBy(leaseGeneration);
+            leaseGeneration = -1;
+            leaseThreadId = -1;
+            pool = null;
+        }
+        log.debug(
+            "k-NN Direct I/O: [{}] switched to {} at a prefetch burst boundary, with no reopen",
+            handle.path.getFileName(),
+            enabled ? "O_DIRECT" : "the mmap fallback"
+        );
+    }
+
+    /**
+     * The input this read must go through instead of the {@code O_DIRECT} channel, or {@code null} to read
+     * through the channel. Positions the fallback at this input's file pointer, so a caller that seeks and
+     * reads sees one cursor whichever route is live.
+     */
+    @Nullable
+    private IndexInput fallbackFor(final int bytes) throws IOException {
+        if (directIOActive) {
+            return null;
+        }
+        ensureOpen();
+        // A read ends a burst on this route too, so that the next prefetch is recognised as a boundary and
+        // the switch can be read again. Without it an input that went to mmap could never come back.
+        readSincePrefetch = true;
+        STATS.recordFallbackRead(bytes);
+        mmapFallback.seek(filePointer);
+        return mmapFallback;
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -1539,6 +1791,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
     @Override
     public byte readByte() throws IOException {
+        final IndexInput fallback = fallbackFor(1);
+        if (fallback != null) {
+            final byte served = fallback.readByte();
+            filePointer++;
+            STATS.servedBytes.incrementAndGet();
+            return served;
+        }
         final Source source = source(1);
         final byte value = source.buffer.get(source.position);
         filePointer++;
@@ -1548,6 +1807,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
     @Override
     public void readBytes(final byte[] destination, final int destinationOffset, final int count) throws IOException {
+        final IndexInput fallback = fallbackFor(count);
+        if (fallback != null) {
+            fallback.readBytes(destination, destinationOffset, count);
+            filePointer += count;
+            STATS.servedBytes.addAndGet(count);
+            return;
+        }
         int written = 0;
         while (written < count) {
             final Source source = source(Math.min(count - written, 1));
@@ -1571,6 +1837,15 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     @Override
     public void readFloats(final float[] destination, final int destinationOffset, final int count) throws IOException {
         final int requested = count * Float.BYTES;
+        final IndexInput fallback = fallbackFor(requested);
+        if (fallback != null) {
+            // The same bytes of the same file, decoded by Lucene's own reader: this is the mmap read the
+            // dispatch rule would have produced had the switch been off when the file was opened.
+            fallback.readFloats(destination, destinationOffset, count);
+            filePointer += requested;
+            STATS.servedBytes.addAndGet(requested);
+            return;
+        }
         // No cache lookup and no cache fill here any more: both moved into the scorer with D1, so this
         // method reads what the scorer could not serve and nothing else.
         int written = 0;
@@ -2021,6 +2296,11 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         return new DirectIOVectorIndexInput(
             sliceDescription,
             handle,
+            // The matching slice of the fallback, so that the two routes share this slice's coordinates and
+            // filePointer addresses both. A slice of a Lucene input is owned by its parent and is not closed
+            // on its own, which is the same contract the O_DIRECT handle has here.
+            mmapFallback == null ? null : mmapFallback.slice(sliceDescription, offset, length),
+            routeEnabled,
             this.offset + offset,
             length,
             false,
@@ -2042,6 +2322,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final DirectIOVectorIndexInput copy = new DirectIOVectorIndexInput(
             toString(),
             handle,
+            mmapFallback == null ? null : mmapFallback.clone(),
+            routeEnabled,
             offset,
             length,
             false,
@@ -2053,6 +2335,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             readaheadTrigger
         );
         copy.filePointer = filePointer;
+        // The route this clone starts on is the one its parent is on, so a clone taken mid burst does not
+        // change path on its first read; it re-reads the switch at its own next burst like any other input.
+        copy.directIOActive = directIOActive;
         return copy;
     }
 
@@ -2069,6 +2354,11 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         endBurst();
         quiesceReadahead();
         if (ownsHandle) {
+            if (mmapFallback != null) {
+                // Opened by the directory alongside the channel and owned with it, so the two routes are
+                // released together and a rollback can never find a half-closed input.
+                mmapFallback.close();
+            }
             handle.channel.close();
             // One snapshot per file closed, and deliberately not per burst or per clone: clones close once
             // per query thread per segment, and a line there would be per-query log traffic inside the very
