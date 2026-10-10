@@ -29,8 +29,8 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * under the AOSS buffer pool, so the cache went with it. D1 moves the lookup above the {@code IndexInput},
  * into the scorer, so the same cache serves whatever input a segment happens to have, and moves the memory
  * off the heap into slabs the k-NN native budget accounts for. This class is the index and the eviction
- * policy; {@link VectorCacheSlab} is the memory; I3 connects the slab supply to
- * {@link NativeMemoryCacheManager}; I4 calls {@link #get} and {@link #put} from the scorer.
+ * policy; {@link VectorCacheSlab} is the memory; {@link NativeMemoryCacheManager} grants the slabs and
+ * owns the node's instance of this class; I4 calls {@link #get} and {@link #put} from the scorer.
  *
  * <h2>The key is the segment's core identity, the field and the ordinal</h2>
  * A Lucene segment's core identity ({@code LeafReader#getCoreCacheHelper().getKey()}) is stable for as long
@@ -122,8 +122,12 @@ public final class SlabVectorCache {
         void release(VectorCacheSlab slab);
     }
 
-    /** Allocates and frees without asking anyone, which is what I1 measured and what tests use. */
-    static final SlabSource DIRECT_SOURCE = new SlabSource() {
+    /**
+     * Allocates and frees without asking anyone. What the microbenchmarks use, and what a test uses when it
+     * is not testing the accounting. The node's cache is owned by {@link NativeMemoryCacheManager} and takes
+     * every slab as a grant from it instead; see {@code NativeMemoryCacheManager#getVectorCache}.
+     */
+    public static final SlabSource DIRECT_SOURCE = new SlabSource() {
         @Override
         public VectorCacheSlab acquire(final int bytes) {
             return VectorCacheSlab.allocate(bytes);
@@ -134,14 +138,6 @@ public final class SlabVectorCache {
             slab.close();
         }
     };
-
-    /** The node's cache. One per node, because the budget it spends is the node's. */
-    private static final SlabVectorCache NODE = new SlabVectorCache(DIRECT_SOURCE, VectorCacheSlab.SLAB_BYTES);
-
-    /** The node's cache. */
-    public static SlabVectorCache node() {
-        return NODE;
-    }
 
     /** One segment field. {@code core} is a Lucene core cache key, whose equality is identity. */
     private record FieldKey(Object core, int field) {
@@ -222,7 +218,11 @@ public final class SlabVectorCache {
     /** Scratch for an in-place compaction move, which must not read and write one slot at a time. */
     private byte[] moveBuffer = new byte[0];
 
-    SlabVectorCache(final SlabSource source, final int slabBytes) {
+    /**
+     * @param source where slabs come from and go back to
+     * @param slabBytes the fixed slab size, {@link VectorCacheSlab#SLAB_BYTES} outside tests and benchmarks
+     */
+    public SlabVectorCache(final SlabSource source, final int slabBytes) {
         this.source = source;
         this.slabBytes = slabBytes;
     }

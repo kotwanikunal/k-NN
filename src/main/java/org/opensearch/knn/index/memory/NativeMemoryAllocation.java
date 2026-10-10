@@ -500,4 +500,103 @@ public interface NativeMemoryAllocation {
             return size;
         }
     }
+
+    /**
+     * One full-precision vector cache slab, granted by {@link NativeMemoryCacheManager} and accounted under
+     * the k-NN native budget the same way a faiss graph's {@code malloc} memory is (D1 proof b).
+     *
+     * <h2>Why a slab is not a cache entry</h2>
+     * Every other allocation here lives in the manager's Guava cache and is freed by its removal listener.
+     * A slab deliberately does not, for two reasons that are both correctness rather than taste:
+     * <ol>
+     *   <li>Guava would evict it on weight, at a moment of its own choosing, and freeing a slab that
+     *       {@link SlabVectorCache}'s index still points into is a use after free of native memory. A slab's
+     *       lifetime has to be the vector cache's to end, because only the vector cache knows which entries
+     *       name it.</li>
+     *   <li>A Guava eviction arrives at {@code onRemoval} with {@link com.google.common.cache.RemovalCause#SIZE},
+     *       which trips the cluster-wide circuit breaker and sets capacity-reached. A cache that evicts in
+     *       steady state would therefore keep k-NN indexing rejected cluster-wide, which is the first of the
+     *       four reasons the design note gives for not making vectors cache entries.</li>
+     * </ol>
+     * So the manager grants and accounts slabs with a running byte counter and a registry of the live ones,
+     * and the vector cache releases them when its target drops. This class is that grant: it owns the free
+     * and the return of the budget, and it is what the registry holds.
+     *
+     * <h2>The locks are the interface's, not the slab's</h2>
+     * {@link #readLock()} and the rest are here because {@link NativeMemoryAllocation} requires them. What
+     * actually keeps a slab from being freed under a reader is {@link SlabVectorCache}'s own read-write lock
+     * plus {@link VectorCacheSlab}'s, described in those two classes. Nothing takes these.
+     */
+    class VectorCacheSlabAllocation implements NativeMemoryAllocation {
+
+        private final VectorCacheSlab slab;
+        private final int sizeKb;
+        private final Runnable onClose;
+        private final ReadWriteLock readWriteLock;
+        private volatile boolean closed;
+
+        VectorCacheSlabAllocation(final VectorCacheSlab slab, final Runnable onClose) {
+            this.slab = slab;
+            this.sizeKb = slab.capacity() / 1024;
+            this.onClose = onClose;
+            this.readWriteLock = new ReentrantReadWriteLock();
+            this.closed = false;
+        }
+
+        /** The slab this grant is for. */
+        public VectorCacheSlab getSlab() {
+            return slab;
+        }
+
+        /**
+         * Frees the slab and gives its bytes back to the native budget. Idempotent, and synchronous: unlike
+         * {@link AnonymousAllocation#close()} this does not hand the free to an executor, because the caller
+         * is the vector cache releasing a slab it has already emptied and the budget has to be free before
+         * the allocation that is waiting for it is tried.
+         */
+        @Override
+        public synchronized void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            slab.close();
+            onClose.run();
+        }
+
+        @Override
+        public boolean isClosed() {
+            return closed;
+        }
+
+        @Override
+        public long getMemoryAddress() {
+            return slab.address();
+        }
+
+        @Override
+        public void readLock() {
+            readWriteLock.readLock().lock();
+        }
+
+        @Override
+        public void writeLock() {
+            readWriteLock.writeLock().lock();
+        }
+
+        @Override
+        public void readUnlock() {
+            readWriteLock.readLock().unlock();
+        }
+
+        @Override
+        public void writeUnlock() {
+            readWriteLock.writeLock().unlock();
+        }
+
+        @Override
+        public int getSizeInKB() {
+            return sizeKb;
+        }
+    }
 }

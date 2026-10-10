@@ -36,12 +36,14 @@ import java.util.Iterator;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -65,10 +67,35 @@ public class NativeMemoryCacheManager implements Closeable {
     @Getter
     private Cancellable maintenanceTask;
 
+    /**
+     * The cache's size in KB, maintained as entries are loaded and removed rather than re-summed.
+     *
+     * <p>It replaces an {@code O(entries)} stream sum that {@link #get} called on every miss, and twice more
+     * per iteration of the force-evict loop. Equal to the sum by construction and by test: the only two ways
+     * an entry enters are the two {@code cache.get} calls in {@link #get}, both of which add the loaded
+     * allocation's size, and the only way one leaves is {@link #onRemoval}, which subtracts it.
+     * {@code getCacheSizeInKilobytesByScan} is the old sum, kept so a test can assert they agree.
+     */
+    private final AtomicLong cacheSizeInKb = new AtomicLong();
+
+    /** Bytes of vector cache slab granted, in KB. Not part of {@link #cacheSizeInKb}; see the javadoc. */
+    private final AtomicLong slabSizeInKb = new AtomicLong();
+
+    /** The slabs this manager has granted, by address, so that it can free them when it is closed. */
+    private final ConcurrentHashMap<Long, NativeMemoryAllocation.VectorCacheSlabAllocation> grantedSlabs = new ConcurrentHashMap<>();
+
+    /**
+     * The node's full-precision vector cache. Its memory is this manager's to account, so the cache is this
+     * manager's to own: every slab it holds is a grant taken under the same budget as a graph.
+     */
+    @Getter
+    private final SlabVectorCache vectorCache;
+
     NativeMemoryCacheManager() {
         this.executor = Executors.newSingleThreadExecutor();
         this.cacheCapacityReached = new AtomicBoolean(false);
         this.maxWeight = Long.MAX_VALUE;
+        this.vectorCache = new SlabVectorCache(new ManagedSlabSource(), VectorCacheSlab.SLAB_BYTES);
         initialize();
     }
 
@@ -124,12 +151,18 @@ public class NativeMemoryCacheManager implements Closeable {
         cacheCapacityReached = new AtomicBoolean(false);
         accessRecencyQueue = new ConcurrentLinkedDeque<>();
         cache = cacheBuilder.build();
+        cacheSizeInKb.set(0);
 
         if (threadPool != null) {
             startMaintenance(cache);
         } else {
             logger.warn("ThreadPool is null during NativeMemoryCacheManager initialization. Maintenance will not start.");
         }
+
+        // A limit change changes what is left over for vector cache slabs. The vector cache resizes by
+        // adding or releasing slabs rather than being rebuilt, so unlike the graph cache above it keeps
+        // whatever still fits.
+        updateVectorCacheTarget();
     }
 
     /**
@@ -167,6 +200,9 @@ public class NativeMemoryCacheManager implements Closeable {
 
     @Override
     public void close() {
+        // Through the vector cache and not through grantedSlabs directly: a slab must not be freed while
+        // the cache's index still names it, and only the cache can drop those entries first.
+        vectorCache.configure(0);
         executor.shutdown();
         if (maintenanceTask != null) {
             maintenanceTask.cancel();
@@ -174,11 +210,23 @@ public class NativeMemoryCacheManager implements Closeable {
     }
 
     /**
-     * Getter for current cache size in Kilobytes.
+     * Getter for current cache size in Kilobytes. Vector cache slabs are not counted here; see
+     * {@link #getVectorCacheSlabSizeInKilobytes()} for why, and {@link #getTotalNativeMemoryInKilobytes()}
+     * for the two together.
      *
      * @return current size of the cache
      */
     public long getCacheSizeInKilobytes() {
+        return cacheSizeInKb.get();
+    }
+
+    /**
+     * The same figure by the summation this used to do on every miss, so that a test can show the running
+     * counter agrees with it.
+     *
+     * @return current size of the cache, by scanning every entry
+     */
+    long getCacheSizeInKilobytesByScan() {
         return cache.asMap().values().stream().mapToLong(NativeMemoryAllocation::getSizeInKB).sum();
     }
 
@@ -280,6 +328,140 @@ public class NativeMemoryCacheManager implements Closeable {
         return maxWeight;
     }
 
+    // -------------------------------------------------------------------------------------------------
+    // Vector cache slabs (D1 proof b)
+    // -------------------------------------------------------------------------------------------------
+
+    /**
+     * Bytes of vector cache slab granted right now, in KB.
+     *
+     * <p>Deliberately not part of {@link #getCacheSizeInKilobytes()}, and the reason is the circuit breaker
+     * rather than bookkeeping. {@link KNNCircuitBreaker} clears a tripped breaker only when the cache is at
+     * or below the unset percentage of the limit, so if a full vector cache counted towards that figure a
+     * breaker tripped by a graph eviction could never be cleared and k-NN indexing would stay rejected
+     * cluster-wide for as long as the cache stayed full. The budget is still respected, because the cache's
+     * target is the limit minus the non-slab allocations: see {@link #updateVectorCacheTarget()}.
+     *
+     * @return size of the granted vector cache slabs in KB
+     */
+    public long getVectorCacheSlabSizeInKilobytes() {
+        return slabSizeInKb.get();
+    }
+
+    /**
+     * Everything k-NN holds in native memory under this budget: cache entries plus vector cache slabs.
+     *
+     * @return total native memory held in KB
+     */
+    public long getTotalNativeMemoryInKilobytes() {
+        return cacheSizeInKb.get() + slabSizeInKb.get();
+    }
+
+    /** Vector cache slabs granted right now. */
+    public int getVectorCacheSlabCount() {
+        return grantedSlabs.size();
+    }
+
+    /**
+     * Sets the vector cache's target to {@code min(knn.direct_io.rescore.cache.max_bytes, the native budget
+     * minus everything that is not a slab)} and resizes it to match.
+     *
+     * <p>The second term is what makes the cache yield: a graph load raises the non-slab total, which lowers
+     * the target, which releases slabs. The cache resizes by adding or releasing slabs rather than being
+     * rebuilt, so a change keeps every vector that still fits. The breaker limit is a ceiling here and not a
+     * target, which is the design note's point: on a memory-optimized-search node those bytes would
+     * otherwise be page cache for the graph.
+     *
+     * <p>A setting that cannot be read leaves the target alone rather than guessing at zero, which is the
+     * same choice {@code DirectIOVectorCache#applyConfiguredSize} makes for the same reason.
+     */
+    public void updateVectorCacheTarget() {
+        applyVectorCacheTarget(cacheSizeInKb.get());
+    }
+
+    /**
+     * Shrinks the vector cache so that {@code neededKb} of non-slab allocation will fit beside what is
+     * already there, and returns whether it had to.
+     *
+     * <p>This is rule two of the four the design note asks for: when a graph needs room, vector cache slabs
+     * go first and graphs are evicted only if that is not enough. It runs before every path in {@link #get}
+     * that could evict or refuse, so by the time Guava weighs the cache or the force-evict loop walks the
+     * recency queue, the slabs have already been handed back.
+     */
+    private boolean makeRoomForNonSlab(final long neededKb) {
+        final long nonSlab = cacheSizeInKb.get() + neededKb;
+        if (slabSizeInKb.get() == 0 || nonSlab + slabSizeInKb.get() <= maxWeight) {
+            return false;
+        }
+        applyVectorCacheTarget(nonSlab);
+        return true;
+    }
+
+    private void applyVectorCacheTarget(final long nonSlabKb) {
+        final long configuredBytes;
+        try {
+            final org.opensearch.core.common.unit.ByteSizeValue configured = KNNSettings.getDirectIORescoreCacheMaxBytes();
+            configuredBytes = configured == null ? 0L : configured.getBytes();
+        } catch (RuntimeException e) {
+            logger.debug("Could not read knn.direct_io.rescore.cache.max_bytes; leaving the vector cache target alone", e);
+            return;
+        }
+        final long budgetKb = Math.max(0L, maxWeight - nonSlabKb);
+        final long budgetBytes = budgetKb > Long.MAX_VALUE / 1024 ? Long.MAX_VALUE : budgetKb * 1024;
+        vectorCache.configure(Math.min(configuredBytes, budgetBytes));
+    }
+
+    /**
+     * The vector cache's slab supply: every slab is a grant taken under this manager's budget, and giving
+     * one back frees it and returns its bytes.
+     *
+     * <p>Neither method takes any lock this manager holds while it is calling into the vector cache, which
+     * is what keeps the two from deadlocking: the cache calls {@code acquire} with its own write lock held,
+     * and {@code acquire} does nothing but a compare-and-set on a counter and a {@code malloc}.
+     */
+    private final class ManagedSlabSource implements SlabVectorCache.SlabSource {
+
+        @Override
+        public VectorCacheSlab acquire(final int bytes) {
+            final long kb = bytes / 1024L;
+            while (true) {
+                final long granted = slabSizeInKb.get();
+                if (cacheSizeInKb.get() + granted + kb > maxWeight) {
+                    // The budget moved under the cache's target, which a concurrent graph load can do.
+                    // Declining is the whole protocol: the cache keeps what it has and fills no further.
+                    return null;
+                }
+                if (slabSizeInKb.compareAndSet(granted, granted + kb)) {
+                    break;
+                }
+            }
+            final VectorCacheSlab slab;
+            try {
+                slab = VectorCacheSlab.allocate(bytes);
+            } catch (Throwable t) {
+                slabSizeInKb.addAndGet(-kb);
+                logger.warn("Could not allocate a {} byte vector cache slab", bytes, t);
+                return null;
+            }
+            grantedSlabs.put(slab.address(), new NativeMemoryAllocation.VectorCacheSlabAllocation(slab, () -> slabSizeInKb.addAndGet(-kb)));
+            return slab;
+        }
+
+        @Override
+        public void release(final VectorCacheSlab slab) {
+            final NativeMemoryAllocation.VectorCacheSlabAllocation allocation = grantedSlabs.remove(slab.address());
+            if (allocation == null) {
+                // Not one of ours, which only a test that mixed sources can produce. Free it anyway rather
+                // than leaking it, and do not touch the accounting for a grant that was never made.
+                slab.close();
+                return;
+            }
+            // Frees the slab and returns its bytes. Never reaches onRemoval, so it cannot trip the breaker
+            // or set capacity-reached: rule one of the four.
+            allocation.close();
+        }
+    }
+
     /**
      * Get graph count for a particular index
      *
@@ -368,6 +550,12 @@ public class NativeMemoryCacheManager implements Closeable {
      */
     public NativeMemoryAllocation get(NativeMemoryEntryContext<?> nativeMemoryEntryContext, boolean isAbleToTriggerEviction)
         throws ExecutionException {
+        // Vector cache slabs go back before anything else is weighed, evicted or refused, so that a graph
+        // never loses its place to a cache of full-precision vectors. Rule two of the design note's four.
+        // Nothing below has to account for the slabs that remain: after this returns they fit in whatever
+        // the limit has left once this entry is in, which is what the target it sets means.
+        makeRoomForNonSlab(nativeMemoryEntryContext.calculateSizeInKB());
+
         if (!isAbleToTriggerEviction
             && (maxWeight - getCacheSizeInKilobytes() - nativeMemoryEntryContext.calculateSizeInKB()) <= 0
             && !cache.asMap().containsKey(nativeMemoryEntryContext.getKey())) {
@@ -427,7 +615,7 @@ public class NativeMemoryCacheManager implements Closeable {
                     }
                 }
 
-                result = cache.get(key, nativeMemoryEntryContext::load);
+                result = loadIntoCache(key, nativeMemoryEntryContext::load);
                 accessRecencyQueue.addLast(key);
 
                 return result;
@@ -438,13 +626,33 @@ public class NativeMemoryCacheManager implements Closeable {
                 // if we already have the allocation we should not open file again as this will cause slowdown in
                 // heavy throughput cases, since open() function do locking while opening and mapping the graph file to
                 // memory.
-                return cache.get(key, () -> {
+                return loadIntoCache(key, () -> {
                     // open graphFile before load
                     open(key, nativeMemoryEntryContext);
                     return nativeMemoryEntryContext.load();
                 });
             }
         }
+    }
+
+    /**
+     * {@code cache.get(key, loader)}, plus the running size counter.
+     *
+     * <p>The counter is adjusted only when the loader actually ran, so a hit on an entry another thread
+     * loaded does not count twice. {@link #onRemoval} is the other side of it.
+     */
+    private NativeMemoryAllocation loadIntoCache(final String key, final Callable<NativeMemoryAllocation> loader)
+        throws ExecutionException {
+        final boolean[] loaded = new boolean[1];
+        final NativeMemoryAllocation allocation = cache.get(key, () -> {
+            final NativeMemoryAllocation value = loader.call();
+            loaded[0] = true;
+            return value;
+        });
+        if (loaded[0]) {
+            cacheSizeInKb.addAndGet(allocation.getSizeInKB());
+        }
+        return allocation;
     }
 
     /**
@@ -525,8 +733,13 @@ public class NativeMemoryCacheManager implements Closeable {
 
     private void onRemoval(RemovalNotification<String, NativeMemoryAllocation> removalNotification) {
         NativeMemoryAllocation nativeMemoryAllocation = removalNotification.getValue();
+        cacheSizeInKb.addAndGet(-nativeMemoryAllocation.getSizeInKB());
         nativeMemoryAllocation.close();
 
+        // A vector cache slab cannot arrive here, because a slab is never a cache entry: see
+        // NativeMemoryAllocation.VectorCacheSlabAllocation for the two reasons. That is what makes rule one
+        // of the design note's four true by construction rather than by a test of the cause below, and it is
+        // why releasing a slab, for any cause, neither trips the breaker nor sets capacity-reached.
         if (RemovalCause.SIZE == removalNotification.getCause()) {
             KNNSettings.state().updateCircuitBreakerSettings(true);
             setCacheCapacityReached(true);
