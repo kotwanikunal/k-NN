@@ -10,6 +10,8 @@
  */
 #include <jni.h>
 
+#include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 #include "jni_util.h"
@@ -94,6 +96,30 @@ void knn_jni::commons::freeByteVectorData(jlong memoryAddressJ) {
         auto *vect = reinterpret_cast<std::vector<int8_t>*>(memoryAddressJ);
         delete vect;
     }
+}
+
+jlong knn_jni::commons::allocateSlab(jlong bytesJ) {
+    if (bytesJ <= 0) {
+        return 0;
+    }
+    void *slab = malloc((size_t) bytesJ);
+    if (slab == nullptr) {
+        return 0;
+    }
+    return (jlong) (uintptr_t) slab;
+}
+
+void knn_jni::commons::freeSlab(jlong addressJ) {
+    if (addressJ != 0) {
+        free((void *) (uintptr_t) addressJ);
+    }
+}
+
+jobject knn_jni::commons::wrapSlab(JNIEnv *env, jlong addressJ, jlong bytesJ) {
+    if (addressJ == 0) {
+        return nullptr;
+    }
+    return env->NewDirectByteBuffer((void *) (uintptr_t) addressJ, bytesJ);
 }
 
 int knn_jni::commons::getIntegerMethodParameter(JNIEnv * env, knn_jni::JNIUtilInterface * jniUtil, std::unordered_map<std::string, jobject> methodParams, std::string methodParam, int defaultValue) {

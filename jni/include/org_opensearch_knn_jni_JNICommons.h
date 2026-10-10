@@ -66,6 +66,30 @@ JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_JNICommons_freeBinaryVectorDa
 JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_JNICommons_freeByteVectorData
 (JNIEnv *, jclass, jlong);
 
+/*
+* Class:     org_opensearch_knn_jni_JNICommons
+* Method:    allocateSlab
+* Signature: (J)J
+*/
+JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_JNICommons_allocateSlab
+(JNIEnv *, jclass, jlong);
+
+/*
+* Class:     org_opensearch_knn_jni_JNICommons
+* Method:    freeSlab
+* Signature: (J)V
+*/
+JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_JNICommons_freeSlab
+(JNIEnv *, jclass, jlong);
+
+/*
+* Class:     org_opensearch_knn_jni_JNICommons
+* Method:    wrapSlab
+* Signature: (JJ)Ljava/nio/ByteBuffer;
+*/
+JNIEXPORT jobject JNICALL Java_org_opensearch_knn_jni_JNICommons_wrapSlab
+(JNIEnv *, jclass, jlong, jlong);
+
 #ifdef __cplusplus
 }
 #endif

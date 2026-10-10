@@ -98,6 +98,44 @@ namespace knn_jni {
         void freeBinaryVectorData(jlong);
 
         /**
+         * Allocates one fixed-size off-heap slab for the full-precision vector cache and returns its
+         * address, or 0 when the allocation failed.
+         *
+         * Deliberately a plain malloc rather than a Java direct ByteBuffer: a direct ByteBuffer counts
+         * against -XX:MaxDirectMemorySize, which this plugin's Direct I/O staging and netty already share,
+         * and it is reclaimed only after a garbage collection. A slab is accounted by k-NN under the
+         * native memory budget, the same way a faiss index's malloc memory is, and freeSlab returns it at
+         * a point the cache chooses.
+         *
+         * The memory is NOT zeroed. The cache reads only the slots it has written, and zeroing a 32 MiB
+         * slab costs about 6.7 ms on the dev desktop (MEASURED, output/bench/i1) which the cache would
+         * then immediately overwrite with vector bytes.
+         *
+         * @param bytes size of the slab. Must be positive.
+         * @return address of the slab, or 0 on failure.
+         */
+        jlong allocateSlab(jlong bytes);
+
+        /**
+         * Frees a slab returned by allocateSlab. A 0 address is ignored, so a double free that has already
+         * cleared its address is safe.
+         *
+         * @param address address returned by allocateSlab.
+         */
+        void freeSlab(jlong address);
+
+        /**
+         * Wraps a slab in a direct java.nio.ByteBuffer over the slab's own memory, so the scorer reads the
+         * vector bytes in place rather than through a copy. The buffer carries no cleaner: the slab's
+         * address is the only thing that frees the memory, through freeSlab.
+         *
+         * @param address address returned by allocateSlab.
+         * @param bytes the slab's size.
+         * @return the direct ByteBuffer, or nullptr when the address is 0.
+         */
+        jobject wrapSlab(JNIEnv *, jlong address, jlong bytes);
+
+        /**
          * Extracts query time efSearch from method parameters
          **/
         int getIntegerMethodParameter(JNIEnv *, knn_jni::JNIUtilInterface *, std::unordered_map<std::string, jobject>, std::string, int);

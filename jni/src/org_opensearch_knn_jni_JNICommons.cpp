@@ -103,3 +103,35 @@ JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_JNICommons_freeByteVectorData
         jniUtil.CatchCppExceptionAndThrowJava(env);
     }
 }
+
+JNIEXPORT jlong JNICALL Java_org_opensearch_knn_jni_JNICommons_allocateSlab(JNIEnv * env, jclass cls,
+                                                                            jlong bytesJ)
+{
+    try {
+        return knn_jni::commons::allocateSlab(bytesJ);
+    } catch (...) {
+        jniUtil.CatchCppExceptionAndThrowJava(env);
+    }
+    return 0;
+}
+
+JNIEXPORT void JNICALL Java_org_opensearch_knn_jni_JNICommons_freeSlab(JNIEnv * env, jclass cls,
+                                                                            jlong addressJ)
+{
+    try {
+        return knn_jni::commons::freeSlab(addressJ);
+    } catch (...) {
+        jniUtil.CatchCppExceptionAndThrowJava(env);
+    }
+}
+
+JNIEXPORT jobject JNICALL Java_org_opensearch_knn_jni_JNICommons_wrapSlab(JNIEnv * env, jclass cls,
+                                                                            jlong addressJ, jlong bytesJ)
+{
+    try {
+        return knn_jni::commons::wrapSlab(env, addressJ, bytesJ);
+    } catch (...) {
+        jniUtil.CatchCppExceptionAndThrowJava(env);
+    }
+    return nullptr;
+}

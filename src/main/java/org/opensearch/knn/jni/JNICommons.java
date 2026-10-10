@@ -181,4 +181,58 @@ public class JNICommons {
      * @param memoryAddress address to be freed.
      */
     public static native void freeByteVectorData(long memoryAddress);
+
+    /**
+     * Allocates one fixed-size off-heap slab for the full-precision vector cache and returns its address,
+     * or {@code 0} when the allocation failed.
+     *
+     * <p>This is the allocation primitive the vector cache's slabs are built on. It is native rather than
+     * a Java direct {@link java.nio.ByteBuffer} for two reasons, both measured:
+     * <ul>
+     *   <li>A direct ByteBuffer counts against {@code -XX:MaxDirectMemorySize}, which this plugin's
+     *       Direct I/O staging and netty already share, and is reclaimed only after a garbage collection.
+     *       Phase 15 D3c is the record of what that costs: a gauge measuring churn awaiting collection
+     *       rather than memory in use. A slab is accounted by k-NN under the native memory budget, the
+     *       same way a faiss index's {@code malloc} memory is, and {@link #freeSlab} returns it at a point
+     *       the cache chooses.</li>
+     *   <li>The alternative that is also deterministic, an FFM {@code Arena.ofShared()}, cannot reach the
+     *       production jar: this project compiles at {@code sourceCompatibility = 21} unconditionally, so
+     *       the build excludes every JDK22+ source file. MEASURED in output/bench/i1: FFM also zero-fills,
+     *       which costs 6.8 ms per 32 MiB slab that the cache overwrites immediately, against 4.8 us here.
+     *       </li>
+     * </ul>
+     *
+     * <p><b>The memory is not zeroed.</b> The cache reads only slots it has written. See
+     * {@code VectorCacheSlab} for the accessor that enforces that.
+     *
+     * @param bytes size of the slab in bytes. Must be positive.
+     * @return address of the slab, or {@code 0} on failure.
+     */
+    public static native long allocateSlab(long bytes);
+
+    /**
+     * Frees a slab returned by {@link #allocateSlab}. A {@code 0} address is ignored.
+     *
+     * <p>Not threadsafe for one address: the caller must serialise the free with every read of the slab.
+     * {@code VectorCacheSlab} does that with a read-write lock, the same way
+     * {@code NativeMemoryAllocation.IndexAllocation} serialises a graph's free against its searches.
+     *
+     * @param address address returned by {@link #allocateSlab}.
+     */
+    public static native void freeSlab(long address);
+
+    /**
+     * Wraps a slab in a direct {@link java.nio.ByteBuffer} over the slab's own memory, so a cache hit is
+     * read in place rather than through a copy.
+     *
+     * <p>The buffer carries no cleaner, which is the point: nothing frees this memory except
+     * {@link #freeSlab}, so the slab's lifetime is the cache's to decide rather than the collector's. It
+     * is also why reading the buffer after the slab is freed is undefined, and why {@code VectorCacheSlab}
+     * never hands the buffer out once it is closed.
+     *
+     * @param address address returned by {@link #allocateSlab}.
+     * @param bytes the slab's size in bytes.
+     * @return the direct buffer, or {@code null} when {@code address} is {@code 0}.
+     */
+    public static native java.nio.ByteBuffer wrapSlab(long address, long bytes);
 }
