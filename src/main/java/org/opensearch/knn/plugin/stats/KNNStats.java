@@ -138,7 +138,13 @@ public class KNNStats {
      *       {@code arenas_allocated} and {@code arenas_retired} should stay flat — it moves only when a
      *       staged read would not quiesce (watch {@code staged_wait_timeouts} with it) or when the burst
      *       geometry changed. {@code foreign_thread_reads} is ~0 unless some caller prefetches an input on
-     *       one thread and reads it on another, which costs that read its read-ahead and nothing else.</li>
+     *       one thread and reads it on another, which costs that read its read-ahead and nothing else.
+     *       <p>{@code wide_buffer_bytes} against {@code wide_buffer_budget_bytes} is D3d's sub-budget: the
+     *       buffers a lease keeps for a coalesced group too wide for an arena slot, which are the ones it
+     *       holds for the life of its arena. They are inside {@code live_bytes} as well, and have a cap of
+     *       their own because wide buffers accumulating to the overall budget would leave no room to carve
+     *       an arena and every prefetch would then decline. {@code declined_wide_budget} is ranges not
+     *       staged because that cap was reached, which costs them a blocking read and nothing else.</li>
      *   <li><b>cache</b> — the node-wide vector cache, {@code 0} throughout while
      *       {@code knn.direct_io.rescore.cache.max_bytes} is at its default of {@code 0b}.
      *       {@code hits / (hits + misses)} is the hit rate, and from I4 it is <b>one lookup per vector</b>
@@ -209,6 +215,10 @@ public class KNNStats {
         memory.put("arenas_reused", stats.arenasReused());
         memory.put("arenas_retired", stats.arenasRetired());
         memory.put("foreign_thread_reads", stats.foreignThreadReads());
+        memory.put("wide_buffer_bytes", stats.wideBufferLive());
+        memory.put("wide_buffer_peak_bytes", stats.wideBufferPeak());
+        memory.put("wide_buffer_budget_bytes", DirectIOVectorIndexInput.wideBufferBudgetBytes());
+        memory.put("declined_wide_budget", stats.declinedWideBudget());
 
         // The six keys the node harness reads keep their names and their meanings, but from I4 they are the
         // slab cache's rather than the Guava cache's: the lookup moved into the scorer, so the Guava cache

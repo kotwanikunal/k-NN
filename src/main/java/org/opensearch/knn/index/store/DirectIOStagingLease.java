@@ -116,9 +116,14 @@ final class DirectIOStagingLease {
     private ByteBuffer[] slotBuffers;
     private FloatBuffer[] slotFloats;
     /**
-     * Per-slot buffers for a coalesced group wider than a slot, grown on demand and reused across bursts.
-     * Bounded by {@code staged_ranges} of them at {@code max_span_bytes} each, and dropped with the arena
-     * when it is retired, because a pool read can be writing into one of these too.
+     * Per-slot buffers for a coalesced group wider than a slot, grown on demand and reused across bursts,
+     * and dropped with the arena when it is retired, because a pool read can be writing into one of these
+     * too.
+     *
+     * <p>{@code staged_ranges} of them at {@code max_span_bytes} each is 8.25 MiB per thread at the
+     * defaults, with no bound on the number of leases, so D3d gives them a node-wide sub-budget of the
+     * direct-memory budget: see {@code DirectIOVectorIndexInput#fitsWideBufferBudget}, which
+     * {@link #bufferFor} asks before it grows one.
      */
     private ByteBuffer[] wideBuffers;
     private FloatBuffer[] wideFloats;
@@ -278,7 +283,16 @@ final class DirectIOStagingLease {
             if (DirectIOVectorIndexInput.fitsBudget(alignedLength, blockSize) == false) {
                 return null;
             }
-            wideBuffers[count] = DirectIOVectorIndexInput.trackedAllocate(alignedLength, blockSize);
+            // D3d: and the wide buffers' own sub-budget, because these are the allocations a lease keeps for
+            // the life of its arena. Declining costs this range its staging and nothing else -- the bytes
+            // are then served by a blocking read, the same fallback the overall budget's decline takes.
+            final ByteBuffer wide = DirectIOVectorIndexInput.allocateWideBuffer(alignedLength, blockSize);
+            if (wide == null) {
+                return null;
+            }
+            // Dropping the old buffer here is what returns its bytes: both charges hang off the one
+            // ByteBuffer, so the reclamation that returns it to the overall budget returns it to this one.
+            wideBuffers[count] = wide;
             wideFloats[count] = wideBuffers[count].asFloatBuffer();
         }
         return wideBuffers[count];
