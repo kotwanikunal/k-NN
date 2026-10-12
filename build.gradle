@@ -961,6 +961,14 @@ testClusters.integTest {
     // dependency). Single-node integTest makes a fixed port safe.
     setting 'aux.transport.types', '[transport-grpc]'
     setting 'aux.transport.transport-grpc.port', System.getProperty('tests.grpc.port', '9400-9400')
+    // Phase 16-M M5 (the same seven lines phase 16-I's I8 added, for the same reason): lets an integration
+    // test be run a second time with the Direct I/O read path and its slab vector store on, which is what
+    // the circuit-breaker arm needs -- KNNCircuitBreakerIT must pass both with the store off and with it
+    // filling. Every default here is the SHIPPED default, so the ordinary integTest cluster is exactly what
+    // it was.
+    setting 'knn.direct_io.rescore.enabled', System.getProperty('tests.knn.direct_io.enabled', 'false')
+    setting 'knn.direct_io.rescore.cache.max_bytes', System.getProperty('tests.knn.direct_io.cache', '0b')
+    setting 'knn.direct_io.min_file_size', System.getProperty('tests.knn.direct_io.min_file_size', '10mb')
 }
 
 testClusters.integTestRemoteIndexBuild {
