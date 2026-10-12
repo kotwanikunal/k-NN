@@ -140,6 +140,58 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
         assertEquals(0L, DirectIOVectorCache.misses());
     }
 
+    /**
+     * The prefetch-side lookup is asked about a <b>coalesced group</b>, not a vector: it must answer yes only
+     * when every vector of the run is cached, and it must walk the run by the slots' own lengths rather than
+     * needing the caller to know the field's vector length. M4 MEASURED what the one-vector form costs
+     * instead: 27.9x the file in device reads against 1.21x.
+     */
+    public void testContainsAnswersForAWholeRun() {
+        cacheOf(2);
+        final String file = "run-contains.vec#1";
+        final int dimension = 128;
+        final int bytes = dimension * Float.BYTES;
+        final long first = offsetOf(dimension, 10);
+
+        // Four consecutive vectors, with the third one left out.
+        put(file, first, dimension);
+        put(file, first + bytes, dimension);
+        put(file, first + 3L * bytes, dimension);
+
+        assertTrue("one vector", DirectIOVectorCache.contains(file, first, bytes));
+        assertTrue("two consecutive vectors", DirectIOVectorCache.contains(file, first, 2 * bytes));
+        assertFalse("the third is missing, so the run is not covered", DirectIOVectorCache.contains(file, first, 3 * bytes));
+        assertFalse(DirectIOVectorCache.contains(file, first, 4 * bytes));
+
+        put(file, first + 2L * bytes, dimension);
+        assertTrue("and now it is", DirectIOVectorCache.contains(file, first, 4 * bytes));
+        assertFalse("a run starting one byte off the grid is not covered", DirectIOVectorCache.contains(file, first + 4, 2 * bytes));
+        assertFalse(
+            "and neither is one that would need a vector past the last cached one",
+            DirectIOVectorCache.contains(file, first, 5 * bytes)
+        );
+        assertFalse(
+            "a run whose last vector overshoots the range asked about is not an answer",
+            DirectIOVectorCache.contains(file, first, 2 * bytes + 4)
+        );
+        assertEquals("and none of this counted as a hit or a miss", 0L, DirectIOVectorCache.hits());
+        assertEquals(0L, DirectIOVectorCache.misses());
+    }
+
+    /** A run of mixed vector lengths is still walked correctly, because the stride comes from each slot. */
+    public void testContainsWalksARunOfTwoLengths() {
+        cacheOf(2);
+        final String file = "mixed-run.vec#1";
+        final long first = 44L;
+        // A 128-dim vector (512 B) followed by a 256-dim one (1,024 B), which is not a layout Lucene writes
+        // but is the case that proves the stride is the slot's and not the caller's.
+        put(file, first, 128);
+        put(file, first + 512, 256);
+        assertTrue(DirectIOVectorCache.contains(file, first, 512));
+        assertTrue(DirectIOVectorCache.contains(file, first, 512 + 1024));
+        assertFalse(DirectIOVectorCache.contains(file, first, 512 + 1024 + 4));
+    }
+
     public void testRecachingAVectorReplacesItRatherThanAddingIt() {
         cacheOf(1);
         final String file = "recache.vec#1";

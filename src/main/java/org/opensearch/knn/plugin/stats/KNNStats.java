@@ -146,7 +146,10 @@ public class KNNStats {
      *       {@code max_bytes} is the target rounded down to whole slabs, which is why a target under one
      *       slab reads {@code 0}. {@code reclaimed_slabs} is how often the FIFO had to take the oldest slab
      *       and {@code readmissions} how many vectors a second chance kept; {@code evictions} is vectors
-     *       dropped, by a reclaim or with a released slab. {@code slab_memory} names the off-heap backend
+     *       dropped, by a reclaim or with a released slab. {@code span_fills} is vectors admitted because
+     *       they lay inside a span a burst had already staged rather than because a read asked for them,
+     *       which is {@code 0} while {@code knn.direct_io.rescore.cache.span_fill} is false and once the
+     *       store is at its slab target. {@code slab_memory} names the off-heap backend
      *       ({@code ffm} or {@code direct_buffer}), which decides whether releasing memory is immediate and
      *       whether the bytes sit inside {@code MaxDirectMemorySize}.</li>
      * </ul>
@@ -216,6 +219,7 @@ public class KNNStats {
         cache.put("slab_bytes", DirectIOVectorCache.slabBytes());
         cache.put("reclaimed_slabs", DirectIOVectorCache.reclaimedSlabs());
         cache.put("readmissions", DirectIOVectorCache.readmissions());
+        cache.put("span_fills", DirectIOVectorCache.spanFills());
 
         final Map<String, Map<String, Object>> directIOStats = new HashMap<>();
         directIOStats.put("dispatch", dispatch);

@@ -161,6 +161,12 @@ public final class DirectIOVectorCache {
     /** Slabs the store may hold, from {@link #configure(long)}. Zero means off, and is the default. */
     private static volatile int maxSlabs;
 
+    /**
+     * Whether span fill is on, refreshed once per prefetch burst by {@link #applyConfiguredSize()}. Starts at
+     * the setting's default so that a store filled before the first refresh behaves as the setting says.
+     */
+    private static volatile boolean spanFill = KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_DEFAULT_VALUE;
+
     private static int liveSlabs;
     private static long liveEntries;
     private static long liveEntryBytes;
@@ -249,27 +255,66 @@ public final class DirectIOVectorCache {
     // ---------------------------------------------------------------------------------------------------
 
     /**
-     * Whether the vector at {@code (fileId, offset)} of {@code length} bytes is cached, <b>without counting a
-     * hit or a miss</b>.
+     * Whether <b>every</b> vector in {@code [offset, offset + length)} of {@code fileId} is cached, walking
+     * the run by the lengths the slots themselves record, and <b>without counting a hit or a miss</b>.
      *
      * <p>This is the input's first lookup, in {@code prefetch}, where the answer decides whether the range
-     * joins the burst — so a hit here is what saves the device read, but it is not what serves the vector.
+     * joins the burst — so a yes here is what saves the device read, but it is not what serves the vectors.
      * Counting it would double every count against the vectors actually served, which is what phase 15 did
      * and had to document ({@link #lookupsPerVector()}); one count per vector at the lookup that serves it
      * makes {@code hits / (hits + misses)} a hit rate directly comparable with the 16-S node figures.
      *
+     * <h4>Why it is a run and not one vector (MEASURED)</h4>
+     * The range {@code prefetch} is given is not a vector, it is a <em>coalesced group</em>:
+     * {@code PrefetchHelper#prefetchExactVectorSize} sorts the batch's ordinals and asks for the span of each
+     * group it can fit in 128 KB (CODE: {@code PrefetchHelper.java:97-108}), so both ends are vector
+     * boundaries on one grid but the span can hold dozens of them. A one-vector lookup therefore answers
+     * "no" for every multi-vector group, however much of it is cached, and the group is staged in full.
+     *
+     * <p>MEASURED on M4's fixture (output/bench/m4), 4,000 batches of 64 random candidates over a 64 MB
+     * {@code .vec}, span fill on, with the one-vector form: a 97.1% hit rate and <b>1.87 GB of device reads,
+     * 27.9x the whole file</b>, because 10.7 groups per batch averaging 45 KB were staged even once the store
+     * held every vector in the file. Walking the run takes the same arm to <b>81 MB, 1.21x the file</b>, and
+     * 16-I's scorer-level cache measured 1.53x. The cost is up to {@code max_span_bytes / vectorBytes} index
+     * probes (43 at the defaults) under one read-lock acquisition, against the 45 KB device read it avoids.
+     *
+     * <p>A run of one vector is the single lookup this method used to be, so the key's meaning is unchanged
+     * and a caller asking about one vector asks exactly as before.
+     *
      * @param fileId the file's identity, from {@link #fileId}
-     * @param offset the vector's byte offset in that file
-     * @param length the vector's length in bytes
-     * @return whether a {@link #getFloats} for the same key would hit
+     * @param offset the first vector's byte offset in that file
+     * @param length the run's length in bytes, one or more whole vectors
+     * @return whether a {@link #getFloats} would hit for every vector in the run
      */
     static boolean contains(final String fileId, final long offset, final int length) {
-        if (maxSlabs == 0) {
+        if (maxSlabs == 0 || length <= 0) {
             return false;
         }
         LOCK.readLock().lock();
         try {
-            return locate(INDEX.get(fileId), offset, length) >= 0;
+            final DirectIOSlotMap map = INDEX.get(fileId);
+            if (map == null) {
+                return false;
+            }
+            final long end = offset + length;
+            long at = offset;
+            while (at < end) {
+                final int cell = map.find(at);
+                if (cell < 0) {
+                    return false;
+                }
+                final Slab slab = slabAt(map.slabIdAt(cell));
+                final int slot = map.slotAt(cell);
+                if (slab == null || slot >= slab.slotCount || slab.owner[slot] != map || slab.offset[slot] != at) {
+                    return false;
+                }
+                // The slot's own length is the stride: the caller does not know the field's vector length at
+                // this point and must not have to guess it.
+                at += slab.slotBytes;
+            }
+            // Exactly tiled, or not cached: a run whose last vector overshoots the range is a different
+            // layout than the one being asked about, and the honest answer for one is no.
+            return at == end;
         } finally {
             LOCK.readLock().unlock();
         }
@@ -535,6 +580,11 @@ public final class DirectIOVectorCache {
      * value that was already persisted. A setting that cannot be read leaves the store exactly as it is.
      */
     static void applyConfiguredSize() {
+        try {
+            spanFill = KNNSettings.isDirectIORescoreCacheSpanFillEnabled();
+        } catch (RuntimeException e) {
+            log.debug("Could not read knn.direct_io.rescore.cache.span_fill; leaving span fill as it is", e);
+        }
         final long wanted;
         try {
             final ByteSizeValue configured = KNNSettings.getDirectIORescoreCacheMaxBytes();
@@ -544,6 +594,21 @@ public final class DirectIOVectorCache {
             return;
         }
         configure(wanted);
+    }
+
+    /**
+     * Whether span fill is on, from {@code knn.direct_io.rescore.cache.span_fill} as of the last burst
+     * boundary (M4).
+     *
+     * <p>A volatile read of a field refreshed by {@link #applyConfiguredSize()}, not a settings read, because
+     * the caller asks once per staged range consumed and a settings read walks the cluster state. The burst
+     * boundary is the right cadence for the same reason it is for the size: a span fill can only follow a
+     * staged read, and a staged read can only follow a prefetch.
+     *
+     * @return whether a staged span may admit the whole vectors inside it
+     */
+    static boolean isSpanFillOn() {
+        return spanFill && maxSlabs != 0;
     }
 
     /**
@@ -955,6 +1020,7 @@ public final class DirectIOVectorCache {
     static void resetForTesting() {
         configure(0);
         slabBytes = DirectIOSlab.SLAB_BYTES;
+        spanFill = KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_DEFAULT_VALUE;
         hits.reset();
         misses.reset();
         insertions.reset();

@@ -118,7 +118,8 @@ public class KNNStatsTests extends KNNTestCase {
                 "slabs",
                 "slab_bytes",
                 "reclaimed_slabs",
-                "readmissions"
+                "readmissions",
+                "span_fills"
             ),
             directIO.get("cache").keySet()
         );

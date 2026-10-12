@@ -159,6 +159,12 @@ public final class DirectIOVectorIndexInput extends IndexInput {
          * {@code volatile} only so that a buffer handed back is not reused on a stale read of this flag.
          */
         private volatile boolean abandoned;
+        /**
+         * Whether this range has already been offered to span fill (M4). Set the first time a read consumes
+         * the range, whatever the geometry then decides to admit, so the walk happens once per range rather
+         * than once per vector read out of it. Written and read by the one thread that owns the burst.
+         */
+        private boolean spanFilled;
 
         private StagedRange(
             final FileChannel channel,
@@ -1260,8 +1266,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final long absolute = this.offset + offset;
         final int blockSize = handle.blockSize;
         // The cache lookup comes BEFORE the submit, so a hit costs the device nothing: the range is simply
-        // not added to the burst, and readFloats will find the same entry when it consumes the vector. This
-        // is where the 707k -> ~420k device reads per 5,000 queries would come from.
+        // not added to the burst, and readFloats will find the same entries when it consumes the vectors.
+        // This is where the 707k -> ~420k device reads per 5,000 queries would come from.
+        //
+        // The range here is a coalesced GROUP and not one vector (PrefetchHelper sorts the batch's ordinals
+        // and asks for each group's span), so the store walks the whole run and answers only if every vector
+        // in it is cached. M4 MEASURED what the one-vector form costs instead: 27.9x the file in device
+        // reads against 1.21x, because a group of a dozen cached vectors was staged in full.
         if (DirectIOVectorCache.isOn() && DirectIOVectorCache.contains(handle.fileId, absolute, Math.toIntExact(length))) {
             return;
         }
@@ -1617,13 +1628,98 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             // because that is the random rescore channel -- the ring is sequential, where a cache buys
             // nothing and would evict the random path's working set, and a blocking read is already the
             // fallback this is trying to avoid.
-            if (written == 0 && usableFloats == count && source.staged) {
+            if (written == 0 && usableFloats == count && source.staged()) {
                 DirectIOVectorCache.put(handle.fileId, runStart, source.buffer, source.position, requested);
+                // And, while the store is below its slab target, the rest of the whole vectors this span
+                // already holds (M4). Done here rather than anywhere else because this is the one point
+                // where the bytes are known to be valid, the vector length is known, and the range is known.
+                spanFill(source.range, runStart, requested);
             }
             filePointer += (long) usableFloats * Float.BYTES;
             written += usableFloats;
         }
         STATS.servedBytes.addAndGet(requested);
+    }
+
+    /**
+     * Admits the whole vectors of this slice that {@code range} holds besides the one just read, while the
+     * store is below its slab target. M4, ported from phase 16-I's F5.
+     *
+     * <h4>Why it exists (MEASURED by 16-I on the EBS node, S1b)</h4>
+     * On dio-1m, with a cache large enough for every vector in the file, Direct I/O's p50 stayed 9.7x mmap's
+     * because 16% of candidates still missed after a 10,000-query warm-up. In that warm-up Direct I/O read
+     * 2.01 MB per query in about 40 KB staged spans, 6.5x the whole file, and cached only the vectors a
+     * candidate had asked for; mmap's page cache kept every page it read and ended up holding 95% of the
+     * file. The cache was paying for the reads and keeping a fraction of what they delivered. With span fill
+     * on, dio-1m's p50 went from 43.9 to 10.9 ms.
+     *
+     * <h4>Four rules, each of them a thing this must not do</h4>
+     * <ul>
+     *   <li><b>Below the target only.</b> {@link DirectIOVectorCache#putRun} places with eviction refused and
+     *       re-checks the target under the write lock, so span fill can neither evict a requested vector nor
+     *       take a slab the target does not already allow. At the target, admission is requested vectors
+     *       only, which is exactly M3's policy. That is what keeps this from being a scan that pushes out
+     *       the working set (agenda item 4, which this phase does not decide).</li>
+     *   <li><b>Whole vectors of the reading slice only.</b> A staged range is block aligned in the whole
+     *       file, so its ends routinely reach outside this slice, into another field's vectors or into the
+     *       file's header or footer. The span is clipped to {@code [offset, offset + length)} <em>before</em>
+     *       any boundary is computed, the first boundary is rounded up and the last down, so no partial
+     *       vector and no byte outside the slice is ever admitted.</li>
+     *   <li><b>Only bytes the read returned.</b> The span ends at {@code alignedStart + valid}, not at
+     *       {@code alignedStart + alignedLength}, so a short read at end of file cannot offer whatever the
+     *       buffer held before.</li>
+     *   <li><b>Staged spans only, once per range, one lock.</b> The caller is the burst-table branch of
+     *       {@link #readFloats}, so nothing changes for mmap, for the read-ahead ring or for a blocking read;
+     *       {@link StagedRange#spanFilled} makes it one walk per range however many vectors are read out of
+     *       it; and the whole run goes in under a single write-lock acquisition rather than one per vector.
+     *       The copy happens here, while the staged bytes are still this burst's.</li>
+     * </ul>
+     *
+     * <h4>The boundary grid is anchored on the vector just read, not on the slice start</h4>
+     * 16-I's F5 computed ordinals from the slice start, which is the same grid whenever the slice begins at
+     * vector zero -- which is what {@code OffHeapFloatVectorValues} gives it. Anchoring on {@code runStart}
+     * instead makes the grid right for <em>any</em> caller: the keys admitted are then exactly the offsets
+     * some later {@code readFloats} of this field will ask for, including the case where a slice starts part
+     * way into a field. The requested vector is at {@code k = 0} and is always inside the clipped span,
+     * because it was just read out of it, so the run is never empty and always contains it (the store skips
+     * it, having just been given it).
+     *
+     * @param range the staged range the read was served from
+     * @param runStart the absolute file offset of the vector just read
+     * @param vectorBytes that vector's length in bytes, which is the field's
+     */
+    private void spanFill(final StagedRange range, final long runStart, final int vectorBytes) {
+        if (range == null
+            || range.spanFilled
+            || vectorBytes <= 0
+            || DirectIOVectorCache.isSpanFillOn() == false
+            || DirectIOVectorCache.belowSlabTarget() == false) {
+            return;
+        }
+        // Set before the geometry, so a range whose span offers nothing is not walked again by the next
+        // vector read out of it.
+        range.spanFilled = true;
+        final long from = Math.max(range.alignedStart, offset);
+        final long to = Math.min(range.alignedStart + range.valid, offset + length);
+        if (to - from < vectorBytes) {
+            return;
+        }
+        // First boundary at or after `from`, last vector ending at or before `to`. floorDiv because the
+        // grid is anchored on runStart and the span can start before it.
+        final long firstIndex = -Math.floorDiv(runStart - from, (long) vectorBytes);
+        final long lastIndex = Math.floorDiv(to - runStart, (long) vectorBytes) - 1;
+        if (lastIndex < firstIndex) {
+            return;
+        }
+        final long firstOffset = runStart + firstIndex * vectorBytes;
+        final long count = lastIndex - firstIndex + 1;
+        if (firstOffset < from || firstOffset + count * vectorBytes > to || count > Integer.MAX_VALUE) {
+            // Not reachable from the arithmetic above; a bound rather than a comment, because the next thing
+            // that happens is a copy out of a staging buffer.
+            return;
+        }
+        final int position = Math.toIntExact(firstOffset - range.alignedStart);
+        DirectIOVectorCache.putRun(handle.fileId, firstOffset, (int) count, range.buffer, position, vectorBytes);
     }
 
     /** Where the bytes at the current file pointer live: a buffer, a position in it, and how much follows. */
@@ -1633,23 +1729,38 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         private final int position;
         private final int available;
         /**
-         * Whether these bytes came from the prefetch burst table, i.e. from the random rescore channel.
-         * Only that channel populates {@link DirectIOVectorCache}: the ring is sequential, where a cache
-         * buys nothing and would evict the random path's working set, and a blocking read is the fallback
-         * the cache exists to avoid rather than a thing to remember.
+         * The burst-table range these bytes came from, or null for the read-ahead ring and for a blocking
+         * read. Non-null <em>is</em> "this is the random rescore channel", which is the only channel that
+         * populates {@link DirectIOVectorCache}: the ring is sequential, where a cache buys nothing and
+         * would evict the random path's working set, and a blocking read is the fallback the cache exists to
+         * avoid rather than a thing to remember.
+         *
+         * <p>It is the range and not a flag because span fill (M4) needs the range's geometry -- its aligned
+         * start and the bytes the read actually returned -- and needs to mark it walked.
          */
-        private final boolean staged;
+        private final StagedRange range;
 
         private Source(final ByteBuffer buffer, final FloatBuffer floats, final int position, final int available) {
-            this(buffer, floats, position, available, false);
+            this(buffer, floats, position, available, null);
         }
 
-        private Source(final ByteBuffer buffer, final FloatBuffer floats, final int position, final int available, final boolean staged) {
+        private Source(
+            final ByteBuffer buffer,
+            final FloatBuffer floats,
+            final int position,
+            final int available,
+            final StagedRange range
+        ) {
             this.buffer = buffer;
             this.floats = floats;
             this.position = position;
             this.available = available;
-            this.staged = staged;
+            this.range = range;
+        }
+
+        /** Whether these bytes came from the prefetch burst table. */
+        private boolean staged() {
+            return range != null;
         }
     }
 
@@ -1686,7 +1797,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 // through to a blocking read rather than decode whatever the buffer last held.
                 if (position + needed <= range.valid) {
                     STATS.stagedHits.incrementAndGet();
-                    return new Source(range.buffer, range.floats, position, range.valid - position, true);
+                    return new Source(range.buffer, range.floats, position, range.valid - position, range);
                 }
             }
         }
