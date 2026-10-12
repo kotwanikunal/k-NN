@@ -132,13 +132,23 @@ public class KNNStats {
      *       staged read would not quiesce (watch {@code staged_wait_timeouts} with it) or when the burst
      *       geometry changed. {@code foreign_thread_reads} is ~0 unless some caller prefetches an input on
      *       one thread and reads it on another, which costs that read its read-ahead and nothing else.</li>
-     *   <li><b>cache</b> — the node-wide vector cache, {@code 0} throughout while
+     *   <li><b>cache</b> — the node-wide slab store of individual vectors, every counter {@code 0} while
      *       {@code knn.direct_io.rescore.cache.max_bytes} is at its default of {@code 0b}.
      *       {@code hits / (hits + misses)} is the hit rate and is directly comparable with the 40.3%
-     *       measured at 16 MB on 10M vectors; the absolute counts are <b>twice</b> the vectors served,
-     *       because a vector is looked up once in {@code prefetch} (where a hit saves the device read) and
-     *       once in {@code readFloats} (where a hit serves the bytes). See
-     *       {@link DirectIOVectorCache#lookupsPerVector()}.</li>
+     *       measured at 16 MB on 10M vectors and with the 16-S node figures, because a vector is counted
+     *       <b>once</b>, at the lookup that serves or misses it; the lookup in {@code prefetch} decides
+     *       whether the range joins the burst and counts nothing. See
+     *       {@link DirectIOVectorCache#lookupsPerVector()}.
+     *       <p>{@code bytes} is the slot bytes live vectors occupy and {@code entries} how many there are,
+     *       while {@code slabs} and {@code slab_bytes} are what the node is actually holding off heap:
+     *       slabs are whole and a partly filled one is charged in full, so {@code slab_bytes} is the figure
+     *       to compare with a memory budget and {@code bytes} the one to compare with the working set.
+     *       {@code max_bytes} is the target rounded down to whole slabs, which is why a target under one
+     *       slab reads {@code 0}. {@code reclaimed_slabs} is how often the FIFO had to take the oldest slab
+     *       and {@code readmissions} how many vectors a second chance kept; {@code evictions} is vectors
+     *       dropped, by a reclaim or with a released slab. {@code slab_memory} names the off-heap backend
+     *       ({@code ffm} or {@code direct_buffer}), which decides whether releasing memory is immediate and
+     *       whether the bytes sit inside {@code MaxDirectMemorySize}.</li>
      * </ul>
      *
      * <p>Node level rather than cluster level, and cumulative since node start, because every counter is a
@@ -202,6 +212,10 @@ public class KNNStats {
         cache.put("entries", DirectIOVectorCache.entries());
         cache.put("max_bytes", DirectIOVectorCache.maxBytes());
         cache.put("slab_memory", DirectIOVectorCache.slabMemory());
+        cache.put("slabs", DirectIOVectorCache.slabs());
+        cache.put("slab_bytes", DirectIOVectorCache.slabBytes());
+        cache.put("reclaimed_slabs", DirectIOVectorCache.reclaimedSlabs());
+        cache.put("readmissions", DirectIOVectorCache.readmissions());
 
         final Map<String, Map<String, Object>> directIOStats = new HashMap<>();
         directIOStats.put("dispatch", dispatch);

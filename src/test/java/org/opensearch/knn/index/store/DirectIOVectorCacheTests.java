@@ -50,6 +50,16 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
     private static final int HEADER_LENGTH = 44;
     private static final int VECTOR_COUNT = 400;
 
+    /**
+     * 64 KiB rather than the shipped 32 MiB, so that a budget of one slab is 256 of this file's vectors and
+     * eviction is reached inside a unit test. Everything else is the shipped path: real slabs, the real
+     * index, the real input.
+     */
+    private static final int TEST_SLAB_BYTES = 64 * 1024;
+
+    /** Slots a slab of {@link #TEST_SLAB_BYTES} gives this file's vectors. */
+    private static final int SLOTS_PER_SLAB = TEST_SLAB_BYTES / VECTOR_BYTES;
+
     @Override
     public void tearDown() throws Exception {
         DirectIOVectorCache.resetForTesting();
@@ -83,14 +93,21 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
         KNNSettings.state().setClusterService(clusterService);
     }
 
-    /** The cache on at {@code maxBytes} and the read-ahead ring off, so the burst table is the only channel. */
-    private void cacheOn(final long maxBytes) {
+    /**
+     * The cache on at {@code slabs} test slabs and the read-ahead ring off, so the burst table is the only
+     * channel. The slab size is set here rather than in {@code setUp} because {@code resetForTesting} puts it
+     * back to the shipped 32 MiB, and the store refuses a change while it holds slabs.
+     */
+    private void cacheOn(final int slabs) {
+        final long maxBytes = (long) slabs * TEST_SLAB_BYTES;
         withNodeSettings(
             Settings.builder()
                 .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, maxBytes + "b")
                 .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
                 .build()
         );
+        DirectIOVectorCache.resetForTesting();
+        DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
         DirectIOVectorCache.configure(maxBytes);
     }
 
@@ -135,89 +152,93 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
     // -----------------------------------------------------------------------------------------------
 
     /**
-     * Hit, miss and eviction accounting, and the weigher that makes {@code max_bytes} mean something.
+     * Hit, miss and admission accounting, and what {@code bytes} and {@code entries} mean.
      *
-     * <p>Two lookups happen per vector — one in {@code prefetch}, one in {@code readFloats} — so the counts
-     * are asserted in pairs. That is documented in {@link DirectIOVectorCache#lookupsPerVector()} rather
-     * than hidden, because an operator comparing the absolute numbers against a query count would otherwise
-     * conclude the cache was being consulted twice as often as it should be. It is, and on purpose.
+     * <p>A vector is counted <b>once</b>, at the lookup in {@code readFloats} that serves or misses it. The
+     * lookup in {@code prefetch} decides whether the range joins the burst and counts nothing, which is the
+     * M2 change from phase 15's two counts per vector: it makes {@code hits / (hits + misses)} a hit rate
+     * whose absolute counts are also the vectors served, and so directly comparable with the node figures.
      */
     @SneakyThrows
-    public void testHitAndMissAccountingAndTheWeigher() {
+    public void testHitAndMissAccountingAndWhatIsHeld() {
         assumeDirectIOWorksHere();
         final float[][] vectors = randomVectors(1L);
         final Path path = writeVectorFile(createTempDir(), "a.vec", vectors);
 
-        // A budget far larger than this test's working set, so nothing evicts and the counts are exact.
-        final int entryWeight = VECTOR_BYTES + DirectIOVectorCache.ENTRY_OVERHEAD_BYTES;
-        cacheOn(1 << 20);
+        // Two slabs, far more than this test's working set, so nothing evicts and the counts are exact.
+        cacheOn(2);
         final float[] scratch = new float[DIMENSION];
 
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
-            assertEquals(2, DirectIOVectorCache.lookupsPerVector());
+            assertEquals(1, DirectIOVectorCache.lookupsPerVector());
 
             readVector(input, 0, scratch);
             assertArrayEquals(vectors[0], scratch, 0.0f);
-            assertEquals("cold: both lookups miss", 0L, DirectIOVectorCache.hits());
-            assertEquals(2L, DirectIOVectorCache.misses());
+            assertEquals("cold: the one lookup that serves it misses", 0L, DirectIOVectorCache.hits());
+            assertEquals(1L, DirectIOVectorCache.misses());
             assertEquals("and the vector is now held", 1L, DirectIOVectorCache.entries());
-            assertEquals("weighed as its bytes plus the entry's own cost", entryWeight, DirectIOVectorCache.bytes());
+            assertEquals("bytes is the slot the vector occupies", VECTOR_BYTES, DirectIOVectorCache.bytes());
+            assertEquals("one slab was taken for it", 1L, DirectIOVectorCache.slabs());
+            assertEquals((long) TEST_SLAB_BYTES, DirectIOVectorCache.slabBytes());
 
             readVector(input, 0, scratch);
             assertArrayEquals("a hit must return the same bytes", vectors[0], scratch, 0.0f);
-            assertEquals("warm: both lookups hit", 2L, DirectIOVectorCache.hits());
-            assertEquals(2L, DirectIOVectorCache.misses());
+            assertEquals("warm: one hit", 1L, DirectIOVectorCache.hits());
+            assertEquals(1L, DirectIOVectorCache.misses());
             assertEquals("and nothing new is held", 1L, DirectIOVectorCache.entries());
-            assertEquals("re-reading must not double-charge", entryWeight, DirectIOVectorCache.bytes());
+            assertEquals("re-reading must not double-charge", VECTOR_BYTES, DirectIOVectorCache.bytes());
 
             readVector(input, 1, scratch);
             readVector(input, 2, scratch);
             assertEquals(3L, DirectIOVectorCache.entries());
-            assertEquals("the weigher is exactly bytes + overhead per entry", 3L * entryWeight, DirectIOVectorCache.bytes());
-            assertEquals("and with budget to spare nothing is evicted", 0L, DirectIOVectorCache.evictions());
+            assertEquals("bytes is exactly entries x the vector length", 3L * VECTOR_BYTES, DirectIOVectorCache.bytes());
+            assertEquals("and with slots to spare nothing is evicted", 0L, DirectIOVectorCache.evictions());
+            assertEquals("and no slab was reclaimed", 0L, DirectIOVectorCache.reclaimedSlabs());
         }
     }
 
     /**
-     * Eviction, and the thing it is there to guarantee: the charged weight never exceeds {@code max_bytes}.
+     * Eviction, and the two things it is there to guarantee: the store never holds more than its slab target,
+     * and a read is correct whether or not its vector survived.
      *
-     * <p><b>Not asserted as "N entries fit in N entries' worth of budget", because that is false.</b>
-     * MEASURED while writing this test: a budget of three entries' weight holds <b>zero</b> entries. Guava's
-     * {@code LocalCache} splits {@code maximumWeight} across {@code concurrencyLevel} segments and evicts
-     * against the per-segment share, so an entry heavier than {@code max_bytes / concurrencyLevel} is
-     * inserted and immediately evicted again. At the sizes the reuse gate measured (16 MB and up) that
-     * division is immaterial; at a handful of entries it is the whole behaviour. So what is pinned here is
-     * the invariant that actually matters to a node — the bound holds, and the reads stay correct across
-     * eviction — rather than a per-entry count that depends on Guava's hashing.
+     * <p>The target is whole slabs, so {@code max_bytes} bounds the <em>slabs</em> and the live vectors'
+     * bytes are at most that. Nothing is read twice here, so no vector earns a second chance and
+     * {@code readmissions} must stay at zero: that is what makes the FIFO's behaviour visible rather than
+     * inferred.
      */
     @SneakyThrows
-    public void testEvictionKeepsTheChargedWeightUnderTheBudget() {
+    public void testEvictionStaysInsideTheSlabTarget() {
         assumeDirectIOWorksHere();
         final float[][] vectors = randomVectors(7L);
         final Path path = writeVectorFile(createTempDir(), "evict.vec", vectors);
 
-        final int entryWeight = VECTOR_BYTES + DirectIOVectorCache.ENTRY_OVERHEAD_BYTES;
-        final long budget = 16L * entryWeight;
-        cacheOn(budget);
+        cacheOn(1);
+        final long budget = TEST_SLAB_BYTES;
         final float[] scratch = new float[DIMENSION];
 
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
-            for (int ord = 0; ord < 120; ord++) {
+            for (int ord = 0; ord < VECTOR_COUNT; ord++) {
                 readVector(input, ord, scratch);
                 assertArrayEquals("eviction must never change a byte", vectors[ord], scratch, 0.0f);
             }
-            assertTrue("120 distinct vectors into a 16-entry budget must evict", DirectIOVectorCache.evictions() > 0);
             assertTrue(
-                "and the charged weight must stay under max_bytes, which is the point: " + DirectIOVectorCache.bytes() + " > " + budget,
+                VECTOR_COUNT + " distinct vectors into a " + SLOTS_PER_SLAB + "-slot slab must evict",
+                DirectIOVectorCache.evictions() > 0
+            );
+            assertEquals("by reclaiming the one slab it has", 1L, DirectIOVectorCache.slabs());
+            assertEquals("nothing was read twice, so nothing earned a second chance", 0L, DirectIOVectorCache.readmissions());
+            assertTrue(
+                "the live vectors must stay inside max_bytes, which is the point: " + DirectIOVectorCache.bytes() + " > " + budget,
                 DirectIOVectorCache.bytes() <= budget
             );
             assertEquals(
-                "the weight is always entries x entryWeight, so the weigher and the listener agree",
-                DirectIOVectorCache.entries() * entryWeight,
+                "bytes is always entries x the vector length",
+                DirectIOVectorCache.entries() * VECTOR_BYTES,
                 DirectIOVectorCache.bytes()
             );
+            assertTrue("and entries cannot exceed the slab's slots", DirectIOVectorCache.entries() <= SLOTS_PER_SLAB);
 
             // Re-reading an evicted vector is a miss that reaches the device and repopulates: correctness
             // does not depend on an entry still being there.
@@ -239,7 +260,7 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
         assumeDirectIOWorksHere();
         final float[][] vectors = randomVectors(2L);
         final Path path = writeVectorFile(createTempDir(), "shared.vec", vectors);
-        cacheOn(1 << 20);
+        cacheOn(2);
         final float[] scratch = new float[DIMENSION];
 
         try (DirectIOVectorIndexInput first = DirectIOVectorIndexInput.open(path)) {
@@ -258,7 +279,7 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
             readVector(second, 7, scratch);
             assertArrayEquals("the second reader must get the right bytes", vectors[7], scratch, 0.0f);
         }
-        assertEquals("both of the second reader's lookups must hit", hitsAfterPopulate + 2, DirectIOVectorCache.hits());
+        assertEquals("the second reader's lookup must hit", hitsAfterPopulate + 1, DirectIOVectorCache.hits());
         assertEquals("and neither may miss", missesAfterPopulate, DirectIOVectorCache.misses());
         assertEquals("sharing means one entry, not two", 1L, DirectIOVectorCache.entries());
     }
@@ -278,7 +299,7 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
         assertEquals("the two files are byte identical, which is the hard case", Files.size(a), Files.size(b));
         assertArrayEquals(Files.readAllBytes(a), Files.readAllBytes(b));
 
-        cacheOn(1 << 20);
+        cacheOn(2);
         final float[] scratch = new float[DIMENSION];
 
         try (DirectIOVectorIndexInput inputA = DirectIOVectorIndexInput.open(a)) {
@@ -293,7 +314,7 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
             readVector(inputB, 11, scratch);
             assertArrayEquals(vectors[11], scratch, 0.0f);
         }
-        assertEquals("the other file's entry must not be served", missesAfterA + 2, DirectIOVectorCache.misses());
+        assertEquals("the other file's entry must not be served", missesAfterA + 1, DirectIOVectorCache.misses());
         assertEquals("each file gets its own entry", 2L, DirectIOVectorCache.entries());
     }
 
@@ -328,18 +349,20 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
     }
 
     /**
-     * A live change is applied at the next prefetch burst, and a change of size <b>rebuilds</b> rather than
-     * resizing — Guava fixes {@code maximumWeight} at build time. So the entries go, which is a real cost of
-     * retuning this knob and is why it is asserted rather than assumed.
+     * A live change is applied at the next prefetch burst, and a change of size <b>resizes</b> rather than
+     * rebuilding: growing keeps every vector already held and lets the next miss take a slab. That is the M2
+     * change from phase 15, whose Guava cache had to be rebuilt because {@code maximumWeight} is fixed at
+     * {@code build()}, so every retune cost the whole cache and a re-warm. Asserted rather than assumed,
+     * because it is the difference an operator feels.
      */
     @SneakyThrows
-    public void testALiveSizeChangeRebuildsAndDropsTheEntries() {
+    public void testALiveSizeChangeResizesAndKeepsTheEntries() {
         assumeDirectIOWorksHere();
         final float[][] vectors = randomVectors(5L);
         final Path path = writeVectorFile(createTempDir(), "live.vec", vectors);
         final float[] scratch = new float[DIMENSION];
 
-        cacheOn(1 << 20);
+        cacheOn(1);
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
             readVector(input, 1, scratch);
@@ -350,14 +373,26 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
             // prefetch after a read establishes.
             withNodeSettings(
                 Settings.builder()
-                    .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, "4mb")
+                    .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, (4 * TEST_SLAB_BYTES) + "b")
                     .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
                     .build()
             );
             readVector(input, 2, scratch);
-            assertEquals("the new budget is live", 4L * 1024 * 1024, DirectIOVectorCache.maxBytes());
-            assertEquals("a rebuild drops what was held, then re-populates from this burst", 1L, DirectIOVectorCache.entries());
+            assertEquals("the new target is live", 4L * TEST_SLAB_BYTES, DirectIOVectorCache.maxBytes());
+            assertEquals("growing keeps what was held and adds this burst's vector", 2L, DirectIOVectorCache.entries());
             assertArrayEquals(vectors[2], scratch, 0.0f);
+            final float[] stillThere = new float[DIMENSION];
+            assertTrue(
+                "and the vector from before the change is still a hit",
+                DirectIOVectorCache.getFloats(
+                    DirectIOVectorCache.fileId(path, Files.size(path)),
+                    HEADER_LENGTH + (long) VECTOR_BYTES,
+                    VECTOR_BYTES,
+                    stillThere,
+                    0
+                )
+            );
+            assertArrayEquals(vectors[1], stillThere, 0.0f);
 
             // And off again, live.
             withNodeSettings(
@@ -384,7 +419,7 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
         assumeDirectIOWorksHere();
         final float[][] vectors = randomVectors(6L);
         final Path path = writeVectorFile(createTempDir(), "iops.vec", vectors);
-        cacheOn(1 << 20);
+        cacheOn(2);
         final float[] scratch = new float[DIMENSION];
 
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {

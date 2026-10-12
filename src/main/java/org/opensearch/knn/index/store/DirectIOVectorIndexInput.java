@@ -1262,7 +1262,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         // The cache lookup comes BEFORE the submit, so a hit costs the device nothing: the range is simply
         // not added to the burst, and readFloats will find the same entry when it consumes the vector. This
         // is where the 707k -> ~420k device reads per 5,000 queries would come from.
-        if (DirectIOVectorCache.isOn() && DirectIOVectorCache.get(handle.fileId, absolute, Math.toIntExact(length)) != null) {
+        if (DirectIOVectorCache.isOn() && DirectIOVectorCache.contains(handle.fileId, absolute, Math.toIntExact(length))) {
             return;
         }
         final long alignedStart = absolute - Math.floorMod(absolute, (long) blockSize);
@@ -1582,14 +1582,15 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         if (DirectIOVectorCache.isOn()) {
             // The second lookup. The first was in prefetch, where a hit kept the range out of the burst; this
             // is the one that actually serves the bytes, and it is also the one that serves a vector nobody
-            // declared (the exact-search path reads some ordinals without a prefetch).
-            final byte[] cached = DirectIOVectorCache.get(handle.fileId, runStart, requested);
-            if (cached != null) {
-                ensureOpen();
-                if (filePointer + requested > length) {
-                    throw new EOFException("read past EOF: " + this);
-                }
-                ByteBuffer.wrap(cached).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(0, destination, destinationOffset, count);
+            // declared (the exact-search path reads some ordinals without a prefetch). The EOF check comes
+            // first, so a hit cannot serve a read the miss path would have refused.
+            ensureOpen();
+            if (filePointer + requested > length) {
+                throw new EOFException("read past EOF: " + this);
+            }
+            // The store copies out of its slab into the caller's array under its own read lock, so no view of
+            // slab memory reaches this method and a hit is the same little-endian decode a staged read does.
+            if (DirectIOVectorCache.getFloats(handle.fileId, runStart, requested, destination, destinationOffset)) {
                 filePointer += requested;
                 // A cache hit is still a read, so the burst boundary is found exactly as before: without
                 // this, a burst every vector of which was cached would never be quiesced.
