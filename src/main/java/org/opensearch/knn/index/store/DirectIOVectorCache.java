@@ -312,6 +312,22 @@ public final class DirectIOVectorCache {
         return configuredBytes;
     }
 
+    /**
+     * How this node allocates off-heap slabs for cached vectors: {@code "ffm"} when
+     * {@code java.lang.foreign.Arena} resolved and proved itself on this runtime, else
+     * {@code "direct_buffer"}. Reported as {@code direct_io_stats.cache.slab_memory} because the two differ
+     * in what releasing memory means and in whether the bytes are inside {@code MaxDirectMemorySize}, which
+     * an operator reading a cache size needs to know; see {@link DirectIOSlab}.
+     *
+     * <p>Reported from M1 onwards, before anything in this class holds a slab: the mechanism and the
+     * operator's view of it land together, so that the M2 commit that moves the storage changes no stat key.
+     *
+     * @return the backend's name, never null
+     */
+    public static String slabMemory() {
+        return DirectIOSlab.backend();
+    }
+
     /** Test seam: drops the cache and every counter, so one test cannot read another's entries. */
     static synchronized void resetForTesting() {
         final Cache<Key, byte[]> current = cache;

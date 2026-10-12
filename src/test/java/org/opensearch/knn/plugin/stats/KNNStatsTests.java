@@ -106,11 +106,18 @@ public class KNNStatsTests extends KNNTestCase {
                 directIO.get("memory").containsKey(required)
             );
         }
-        assertEquals(Set.of("hits", "misses", "evictions", "bytes", "entries", "max_bytes"), directIO.get("cache").keySet());
+        assertEquals(Set.of("hits", "misses", "evictions", "bytes", "entries", "max_bytes", "slab_memory"), directIO.get("cache").keySet());
         // The cache is off by default, so every one of its counters must read zero on a node that has not
         // set knn.direct_io.rescore.cache.max_bytes -- which is what makes "off" distinguishable from
-        // "on and missing".
-        directIO.get("cache").forEach((name, value) -> assertEquals("cache." + name + " must start at zero", 0L, (long) (Long) value));
+        // "on and missing". slab_memory is not a counter: it names the off-heap backend slabs come from, and
+        // it reads the same whether the cache is on or off, which is why it is asserted separately.
+        directIO.get("cache").forEach((name, value) -> {
+            if ("slab_memory".equals(name)) {
+                assertTrue("cache.slab_memory must name a backend, saw " + value, Set.of("ffm", "direct_buffer").contains(value));
+            } else {
+                assertEquals("cache." + name + " must start at zero", 0L, (long) (Long) value);
+            }
+        });
 
         assertEquals(
             Set.of(

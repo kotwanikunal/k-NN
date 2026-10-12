@@ -201,6 +201,7 @@ public class KNNStats {
         cache.put("bytes", DirectIOVectorCache.bytes());
         cache.put("entries", DirectIOVectorCache.entries());
         cache.put("max_bytes", DirectIOVectorCache.maxBytes());
+        cache.put("slab_memory", DirectIOVectorCache.slabMemory());
 
         final Map<String, Map<String, Object>> directIOStats = new HashMap<>();
         directIOStats.put("dispatch", dispatch);
