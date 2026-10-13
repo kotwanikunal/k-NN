@@ -1132,6 +1132,76 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
         DirectIOVectorCache.checkInvariantsForTesting();
     }
 
+    /**
+     * Concurrent fills from empty take <b>one</b> slab while one slab's worth of room is enough.
+     *
+     * <p>This is the N3 fix. Before it, every concurrent fill reserved a slab of its own, so the first burst
+     * took as many slabs as it had threads. MEASURED on the re-proof's arm E: a 64mb store reached its 2 slab
+     * target before a single vector had been cached, span fill stopped because it only runs below the target,
+     * and the arm's hit count fell from 2,921 to 832. Before N3 the write lock enforced this for free,
+     * because only one fill could be inside the allocator.
+     */
+    public void testConcurrentFillsFromEmptyTakeOneSlabAtATime() throws Exception {
+        final AtomicInteger allocations = new AtomicInteger();
+        cacheOf(0);
+        DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
+        DirectIOVectorCache.setSlabMemoryForTesting(new DirectIOVectorCache.SlabMemory() {
+            @Override
+            public DirectIOSlab allocate(final int bytes) {
+                allocations.incrementAndGet();
+                // Slow on purpose: the window every fill used to race into.
+                try {
+                    Thread.sleep(20);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return DirectIOSlab.allocate(bytes);
+            }
+
+            @Override
+            public void release(final DirectIOSlab slab) {
+                slab.close();
+            }
+        });
+        DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
+
+        final int threads = 8;
+        final int perThread = 10;
+        final int slots = DirectIOVectorCache.slotsPerSlab(128 * Float.BYTES);
+        assertTrue("one slab must hold every fill this test makes", slots > threads * perThread);
+
+        final CountDownLatch start = new CountDownLatch(1);
+        final CountDownLatch done = new CountDownLatch(threads);
+        final AtomicReference<Throwable> failure = new AtomicReference<>();
+        for (int t = 0; t < threads; t++) {
+            final int seed = t;
+            final Thread thread = new Thread(() -> {
+                try {
+                    start.await();
+                    for (int i = 0; i < perThread; i++) {
+                        put("one-slab.vec#1", offsetOf(128, seed * perThread + i), 128);
+                    }
+                } catch (Throwable e) {
+                    failure.compareAndSet(null, e);
+                } finally {
+                    done.countDown();
+                }
+            }, "n3-one-slab-" + seed);
+            thread.setDaemon(true);
+            thread.start();
+        }
+        start.countDown();
+        assertTrue(done.await(2, TimeUnit.MINUTES));
+        if (failure.get() != null) {
+            throw new AssertionError(failure.get());
+        }
+
+        assertEquals("one slab, not one per thread", 1L, DirectIOVectorCache.slabs());
+        assertEquals("and one allocation", 1, allocations.get());
+        assertTrue("so the store is still below its target and span fill still runs", DirectIOVectorCache.belowSlabTarget());
+        DirectIOVectorCache.checkInvariantsForTesting();
+    }
+
     // ---------------------------------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------------------------------

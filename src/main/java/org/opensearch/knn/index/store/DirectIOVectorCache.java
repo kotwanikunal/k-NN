@@ -781,17 +781,6 @@ public final class DirectIOVectorCache {
             });
         }
         Slab slab = OPEN_SLABS.get(length);
-        if (request != null && request.spare != null) {
-            // This fill left the lock to fetch a slab, so register it even if another fill's reclaim has
-            // made room meanwhile: discarding it would leave the store below a target it is allowed to
-            // reach, and under concurrent pressure the same race would happen to the next fill as well.
-            // The slots left in the previously open slab are not lost, only unreachable until it is
-            // reclaimed, which is the same thing growing has always done to a slab that was still open.
-            final Slab fresh = growSlabs(length, request);
-            if (fresh != null) {
-                slab = fresh;
-            }
-        }
         if (slab == null || slab.freeSlots() == 0) {
             slab = allowEviction ? obtainSlab(length, request) : growSlabs(length, request);
         }
@@ -962,6 +951,12 @@ public final class DirectIOVectorCache {
             // instead would throw away a slab's worth of vectors the target says the store may keep.
             return null;
         }
+        if (pendingSlabs > 0 && liveSlabs < maxSlabs) {
+            // Another fill is already fetching a slab the target allows, so this fill waits for it by
+            // simply not being cached. Reclaiming now would evict vectors the store is about to have room
+            // for, and a fill that does not happen costs a future hit and nothing else.
+            return null;
+        }
         final Slab oldest = FIFO.poll();
         if (oldest == null) {
             return null;
@@ -1010,10 +1005,17 @@ public final class DirectIOVectorCache {
             return null;
         }
         if (request.spare == null) {
-            if (request.reserved == false) {
-                pendingSlabs++;
-                request.reserved = true;
+            if (others > 0) {
+                // One pending allocation at a time, because one slab holds thousands of vectors and the
+                // fills waiting for it will all fit in it. Letting every concurrent fill fetch its own was
+                // MEASURED on the re-proof's arm E: the first burst's threads each reserved a slab, a 64mb
+                // store reached its 2 slab target before a single vector had been cached, span fill stopped
+                // (it only runs below the target) and the arm's hit count fell from 2,921 to 832. Before N3
+                // the write lock enforced this for free, because only one fill could be allocating.
+                return null;
             }
+            pendingSlabs++;
+            request.reserved = true;
             request.wanted = true;
             return null;
         }
