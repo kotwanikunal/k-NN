@@ -16,9 +16,10 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
-import java.util.function.IntFunction;
 
 /**
  * The one cache of individual vectors on the Direct I/O random rescore path, for the whole node: a slab store
@@ -188,10 +189,53 @@ public final class DirectIOVectorCache {
     private static boolean growthLatched;
 
     /**
-     * Where a slab comes from. A field and not a direct call to {@link DirectIOSlab#allocate} only so that a
-     * test can make allocation fail on demand; production never sets it to anything else.
+     * Slabs other fills have allocated and not yet registered (N3). Counted so that fills growing the store
+     * concurrently cannot overshoot the target between them: each reserves its headroom under the write lock
+     * before leaving it to allocate.
+     *
+     * <p>Only read and written under the write lock.
      */
-    private static IntFunction<DirectIOSlab> slabAllocator = DirectIOSlab::allocate;
+    private static int pendingSlabs;
+
+    /**
+     * Where a slab's memory comes from and goes back to. A seam, and the only reason it is one is that N3's
+     * property is about <b>where</b> these two calls run: neither may run while the caller holds this store's
+     * lock, and a test can only see that if it can observe the calling thread at the moment of the call.
+     * Production has exactly one implementation.
+     */
+    interface SlabMemory {
+        /**
+         * A slab of {@code bytes} bytes, or null when the backend refused.
+         *
+         * @param bytes the slab size
+         * @return the slab, or null
+         */
+        DirectIOSlab allocate(int bytes);
+
+        /**
+         * Gives a slab's memory back.
+         *
+         * @param slab the slab to release
+         */
+        void release(DirectIOSlab slab);
+    }
+
+    private static final SlabMemory DIRECT_SLABS = new SlabMemory() {
+        @Override
+        public DirectIOSlab allocate(final int bytes) {
+            return DirectIOSlab.allocate(bytes);
+        }
+
+        @Override
+        public void release(final DirectIOSlab slab) {
+            slab.close();
+        }
+    };
+
+    private static volatile SlabMemory slabMemory = DIRECT_SLABS;
+
+    /** Release threads still giving memory back, so a test can wait for it. */
+    private static final AtomicInteger releasesRunning = new AtomicInteger();
 
     private static final LongAdder hits = new LongAdder();
     private static final LongAdder misses = new LongAdder();
@@ -501,17 +545,30 @@ public final class DirectIOVectorCache {
         if (maxSlabs == 0 || length <= 0 || (length & 3) != 0 || offset < 0 || length > slabBytes) {
             return;
         }
-        LOCK.writeLock().lock();
+        final SlabRequest request = new SlabRequest();
         try {
-            final Placement placement = place(fileId, length, true);
-            if (placement == null) {
-                return;
+            // At most twice round: once with nothing in hand, and once with the slab that round asked for.
+            // See SlabRequest for why the allocation cannot happen inside the lock.
+            for (int round = 0; round < 2; round++) {
+                LOCK.writeLock().lock();
+                try {
+                    request.wanted = false;
+                    final Placement placement = place(fileId, length, true, request);
+                    if (placement != null) {
+                        placement.slab.memory.bytes().put(placement.slot * length, source, position, length);
+                        attach(placement.slab, placement.slot, placement.map, offset);
+                        insertions.increment();
+                        return;
+                    }
+                } finally {
+                    LOCK.writeLock().unlock();
+                }
+                if (request.wanted == false || allocateOutsideLock(request) == false) {
+                    return;
+                }
             }
-            placement.slab.memory.bytes().put(placement.slot * length, source, position, length);
-            attach(placement.slab, placement.slot, placement.map, offset);
-            insertions.increment();
         } finally {
-            LOCK.writeLock().unlock();
+            request.finish();
         }
     }
 
@@ -573,30 +630,123 @@ public final class DirectIOVectorCache {
             return 0;
         }
         int admitted = 0;
-        LOCK.writeLock().lock();
+        int next = 0;
+        final SlabRequest request = new SlabRequest();
         try {
-            if (belowSlabTarget() == false) {
-                return 0;
-            }
-            for (int i = 0; i < count; i++) {
-                final long offset = firstOffset + (long) i * length;
-                if (locate(INDEX.get(fileId), offset, length) >= 0) {
-                    continue;
+            while (next < count) {
+                LOCK.writeLock().lock();
+                try {
+                    if (belowSlabTarget() == false) {
+                        break;
+                    }
+                    for (; next < count; next++) {
+                        final long offset = firstOffset + (long) next * length;
+                        if (locate(INDEX.get(fileId), offset, length) >= 0) {
+                            continue;
+                        }
+                        request.wanted = false;
+                        final Placement placement = place(fileId, length, false, request);
+                        if (placement == null) {
+                            // Either there is nowhere at all, or the store would take a slab and this thread
+                            // has to leave the lock to get one. Both stop the run here; the second resumes it
+                            // at the same vector on the next round.
+                            break;
+                        }
+                        placement.slab.memory.bytes().put(placement.slot * length, source, position + next * length, length);
+                        attach(placement.slab, placement.slot, placement.map, offset);
+                        insertions.increment();
+                        admitted++;
+                    }
+                } finally {
+                    LOCK.writeLock().unlock();
                 }
-                final Placement placement = place(fileId, length, false);
-                if (placement == null) {
+                // One acquisition per span is the rule, and this is the one thing that can need a second:
+                // a span that fills the open slab. The staged bytes are still the caller's and still valid
+                // across the gap, and the alternative is an 8 ms allocation inside the hold (N3).
+                if (next >= count || request.wanted == false || allocateOutsideLock(request) == false) {
                     break;
                 }
-                placement.slab.memory.bytes().put(placement.slot * length, source, position + i * length, length);
-                attach(placement.slab, placement.slot, placement.map, offset);
-                insertions.increment();
-                admitted++;
+            }
+        } finally {
+            request.finish();
+        }
+        spanFills.add(admitted);
+        return admitted;
+    }
+
+    /**
+     * One fill's slab request, carried across a release of the write lock.
+     *
+     * <p><b>Why the lock has to be released at all.</b> A 32 MiB slab takes about 7 to 10 ms to allocate
+     * (MEASURED, M1 and output/bench/n2: FFM zero-fills it; 16-I's JNI took 7.6 us), and before N3
+     * {@code growSlabs} did that with the write lock held, so every lookup on the node waited behind it.
+     * A fill that needs a slab therefore reserves its headroom under the lock ({@link #pendingSlabs}), leaves
+     * the lock, allocates, and comes back with the slab in hand.
+     *
+     * <p><b>Why the reservation.</b> Without it two fills leaving the lock at the same time would both see
+     * room for one slab and both allocate one, so a 2 slab target could end up holding 3. The reservation is
+     * taken under the lock and counted against the target by every other fill.
+     *
+     * <p>An allocation nobody wanted any more, because the target shrank while this fill was outside the lock,
+     * is released by {@link #finish} and also outside the lock.
+     */
+    private static final class SlabRequest {
+        /** Allocated outside the lock and not yet registered. */
+        private DirectIOSlab spare;
+        /** Set by {@link #growSlabs} to mean "bring me a slab and ask again". */
+        private boolean wanted;
+        /** Whether this request holds one of {@link #pendingSlabs}. */
+        private boolean reserved;
+
+        /** Gives back the headroom and any slab that went unused. Called with no lock held. */
+        private void finish() {
+            if (reserved == false && spare == null) {
+                return;
+            }
+            final DirectIOSlab unused;
+            LOCK.writeLock().lock();
+            try {
+                if (reserved) {
+                    pendingSlabs--;
+                    reserved = false;
+                }
+                unused = spare;
+                spare = null;
+            } finally {
+                LOCK.writeLock().unlock();
+            }
+            if (unused != null) {
+                slabMemory.release(unused);
+            }
+        }
+    }
+
+    /**
+     * Allocates the slab {@code request} asked for, with no lock held, and says whether to ask the store
+     * again. A refusal latches growth (N2) so that no later fill pays for the same answer.
+     */
+    private static boolean allocateOutsideLock(final SlabRequest request) {
+        request.spare = slabMemory.allocate(slabBytes);
+        if (request.spare != null) {
+            return true;
+        }
+        LOCK.writeLock().lock();
+        try {
+            if (growthLatched == false) {
+                growthLatched = true;
+                slabAllocFailures.increment();
+                log.warn(
+                    "A k-NN Direct I/O vector cache slab of {} bytes could not be allocated from {}; the cache will hold the {} "
+                        + "slabs it has until knn.direct_io.rescore.cache.max_bytes changes or a slab is released",
+                    slabBytes,
+                    DirectIOSlab.backend(),
+                    liveSlabs
+                );
             }
         } finally {
             LOCK.writeLock().unlock();
         }
-        spanFills.add(admitted);
-        return admitted;
+        return false;
     }
 
     /** Where a fill is about to write: the file's index, a slab and a slot in it. */
@@ -610,8 +760,11 @@ public final class DirectIOVectorCache {
      *
      * <p>With {@code allowEviction} false the fill must displace nothing: it may use a free slot of the slab
      * already open for this length, or a slab the target still allows, and nothing else.
+     *
+     * <p>{@code request} is how a fill that needs a new slab is told to go and get one: this returns null with
+     * {@link SlabRequest#wanted} set, and the caller allocates outside the lock and asks again.
      */
-    private static Placement place(final String fileId, final int length, final boolean allowEviction) {
+    private static Placement place(final String fileId, final int length, final boolean allowEviction, final SlabRequest request) {
         if (maxSlabs == 0) {
             return null;
         }
@@ -628,8 +781,19 @@ public final class DirectIOVectorCache {
             });
         }
         Slab slab = OPEN_SLABS.get(length);
+        if (request != null && request.spare != null) {
+            // This fill left the lock to fetch a slab, so register it even if another fill's reclaim has
+            // made room meanwhile: discarding it would leave the store below a target it is allowed to
+            // reach, and under concurrent pressure the same race would happen to the next fill as well.
+            // The slots left in the previously open slab are not lost, only unreachable until it is
+            // reclaimed, which is the same thing growing has always done to a slab that was still open.
+            final Slab fresh = growSlabs(length, request);
+            if (fresh != null) {
+                slab = fresh;
+            }
+        }
         if (slab == null || slab.freeSlots() == 0) {
-            slab = allowEviction ? obtainSlab(length) : growSlabs(length);
+            slab = allowEviction ? obtainSlab(length, request) : growSlabs(length, request);
         }
         if (slab == null) {
             // A file that got an index entry and no slot is left in the index with nothing in it, which costs
@@ -708,39 +872,75 @@ public final class DirectIOVectorCache {
             // Taking the write lock to find that out would put every burst through the lock a fill uses.
             return;
         }
+        final List<DirectIOSlab> detached = new ArrayList<>();
         LOCK.writeLock().lock();
         try {
-            if (wanted == maxSlabs) {
-                return;
-            }
-            if (maxBytes > 0 && wanted == 0) {
-                log.warn(
-                    "A vector cache target of {} bytes is under one {} byte slab, so the cache will hold nothing",
-                    maxBytes,
-                    slabBytes
-                );
-            }
-            maxSlabs = wanted;
-            // A new target is a new question, so an earlier allocation failure stops standing (N2).
-            growthLatched = false;
-            while (liveSlabs > wanted) {
-                final Slab oldest = FIFO.poll();
-                if (oldest == null) {
-                    break;
+            if (wanted != maxSlabs) {
+                if (maxBytes > 0 && wanted == 0) {
+                    log.warn(
+                        "A vector cache target of {} bytes is under one {} byte slab, so the cache will hold nothing",
+                        maxBytes,
+                        slabBytes
+                    );
                 }
-                dropAll(oldest);
-                unregister(oldest);
-            }
-            if (wanted == 0) {
-                INDEX.clear();
-                OPEN_SLABS.clear();
-                log.info("The k-NN Direct I/O vector cache is off (knn.direct_io.rescore.cache.max_bytes=0)");
-            } else {
-                log.info("The k-NN Direct I/O vector cache holds up to {} slabs of {} bytes", wanted, slabBytes);
+                maxSlabs = wanted;
+                // A new target is a new question, so an earlier allocation failure stops standing (N2).
+                growthLatched = false;
+                while (liveSlabs > wanted) {
+                    final Slab oldest = FIFO.poll();
+                    if (oldest == null) {
+                        break;
+                    }
+                    dropAll(oldest);
+                    detached.add(detach(oldest));
+                }
+                if (wanted == 0) {
+                    INDEX.clear();
+                    OPEN_SLABS.clear();
+                    log.info("The k-NN Direct I/O vector cache is off (knn.direct_io.rescore.cache.max_bytes=0)");
+                } else {
+                    log.info("The k-NN Direct I/O vector cache holds up to {} slabs of {} bytes", wanted, slabBytes);
+                }
             }
         } finally {
             LOCK.writeLock().unlock();
         }
+        releaseDetached(detached);
+    }
+
+    /**
+     * Gives back the memory of slabs a release has detached, with no lock held and not on the calling thread.
+     *
+     * <p><b>Why not under the lock.</b> An FFM arena takes about 2.2 ms to close (MEASURED, M1), so before N3
+     * a {@code configure(0)} at a 4 GB target held the write lock for about 0.26 s and a 12 GB one for about
+     * 0.8 s, and every lookup on the node waited behind it. Detaching is what makes the close safe to do
+     * outside the lock: it clears the slab's {@code slabsById} entry under the write lock, so its index cells
+     * go stale and no reader that arrives afterwards can reach it, while a reader already inside holds the
+     * read lock the detaching thread had to wait for.
+     *
+     * <p><b>Why not on the calling thread.</b> Every production call to {@link #configure} arrives from
+     * {@code DirectIOVectorIndexInput#beginBurst}, which is to say on a thread serving a query, so an
+     * operator turning the cache off would spend that query's latency closing arenas. A thread per release
+     * rather than a pool, because a release happens when an operator changes a setting: there is no steady
+     * state to amortise a pool over, and a thread that does not exist cannot be left running.
+     */
+    private static void releaseDetached(final List<DirectIOSlab> detached) {
+        if (detached.isEmpty()) {
+            return;
+        }
+        final SlabMemory backend = slabMemory;
+        releasesRunning.incrementAndGet();
+        final Thread releaser = new Thread(() -> {
+            try {
+                for (final DirectIOSlab memory : detached) {
+                    backend.release(memory);
+                }
+            } finally {
+                releasesRunning.decrementAndGet();
+            }
+        }, "knn-dio-slab-release");
+        releaser.setDaemon(true);
+        releaser.start();
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -752,10 +952,15 @@ public final class DirectIOVectorCache {
      * target and otherwise by reclaiming the oldest. Returns {@code null} only when the allocation failed and
      * there was nothing to reclaim. Called under the write lock.
      */
-    private static Slab obtainSlab(final int length) {
-        final Slab grown = growSlabs(length);
+    private static Slab obtainSlab(final int length, final SlabRequest request) {
+        final Slab grown = growSlabs(length, request);
         if (grown != null) {
             return grown;
+        }
+        if (request != null && request.wanted) {
+            // The target allows another slab and this fill has to leave the lock to get one. Reclaiming
+            // instead would throw away a slab's worth of vectors the target says the store may keep.
+            return null;
         }
         final Slab oldest = FIFO.poll();
         if (oldest == null) {
@@ -782,36 +987,42 @@ public final class DirectIOVectorCache {
     }
 
     /**
-     * A fresh slab opened for {@code length}-byte vectors while the store is below its target, or
-     * {@code null} when it is at the target, growth is latched or the allocation failed. The half of
-     * {@link #obtainSlab} that displaces nothing, which is the only half span fill is allowed. Called under
-     * the write lock.
+     * Registers the slab {@code request} is carrying and opens it for {@code length}-byte vectors, or returns
+     * {@code null}: at the target, with growth latched, or -- the interesting case -- with
+     * {@link SlabRequest#wanted} set to tell the caller to allocate one outside the lock and ask again. The
+     * half of {@link #obtainSlab} that displaces nothing, which is the only half span fill is allowed. Called
+     * under the write lock.
      *
-     * <p>One attempt per latch, not one per fill: see {@link #growthLatched} for what a failed attempt costs
-     * the caller. The store then stays the size it is, keeps serving the slabs it holds, and the cost is hit
-     * rate -- which is what a cache that cannot grow should cost.
+     * <p>Nothing here allocates: that is N3. The target check counts the slabs other fills are allocating
+     * right now ({@link #pendingSlabs}) as well as the live ones, so concurrent growth cannot overshoot.
+     *
+     * <p>One allocation attempt per latch, not one per fill: see {@link #growthLatched} for what a failed
+     * attempt costs the caller. The store then stays the size it is, keeps serving the slabs it holds, and
+     * the cost is hit rate -- which is what a cache that cannot grow should cost.
      */
-    private static Slab growSlabs(final int length) {
-        if (liveSlabs >= maxSlabs || growthLatched) {
+    private static Slab growSlabs(final int length, final SlabRequest request) {
+        if (growthLatched || request == null) {
             return null;
         }
-        final DirectIOSlab memory = slabAllocator.apply(slabBytes);
-        if (memory == null) {
-            // The backend would not give up the memory: on JDK 21 that is MaxDirectMemorySize, charged at
-            // Arena#allocate. Once at warn, because an operator who set a cap the JVM cannot honour needs to
-            // see it, and the latch is what keeps it to once.
-            growthLatched = true;
-            slabAllocFailures.increment();
-            log.warn(
-                "A k-NN Direct I/O vector cache slab of {} bytes could not be allocated from {}; the cache will hold the {} "
-                    + "slabs it has until knn.direct_io.rescore.cache.max_bytes changes or a slab is released",
-                slabBytes,
-                DirectIOSlab.backend(),
-                liveSlabs
-            );
+        // This request's own reservation does not count against it; every other fill's does.
+        final int others = pendingSlabs - (request.reserved ? 1 : 0);
+        if (liveSlabs + others >= maxSlabs) {
             return null;
         }
-        final Slab fresh = register(memory);
+        if (request.spare == null) {
+            if (request.reserved == false) {
+                pendingSlabs++;
+                request.reserved = true;
+            }
+            request.wanted = true;
+            return null;
+        }
+        final Slab fresh = register(request.spare);
+        request.spare = null;
+        if (request.reserved) {
+            pendingSlabs--;
+            request.reserved = false;
+        }
         open(fresh, length);
         return fresh;
     }
@@ -960,13 +1171,22 @@ public final class DirectIOVectorCache {
         return slab;
     }
 
-    private static void unregister(final Slab slab) {
+    /**
+     * Takes a slab out of service under the write lock and hands its memory back to the caller to release
+     * outside the lock (N3). Clearing {@code slabsById} is what makes that safe: every lookup resolves a slab
+     * through {@link #slabAt} under the read lock, so a reader arriving after this cannot reach the slab and a
+     * reader already inside held the read lock this thread had to wait for.
+     *
+     * @param slab the slab to detach
+     * @return its memory, for {@link #releaseDetached}
+     */
+    private static DirectIOSlab detach(final Slab slab) {
         slabsById[slab.id] = null;
         OPEN_SLABS.remove(slab.slotBytes, slab);
         liveSlabs--;
-        // Memory came back, so an earlier allocation failure may not stand any more (N2).
+        // Memory is coming back, so an earlier allocation failure may not stand any more (N2).
         growthLatched = false;
-        slab.memory.close();
+        return slab.memory;
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -1120,8 +1340,9 @@ public final class DirectIOVectorCache {
 
     /** Test seam: empties the store, releases every slab, and zeroes every counter. */
     static void resetForTesting() {
-        slabAllocator = DirectIOSlab::allocate;
+        slabMemory = DIRECT_SLABS;
         configure(0);
+        awaitReleasesForTesting();
         slabBytes = DirectIOSlab.SLAB_BYTES;
         spanFill = KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_DEFAULT_VALUE;
         hits.reset();
@@ -1136,20 +1357,41 @@ public final class DirectIOVectorCache {
     }
 
     /**
-     * Test seam: where slabs come from, so a suite can exercise a backend that will not allocate without
-     * needing a JVM whose direct memory is actually exhausted. Takes effect on the next growth attempt and is
-     * restored by {@link #resetForTesting()}.
+     * Test seam: where slab memory comes from and goes back to, so a suite can exercise a backend that will
+     * not allocate (N2) and can see which thread, holding which lock, each call runs on (N3). Takes effect on
+     * the next growth attempt or release and is restored by {@link #resetForTesting()}.
      *
-     * @param allocator given the slab size in bytes, a slab or null
+     * @param memory the allocate and release pair to use until the next reset
      */
-    static void setSlabAllocatorForTesting(final IntFunction<DirectIOSlab> allocator) {
+    static void setSlabMemoryForTesting(final SlabMemory memory) {
         LOCK.writeLock().lock();
         try {
-            slabAllocator = allocator;
+            slabMemory = memory;
             growthLatched = false;
         } finally {
             LOCK.writeLock().unlock();
         }
+    }
+
+    /**
+     * Test seam: waits for every release in flight to have given its memory back, because
+     * {@link #releaseDetached} does that on a thread of its own.
+     */
+    static void awaitReleasesForTesting() {
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (releasesRunning.get() > 0 && System.nanoTime() < deadline) {
+            Thread.onSpinWait();
+        }
+    }
+
+    /**
+     * Test seam: whether the calling thread is inside this store's lock in either mode. N3's property is that
+     * neither a slab allocation nor a slab release ever runs while it is.
+     *
+     * @return whether this thread holds the read or the write lock
+     */
+    static boolean lockHeldByCurrentThreadForTesting() {
+        return LOCK.isWriteLockedByCurrentThread() || LOCK.getReadHoldCount() > 0;
     }
 
     /**
@@ -1239,6 +1481,9 @@ public final class DirectIOVectorCache {
             }
             if (FIFO.size() != liveSlabs) {
                 throw new IllegalStateException("queue holds " + FIFO.size() + " slabs but the counter says " + liveSlabs);
+            }
+            if (pendingSlabs < 0 || liveSlabs + pendingSlabs > Math.max(maxSlabs, liveSlabs)) {
+                throw new IllegalStateException(liveSlabs + " live and " + pendingSlabs + " pending slabs against a target of " + maxSlabs);
             }
             for (final Map.Entry<DirectIOSlotMap, Integer> entry : counted.entrySet()) {
                 if (entry.getKey().liveEntries() != entry.getValue()) {

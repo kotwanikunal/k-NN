@@ -10,6 +10,7 @@ import org.opensearch.knn.KNNTestCase;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
@@ -514,6 +515,8 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
         assertEquals(0L, DirectIOSlab.freedCount());
 
         DirectIOVectorCache.configure(0);
+        // The closes run on a release thread of their own since N3, so wait for them.
+        DirectIOVectorCache.awaitReleasesForTesting();
 
         assertEquals("every slab back", DirectIOSlab.allocatedCount(), DirectIOSlab.freedCount());
     }
@@ -802,9 +805,9 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
         final int bytes = dimension * Float.BYTES;
         final int slots = DirectIOVectorCache.slotsPerSlab(bytes);
         assertTrue("this test needs several slots in a slab, it has " + slots, slots >= 4);
+        final long first = offsetOf(dimension, 0);
 
         final int offered = slots + 4;
-        final long first = offsetOf(dimension, 0);
         final int admitted = DirectIOVectorCache.putRun(file, first, offered, runOf(file, first, offered, dimension), 0, bytes);
         assertEquals("exactly the slab's worth", slots, admitted);
         assertEquals(1L, DirectIOVectorCache.slabs());
@@ -891,10 +894,7 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
         final AtomicInteger attempts = new AtomicInteger();
         cacheOf(0);
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
-        DirectIOVectorCache.setSlabAllocatorForTesting(bytes -> {
-            attempts.incrementAndGet();
-            return null;
-        });
+        DirectIOVectorCache.setSlabMemoryForTesting(refusing(attempts));
         DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
 
         final String file = "no-slab.vec#1";
@@ -916,10 +916,7 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
         final AtomicInteger attempts = new AtomicInteger();
         cacheOf(0);
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
-        DirectIOVectorCache.setSlabAllocatorForTesting(bytes -> {
-            attempts.incrementAndGet();
-            return null;
-        });
+        DirectIOVectorCache.setSlabMemoryForTesting(refusing(attempts));
         final String file = "rearm.vec#1";
 
         DirectIOVectorCache.configure(2L * TEST_SLAB_BYTES);
@@ -951,10 +948,7 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
         assertEquals(1L, DirectIOVectorCache.slabs());
 
         // The target goes up but the backend will not give the store a second slab.
-        DirectIOVectorCache.setSlabAllocatorForTesting(bytes -> {
-            attempts.incrementAndGet();
-            return null;
-        });
+        DirectIOVectorCache.setSlabMemoryForTesting(refusing(attempts));
         DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
         assertTrue(DirectIOVectorCache.belowSlabTarget());
 
@@ -993,10 +987,7 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
 
         // The target goes up and the backend refuses, so growth latches. The 4,096-dim fill needs a slab of
         // its own slot layout, which is what asks for one.
-        DirectIOVectorCache.setSlabAllocatorForTesting(bytes -> {
-            attempts.incrementAndGet();
-            return null;
-        });
+        DirectIOVectorCache.setSlabMemoryForTesting(refusing(attempts));
         DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
         put(file, offsetOf(4096, 100), 4096);
         put(file, offsetOf(4096, 101), 4096);
@@ -1013,8 +1004,153 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
     }
 
     // ---------------------------------------------------------------------------------------------------
+    // N3: no slab allocate or close while holding the store's lock
+    // ---------------------------------------------------------------------------------------------------
+
+    /**
+     * Neither an allocation nor a release ever runs while the calling thread holds this store's lock, in
+     * either mode. MEASURED (M1, output/bench/n2): an allocation is 7 to 10 ms and a release about 2.2 ms per
+     * 32 MiB slab, so before N3 a fill held the write lock for the first and a {@code configure(0)} at 4 GB
+     * held it for about 0.26 s of the second, with every lookup waiting behind them.
+     */
+    public void testNeitherAllocateNorReleaseRunsUnderTheStoresLock() {
+        final List<String> violations = Collections.synchronizedList(new ArrayList<>());
+        final AtomicInteger allocations = new AtomicInteger();
+        final AtomicInteger releases = new AtomicInteger();
+        cacheOf(0);
+        DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
+        DirectIOVectorCache.setSlabMemoryForTesting(new DirectIOVectorCache.SlabMemory() {
+            @Override
+            public DirectIOSlab allocate(final int bytes) {
+                allocations.incrementAndGet();
+                if (DirectIOVectorCache.lockHeldByCurrentThreadForTesting()) {
+                    violations.add("allocate held the store's lock");
+                }
+                return DirectIOSlab.allocate(bytes);
+            }
+
+            @Override
+            public void release(final DirectIOSlab slab) {
+                releases.incrementAndGet();
+                if (DirectIOVectorCache.lockHeldByCurrentThreadForTesting()) {
+                    violations.add("release held the store's lock");
+                }
+                slab.close();
+            }
+        });
+        DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
+
+        final String file = "lockfree.vec#1";
+        final int dimension = 128;
+        final int slots = DirectIOVectorCache.slotsPerSlab(dimension * Float.BYTES);
+        // Four slabs' worth of requested fills, so growth runs four times.
+        for (int i = 0; i < 4 * slots; i++) {
+            put(file, offsetOf(dimension, i), dimension);
+        }
+        assertEquals(4L, DirectIOVectorCache.slabs());
+        // And a span fill, which grows through the other half of place().
+        DirectIOVectorCache.configure(0);
+        DirectIOVectorCache.awaitReleasesForTesting();
+        DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
+        for (int run = 0; run < 4; run++) {
+            final long at = offsetOf(dimension, run * slots);
+            DirectIOVectorCache.putRun(file, at, slots, runOf(file, at, slots, dimension), 0, dimension * Float.BYTES);
+        }
+        assertTrue("the span fills took slabs too", DirectIOVectorCache.slabs() > 1);
+        assertTrue(DirectIOVectorCache.spanFills() > 0);
+
+        // Down, which releases some, and off, which releases the rest.
+        DirectIOVectorCache.configure(TEST_SLAB_BYTES);
+        DirectIOVectorCache.configure(0);
+        DirectIOVectorCache.awaitReleasesForTesting();
+
+        assertEquals("every allocate and release must run outside the lock", List.of(), violations);
+        assertTrue("the test has to have exercised allocation, saw " + allocations.get(), allocations.get() >= 4);
+        assertTrue("and release, saw " + releases.get(), releases.get() >= 4);
+    }
+
+    /** Eight threads filling from empty never take more slabs than the target allows. */
+    public void testConcurrentFillsFromEmptyNeverExceedTheTarget() throws Exception {
+        final int target = 3;
+        final AtomicInteger allocations = new AtomicInteger();
+        final AtomicInteger overshoot = new AtomicInteger();
+        cacheOf(0);
+        DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
+        DirectIOVectorCache.setSlabMemoryForTesting(new DirectIOVectorCache.SlabMemory() {
+            @Override
+            public DirectIOSlab allocate(final int bytes) {
+                allocations.incrementAndGet();
+                // Slow on purpose: this is the window in which two fills could both decide to grow.
+                try {
+                    Thread.sleep(5);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return DirectIOSlab.allocate(bytes);
+            }
+
+            @Override
+            public void release(final DirectIOSlab slab) {
+                slab.close();
+            }
+        });
+        DirectIOVectorCache.configure((long) target * TEST_SLAB_BYTES);
+
+        final int threads = 8;
+        final CountDownLatch start = new CountDownLatch(1);
+        final CountDownLatch done = new CountDownLatch(threads);
+        final AtomicReference<Throwable> failure = new AtomicReference<>();
+        for (int t = 0; t < threads; t++) {
+            final int seed = t;
+            final Thread thread = new Thread(() -> {
+                try {
+                    final Random random = new Random(400L + seed);
+                    start.await();
+                    for (int i = 0; i < 400; i++) {
+                        put("race.vec#1", offsetOf(128, random.nextInt(4096)), 128);
+                        if (DirectIOVectorCache.slabs() > target) {
+                            overshoot.incrementAndGet();
+                        }
+                    }
+                } catch (Throwable e) {
+                    failure.compareAndSet(null, e);
+                } finally {
+                    done.countDown();
+                }
+            }, "n3-fill-" + t);
+            thread.setDaemon(true);
+            thread.start();
+        }
+        start.countDown();
+        assertTrue(done.await(2, TimeUnit.MINUTES));
+        if (failure.get() != null) {
+            throw new AssertionError(failure.get());
+        }
+        assertEquals("the target was never exceeded", 0, overshoot.get());
+        assertEquals((long) target, DirectIOVectorCache.slabs());
+        assertTrue("at most one allocation per slab the target allows, saw " + allocations.get(), allocations.get() <= target);
+        DirectIOVectorCache.checkInvariantsForTesting();
+    }
+
+    // ---------------------------------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------------------------------
+
+    /** A backend that counts what it is asked for and refuses every slab. */
+    private static DirectIOVectorCache.SlabMemory refusing(final AtomicInteger attempts) {
+        return new DirectIOVectorCache.SlabMemory() {
+            @Override
+            public DirectIOSlab allocate(final int bytes) {
+                attempts.incrementAndGet();
+                return null;
+            }
+
+            @Override
+            public void release(final DirectIOSlab slab) {
+                slab.close();
+            }
+        };
+    }
 
     /** The byte offset of vector {@code i} of a {@code dimension}-dim field, past a Lucene header. */
     private static long offsetOf(final int dimension, final int i) {
