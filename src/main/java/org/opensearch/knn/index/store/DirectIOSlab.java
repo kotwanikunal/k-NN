@@ -59,13 +59,18 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <h2>{@code MaxDirectMemorySize}: outside it on the node's JDK, inside it on 21 (MEASURED)</h2>
  * With {@code -XX:MaxDirectMemorySize=64m}, 16 FFM slabs (512 MiB) allocate fine on JDK 25, which does not
- * count them in {@code BufferPoolMXBean("direct")} either. On JDK 21 the <em>view</em> charges the limit,
- * not the arena: the third {@code asByteBuffer()} throws
+ * count them in {@code BufferPoolMXBean("direct")} either. On JDK 21 the <b>allocation</b> charges the limit:
+ * the third {@code allocate(32 MiB, 64)} throws
  * {@code OutOfMemoryError: Cannot reserve 33554495 bytes of direct buffer memory} from
  * {@code java.nio.Bits.reserveMemory}, and {@code Arena#close} gives that reservation straight back with no
- * GC. {@code allocateDirect} is inside the limit on both. So on a JDK 21 runtime this cache shares
- * {@code MaxDirectMemorySize} with Direct I/O staging and netty, and on a JDK 22+ runtime it does not; its
- * own ceiling, {@code knn.direct_io.rescore.cache.max_bytes}, is the bound either way.
+ * GC. Corretto 21's {@code jdk.internal.foreign.NativeMemorySegmentImpl#makeNativeSegment:127} is where it
+ * happens, and its cleanup unreserves at {@code :140}; {@code makeByteBuffer:91-94} reserves nothing, so the
+ * view is free. The 63 bytes over 32 MiB in that message are the alignment pad the same method adds
+ * ({@code byteSize + (byteAlignment - 1)} for an alignment past {@code MAX_MALLOC_ALIGN}), which is another
+ * way of seeing that it is the allocation and not the view. {@code allocateDirect} is inside the limit on
+ * both JDKs. So on a JDK 21 runtime this cache shares {@code MaxDirectMemorySize} with Direct I/O staging
+ * and netty, and on a JDK 22+ runtime it does not; its own ceiling,
+ * {@code knn.direct_io.rescore.cache.max_bytes}, is the bound either way.
  *
  * <h2>An allocation that fails is not an error</h2>
  * {@link #allocate(int)} returns {@code null} rather than throwing when the backend will not give up the
@@ -110,9 +115,8 @@ final class DirectIOSlab {
     /**
      * The reflective handles on {@code java.lang.foreign}, resolved once and proven once.
      *
-     * <p>Resolution alone is not proof: a runtime can carry the classes and still refuse an arena, and on
-     * JDK 21 the failure arrives at {@code asByteBuffer} rather than at {@code allocate}. So the holder
-     * allocates one small arena, views it, writes a float, reads it back and closes it. A backend that
+     * <p>Resolution alone is not proof: a runtime can carry the classes and still refuse an arena. So the
+     * holder allocates one small arena, views it, writes a float, reads it back and closes it. A backend that
      * cannot do that for 1 KiB will not do it for 32 MiB.
      */
     private static final class Ffm {
@@ -224,8 +228,9 @@ final class DirectIOSlab {
             final ByteBuffer view = (ByteBuffer) Ffm.AS_BYTE_BUFFER.invoke(Ffm.ALLOCATE.invoke(arena, (long) capacity, ALIGNMENT));
             return new DirectIOSlab(arena, capacity, view.order(ByteOrder.LITTLE_ENDIAN));
         } catch (Throwable t) {
-            // On JDK 21 this is where MaxDirectMemorySize is enforced, inside asByteBuffer, so the arena may
-            // be open with memory already behind it. Give it back before reporting no slab.
+            // On JDK 21 MaxDirectMemorySize is enforced inside allocate, which leaves the arena open with no
+            // memory behind it; a later failure would leave it open with memory behind it. Either way, close
+            // it before reporting no slab.
             if (arena != null) {
                 try {
                     Ffm.CLOSE.invoke(arena);

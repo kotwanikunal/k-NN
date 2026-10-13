@@ -308,12 +308,15 @@ public class KNNSettings {
     // span also admits every whole vector of the reading slice that lies inside it, keyed exactly like a
     // requested fill.
     //
-    // The measurement it exists for (MEASURED by 16-I on the EBS node, S1b): on dio-1m with a cache large
-    // enough for every vector in the file, Direct I/O's p50 stayed 9.7x mmap's because 16% of candidates
-    // still missed after a 10,000-query warm-up. In that warm-up Direct I/O read 2.01 MB per query in ~40 KB
-    // staged spans (20 GB, 6.5x the file) and cached only the requested vectors, while mmap's page cache
-    // kept every page it read and ended up holding 95% of the file. The cache was paying for the reads and
-    // keeping a fraction of what they delivered. With span fill on, dio-1m's p50 went from 43.9 to 10.9 ms.
+    // The measurement it exists for (MEASURED on the EBS node by phase 16-P, the pilot, whose cache was the
+    // on-heap one): on dio-1m with a cache large enough for every vector in the file, Direct I/O's p50 stayed
+    // 9.7x mmap's because 16% of candidates still missed after a 10,000-query warm-up. In that warm-up
+    // Direct I/O read 2.01 MB per query in ~40 KB staged spans (20 GB, 6.5x the file) and cached only the
+    // requested vectors, while mmap's page cache kept every page it read and ended up holding 95% of the
+    // file. The cache was paying for the reads and keeping a fraction of what they delivered.
+    //
+    // What span fill then did about it (MEASURED by 16-I on the EBS node, S1b, on the slab build): dio-1m's
+    // p50 went from 43.9 to 10.9 ms.
     //
     // A boolean rather than a size, because the policy has no magnitude: at or above the slab target
     // admission is requested vectors only, exactly as before, so this cannot cause an eviction and cannot
