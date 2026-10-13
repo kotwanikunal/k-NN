@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.IntFunction;
 
 /**
  * The one cache of individual vectors on the Direct I/O random rescore path, for the whole node: a slab store
@@ -171,6 +172,27 @@ public final class DirectIOVectorCache {
     private static long liveEntries;
     private static long liveEntryBytes;
 
+    /**
+     * Set when an allocation failed, so the store stops asking for a slab it cannot have (N2). Cleared when
+     * the target changes or a slab is released, which are the two events that can make the answer different.
+     *
+     * <p>MEASURED by the orchestrator (2026-10-12, desktop, {@code -Xmx256m} with
+     * {@code -XX:MaxDirectMemorySize=96m}): a failed reservation blocks the caller for 515 to 525 ms and runs
+     * one {@code Pause Full (System.gc())}, for {@code allocateDirect} on JDK 21 and 25 and for FFM on JDK 21,
+     * because {@code java.nio.Bits#reserveMemory} calls {@code System.gc()} and then sleeps nine times with
+     * backoff. Retrying it on every fill below the target costs that once per fill, under this class's write
+     * lock, and the answer is the same every time.
+     *
+     * <p>Only read and written under the write lock, like {@link #liveSlabs}.
+     */
+    private static boolean growthLatched;
+
+    /**
+     * Where a slab comes from. A field and not a direct call to {@link DirectIOSlab#allocate} only so that a
+     * test can make allocation fail on demand; production never sets it to anything else.
+     */
+    private static IntFunction<DirectIOSlab> slabAllocator = DirectIOSlab::allocate;
+
     private static final LongAdder hits = new LongAdder();
     private static final LongAdder misses = new LongAdder();
     private static final LongAdder insertions = new LongAdder();
@@ -178,6 +200,8 @@ public final class DirectIOVectorCache {
     private static final LongAdder readmissions = new LongAdder();
     private static final LongAdder droppedEntries = new LongAdder();
     private static final LongAdder spanFills = new LongAdder();
+    /** Allocations that failed, which is one per latch and so also how often growth was given up on. */
+    private static final LongAdder slabAllocFailures = new LongAdder();
     /** Write-lock time spent reclaiming slabs, which is the figure a node has to be able to read. */
     private static final LongAdder reclaimNanos = new LongAdder();
 
@@ -697,6 +721,8 @@ public final class DirectIOVectorCache {
                 );
             }
             maxSlabs = wanted;
+            // A new target is a new question, so an earlier allocation failure stops standing (N2).
+            growthLatched = false;
             while (liveSlabs > wanted) {
                 final Slab oldest = FIFO.poll();
                 if (oldest == null) {
@@ -757,18 +783,32 @@ public final class DirectIOVectorCache {
 
     /**
      * A fresh slab opened for {@code length}-byte vectors while the store is below its target, or
-     * {@code null} when it is at the target or the allocation failed. The half of {@link #obtainSlab} that
-     * displaces nothing, which is the only half span fill is allowed. Called under the write lock.
+     * {@code null} when it is at the target, growth is latched or the allocation failed. The half of
+     * {@link #obtainSlab} that displaces nothing, which is the only half span fill is allowed. Called under
+     * the write lock.
+     *
+     * <p>One attempt per latch, not one per fill: see {@link #growthLatched} for what a failed attempt costs
+     * the caller. The store then stays the size it is, keeps serving the slabs it holds, and the cost is hit
+     * rate -- which is what a cache that cannot grow should cost.
      */
     private static Slab growSlabs(final int length) {
-        if (liveSlabs >= maxSlabs) {
+        if (liveSlabs >= maxSlabs || growthLatched) {
             return null;
         }
-        final DirectIOSlab memory = DirectIOSlab.allocate(slabBytes);
+        final DirectIOSlab memory = slabAllocator.apply(slabBytes);
         if (memory == null) {
-            // The backend would not give up the memory: on JDK 21 that is MaxDirectMemorySize, enforced
-            // inside asByteBuffer. The store stays the size it is and the cost is hit rate.
-            log.debug("A vector cache slab of {} bytes could not be allocated; the cache will not grow now", slabBytes);
+            // The backend would not give up the memory: on JDK 21 that is MaxDirectMemorySize, charged at
+            // Arena#allocate. Once at warn, because an operator who set a cap the JVM cannot honour needs to
+            // see it, and the latch is what keeps it to once.
+            growthLatched = true;
+            slabAllocFailures.increment();
+            log.warn(
+                "A k-NN Direct I/O vector cache slab of {} bytes could not be allocated from {}; the cache will hold the {} "
+                    + "slabs it has until knn.direct_io.rescore.cache.max_bytes changes or a slab is released",
+                slabBytes,
+                DirectIOSlab.backend(),
+                liveSlabs
+            );
             return null;
         }
         final Slab fresh = register(memory);
@@ -924,6 +964,8 @@ public final class DirectIOVectorCache {
         slabsById[slab.id] = null;
         OPEN_SLABS.remove(slab.slotBytes, slab);
         liveSlabs--;
+        // Memory came back, so an earlier allocation failure may not stand any more (N2).
+        growthLatched = false;
         slab.memory.close();
     }
 
@@ -1028,6 +1070,16 @@ public final class DirectIOVectorCache {
         return spanFills.sum();
     }
 
+    /**
+     * Slab allocations the backend refused (N2). One per latch: after a failure the store stops growing until
+     * its target changes or it releases a slab, so this is also how many times growth was given up on.
+     * Non-zero means the node's {@code knn.direct_io.rescore.cache.max_bytes} is above what the JVM would
+     * hand out, and the store is smaller than the operator asked for.
+     */
+    public static long slabAllocFailures() {
+        return slabAllocFailures.sum();
+    }
+
     /** Nanoseconds spent inside a slab reclaim, which is write-lock time every fill waits behind. */
     public static long reclaimNanos() {
         return reclaimNanos.sum();
@@ -1068,6 +1120,7 @@ public final class DirectIOVectorCache {
 
     /** Test seam: empties the store, releases every slab, and zeroes every counter. */
     static void resetForTesting() {
+        slabAllocator = DirectIOSlab::allocate;
         configure(0);
         slabBytes = DirectIOSlab.SLAB_BYTES;
         spanFill = KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_DEFAULT_VALUE;
@@ -1079,6 +1132,24 @@ public final class DirectIOVectorCache {
         droppedEntries.reset();
         reclaimNanos.reset();
         spanFills.reset();
+        slabAllocFailures.reset();
+    }
+
+    /**
+     * Test seam: where slabs come from, so a suite can exercise a backend that will not allocate without
+     * needing a JVM whose direct memory is actually exhausted. Takes effect on the next growth attempt and is
+     * restored by {@link #resetForTesting()}.
+     *
+     * @param allocator given the slab size in bytes, a slab or null
+     */
+    static void setSlabAllocatorForTesting(final IntFunction<DirectIOSlab> allocator) {
+        LOCK.writeLock().lock();
+        try {
+            slabAllocator = allocator;
+            growthLatched = false;
+        } finally {
+            LOCK.writeLock().unlock();
+        }
     }
 
     /**

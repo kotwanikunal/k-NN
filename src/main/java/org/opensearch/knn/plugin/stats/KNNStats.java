@@ -149,7 +149,11 @@ public class KNNStats {
      *       dropped, by a reclaim or with a released slab. {@code span_fills} is vectors admitted because
      *       they lay inside a span a burst had already staged rather than because a read asked for them,
      *       which is {@code 0} while {@code knn.direct_io.rescore.cache.span_fill} is false and once the
-     *       store is at its slab target. {@code slab_memory} names the off-heap backend
+     *       store is at its slab target. {@code slab_alloc_failures} counts the times the backend refused a
+     *       slab the store was below its target for; it is one per time growth was given up on, because the
+     *       store then stops asking until its target changes or it releases a slab, so non-zero means the
+     *       node is holding a smaller cache than {@code max_bytes} asked for. {@code slab_memory} names the
+     *       off-heap backend
      *       ({@code ffm} or {@code direct_buffer}), which decides whether releasing memory is immediate and
      *       whether the bytes sit inside {@code MaxDirectMemorySize}.</li>
      * </ul>
@@ -220,6 +224,7 @@ public class KNNStats {
         cache.put("reclaimed_slabs", DirectIOVectorCache.reclaimedSlabs());
         cache.put("readmissions", DirectIOVectorCache.readmissions());
         cache.put("span_fills", DirectIOVectorCache.spanFills());
+        cache.put("slab_alloc_failures", DirectIOVectorCache.slabAllocFailures());
 
         final Map<String, Map<String, Object>> directIOStats = new HashMap<>();
         directIOStats.put("dispatch", dispatch);

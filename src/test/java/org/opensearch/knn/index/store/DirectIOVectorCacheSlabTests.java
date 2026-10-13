@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -875,6 +876,140 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
     public void testTheSlabSizeCannotChangeWhileTheStoreHoldsSlabs() {
         cacheOf(1);
         expectThrows(IllegalStateException.class, () -> DirectIOVectorCache.setSlabBytesForTesting(4096));
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // N2: a failed slab allocation is not retried
+    // ---------------------------------------------------------------------------------------------------
+
+    /**
+     * Many fills below the target make exactly one allocation attempt, and count one failure. MEASURED by
+     * the orchestrator: a refused reservation costs the caller 515 to 525 ms and one full GC, under this
+     * store's write lock, and every retry costs the same for the same answer.
+     */
+    public void testAFailedAllocationIsAttemptedOnceAndCounted() {
+        final AtomicInteger attempts = new AtomicInteger();
+        cacheOf(0);
+        DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
+        DirectIOVectorCache.setSlabAllocatorForTesting(bytes -> {
+            attempts.incrementAndGet();
+            return null;
+        });
+        DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
+
+        final String file = "no-slab.vec#1";
+        for (int i = 0; i < 200; i++) {
+            put(file, offsetOf(128, i), 128);
+        }
+        assertEquals("exactly one attempt, however many fills asked", 1, attempts.get());
+        assertEquals(1L, DirectIOVectorCache.slabAllocFailures());
+        assertEquals("and nothing was cached", 0L, DirectIOVectorCache.entries());
+        assertEquals(0L, DirectIOVectorCache.slabs());
+        // The file does get an index table and no slot in it, which is this store's documented behaviour for
+        // a fill that cannot be placed: one empty table until the next fill for that file uses it.
+        assertTrue(DirectIOVectorCache.hasIndexFor(file));
+        DirectIOVectorCache.checkInvariantsForTesting();
+    }
+
+    /** A new target is a new question, so it re-arms growth: one more attempt, one more failure. */
+    public void testATargetChangeReArmsGrowth() {
+        final AtomicInteger attempts = new AtomicInteger();
+        cacheOf(0);
+        DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
+        DirectIOVectorCache.setSlabAllocatorForTesting(bytes -> {
+            attempts.incrementAndGet();
+            return null;
+        });
+        final String file = "rearm.vec#1";
+
+        DirectIOVectorCache.configure(2L * TEST_SLAB_BYTES);
+        for (int i = 0; i < 20; i++) {
+            put(file, offsetOf(128, i), 128);
+        }
+        assertEquals(1, attempts.get());
+
+        DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
+        for (int i = 0; i < 20; i++) {
+            put(file, offsetOf(128, i), 128);
+        }
+        assertEquals(2, attempts.get());
+        assertEquals(2L, DirectIOVectorCache.slabAllocFailures());
+    }
+
+    /**
+     * The store keeps serving and keeps filling the slab it already holds: a fill that cannot grow reclaims
+     * instead, which is what {@code obtainSlab} did before N2 as well. The only thing that changed is that
+     * it no longer pays for an allocation attempt first.
+     */
+    public void testTheStoreKeepsServingTheSlabsItHoldsAfterAFailure() {
+        final AtomicInteger attempts = new AtomicInteger();
+        cacheOf(1);
+        final String file = "keep.vec#1";
+        final int dimension = 128;
+        final int slots = DirectIOVectorCache.slotsPerSlab(dimension * Float.BYTES);
+        put(file, offsetOf(dimension, 0), dimension);
+        assertEquals(1L, DirectIOVectorCache.slabs());
+
+        // The target goes up but the backend will not give the store a second slab.
+        DirectIOVectorCache.setSlabAllocatorForTesting(bytes -> {
+            attempts.incrementAndGet();
+            return null;
+        });
+        DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
+        assertTrue(DirectIOVectorCache.belowSlabTarget());
+
+        final float[] read = new float[dimension];
+        assertTrue(
+            "the vector it already held is still served",
+            DirectIOVectorCache.getFloats(file, offsetOf(dimension, 0), dimension * Float.BYTES, read, 0)
+        );
+        assertArrayEquals(vector(file, offsetOf(dimension, 0), dimension), read, 0.0f);
+
+        // Past the one slab's slot count, so every further fill has to reclaim it.
+        for (int i = 1; i < 2 * slots; i++) {
+            put(file, offsetOf(dimension, i), dimension);
+        }
+        assertEquals("one attempt in all of that", 1, attempts.get());
+        assertEquals(1L, DirectIOVectorCache.slabAllocFailures());
+        assertEquals("and the slab it holds is still in service", 1L, DirectIOVectorCache.slabs());
+        assertTrue(DirectIOVectorCache.reclaimedSlabs() > 0);
+        final long last = offsetOf(dimension, 2 * slots - 1);
+        assertTrue(DirectIOVectorCache.getFloats(file, last, dimension * Float.BYTES, read, 0));
+        assertArrayEquals(vector(file, last, dimension), read, 0.0f);
+        DirectIOVectorCache.checkInvariantsForTesting();
+    }
+
+    /**
+     * Releasing the store's slabs gives the memory back, so an earlier failure stops standing. This is the
+     * operator sequence: a cap the JVM would not honour, then {@code 0b}, then a cap again. The re-arm sits in
+     * the release itself as well as in the target change, so that it stays true of any other release path.
+     */
+    public void testAReleaseReArmsGrowth() {
+        final AtomicInteger attempts = new AtomicInteger();
+        cacheOf(2);
+        final String file = "release.vec#1";
+        put(file, offsetOf(128, 0), 128);
+        assertEquals(1L, DirectIOVectorCache.slabs());
+
+        // The target goes up and the backend refuses, so growth latches. The 4,096-dim fill needs a slab of
+        // its own slot layout, which is what asks for one.
+        DirectIOVectorCache.setSlabAllocatorForTesting(bytes -> {
+            attempts.incrementAndGet();
+            return null;
+        });
+        DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
+        put(file, offsetOf(4096, 100), 4096);
+        put(file, offsetOf(4096, 101), 4096);
+        assertEquals("one attempt, and the second fill used the slab the first reclaimed", 1, attempts.get());
+
+        // Every slab released, and then a cap again.
+        DirectIOVectorCache.configure(0);
+        assertEquals(0L, DirectIOVectorCache.slabs());
+        DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
+        put(file, offsetOf(128, 0), 128);
+        assertEquals("the release re-armed it", 2, attempts.get());
+        assertEquals(2L, DirectIOVectorCache.slabAllocFailures());
+        DirectIOVectorCache.checkInvariantsForTesting();
     }
 
     // ---------------------------------------------------------------------------------------------------
