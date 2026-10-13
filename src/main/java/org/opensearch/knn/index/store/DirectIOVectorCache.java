@@ -321,6 +321,56 @@ public final class DirectIOVectorCache {
     }
 
     /**
+     * Writes into {@code missing} the members of {@code ords[0..numOrds)} whose vector this store does not
+     * hold whole and returns how many, or returns {@code -1} when it holds nothing of {@code fileId} at all.
+     *
+     * <p>One read-lock acquisition for the batch, and like {@link #contains} it <b>counts nothing</b>: the
+     * caller ({@code DirectIOVectorIndexInput#selectUncachedOrdinals}, N1) is deciding what to prefetch, not
+     * serving bytes. {@code -1} rather than a copy of every ordinal is what lets a cold file take the
+     * caller's unfiltered path with no array to walk.
+     *
+     * <p>A vector held at a different length than {@code vectorBytes} counts as missing, for the same reason
+     * {@link #getFloats} answers a length mismatch with a miss: a caller asking about a layout this store did
+     * not cache is a caller it was not designed for.
+     *
+     * @param fileId      the file's identity, from {@link #fileId}
+     * @param baseOffset  the byte offset of ordinal zero in that file
+     * @param vectorBytes one vector's length in bytes, which is also the ordinal stride
+     * @param ords        the ordinals to ask about, read and not written
+     * @param numOrds     how many of {@code ords} are valid
+     * @param missing     at least {@code numOrds} ints
+     * @return how many ordinals were written to {@code missing}, or {@code -1}
+     */
+    static int selectMissing(
+        final String fileId,
+        final long baseOffset,
+        final int vectorBytes,
+        final int[] ords,
+        final int numOrds,
+        final int[] missing
+    ) {
+        if (maxSlabs == 0) {
+            return -1;
+        }
+        int found = 0;
+        LOCK.readLock().lock();
+        try {
+            final DirectIOSlotMap map = INDEX.get(fileId);
+            if (map == null) {
+                return -1;
+            }
+            for (int i = 0; i < numOrds; i++) {
+                if (locate(map, baseOffset + (long) ords[i] * vectorBytes, vectorBytes) < 0) {
+                    missing[found++] = ords[i];
+                }
+            }
+        } finally {
+            LOCK.readLock().unlock();
+        }
+        return found;
+    }
+
+    /**
      * Copies the cached vector into {@code destination} and returns true, or returns false and leaves
      * {@code destination} alone. A hit also flags the slot, which is what earns it a second chance when its
      * slab is reclaimed.

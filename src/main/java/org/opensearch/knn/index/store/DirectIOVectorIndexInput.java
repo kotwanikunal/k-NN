@@ -883,6 +883,17 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     private ExecutorService pool;
     /** Whether a read has happened since the last {@link #prefetch}, which is how a burst's end is found. */
     private boolean readSincePrefetch;
+    /**
+     * Whether this burst has already picked up a settings change, cleared by {@link #endBurst}.
+     *
+     * <p>The marker used to be {@code pool == null}, which is set by {@link #ensureStagingTable} part way
+     * through {@link #prefetch}. It is a field of its own since N1 because the burst boundary is now also
+     * reached by {@link #selectUncachedOrdinals}, which runs <em>before</em> the first {@link #prefetch} of a
+     * batch and has to do the refresh itself: a batch whose every candidate is cached issues no
+     * {@link #prefetch} at all, and without this an operator's {@code max_bytes} change (0b included) would
+     * never be read on a node whose cache serves everything.
+     */
+    private boolean burstConfigured;
 
     // -- Sequential read-ahead ring. Distinct from the burst table above: it holds no state in common with
     // it, is scanned independently in source(), and neither mechanism resets the other. Allocated lazily
@@ -1215,6 +1226,58 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     // ---------------------------------------------------------------------------------------------------
 
     /**
+     * Writes into {@code uncached} the ordinals of {@code ords[0..numOrds)} whose vectors the store does
+     * <b>not</b> hold whole, and returns how many, or returns {@code -1} to mean "ask about nothing, prefetch
+     * the batch as it is".
+     *
+     * <p>This is N1. The caller is {@code PrefetchHelper#prefetch}, which without it hands every candidate of
+     * a batch to its 128 KB coalescing and so asks this input for groups whose spans are mostly already
+     * cached. The input can only accept or decline a whole group, so a group with one missing vector in it is
+     * staged in full: MEASURED on the node (ref/NODE-16M.md), 73.4 staged reads per query for 77.1 missing
+     * vectors at 22.9 KB a read in S2, against 16-I's 62.7 for 76.9 at 12.6 KB, because 16-I grouped only its
+     * misses. Dropping the hits here before the grouping is what makes the groups the same ones 16-I built.
+     *
+     * <h4>What it does not do</h4>
+     * It counts no hit and no miss, like {@link DirectIOVectorCache#contains}: a hit is counted once, by the
+     * {@code readFloats} that serves it, so {@code hits / (hits + misses)} stays a per-vector hit rate
+     * comparable with the 16-S node figures. It serves no bytes either: a vector dropped here is still read
+     * through {@link #readFloats}, which looks it up again, and a vector evicted in between is a blocking read
+     * of the same bytes. So no score can change.
+     *
+     * <p>It also opens the burst ({@link #beginBurst}), because it is the first call of a batch and a batch
+     * whose every candidate is cached makes no {@link #prefetch} call at all.
+     *
+     * @param sliceOffset where the vectors start, relative to this input (0 for the slice Lucene hands the
+     *                    scorer, which is what the helper passes)
+     * @param vectorBytes one vector's length in bytes
+     * @param ords        the batch's ordinals, read and not written
+     * @param numOrds     how many of {@code ords} are valid
+     * @param uncached    scratch of at least {@code numOrds} ints, the caller's to reuse
+     * @return how many ordinals were written to {@code uncached}, or {@code -1} when the store can answer
+     *         nothing useful and the caller should take its unfiltered path
+     */
+    public int selectUncachedOrdinals(
+        final long sliceOffset,
+        final long vectorBytes,
+        final int[] ords,
+        final int numOrds,
+        final int[] uncached
+    ) {
+        if (closed || DirectIOVectorCache.isOn() == false) {
+            return -1;
+        }
+        beginBurst();
+        if (vectorBytes <= 0 || vectorBytes > Integer.MAX_VALUE || numOrds <= 0 || uncached.length < numOrds) {
+            return -1;
+        }
+        final long base = this.offset + sliceOffset;
+        if (sliceOffset < 0 || base < 0) {
+            return -1;
+        }
+        return DirectIOVectorCache.selectMissing(handle.fileId, base, (int) vectorBytes, ords, numOrds, uncached);
+    }
+
+    /**
      * Puts the block-aligned range covering {@code [offset, offset + length)} in flight on
      * {@link DirectIOReadPool}.
      *
@@ -1252,17 +1315,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             STATS.declinedSpanBytes.addAndGet(length);
             return;
         }
-        // A burst has no explicit boundary, so it is recovered: the first prefetch after any read ends the
-        // previous burst. Same move the rescore seam's stage() made by calling abandonBatch() on entry.
-        if (readSincePrefetch) {
-            endBurst();
-        }
-        if (pool == null) {
-            // Exactly once per burst, which is the burst boundary endBurst just established (or the
-            // input's first prefetch). Same cadence and same contract as DirectIOReadPool.executor(): an
-            // operator's change to knn.direct_io.rescore.cache.max_bytes takes effect on the next burst.
-            DirectIOVectorCache.applyConfiguredSize();
-        }
+        beginBurst();
         final long absolute = this.offset + offset;
         final int blockSize = handle.blockSize;
         // The cache lookup comes BEFORE the submit, so a hit costs the device nothing: the range is simply
@@ -1534,6 +1587,27 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     }
 
     /**
+     * Opens a burst at whichever of its two entry points arrives first: {@link #selectUncachedOrdinals}, which
+     * the scorer's prefetch helper calls once per batch, or {@link #prefetch}.
+     *
+     * <p>A burst has no explicit boundary, so it is recovered: the first of these after any read ends the
+     * previous burst. Same move the rescore seam's {@code stage()} made by calling {@code abandonBatch()} on
+     * entry. The settings refresh then runs exactly once per burst, which is the same cadence and the same
+     * contract as {@link DirectIOReadPool#executor()}: an operator's change to
+     * {@code knn.direct_io.rescore.cache.max_bytes} or {@code .span_fill} takes effect on the next burst with
+     * no restart.
+     */
+    private void beginBurst() {
+        if (readSincePrefetch) {
+            endBurst();
+        }
+        if (burstConfigured == false) {
+            burstConfigured = true;
+            DirectIOVectorCache.applyConfiguredSize();
+        }
+    }
+
+    /**
      * Ends this input's burst: it stops consulting the staged table and stops holding the pool.
      *
      * <p><b>It does not quiesce anything, and that is the D3c change.</b> The ranges stay staged in the
@@ -1546,6 +1620,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         leaseGeneration = -1;
         leaseThreadId = -1;
         readSincePrefetch = false;
+        burstConfigured = false;
         // The burst boundary is also where the pool reference is dropped, so the next burst picks up a pool
         // rebuilt by a capacity change. See ensureStagingTable.
         pool = null;

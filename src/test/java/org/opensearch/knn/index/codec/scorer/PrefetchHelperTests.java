@@ -268,6 +268,22 @@ public class PrefetchHelperTests extends KNNTestCase {
         }
     }
 
+    /**
+     * The caller's array is sorted in place and otherwise left alone. The delegate scores it after this
+     * returns, so what it holds is observable; N1's miss list is built in scratch for exactly this reason.
+     */
+    public void testPrefetch_whenNotADirectIOInput_thenCallersArrayIsOnlySorted() throws IOException {
+        try (MockedStatic<KNNFeatureFlags> mockedFlags = mockStatic(KNNFeatureFlags.class)) {
+            mockedFlags.when(KNNFeatureFlags::isPrefetchEnabled).thenReturn(true);
+
+            TrackingIndexInput trackingInput = createTrackingInput(800 * 1024);
+            int[] ords = { 600, 0, 200, 50, 400 };
+            PrefetchHelper.prefetch(trackingInput, 0L, 1024L, ords, 5);
+            assertArrayEquals(new int[] { 0, 50, 200, 400, 600 }, ords);
+            assertEquals(4, trackingInput.prefetchCalls.size());
+        }
+    }
+
     private TrackingIndexInput createTrackingInput(int sizeInBytes) throws IOException {
         ByteBuffersDirectory dir = new ByteBuffersDirectory();
         try (IndexOutput out = dir.createOutput("test", IOContext.DEFAULT)) {
