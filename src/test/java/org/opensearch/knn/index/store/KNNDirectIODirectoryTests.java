@@ -26,7 +26,9 @@ import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.store.FsDirectoryFactory;
 import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.index.KNNSettings;
+import org.opensearch.knn.index.codec.KNN1040Codec.Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat;
 import org.opensearch.knn.index.codec.KNN1040Codec.Faiss1040ScalarQuantizedKnnVectorsFormat;
+import org.opensearch.knn.index.codec.KNN990Codec.NativeEngines990HalfFloatKnnVectorsFormat;
 import org.opensearch.knn.index.codec.KNN990Codec.NativeEngines990KnnVectorsFormat;
 import org.opensearch.test.IndexSettingsModule;
 
@@ -730,5 +732,50 @@ public class KNNDirectIODirectoryTests extends KNNTestCase {
         assertFalse(KNNDirectIODirectory.isFaissVectorData("_7_Lucene99HnswVectorsFormat_0.vec"));
         assertFalse(KNNDirectIODirectory.isFaissVectorData("_7_" + NativeEngines990KnnVectorsFormat.FORMAT_NAME + "_0.veq"));
         assertFalse(KNNDirectIODirectory.isFaissVectorData(null));
+    }
+
+    /**
+     * O8. The two FP16 per-field formats declare their {@code FORMAT_NAME} private, so the rule carries the
+     * strings; this is what fails if either format is renamed. Before O8 the inserted {@code HalfFloat} broke
+     * the fp32 substrings and a half-float {@code .vec} was declined at condition 1, before any counter.
+     */
+    public void testHalfFloatFormatNamesMatchTheFormats() {
+        assertEquals(KNNDirectIODirectory.HALF_FLOAT_FORMAT_NAME, new NativeEngines990HalfFloatKnnVectorsFormat().getName());
+        assertEquals(KNNDirectIODirectory.HALF_FLOAT_SQ_FORMAT_NAME, new Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat().getName());
+        // And the reason the names had to be listed at all: neither contains the fp32 name it extends.
+        assertFalse(KNNDirectIODirectory.HALF_FLOAT_FORMAT_NAME.contains(NativeEngines990KnnVectorsFormat.FORMAT_NAME));
+        assertFalse(KNNDirectIODirectory.HALF_FLOAT_SQ_FORMAT_NAME.contains(Faiss1040ScalarQuantizedKnnVectorsFormat.FORMAT_NAME));
+    }
+
+    /** O8. A half-float {@code .vec}, of either FP16 format, is routed under exactly the same rule. */
+    public void testTheHalfFloatVectorDataIsRouted() {
+        assertTrue(KNNDirectIODirectory.isFaissVectorData("_7_" + new NativeEngines990HalfFloatKnnVectorsFormat().getName() + "_0.vec"));
+        assertTrue(
+            KNNDirectIODirectory.isFaissVectorData("_7_" + new Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat().getName() + "_0.vec")
+        );
+        // Still only the .vec: the half-float formats' other files are no more routed than the fp32 ones'.
+        assertFalse(KNNDirectIODirectory.isFaissVectorData("_7_" + KNNDirectIODirectory.HALF_FLOAT_FORMAT_NAME + "_0.vemf"));
+        assertFalse(KNNDirectIODirectory.isFaissVectorData("_7_" + KNNDirectIODirectory.HALF_FLOAT_SQ_FORMAT_NAME + "_0.veq"));
+    }
+
+    /** O8, end to end through the dispatch point: the open is routed and the counter sees it. */
+    @SneakyThrows
+    public void testAHalfFloatVectorDataOpenIsServedWithDirectIO() {
+        assumeDirectIOWorksHere();
+        final Path path = createTempDir();
+        final String name = "_0_" + KNNDirectIODirectory.HALF_FLOAT_FORMAT_NAME + "_0.vec";
+        try (MMapDirectory delegate = new MMapDirectory(path)) {
+            final byte[] expected = writeFile(delegate, name, FILE_BYTES);
+            try (KNNDirectIODirectory storage = storageOver(delegate, true)) {
+                try (IndexInput input = storage.openInput(name, vectorDataContext())) {
+                    assertTrue("a half-float .vec must be routed", input instanceof DirectIOVectorIndexInput);
+                    assertArrayEquals("and read the same bytes", expected, readAll(input));
+                }
+                assertEquals(1, storage.routedOpens());
+                assertEquals(0, storage.declinedOpens());
+            }
+        } finally {
+            DirectIOVectorIndexInput.STATS.reset();
+        }
     }
 }

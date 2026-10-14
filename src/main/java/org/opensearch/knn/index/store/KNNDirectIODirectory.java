@@ -37,8 +37,8 @@ import java.util.function.LongSupplier;
  * A read is served with {@code O_DIRECT} if and only if <b>all seven</b> of these hold:
  *
  * <ol>
- *   <li>the file is a <b>faiss or memory-optimized-search</b> full-precision flat vector file — see
- *       {@link #isFaissVectorData};
+ *   <li>the file is a <b>faiss or memory-optimized-search</b> flat vector file, of either precision
+ *       (O8 added the two FP16 formats) — see {@link #isFaissVectorData};
  *   <li>{@link KNNSettings#isDirectIORescoreEnabled()} is on — the per-substrate enablement rule, which
  *       stays a setting because Direct I/O is a win only where the {@code .vec} working set cannot stay
  *       in the page cache;
@@ -65,7 +65,7 @@ import java.util.function.LongSupplier;
  * selectivity at the cost of a channel that had to be threaded through the codec and the query layer: a
  * second reader per segment, a {@code Directory} view to attach the hint below the codec, a capability
  * interface on three readers, and an argument on the exact-search scorer factory. Under the design this
- * class now implements — <em>all</em> faiss/MOS full-precision vectors are read with {@code O_DIRECT}
+ * class now implements — <em>all</em> faiss/MOS flat vector files are read with {@code O_DIRECT}
  * when the feature is on — none of that is needed, because the file name already says everything the
  * rule asks. The whole channel is gone and the query layer names nothing.
  *
@@ -121,7 +121,7 @@ import java.util.function.LongSupplier;
 @Log4j2
 public final class KNNDirectIODirectory extends FilterDirectory {
 
-    /** Lucene's flat full-precision vector data — the only file this routes. */
+    /** Lucene's flat vector data — the only extension this routes, at either precision. */
     static final String VECTOR_DATA_EXTENSION = ".vec";
 
     /**
@@ -410,8 +410,17 @@ public final class KNNDirectIODirectory extends FilterDirectory {
     }
 
     /**
-     * Whether {@code name} is the full-precision flat vector data of a <b>faiss or MOS</b> field — the
-     * only file this routes.
+     * The two FP16 per-field formats' names (O8). Spelled out here rather than read from the formats because
+     * both declare their {@code FORMAT_NAME} private and one of them lives outside the files this phase may
+     * change; {@code KNNDirectIODirectoryTests#halfFloatFormatNamesMatchTheFormats} asks the formats
+     * themselves and fails if either is ever renamed, so these strings cannot drift in silence.
+     */
+    static final String HALF_FLOAT_FORMAT_NAME = "NativeEngines990HalfFloatKnnVectorsFormat";
+    static final String HALF_FLOAT_SQ_FORMAT_NAME = "Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat";
+
+    /**
+     * Whether {@code name} is the flat vector data of a <b>faiss or MOS</b> field — the only file this
+     * routes.
      *
      * <p>The extension alone is not enough, and the difference is the whole of condition 1. Every flat
      * vectors format writes a {@code .vec}, the Lucene-engine ones included, and a routed file is routed
@@ -426,13 +435,27 @@ public final class KNNDirectIODirectory extends FilterDirectory {
      * {@code _0_NativeEngines990KnnVectorsFormat_0.vec} or
      * {@code _0_Faiss1040ScalarQuantizedKnnVectorsFormat_0.vec}, while a Lucene-engine one carries
      * Lucene's own format name.
+     *
+     * <h4>The two FP16 names (O8)</h4>
+     * A {@code half_float} faiss or MOS field writes its vectors through
+     * {@code NativeEngines990HalfFloatKnnVectorsFormat} or, with {@code sq, bits:1}, through
+     * {@code Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat}. Both extend the fp32 formats above and both
+     * nest {@code KNN1040HalfFloatFlatVectorsFormat}, whose data extension is also {@code vec}, so the open
+     * always reached this rule — but the inserted {@code HalfFloat} breaks the substring, so before O8 the
+     * file was declined at condition 1, before any counter. The two names are listed and nothing else about
+     * the rule changes: a half-float {@code .vec} is a flat file of {@code 2 x dimension} bytes per vector
+     * that the rescore path reads at random, which is what this feature is for. The store keys on offset and
+     * byte length, so the halved vector length needs nothing of it, and the FP16 read path's
+     * {@code readBytes} is served by {@code DirectIOVectorIndexInput#isVectorRead}.
      */
     static boolean isFaissVectorData(final String name) {
         if (name == null || name.endsWith(VECTOR_DATA_EXTENSION) == false) {
             return false;
         }
         return name.contains(NativeEngines990KnnVectorsFormat.FORMAT_NAME)
-            || name.contains(Faiss1040ScalarQuantizedKnnVectorsFormat.FORMAT_NAME);
+            || name.contains(Faiss1040ScalarQuantizedKnnVectorsFormat.FORMAT_NAME)
+            || name.contains(HALF_FLOAT_FORMAT_NAME)
+            || name.contains(HALF_FLOAT_SQ_FORMAT_NAME);
     }
 
     // -------------------------------------------------------------------------------------------------
@@ -451,7 +474,7 @@ public final class KNNDirectIODirectory extends FilterDirectory {
         DirectIOVectorIndexInput.STATS.recordDecline(reason);
     }
 
-    /** Full-precision vector data opens this directory served with {@code O_DIRECT}. */
+    /** Flat vector data opens this directory served with {@code O_DIRECT}, at either precision. */
     public long routedOpens() {
         return routedOpens.get();
     }

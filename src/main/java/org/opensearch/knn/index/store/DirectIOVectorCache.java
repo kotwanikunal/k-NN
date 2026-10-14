@@ -500,7 +500,11 @@ public final class DirectIOVectorCache {
         final float[] destination,
         final int destinationOffset
     ) {
-        if (maxSlabs == 0) {
+        // Not a whole number of floats is a miss and not a lookup. Since O8 a slab's slot length may be any
+        // even number of bytes (an FP16 vector of an odd dimension is 2 x dim bytes), and the
+        // {@link DirectIOSlab#floats} view below indexes in floats, so a slot that is not float-aligned must
+        // never be reachable through this method. The FP16 path reads through {@link #getBytes} instead.
+        if (maxSlabs == 0 || (length & 3) != 0) {
             return false;
         }
         boolean hit = false;
@@ -514,6 +518,67 @@ public final class DirectIOVectorCache {
                 slab.memory.floats().get((slot * slab.slotBytes) >> 2, destination, destinationOffset, length >> 2);
                 // A plain write, and a lost one only costs a second chance. Readers run concurrently with
                 // each other but never with the reclaim that reads this, which holds the write lock.
+                slab.hit[slot] = 1;
+                hit = true;
+            }
+        } finally {
+            LOCK.readLock().unlock();
+        }
+        if (hit) {
+            hits.increment();
+        } else {
+            misses.increment();
+        }
+        return hit;
+    }
+
+    /**
+     * {@link #getFloats} for a caller that wants the vector's bytes rather than its floats: copies
+     * {@code length} bytes into {@code destination} and returns true, or returns false and leaves
+     * {@code destination} alone. O8.
+     *
+     * <h4>Why this exists, and why the store needed nothing else for FP16</h4>
+     * The FP16 flat format's values read a vector with
+     * {@code KNN1040HalfFloatFlatVectorsValues#readRawVectorBytes}, which is
+     * {@code slice.readBytes(dest, destOffset, 2 * dimension)} and never {@code readFloats} — the whole point
+     * of that format being that nothing decodes FP16 to FP32 on the read path. The store keys on
+     * {@code (fileId, offset)} and checks the slot's byte length, and a slab holds raw bytes, so a 2-byte
+     * vector needs no new key, no new slot layout and no new fill path: it needs a serve site that copies
+     * bytes out instead of floats. That is this method, and it counts a hit or a miss exactly as
+     * {@link #getFloats} does, so {@code hits / (hits + misses)} stays one per-vector hit rate across both
+     * precisions.
+     *
+     * <p>Even lengths only, which is what a whole number of half floats is. An odd length cannot be a vector
+     * of either precision and the honest answer for one is a miss, counted as nothing.
+     *
+     * @param fileId the file's identity, from {@link #fileId}
+     * @param offset the vector's byte offset in that file
+     * @param length the vector's length in bytes
+     * @param destination at least {@code destinationOffset + length} bytes
+     * @param destinationOffset where in {@code destination} to write the first byte
+     * @return whether the vector was cached
+     */
+    static boolean getBytes(
+        final String fileId,
+        final long offset,
+        final int length,
+        final byte[] destination,
+        final int destinationOffset
+    ) {
+        if (maxSlabs == 0 || length <= 0 || (length & 1) != 0) {
+            return false;
+        }
+        boolean hit = false;
+        LOCK.readLock().lock();
+        try {
+            final DirectIOSlotMap map = INDEX.get(fileId);
+            final int packedSlot = locate(map, offset, length);
+            if (packedSlot >= 0) {
+                final Slab slab = slabsById[packedSlot >>> SLOT_SHIFT];
+                final int slot = packedSlot & SLOT_LOW_MASK;
+                // An absolute get out of the shared byte view, so no position is touched and no view of slab
+                // memory leaves the store -- the same discipline getFloats keeps.
+                slab.memory.bytes().get(slot * slab.slotBytes, destination, destinationOffset, length);
                 slab.hit[slot] = 1;
                 hit = true;
             }
@@ -570,9 +635,13 @@ public final class DirectIOVectorCache {
      * {@code (fileId, offset)}. A copy and not a view, because {@code source} is a staging buffer that the
      * next burst reuses.
      *
-     * <p>Silently does nothing when the cache is off, when the length is not a whole number of floats or is
-     * larger than a slab, or when no slab can be had. A fill that does not happen costs a future hit and
-     * nothing else.
+     * <p>Silently does nothing when the cache is off, when the length is odd or is larger than a slab, or
+     * when no slab can be had. A fill that does not happen costs a future hit and nothing else.
+     *
+     * <p>The length rule is "an even number of bytes", not "a whole number of floats", since O8: an FP16
+     * vector is {@code 2 x dimension} bytes and an odd dimension makes that a multiple of 2 and not of 4. A
+     * slot that is not float-aligned is unreachable through {@link #getFloats}, which refuses such a length
+     * outright, and is served by {@link #getBytes}, which is what the FP16 read path uses.
      *
      * @param fileId the file's identity, from {@link #fileId}
      * @param offset the vector's byte offset in that file
@@ -581,7 +650,7 @@ public final class DirectIOVectorCache {
      * @param length the vector's length in bytes
      */
     static void put(final String fileId, final long offset, final ByteBuffer source, final int position, final int length) {
-        if (maxSlabs == 0 || length <= 0 || (length & 3) != 0 || offset < 0 || length > slabBytes) {
+        if (maxSlabs == 0 || length <= 0 || (length & 1) != 0 || offset < 0 || length > slabBytes) {
             return;
         }
         final SlabRequest request = new SlabRequest();
@@ -635,7 +704,7 @@ public final class DirectIOVectorCache {
      * @return whether the vector was admitted
      */
     static boolean readmitAfterRace(final String fileId, final long offset, final ByteBuffer source, final int position, final int length) {
-        if (maxSlabs == 0 || length <= 0 || (length & 3) != 0 || offset < 0 || length > slabBytes) {
+        if (maxSlabs == 0 || length <= 0 || (length & 1) != 0 || offset < 0 || length > slabBytes) {
             return false;
         }
         final SlabRequest request = new SlabRequest();
@@ -841,7 +910,7 @@ public final class DirectIOVectorCache {
         final int position,
         final int length
     ) {
-        if (maxSlabs == 0 || count <= 0 || length <= 0 || (length & 3) != 0 || firstOffset < 0 || length > slabBytes) {
+        if (maxSlabs == 0 || count <= 0 || length <= 0 || (length & 1) != 0 || firstOffset < 0 || length > slabBytes) {
             return 0;
         }
         int admitted = 0;

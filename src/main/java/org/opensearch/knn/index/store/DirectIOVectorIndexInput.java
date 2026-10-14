@@ -1121,6 +1121,32 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      */
     private int burstReadAroundBytes;
 
+    /**
+     * The field's vector grid on this input: the absolute offset of ordinal zero and one vector's length in
+     * bytes, or {@code 0} length for "this input has not been told". O8.
+     *
+     * <h4>What it is for</h4>
+     * The FP32 path's vector read is a {@code readFloats} of one whole vector, which is the only read shape
+     * that reaches {@link #readFloats} on a {@code .vec}, so that method can look the store up
+     * unconditionally. The FP16 path's vector read is a {@code readBytes}
+     * ({@code KNN1040HalfFloatFlatVectorsValues#readRawVectorBytes}), and {@link #readBytes} also serves the
+     * file's header and footer and the whole sequential merge path. Hooking it unconditionally would admit a
+     * 44-byte header as a "vector" and break M4's whole-vectors-only geometry. This grid is the gate that
+     * makes it precise: a {@code readBytes} is treated as a vector read only when its length is the declared
+     * vector length and its offset sits on the declared grid.
+     *
+     * <h4>Why it is declared by the prefetch filter, and why it outlives the burst</h4>
+     * {@link #selectUncachedOrdinals} is the one call that is told both numbers by the layer that knows them,
+     * and it runs before the first {@link #prefetch} of every batch. The grid is <b>not</b> cleared by
+     * {@link #endBurst}, because an input handed to the scorer is the slice of exactly one field for its whole
+     * life, so the grid cannot change under it, and a later single-candidate batch makes no filter call of its
+     * own ({@code PrefetchHelper#prefetch} returns early at {@code numOrds <= 1}) and would otherwise lose
+     * both its lookup and its admission. An input nobody declared a grid for -- a merge's input, the parent
+     * input the codec reads headers through -- is never hooked.
+     */
+    private long vectorGridBase;
+    private int vectorGridBytes;
+
     // -- Sequential read-ahead ring. Distinct from the burst table above: it holds no state in common with
     // it, is scanned independently in source(), and neither mechanism resets the other. Allocated lazily
     // on the first arm, so a non-sequential input never pays for it; null until then. --
@@ -1569,7 +1595,22 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final int numOrds,
         final int[] uncached
     ) {
-        if (closed || DirectIOVectorCache.isOn() == false) {
+        if (closed) {
+            return -1;
+        }
+        final long base = this.offset + sliceOffset;
+        final boolean geometryUsable = sliceOffset >= 0 && base >= 0 && vectorBytes > 0 && vectorBytes <= Integer.MAX_VALUE;
+        if (geometryUsable) {
+            // O8: the grid the FP16 path's readBytes is gated on. Declared here, before anything below can
+            // decline, because it describes this input's field and not this batch or the store's state. If it
+            // were declared after the checks below, the burst at which an operator's change to
+            // max_bytes or to knn.direct_io.rescore.enabled is picked up -- the one burst that arrives with
+            // the store still released -- would leave the FP16 read path ungated, and that whole burst would
+            // neither hit nor admit. See the field's javadoc for why it then outlives the burst.
+            vectorGridBase = base;
+            vectorGridBytes = (int) vectorBytes;
+        }
+        if (DirectIOVectorCache.isOn() == false) {
             return -1;
         }
         beginBurst();
@@ -1579,11 +1620,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             // delegate. Checked after beginBurst, which is where the switch was just re-read.
             return -1;
         }
-        if (vectorBytes <= 0 || vectorBytes > Integer.MAX_VALUE || numOrds <= 0 || uncached.length < numOrds) {
-            return -1;
-        }
-        final long base = this.offset + sliceOffset;
-        if (sliceOffset < 0 || base < 0) {
+        if (geometryUsable == false || numOrds <= 0 || uncached.length < numOrds) {
             return -1;
         }
         final int missing = DirectIOVectorCache.selectMissing(handle.fileId, base, (int) vectorBytes, ords, numOrds, uncached);
@@ -2193,24 +2230,87 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         return value;
     }
 
+    /**
+     * Reads {@code count} raw bytes, which on the FP16 {@code .vec} path is one whole vector and is that
+     * path's only read shape that matters for latency (O8), and on every other path is a header, a footer, a
+     * {@code DirectMonotonicReader}'s metadata or a merge's sequential scan.
+     *
+     * <p>The store's two sites are here as well as in {@link #readFloats}, for exactly the reads
+     * {@link #isVectorRead} recognises: a lookup first, so a hit costs no device read, and admission from a
+     * staged read that covered the whole vector in one buffer. Everything else is byte for byte the read it
+     * was before O8, with no lookup and no admission, which is what keeps a 44-byte header and the merge
+     * path out of the store.
+     */
     @Override
     public void readBytes(final byte[] destination, final int destinationOffset, final int count) throws IOException {
+        final long runStart = offset + filePointer;
         final IndexInput fallback = fallbackFor(count);
         if (fallback != null) {
+            // O1: the delegate's own read of the same bytes, and no lookup and no admission on this route.
             fallback.readBytes(destination, destinationOffset, count);
             filePointer += count;
             STATS.servedBytes.addAndGet(count);
             return;
+        }
+        final boolean vectorRead = DirectIOVectorCache.isOn() && isVectorRead(runStart, count);
+        if (vectorRead) {
+            // The second lookup, as in readFloats: the first was the prefetch filter, which kept this
+            // vector's range out of the burst if the store held it. The EOF check comes first, so a hit
+            // cannot serve a read the miss path would have refused.
+            ensureOpen();
+            if (filePointer + count > length) {
+                throw new EOFException("read past EOF: " + this);
+            }
+            if (DirectIOVectorCache.getBytes(handle.fileId, runStart, count, destination, destinationOffset)) {
+                filePointer += count;
+                // A hit is still a read, so the burst boundary is found exactly as it is for a hit in
+                // readFloats; without this a burst every vector of which was cached would never quiesce.
+                readSincePrefetch = true;
+                STATS.servedBytes.addAndGet(count);
+                return;
+            }
         }
         int written = 0;
         while (written < count) {
             final Source source = source(Math.min(count - written, 1));
             final int available = Math.min(count - written, source.available);
             source.buffer.get(source.position, destination, destinationOffset + written, available);
+            // Populate on consume, from a staged read that covered the whole vector in one buffer, and then
+            // the rest of the whole vectors that span holds while the store is below its target. The same
+            // rule, the same reasons and the same geometry as readFloats'; only the decode differs, and this
+            // path does not decode at all.
+            if (vectorRead && written == 0 && available == count) {
+                if (source.staged()) {
+                    DirectIOVectorCache.put(handle.fileId, runStart, source.buffer, source.position, count);
+                    spanFill(source.range, runStart, count);
+                } else if (wasFilteredAsCached(runStart)) {
+                    // O4's filter-then-read race, on the FP16 path: the filter believed this vector cached,
+                    // so it was not staged, and the store has lost it since. Keeping the bytes this
+                    // synchronous read had to fetch is what stops it staying a miss.
+                    DirectIOVectorCache.readmitAfterRace(handle.fileId, runStart, source.buffer, source.position, count);
+                }
+            }
             filePointer += available;
             written += available;
         }
         STATS.servedBytes.addAndGet(count);
+    }
+
+    /**
+     * Whether a {@code readBytes} of {@code count} bytes at {@code runStart} is one whole vector of the field
+     * {@link #selectUncachedOrdinals} declared on this input. O8's gate; see {@link #vectorGridBytes}.
+     *
+     * <p>Three conditions and each excludes a real read of this file: the length must be the field's vector
+     * length (a header, a footer and a checksum are other lengths), the offset must not precede ordinal zero
+     * (the header does), and the offset must sit on the vector grid (a merge's sequential scan walks in
+     * buffer-sized steps and lands on it only by coincidence, and when it does it reads a whole vector's
+     * bytes at a whole vector's offset, which is the one case where being wrong costs nothing).
+     */
+    private boolean isVectorRead(final long runStart, final int count) {
+        if (vectorGridBytes <= 0 || count != vectorGridBytes || runStart < vectorGridBase) {
+            return false;
+        }
+        return (runStart - vectorGridBase) % vectorGridBytes == 0;
     }
 
     /**
@@ -2873,6 +2973,11 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         // The route this clone starts on is the one its parent is on, so a clone taken mid burst does not
         // change path on its first read; it re-reads the switch at its own next burst like any other input.
         copy.directIOActive = directIOActive;
+        // O8: and the same field's vector grid, which is sound because a clone covers the same offset and
+        // length as its parent. Without this a clone taken for a values copy could read a vector before its
+        // own first prefetch filter call and so neither hit nor admit it.
+        copy.vectorGridBase = vectorGridBase;
+        copy.vectorGridBytes = vectorGridBytes;
         return copy;
     }
 
