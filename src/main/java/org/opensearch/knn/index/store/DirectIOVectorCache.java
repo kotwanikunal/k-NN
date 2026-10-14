@@ -121,7 +121,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  *
  * <h2>A size change resizes; it does not rebuild</h2>
  * {@code knn.direct_io.rescore.cache.max_bytes} is read once per prefetch burst
- * ({@link #applyConfiguredSize()}). Growing lets the next miss allocate a slab and keeps every cached vector;
+ * ({@link #applyConfiguredSize(boolean)}). Growing lets the next miss allocate a slab and keeps every cached vector;
  * shrinking releases the oldest slabs and keeps every vector that still fits; {@code 0b} releases every slab.
  * Phase 15's Guava cache could not do that — {@code maximumWeight} is fixed at {@code CacheBuilder#build()},
  * so a change dropped the whole cache and warmed it again.
@@ -192,7 +192,7 @@ public final class DirectIOVectorCache {
     private static volatile int maxSlabs;
 
     /**
-     * Whether span fill is on, refreshed once per prefetch burst by {@link #applyConfiguredSize()}. Starts at
+     * Whether span fill is on, refreshed once per prefetch burst by {@link #applyConfiguredSize(boolean)}. Starts at
      * the setting's default so that a store filled before the first refresh behaves as the setting says.
      */
     private static volatile boolean spanFill = KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_DEFAULT_VALUE;
@@ -1200,7 +1200,7 @@ public final class DirectIOVectorCache {
      * Whether span fill is on, from {@code knn.direct_io.rescore.cache.span_fill} as of the last burst
      * boundary (M4).
      *
-     * <p>A volatile read of a field refreshed by {@link #applyConfiguredSize()}, not a settings read, because
+     * <p>A volatile read of a field refreshed by {@link #applyConfiguredSize(boolean)}, not a settings read, because
      * the caller asks once per staged range consumed and a settings read walks the cluster state. The burst
      * boundary is the right cadence for the same reason it is for the size: a span fill can only follow a
      * staged read, and a staged read can only follow a prefetch.
