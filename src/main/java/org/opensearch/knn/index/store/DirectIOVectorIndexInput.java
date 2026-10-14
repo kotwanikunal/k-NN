@@ -1502,9 +1502,47 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         return maxStagedRanges;
     }
 
-    /** The waste guard's bound: the largest single prefetch span this input will stage, in bytes. */
-    int maxStagedRangeBytes() {
+    /**
+     * The waste guard's bound: the largest single prefetch span this input will stage, in bytes.
+     *
+     * <p>Public since P1, because the grouping that produces the spans is one layer up in
+     * {@code PrefetchHelper} and a group it closes before this bound is a group this input stages rather than
+     * declines. The bound is read from {@code knn.direct_io.rescore.prefetch.max_span_bytes} at open, so it
+     * is per input and not a constant the helper could carry.
+     */
+    public int maxStagedRangeBytes() {
         return maxStagedRangeBytes;
+    }
+
+    /**
+     * How many bytes {@link #prefetch} would stage for {@code [sliceOffset, sliceOffset + length)}: the
+     * length of the block-aligned range covering it.
+     *
+     * <p><b>P1's accessor, and it exists because the answer is not computable one layer up.</b> The aligned
+     * range is taken over the <em>absolute</em> file offset, which is {@link #offset} plus the argument, and
+     * {@link #offset} is the slice's own base: the slice Lucene hands the scorer starts at the field's data
+     * offset, which is not block aligned. A caller holding only slice-relative offsets would be off by
+     * whatever that base's remainder is, and at a 16 KiB cap being off by one block is the difference between
+     * a group that stages and a group that declines. Exposing the block size alone would not fix that;
+     * exposing {@link #offset} would hand out an absolute file coordinate for no other purpose.
+     *
+     * <p>Returns a {@code long} and performs no narrowing, so a caller may ask about a range larger than the
+     * cap (or than {@code int}) and simply learn that it is larger. Answers for a range outside this input
+     * too: it is arithmetic over the arguments and reads nothing.
+     *
+     * @param sliceOffset start of the range, relative to this input
+     * @param length      bytes wanted from it
+     * @return the aligned length {@link #prefetch} would stage, or 0 for a non-positive {@code length}
+     */
+    public long alignedSpanBytes(final long sliceOffset, final long length) {
+        if (length <= 0) {
+            return 0L;
+        }
+        final long blockSize = handle.blockSize;
+        final long absolute = this.offset + sliceOffset;
+        final long alignedStart = absolute - Math.floorMod(absolute, blockSize);
+        final long span = absolute + length - alignedStart;
+        return ((span + blockSize - 1) / blockSize) * blockSize;
     }
 
     /** Windows the sequential read-ahead ring keeps in flight, after the setting was read at open. */
@@ -1698,6 +1736,16 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * gaps were: the bytes are then served by {@link #blockingSource}, one {@link #bufferSize} window per
      * vector touched and nothing for the gaps. That is a real trade and not a free win, which is why the
      * bound is a setting with the measured value as its default rather than a new constant.
+     *
+     * <p><b>P1: a decline costs more than read-ahead, so the rescore path no longer reaches one.</b> The
+     * bytes a declined group's vectors are then read with are blocking reads, and the store admits only
+     * vectors a staged read covered (M3), so a declined group costs its <em>hits</em> as well, for as long as
+     * those vectors stay uncached. MEASURED on the NVMe node at a {@code 16kb} cap: 98.3% hits to 85.6% in
+     * the f regime and 51.6% to 43% in r1 (ref/RESULTS-NVME.md section 3). {@code PrefetchHelper} therefore
+     * closes a group before {@link #alignedSpanBytes} of it would pass the bound, which turns every decline
+     * it could have caused into one more staged read of the same bytes. The bound still guards the ranges
+     * that do not come from the grouping -- a caller asking for a range of its own -- and a single vector
+     * whose own aligned length is above it, which no split can help.
      */
     @Override
     public void prefetch(final long offset, final long length) throws IOException {

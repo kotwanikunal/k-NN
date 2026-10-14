@@ -32,6 +32,12 @@ import java.util.Arrays;
  *   <li>Group 2: Prefetch 10KB (300KB to 310KB, covers vector at 300KB)</li>
  * </ul>
  * Result: 2 prefetch operations, 50KB total prefetched (vs 6 random seeks without prefetch)
+ * <p>
+ * For a Direct I/O input two further rules apply, and neither changes what any other input sees: the
+ * candidates the vector store already holds whole are dropped before the grouping (N1), and a group is closed
+ * before the block-aligned span the input would have to stage for it would pass that input's span cap (P1),
+ * because a group above the cap is declined and its vectors then go to the device one blocking read at a time
+ * and are never admitted to the store.
  */
 @Log4j2
 @NoArgsConstructor(access = AccessLevel.PRIVATE)
@@ -124,6 +130,13 @@ public class PrefetchHelper {
      * Groups vectors within 128KB ranges and prefetches only the exact bytes needed for each group.
      * The ordinals arrive sorted ascending, either as the caller's array or as the miss list taken from it in
      * order, so the grouping of a given set of ordinals is the same whichever way it got here.
+     * <p>
+     * A Direct I/O input declines a range whose block-aligned length is above its span cap, and a declined
+     * group's vectors become blocking reads that the store never admits, so the decline costs the group's
+     * hits and not just its read-ahead. For such an input a group is therefore <b>closed</b> before it would
+     * pass the cap rather than handed over to be declined (P1): one more staged read of the same bytes,
+     * where before there was one blocking read per vector and no admission. Every other input keeps today's
+     * grouping exactly, because {@link #spanCap} answers {@link Long#MAX_VALUE} for it.
      *
      * @param indexInput the index input to prefetch from
      * @param baseOffset the base offset in the file where vectors start
@@ -139,22 +152,44 @@ public class PrefetchHelper {
         final int[] ordsToPrefetch,
         final int numOrds
     ) throws IOException {
+        final DirectIOVectorIndexInput directIOInput = indexInput instanceof DirectIOVectorIndexInput in ? in : null;
+        final long spanCap = spanCap(directIOInput);
         int groupCount = 1;
         long groupStartOffset = baseOffset + (long) ordsToPrefetch[0] * oneVectorByteSize;
+        long groupEndOffset = groupStartOffset + oneVectorByteSize;
 
         for (int i = 1; i < numOrds; i++) {
             long currentOffset = baseOffset + (long) ordsToPrefetch[i] * oneVectorByteSize;
-            if ((currentOffset + oneVectorByteSize) - groupStartOffset > BYTES_128) {
-                long prevOffset = baseOffset + (long) ordsToPrefetch[i - 1] * oneVectorByteSize;
-                indexInput.prefetch(groupStartOffset, (prevOffset + oneVectorByteSize) - groupStartOffset);
+            long currentEndOffset = currentOffset + oneVectorByteSize;
+            // Two reasons to close the group, and the second one never fires for an input with no span cap:
+            // the 128 KB group budget, and the span the input would actually have to stage for it. A group of
+            // one is always handed over whatever its aligned length, because splitting cannot make a single
+            // vector smaller.
+            if ((currentEndOffset - groupStartOffset) > BYTES_128
+                || exceedsSpanCap(directIOInput, spanCap, groupStartOffset, currentEndOffset - groupStartOffset)) {
+                indexInput.prefetch(groupStartOffset, groupEndOffset - groupStartOffset);
                 groupCount++;
                 groupStartOffset = currentOffset;
             }
+            groupEndOffset = currentEndOffset;
         }
         // Prefetch final group
-        long lastOffset = baseOffset + (long) ordsToPrefetch[numOrds - 1] * oneVectorByteSize;
-        indexInput.prefetch(groupStartOffset, (lastOffset + oneVectorByteSize) - groupStartOffset);
+        indexInput.prefetch(groupStartOffset, groupEndOffset - groupStartOffset);
 
         log.trace("Prefetching grouped [{}] vectors where num of ords was [{}] using exact prefetch size", groupCount, numOrds);
+    }
+
+    /**
+     * The largest span {@code input} will stage, or {@link Long#MAX_VALUE} when there is no such bound to
+     * respect. Read once per batch: it comes from a setting the input read at open, so it cannot change
+     * under one grouping pass, and reading it per candidate would be a field read per vector for no effect.
+     */
+    private static long spanCap(final DirectIOVectorIndexInput input) {
+        return input == null ? Long.MAX_VALUE : input.maxStagedRangeBytes();
+    }
+
+    /** Whether staging {@code [offset, offset + length)} on {@code input} would be declined by its cap. */
+    private static boolean exceedsSpanCap(final DirectIOVectorIndexInput input, final long spanCap, final long offset, final long length) {
+        return input != null && input.alignedSpanBytes(offset, length) > spanCap;
     }
 }
