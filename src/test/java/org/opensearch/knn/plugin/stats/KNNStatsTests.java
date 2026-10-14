@@ -6,13 +6,16 @@
 package org.opensearch.knn.plugin.stats;
 
 import org.opensearch.knn.KNNTestCase;
+import org.opensearch.knn.index.KNNSettings;
+import org.opensearch.knn.index.store.DirectIOVectorIndexInput;
 
 import java.util.Map;
+import java.util.Set;
 
 /**
- * Unit tests for {@link KNNStats}, focusing on the remote vector index build stats map which surfaces the
+ * Unit tests for {@link KNNStats}: the remote vector index build stats map which surfaces the
  * {@link KNNRemoteIndexBuildValue} counters (including the merge-abort and terminal-exception counters) through
- * the {@code _stats} API.
+ * the {@code _stats} API, and the Direct I/O read path's node-wide counters added in phase 14 S4.
  */
 public class KNNStatsTests extends KNNTestCase {
 
@@ -68,5 +71,93 @@ public class KNNStatsTests extends KNNTestCase {
         assertEquals(1L, (long) (Long) clientStats.get(KNNRemoteIndexBuildValue.INDEX_BUILD_MERGE_ABORT_EXCEPTION.getName()));
         assertEquals(2L, (long) (Long) clientStats.get(KNNRemoteIndexBuildValue.INDEX_BUILD_TERMINAL_EXCEPTION.getName()));
         assertEquals(0L, (long) (Long) clientStats.get(KNNRemoteIndexBuildValue.INDEX_BUILD_FAILURE_COUNT.getName()));
+    }
+
+    /**
+     * The Direct I/O counters an operator needs are reachable at {@code _plugins/_knn/stats}, which is the
+     * answer to S4's "state exactly where". The names are asserted literally because they are the API: a
+     * node bench reading {@code direct_io_stats.dispatch.routed_opens} breaks silently if one is renamed.
+     *
+     * <p>The counters this pins by name are the four S4 asked for — {@code staged_reads},
+     * {@code stage_declined}, {@code routed_opens}, {@code declined_opens} — plus the <b>five</b> decline
+     * reasons, which are the ones that make a zero {@code routed_opens} diagnosable rather than mysterious.
+     * Phase 15 D2 added {@code declined_compound}: at the shipped defaults every flushed segment is
+     * compound, so that case is both the commonest decline and the one that means nothing is wrong, and it
+     * used to be indistinguishable from {@code declined_chain}.
+     */
+    @SuppressWarnings("unchecked")
+    public void testDirectIOStatsAreReachableAndNamedStably() {
+        DirectIOVectorIndexInput.STATS.reset();
+        final KNNStats knnStats = new KNNStats();
+
+        final KNNStat<?> stat = knnStats.getStats().get(StatNames.DIRECT_IO_STATS.getName());
+        assertNotNull("direct_io_stats must be registered", stat);
+        assertFalse("these are one node's reads, so the stat is node level", stat.isClusterLevel());
+        assertTrue(
+            "and it must therefore appear in the node stats an operator gets",
+            knnStats.getNodeStats().containsKey(StatNames.DIRECT_IO_STATS.getName())
+        );
+
+        final Map<String, Map<String, Object>> directIO = (Map<String, Map<String, Object>>) stat.getValue();
+        assertEquals(Set.of("dispatch", "reads", "memory", "cache"), directIO.keySet());
+        for (final String required : new String[] { "live_bytes", "peak_bytes", "declined_budget", "budget_bytes", "wall_bytes" }) {
+            assertTrue(
+                "memory." + required + " must be exposed, saw " + directIO.get("memory").keySet(),
+                directIO.get("memory").containsKey(required)
+            );
+        }
+        assertEquals(Set.of("hits", "misses", "evictions", "bytes", "entries", "max_bytes"), directIO.get("cache").keySet());
+        // The cache is off by default, so every one of its counters must read zero on a node that has not
+        // set knn.direct_io.rescore.cache.max_bytes -- which is what makes "off" distinguishable from
+        // "on and missing".
+        directIO.get("cache").forEach((name, value) -> assertEquals("cache." + name + " must start at zero", 0L, (long) (Long) value));
+
+        assertEquals(
+            Set.of(
+                "routed_opens",
+                "declined_opens",
+                "declined_compound",
+                "declined_chain",
+                "declined_missing",
+                "declined_too_small",
+                "declined_open_failed"
+            ),
+            directIO.get("dispatch").keySet()
+        );
+        for (final String required : new String[] {
+            "staged_reads",
+            "stage_declined",
+            "blocking_reads",
+            "readahead_reads",
+            "served_bytes",
+            "queue_peak",
+            "pool_rebuilds" }) {
+            assertTrue(
+                "reads." + required + " must be exposed, saw " + directIO.get("reads").keySet(),
+                directIO.get("reads").containsKey(required)
+            );
+        }
+        // On a node with the feature off -- the shipped default -- every counter reads zero, which is what
+        // makes "off" distinguishable from "on and declining".
+        directIO.get("dispatch").forEach((name, value) -> assertEquals(name + " must start at zero", 0L, (long) (Long) value));
+    }
+
+    /**
+     * D3b. {@code memory.wall_bytes} reports the JVM-wide direct-memory wall the budget was derived from, so
+     * that "is this ceiling actually below the wall" is one GET rather than an SSH to read the JVM's command
+     * line. It is a real need: the bench node pins {@code -XX:MaxDirectMemorySize=2g} against a 24g heap,
+     * where the pre-D3b default sat three times above the wall and nothing in the API said so.
+     */
+    @SuppressWarnings("unchecked")
+    public void testTheDirectMemoryWallIsReportedBesideTheBudget() {
+        final Map<String, Map<String, Object>> directIO = (Map<String, Map<String, Object>>) new KNNStats().getStats()
+            .get(StatNames.DIRECT_IO_STATS.getName())
+            .getValue();
+        final Map<String, Object> memory = directIO.get("memory");
+
+        final long wall = (Long) memory.get("wall_bytes");
+        assertEquals("it is the wall the default was derived from", KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES, wall);
+        assertTrue("and a positive number on any JVM this runs on", wall > 0);
+        assertEquals("the shipped default is exactly half of it", wall / 2, (long) (Long) memory.get("budget_bytes"));
     }
 }

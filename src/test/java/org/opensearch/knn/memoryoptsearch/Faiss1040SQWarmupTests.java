@@ -25,9 +25,13 @@ import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.util.InfoStream;
 import org.apache.lucene.util.StringHelper;
 import org.apache.lucene.util.Version;
+import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.common.settings.Setting;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.generate.IndexingType;
+import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.codec.KNN1040Codec.Faiss1040ScalarQuantizedKnnVectorsFormat;
 import org.opensearch.knn.index.codec.KNN1040Codec.Faiss1040ScalarQuantizedKnnVectorsReader;
 import org.opensearch.knn.index.warmup.WarmableReader;
@@ -39,6 +43,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+
+import static org.mockito.Mockito.when;
 
 /**
  * Warmup-only tests for {@link Faiss1040ScalarQuantizedKnnVectorsReader}.
@@ -68,6 +74,46 @@ public class Faiss1040SQWarmupTests extends KNNTestCase {
 
     @SneakyThrows
     public void testWarmup() {
+        final FaissMemoryOptimizedSearcherTests.ReadTrackingDirectory spyDirectory = warmUpAndTrackReads();
+
+        // Assert all three file types were read during warmup
+        assertTrue("Warmup should read .faiss file", spyDirectory.wasExtensionRead(".faiss"));
+        assertTrue("Warmup should read .veq file (quantized vectors)", spyDirectory.wasExtensionRead(".veq"));
+        assertTrue("Warmup should read .vec file", spyDirectory.wasExtensionRead(".vec"));
+    }
+
+    /**
+     * With Direct I/O routing enabled for faiss {@code .vec}, the fp32 arm of warmup is skipped: those
+     * reads bypass the page cache, so reading the whole file into it pays the full sequential cost for a
+     * cache no later read will consult. The graph and the quantized codes are read with {@code mmap}
+     * either way, so their warmup is untouched — which is the half of this that a regression would break
+     * silently, since skipping too much costs recall-per-latency rather than correctness.
+     */
+    @SneakyThrows
+    public void testWarmupSkipsTheFp32VectorsWhenDirectIOIsEnabled() {
+        enableDirectIORouting();
+
+        final FaissMemoryOptimizedSearcherTests.ReadTrackingDirectory spyDirectory = warmUpAndTrackReads();
+
+        assertFalse("Warmup must not read .vec when it is served with O_DIRECT", spyDirectory.wasExtensionRead(".vec"));
+        assertTrue("Warmup must still read the .faiss graph", spyDirectory.wasExtensionRead(".faiss"));
+        assertTrue("Warmup must still read the .veq quantized codes", spyDirectory.wasExtensionRead(".veq"));
+    }
+
+    /** The node setting the warmup skip is gated on. Reset by {@code KNNTestCase.tearDown}. */
+    private void enableDirectIORouting() {
+        final Set<Setting<?>> settings = new HashSet<>(ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
+        settings.addAll(
+            KNNSettings.state().getSettings().stream().filter(s -> s.getProperties().contains(Setting.Property.NodeScope)).toList()
+        );
+        final Settings enabled = Settings.builder().put(KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED, true).build();
+        when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(enabled, settings));
+        KNNSettings.state().setClusterService(clusterService);
+        assertTrue(KNNSettings.isDirectIORescoreEnabled());
+    }
+
+    @SneakyThrows
+    private FaissMemoryOptimizedSearcherTests.ReadTrackingDirectory warmUpAndTrackReads() {
         final List<Integer> documentIds = IndexingType.DENSE.generateDocumentIds(TOTAL_NUM_DOCS);
         final int maxDoc = documentIds.isEmpty() ? 0 : documentIds.getLast() + 1;
         final float[][] vectors = generateVectorsForDocs(documentIds, DIMENSIONS);
@@ -140,12 +186,8 @@ public class Faiss1040SQWarmupTests extends KNNTestCase {
                 // Trigger warmup via WarmableReader interface
                 assert reader instanceof WarmableReader;
                 ((WarmableReader) reader).warmUp(FIELD_NAME);
-
-                // Assert all three file types were read during warmup
-                assertTrue("Warmup should read .faiss file", spyDirectory.wasExtensionRead(".faiss"));
-                assertTrue("Warmup should read .veq file (quantized vectors)", spyDirectory.wasExtensionRead(".veq"));
-                assertTrue("Warmup should read .vec file", spyDirectory.wasExtensionRead(".vec"));
             }
+            return spyDirectory;
         }
     }
 

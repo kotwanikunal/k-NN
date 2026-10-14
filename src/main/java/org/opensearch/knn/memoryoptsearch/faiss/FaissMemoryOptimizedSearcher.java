@@ -25,6 +25,7 @@ import org.apache.lucene.util.hnsw.OrdinalTranslatedKnnCollector;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
 import org.opensearch.knn.common.FieldInfoExtractor;
 import org.opensearch.knn.common.RobustUniqueRandomIterator;
+import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.KNNVectorSimilarityFunction;
 import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.util.WarmupUtil;
@@ -46,6 +47,12 @@ public class FaissMemoryOptimizedSearcher implements VectorSearcher {
     private final FlatVectorsScorer flatVectorsScorer;
     private final FaissHNSW hnsw;
     private final VectorSimilarityFunction vectorSimilarityFunction;
+    /**
+     * Whether {@link #faissIndex}'s full-precision floats are served out of Lucene's {@code .vec} rather
+     * than from inside the {@code .faiss} file. Only the former can be routed to {@code O_DIRECT} by the
+     * storage directory, and only the former is therefore pointless to warm.
+     */
+    private final boolean fullPrecisionVectorsLiveInVecFile;
     private boolean isAdc;
 
     /**
@@ -77,6 +84,7 @@ public class FaissMemoryOptimizedSearcher implements VectorSearcher {
         this.isAdc = FieldInfoExtractor.isAdc(fieldInfo);
         this.flatVectorsScorer = flatVectorsScorer;
         this.hnsw = extractFaissHnsw(faissIndex);
+        this.fullPrecisionVectorsLiveInVecFile = FaissFlatIndexFactory.usesLuceneFlatStorage(fieldInfo);
     }
 
     /**
@@ -178,7 +186,13 @@ public class FaissMemoryOptimizedSearcher implements VectorSearcher {
         // Warm up flat vectors
         // This can warm up .veb, .vec or .faiss
         if (faissIndex.getVectorEncoding() == VectorEncoding.FLOAT32) {
-            WarmupUtil.readAll(faissIndex.getFloatValues(warmUpIndexInput));
+            // Skip when the floats come out of a .vec the storage directory is serving with O_DIRECT:
+            // those reads bypass the page cache, so reading the whole file into it pays the full
+            // sequential cost for a cache no later read will consult. Flat storage inside the .faiss
+            // file is never routed and is still warmed.
+            if (fullPrecisionVectorsLiveInVecFile == false || KNNSettings.isDirectIORescoreEnabled() == false) {
+                WarmupUtil.readAll(faissIndex.getFloatValues(warmUpIndexInput));
+            }
         } else if (faissIndex.getVectorEncoding() == VectorEncoding.BYTE) {
             WarmupUtil.readAll(faissIndex.getByteValues(warmUpIndexInput));
         }

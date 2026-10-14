@@ -12,6 +12,7 @@ import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.util.quantization.QuantizedByteVectorValues;
 import org.opensearch.knn.KNNTestCase;
+import org.opensearch.knn.index.codec.scorer.HasFullPrecisionVectorValues;
 
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -108,6 +109,78 @@ public class ScalarQuantizedFloatVectorValuesTests extends KNNTestCase {
     public void testGetQuantizedVectorValues_whenNull_thenReturnsNull() {
         var wrapper = new ScalarQuantizedFloatVectorValues(mock(FloatVectorValues.class), null);
         assertNull(wrapper.getQuantizedVectorValues());
+    }
+
+    /**
+     * The full-precision delegate is itself a two-representation wrapper - Lucene's
+     * {@code ScalarQuantizedVectorValues} - which keeps the {@code .vec}-backed values in a private
+     * {@code rawVectorValues} field. Unwrapping that is what lets a prefetch caller reach {@code .vec}
+     * instead of declining, so this asserts the unwrap happened rather than that the getter returns a
+     * constructor argument.
+     */
+    @SneakyThrows
+    public void testGetFullPrecisionVectorValues_thenUnwrapsTheRawValues() {
+        FloatVectorValues rawValues = mock(FloatVectorValues.class);
+        LuceneWrapperStub luceneWrapper = new LuceneWrapperStub();
+        java.lang.reflect.Field field = LuceneWrapperStub.class.getDeclaredField("rawVectorValues");
+        field.setAccessible(true);
+        field.set(luceneWrapper, rawValues);
+
+        var wrapper = new ScalarQuantizedFloatVectorValues(luceneWrapper, mock(QuantizedByteVectorValues.class));
+
+        assertSame(rawValues, wrapper.getFullPrecisionVectorValues());
+        assertTrue(wrapper instanceof HasFullPrecisionVectorValues);
+    }
+
+    /** No raw values reachable means the prefetch caller declines; it must not mean an exception. */
+    public void testGetFullPrecisionVectorValues_whenNotReachable_thenNull() {
+        var wrapper = new ScalarQuantizedFloatVectorValues(mock(FloatVectorValues.class), mock(QuantizedByteVectorValues.class));
+        assertNull(wrapper.getFullPrecisionVectorValues());
+    }
+
+    /** A copy is a fresh wrapper over a fresh delegate, so it has to unwrap again rather than share. */
+    @SneakyThrows
+    public void testCopy_thenUnwrapsTheCopiedRawValues() {
+        FloatVectorValues rawValues = mock(FloatVectorValues.class);
+        LuceneWrapperStub luceneWrapperCopy = new LuceneWrapperStub();
+        java.lang.reflect.Field field = LuceneWrapperStub.class.getDeclaredField("rawVectorValues");
+        field.setAccessible(true);
+        field.set(luceneWrapperCopy, rawValues);
+
+        FloatVectorValues fvv = mock(FloatVectorValues.class);
+        when(fvv.copy()).thenReturn(luceneWrapperCopy);
+
+        var copied = (ScalarQuantizedFloatVectorValues) new ScalarQuantizedFloatVectorValues(fvv, null).copy();
+
+        assertSame(rawValues, copied.getFullPrecisionVectorValues());
+    }
+
+    /**
+     * Stands in for {@code Lucene104ScalarQuantizedVectorsReader.ScalarQuantizedVectorValues}, which is not
+     * constructible from here: what matters is only the private {@code rawVectorValues} field it holds.
+     */
+    private static class LuceneWrapperStub extends FloatVectorValues {
+        private FloatVectorValues rawVectorValues;
+
+        @Override
+        public int dimension() {
+            return 768;
+        }
+
+        @Override
+        public int size() {
+            return 1;
+        }
+
+        @Override
+        public float[] vectorValue(int ord) {
+            return new float[dimension()];
+        }
+
+        @Override
+        public FloatVectorValues copy() {
+            return this;
+        }
     }
 
     public void testDoesNotImplementHasIndexSlice() {

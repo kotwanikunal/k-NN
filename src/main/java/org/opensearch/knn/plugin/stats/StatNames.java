@@ -66,7 +66,13 @@ public enum StatNames {
     MIN_SCORE_QUERY_WITH_FILTER_REQUESTS(KNNCounter.MIN_SCORE_QUERY_WITH_FILTER_REQUESTS.getName()),
 
     MAX_DISTANCE_QUERY_REQUESTS(KNNCounter.MAX_DISTANCE_QUERY_REQUESTS.getName()),
-    MAX_DISTANCE_QUERY_WITH_FILTER_REQUESTS(KNNCounter.MAX_DISTANCE_QUERY_WITH_FILTER_REQUESTS.getName());
+    MAX_DISTANCE_QUERY_WITH_FILTER_REQUESTS(KNNCounter.MAX_DISTANCE_QUERY_WITH_FILTER_REQUESTS.getName()),
+
+    // Direct I/O stats. Node level and cumulative, from DirectIOVectorIndexInput.STATS. Always present and
+    // all zero on a node with knn.direct_io.rescore.enabled off, which is the shipped default -- "the
+    // feature is off" and "the feature is on and not engaging" are then told apart by routed_opens against
+    // the four decline reasons, which is exactly the question the node bench needs answered.
+    DIRECT_IO_STATS("direct_io_stats");
 
     private String name;
 

@@ -14,6 +14,7 @@ import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.KnnCollector;
+import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.codec.KNN990Codec.NativeEngines990KnnVectorsReader;
 import org.opensearch.knn.index.codec.nativeindex.AbstractNativeEnginesKnnVectorsReader;
 import org.opensearch.knn.index.codec.util.KNNCodecUtil;
@@ -123,7 +124,12 @@ public class Faiss1040ScalarQuantizedKnnVectorsReader extends AbstractNativeEngi
         final FieldInfo fieldInfo = fieldInfos.fieldInfo(fieldName);
         final boolean hasGraphFile = KNNCodecUtil.getNativeEngineFileFromFieldInfo(fieldInfo, segmentReadState.segmentInfo) != null;
         if (!hasGraphFile) {
-            WarmupUtil.readAll(vectorValues.getFloatVectorValues());
+            // Unless the .vec is being served with O_DIRECT, in which case reading it warms a page
+            // cache those reads bypass. The .veq warmup above is unaffected and is what serves the
+            // exact-search queries this branch exists for.
+            if (KNNSettings.isDirectIORescoreEnabled() == false) {
+                WarmupUtil.readAll(vectorValues.getFloatVectorValues());
+            }
             return;
         }
 

@@ -26,6 +26,7 @@ import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactor
 import org.opensearch.knn.index.codec.scorer.NativeEngines990KnnVectorsScorer;
 import org.opensearch.knn.index.codec.scorer.PrefetchableFlatVectorScorer;
 import org.opensearch.knn.index.engine.KNNEngine;
+import org.opensearch.knn.index.store.KNNDirectIODirectory;
 
 import java.io.IOException;
 import java.util.Objects;
@@ -41,7 +42,13 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
         new PrefetchableFlatVectorScorer(new NativeEngines990KnnVectorsScorer(FlatVectorScorerUtil.getLucene99FlatVectorsScorer()))
     );
     static final FlatVectorsFormat FLAT_VECTORS_FORMAT_HALF_FLOAT = new KNN1040HalfFloatFlatVectorsFormat();
-    private static final String FORMAT_NAME = "NativeEngines990KnnVectorsFormat";
+    /**
+     * The per-field format name. Public because {@code PerFieldKnnVectorsFormat} puts it in the segment
+     * suffix of every file this format writes, which is how
+     * {@link org.opensearch.knn.index.store.KNNDirectIODirectory} recognises a native-engine
+     * {@code .vec} by name.
+     */
+    public static final String FORMAT_NAME = "NativeEngines990KnnVectorsFormat";
     private final int approximateThreshold;
     private final NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory;
     private final FlatVectorsFormat flatVectorsFormat;
@@ -91,11 +98,18 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
     /**
      * Returns a {@link KnnVectorsReader} to read the vectors from the index.
      *
+     * <p>The flat reader is built over a {@link KNNDirectIODirectory#routeVectorData derived read
+     * state}, so that its {@code .vec} open goes through k-NN's Direct I/O dispatch when
+     * {@code knn.direct_io.rescore.enabled} is on. This is the plugin's only Direct I/O engagement point
+     * and it needs <b>no index setting</b>; it is inert when the node setting is off. Only the flat
+     * reader's state is derived: the wrapper exists to serve one open, and
+     * {@link NativeEngines990KnnVectorsReader} reads the native index through its own channel.
+     *
      * @param state {@link SegmentReadState}
      */
     @Override
     public KnnVectorsReader fieldsReader(final SegmentReadState state) throws IOException {
-        return new NativeEngines990KnnVectorsReader(state, flatVectorsFormat.fieldsReader(state));
+        return new NativeEngines990KnnVectorsReader(state, flatVectorsFormat.fieldsReader(KNNDirectIODirectory.routeVectorData(state)));
     }
 
     /**

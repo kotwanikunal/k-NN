@@ -25,6 +25,7 @@ import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.util.Bits;
 import org.opensearch.common.UUIDs;
+import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.codec.nativeindex.AbstractNativeEnginesKnnVectorsReader;
 import org.opensearch.knn.index.codec.util.KNNCodecUtil;
 import org.opensearch.knn.index.codec.util.NativeMemoryCacheKeyHelper;
@@ -264,7 +265,9 @@ public class NativeEngines990KnnVectorsReader extends AbstractNativeEnginesKnnVe
      * into the OS page cache.
      * <p>
      * For quantized fields (those with a {@code QFRAMEWORK_CONFIG} attribute), this also warms
-     * up the full-precision {@code .vec} file via the flat vectors reader.
+     * up the full-precision {@code .vec} file via the flat vectors reader — unless
+     * {@code knn.direct_io.rescore.enabled} is on, in which case that file is read with
+     * {@code O_DIRECT} and a page-cache warmup of it is pure cost.
      *
      * @param fieldName the name of the vector field to warm up
      * @throws IOException if an I/O error occurs while reading the underlying data
@@ -275,8 +278,10 @@ public class NativeEngines990KnnVectorsReader extends AbstractNativeEnginesKnnVe
 
         final VectorSearcher memoryOptimizedSearcher = loadMemoryOptimizedSearcherIfRequired(fieldInfo);
         if (memoryOptimizedSearcher != null) {
-            // For quantized vectors, we should warm up .vec as well.
-            if (hasQuantizationConfig(fieldInfo)) {
+            // For quantized vectors, we should warm up .vec as well - unless the storage directory is
+            // serving it with O_DIRECT, in which case this would read the whole file into a page cache
+            // that those reads bypass. The graph warmup below is unaffected.
+            if (hasQuantizationConfig(fieldInfo) && KNNSettings.isDirectIORescoreEnabled() == false) {
                 WarmupUtil.readAll(flatVectorsReader.getFloatVectorValues(fieldName));
             }
 

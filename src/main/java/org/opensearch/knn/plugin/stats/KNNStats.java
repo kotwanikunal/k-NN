@@ -8,8 +8,11 @@ package org.opensearch.knn.plugin.stats;
 import com.google.common.cache.CacheStats;
 import com.google.common.collect.ImmutableMap;
 import org.opensearch.knn.common.KNNConstants;
+import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManager;
+import org.opensearch.knn.index.store.DirectIOVectorCache;
+import org.opensearch.knn.index.store.DirectIOVectorIndexInput;
 import org.opensearch.knn.indices.ModelCache;
 import org.opensearch.knn.indices.ModelDao;
 import org.opensearch.knn.plugin.stats.suppliers.EventOccurredWithinThresholdSupplier;
@@ -83,7 +86,128 @@ public class KNNStats {
         addModelStats(builder);
         addGraphStats(builder);
         addRemoteIndexBuildStats(builder);
+        addDirectIOStats(builder);
         return builder.build();
+    }
+
+    /**
+     * The Direct I/O read path's node-wide counters, at {@code _plugins/_knn/stats} under
+     * {@code direct_io_stats}. This is the k-NN-shaped place for them: {@code KNNStats} is already how every
+     * other node-level k-NN counter reaches an operator, and the alternative — the per-segment
+     * {@code KNNDirectIODirectory} the codec seam creates — is discarded with its reader and so can
+     * never be read over REST.
+     *
+     * <p>Two groups, because they answer two different questions.
+     * <ul>
+     *   <li><b>dispatch</b> — is the seam engaging, and if not, why? {@code routed_opens} against the five
+     *       decline reasons, which want five different operator responses: a compound segment, i.e. every
+     *       flushed segment at the shipped defaults and nothing to act on
+     *       ({@code declined_compound}); an unsupported substrate ({@code declined_chain}); a bug
+     *       ({@code declined_missing}); the size floor working as designed ({@code declined_too_small}); or
+     *       a filesystem with no {@code O_DIRECT} ({@code declined_open_failed}).</li>
+     *   <li><b>reads</b> — once engaged, what is it doing? The staged/blocking/read-ahead channels and the
+     *       byte counters behind the amplification ratio. {@code stage_declined} against
+     *       {@code staged_reads} is the queue-capacity decline rate phase 13's audit row 7 measured as the
+     *       binding constraint at concurrent load, and the Oct 4-5 node sweep then measured 46-52% declines
+     *       and 783k device reads per 5,000 queries at an effective capacity of 64 against 0% and 707k at
+     *       1,024. {@code queue_peak} is the occupancy high-water mark the derived default is validated
+     *       against, and {@code pool_rebuilds} is how an operator sees that a live capacity change took
+     *       effect.</li>
+     *   <li><b>memory</b> — how much off-heap is it holding, and is the budget biting? {@code live_bytes}
+     *       against {@code budget_bytes} (the setting, echoed so one GET answers both halves),
+     *       {@code peak_bytes} for the high-water mark, and {@code declined_budget} for prefetches the
+     *       budget refused. The node sat at 1.69 GB of live direct buffers against a 2g
+     *       {@code MaxDirectMemorySize} before this section existed, which is the measurement that made it
+     *       necessary. {@code wall_bytes} is the JVM-wide direct-memory wall the budget was derived from —
+     *       the operator's explicit {@code -XX:MaxDirectMemorySize} when they pinned one, else
+     *       {@code heapSize / 2} — reported beside {@code budget_bytes} so that "is this ceiling actually
+     *       below the wall" is one GET rather than an SSH to read the command line. Neither
+     *       {@code live_bytes} nor {@code peak_bytes} is ever reported above {@code wall_bytes}: the node
+     *       read a {@code peak_bytes} of 7.46 GB against a 2 GB wall before D3c, which was arithmetic rather
+     *       than memory.
+     *       <p>{@code arenas_allocated} / {@code arenas_reused} / {@code arenas_retired} are the lease
+     *       model's own numbers (D3c). A healthy node allocates one arena per reader thread and reuses it
+     *       for every burst after, so {@code arenas_reused} should be orders of magnitude above
+     *       {@code arenas_allocated} and {@code arenas_retired} should stay flat — it moves only when a
+     *       staged read would not quiesce (watch {@code staged_wait_timeouts} with it) or when the burst
+     *       geometry changed. {@code foreign_thread_reads} is ~0 unless some caller prefetches an input on
+     *       one thread and reads it on another, which costs that read its read-ahead and nothing else.</li>
+     *   <li><b>cache</b> — the node-wide vector cache, {@code 0} throughout while
+     *       {@code knn.direct_io.rescore.cache.max_bytes} is at its default of {@code 0b}.
+     *       {@code hits / (hits + misses)} is the hit rate and is directly comparable with the 40.3%
+     *       measured at 16 MB on 10M vectors; the absolute counts are <b>twice</b> the vectors served,
+     *       because a vector is looked up once in {@code prefetch} (where a hit saves the device read) and
+     *       once in {@code readFloats} (where a hit serves the bytes). See
+     *       {@link DirectIOVectorCache#lookupsPerVector()}.</li>
+     * </ul>
+     *
+     * <p>Node level rather than cluster level, and cumulative since node start, because every counter is a
+     * property of one node's reads: the device, the filesystem block size and the page cache that decide
+     * whether Direct I/O is winning are all per node.
+     */
+    private void addDirectIOStats(ImmutableMap.Builder<String, KNNStat<?>> builder) {
+        builder.put(StatNames.DIRECT_IO_STATS.getName(), createNodeStat(KNNStats::createDirectIOStatsMap));
+    }
+
+    private static Map<String, Map<String, Object>> createDirectIOStatsMap() {
+        final DirectIOVectorIndexInput.Stats stats = DirectIOVectorIndexInput.STATS;
+
+        final Map<String, Object> dispatch = new HashMap<>();
+        dispatch.put("routed_opens", stats.routedOpens());
+        dispatch.put("declined_opens", stats.declinedOpens());
+        dispatch.put("declined_compound", stats.declinedCompound());
+        dispatch.put("declined_chain", stats.declinedChain());
+        dispatch.put("declined_missing", stats.declinedMissing());
+        dispatch.put("declined_too_small", stats.declinedTooSmall());
+        dispatch.put("declined_open_failed", stats.declinedOpenFailed());
+
+        final Map<String, Object> reads = new HashMap<>();
+        reads.put("blocking_reads", stats.blockingReads());
+        reads.put("staged_reads", stats.stagedReads());
+        reads.put("staged_hits", stats.stagedHits());
+        reads.put("stage_declined", stats.stageDeclined());
+        reads.put("staged_wait_timeouts", stats.stagedWaitTimeouts());
+        reads.put("prefetch_calls", stats.prefetchCalls());
+        reads.put("in_flight_peak", stats.inFlightPeak());
+        reads.put("readahead_armed", stats.readaheadArmed());
+        reads.put("readahead_reads", stats.readaheadReads());
+        reads.put("readahead_hits", stats.readaheadHits());
+        reads.put("readahead_declined", stats.readaheadDeclined());
+        reads.put("staged_bytes", stats.stagedBytes());
+        reads.put("blocking_bytes", stats.blockingBytes());
+        reads.put("readahead_bytes", stats.readaheadBytes());
+        reads.put("served_bytes", stats.servedBytes());
+        reads.put("declined_span_bytes", stats.declinedSpanBytes());
+        reads.put("queue_peak", stats.queuePeak());
+        reads.put("pool_rebuilds", stats.poolRebuilds());
+
+        final Map<String, Object> memory = new HashMap<>();
+        // Drain first, so the number an operator reads is not stale by however long it has been since the
+        // last allocation decided to drain it. See DirectIOVectorIndexInput#reclaim.
+        memory.put("live_bytes", DirectIOVectorIndexInput.reclaim());
+        memory.put("peak_bytes", stats.directMemoryPeak());
+        memory.put("declined_budget", stats.declinedBudget());
+        memory.put("budget_bytes", KNNSettings.getDirectIODirectMemoryBudget().getBytes());
+        memory.put("wall_bytes", KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES);
+        memory.put("arenas_allocated", stats.arenasAllocated());
+        memory.put("arenas_reused", stats.arenasReused());
+        memory.put("arenas_retired", stats.arenasRetired());
+        memory.put("foreign_thread_reads", stats.foreignThreadReads());
+
+        final Map<String, Object> cache = new HashMap<>();
+        cache.put("hits", DirectIOVectorCache.hits());
+        cache.put("misses", DirectIOVectorCache.misses());
+        cache.put("evictions", DirectIOVectorCache.evictions());
+        cache.put("bytes", DirectIOVectorCache.bytes());
+        cache.put("entries", DirectIOVectorCache.entries());
+        cache.put("max_bytes", DirectIOVectorCache.maxBytes());
+
+        final Map<String, Map<String, Object>> directIOStats = new HashMap<>();
+        directIOStats.put("dispatch", dispatch);
+        directIOStats.put("reads", reads);
+        directIOStats.put("memory", memory);
+        directIOStats.put("cache", cache);
+        return directIOStats;
     }
 
     private void addQueryStats(ImmutableMap.Builder<String, KNNStat<?>> builder) {
