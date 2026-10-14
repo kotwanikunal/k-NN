@@ -268,25 +268,30 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
         cacheOn(2);
         final float[] scratch = new float[DIMENSION];
 
-        try (DirectIOVectorIndexInput first = DirectIOVectorIndexInput.open(path)) {
+        // Both inputs are held open at once, which is what the claim is about: two readers over one file at
+        // the same time share its entries. Closing the first before opening the second would be a different
+        // claim, and since O3 a false one -- the owning input's close frees that file's entries, and a
+        // reopened file refills (see DirectIOClosedFileReleaseTests).
+        try (
+            DirectIOVectorIndexInput first = DirectIOVectorIndexInput.open(path);
+            // A SECOND open of the same path, which is a different Handle over a different FileChannel --
+            // which is exactly why identity would not do as the key's file part.
+            DirectIOVectorIndexInput second = DirectIOVectorIndexInput.open(path)
+        ) {
             assertNotNull(first);
+            assertNotNull(second);
             readVector(first, 7, scratch);
             assertArrayEquals(vectors[7], scratch, 0.0f);
-        }
-        final long hitsAfterPopulate = DirectIOVectorCache.hits();
-        final long missesAfterPopulate = DirectIOVectorCache.misses();
-        assertEquals(1L, DirectIOVectorCache.entries());
+            final long hitsAfterPopulate = DirectIOVectorCache.hits();
+            final long missesAfterPopulate = DirectIOVectorCache.misses();
+            assertEquals(1L, DirectIOVectorCache.entries());
 
-        // A SECOND open of the same path, which is a different Handle over a different FileChannel -- which
-        // is exactly why identity would not do as the key's file part.
-        try (DirectIOVectorIndexInput second = DirectIOVectorIndexInput.open(path)) {
-            assertNotNull(second);
             readVector(second, 7, scratch);
             assertArrayEquals("the second reader must get the right bytes", vectors[7], scratch, 0.0f);
+            assertEquals("the second reader's lookup must hit", hitsAfterPopulate + 1, DirectIOVectorCache.hits());
+            assertEquals("and neither may miss", missesAfterPopulate, DirectIOVectorCache.misses());
+            assertEquals("sharing means one entry, not two", 1L, DirectIOVectorCache.entries());
         }
-        assertEquals("the second reader's lookup must hit", hitsAfterPopulate + 1, DirectIOVectorCache.hits());
-        assertEquals("and neither may miss", missesAfterPopulate, DirectIOVectorCache.misses());
-        assertEquals("sharing means one entry, not two", 1L, DirectIOVectorCache.entries());
     }
 
     /**
@@ -307,20 +312,62 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
         cacheOn(2);
         final float[] scratch = new float[DIMENSION];
 
-        try (DirectIOVectorIndexInput inputA = DirectIOVectorIndexInput.open(a)) {
+        // Both open at once: since O3 closing A would free A's entry, and the claim here is that B cannot be
+        // served A's bytes while both are cached.
+        try (
+            DirectIOVectorIndexInput inputA = DirectIOVectorIndexInput.open(a);
+            DirectIOVectorIndexInput inputB = DirectIOVectorIndexInput.open(b)
+        ) {
             assertNotNull(inputA);
-            readVector(inputA, 11, scratch);
-        }
-        final long missesAfterA = DirectIOVectorCache.misses();
-        assertEquals(1L, DirectIOVectorCache.entries());
-
-        try (DirectIOVectorIndexInput inputB = DirectIOVectorIndexInput.open(b)) {
             assertNotNull(inputB);
+            readVector(inputA, 11, scratch);
+            final long missesAfterA = DirectIOVectorCache.misses();
+            assertEquals(1L, DirectIOVectorCache.entries());
+
             readVector(inputB, 11, scratch);
             assertArrayEquals(vectors[11], scratch, 0.0f);
+            assertEquals("the other file's entry must not be served", missesAfterA + 1, DirectIOVectorCache.misses());
+            assertEquals("each file gets its own entry", 2L, DirectIOVectorCache.entries());
         }
-        assertEquals("the other file's entry must not be served", missesAfterA + 1, DirectIOVectorCache.misses());
-        assertEquals("each file gets its own entry", 2L, DirectIOVectorCache.entries());
+    }
+
+    /**
+     * O3: only the input {@code open} returned frees its file's entries. A clone and a slice share the
+     * {@code O_DIRECT} handle and are closed per query thread per segment, so one of those freeing the
+     * file's vectors would empty the store under the reader that is still using it.
+     */
+    @SneakyThrows
+    public void testOnlyTheOwningInputFreesTheFilesEntriesAtClose() {
+        assumeDirectIOWorksHere();
+        final float[][] vectors = randomVectors(31L);
+        final Path path = writeVectorFile(createTempDir(), "ownership.vec", vectors);
+        cacheOn(2);
+        final float[] scratch = new float[DIMENSION];
+
+        try (DirectIOVectorIndexInput owner = DirectIOVectorIndexInput.open(path)) {
+            assertNotNull(owner);
+            readVector(owner, 5, scratch);
+            assertArrayEquals(vectors[5], scratch, 0.0f);
+            final long entries = DirectIOVectorCache.entries();
+            assertTrue("the read must have cached something", entries > 0);
+
+            owner.slice("values", 0, owner.length()).close();
+            assertEquals("a slice's close must free nothing", entries, DirectIOVectorCache.entries());
+            assertEquals(0L, DirectIOVectorCache.closedFiles());
+
+            owner.clone().close();
+            assertEquals("a clone's close must free nothing", entries, DirectIOVectorCache.entries());
+            assertEquals(0L, DirectIOVectorCache.closedFiles());
+
+            // And the entries are still the file's own bytes after both of those closes.
+            readVector(owner, 5, scratch);
+            assertArrayEquals(vectors[5], scratch, 0.0f);
+        }
+        // The owner's close is the one that frees them.
+        assertEquals("the owner's close frees the file", 0L, DirectIOVectorCache.entries());
+        assertEquals(1L, DirectIOVectorCache.closedFiles());
+        assertTrue(DirectIOVectorCache.closedFileEntries() > 0);
+        assertEquals("freeing is not evicting", 0L, DirectIOVectorCache.evictions());
     }
 
     /**

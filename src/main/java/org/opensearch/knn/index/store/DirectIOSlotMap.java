@@ -52,6 +52,16 @@ final class DirectIOSlotMap {
         boolean isLive(long offset, int slabId, int slot);
     }
 
+    /**
+     * Told every occupied cell of a table, so that the closed-file release (O3) can free this file's slots
+     * without walking every slot of every slab. Implemented by the cache, which is the only thing that can
+     * see a slot; it must still check each slot's back pointer, because an occupied cell is not proof that
+     * the vector is still there -- see the class javadoc.
+     */
+    interface CellVisitor {
+        void visit(long offset, int slabId, int slot);
+    }
+
     /** Free cell. An offset is a position in a file and so is never negative. */
     private static final long EMPTY = -1L;
 
@@ -249,6 +259,21 @@ final class DirectIOSlotMap {
         for (int i = 0; i < oldOffsets.length; i++) {
             if (oldOffsets[i] != EMPTY) {
                 insert(oldOffsets[i], oldPacked[i] >>> SLOT_BITS, oldPacked[i] & SLOT_MASK);
+            }
+        }
+    }
+
+    /**
+     * Tells {@code visitor} every occupied cell, invalidated ones included. O3's release walks the file's own
+     * table rather than every slab's back pointers, so a close costs this file's cells and not the store's
+     * slots: at 128 slabs of 768-dimension vectors that is 500,000 cells against 1,396,736 slots.
+     */
+    void forEachCell(final CellVisitor visitor) {
+        final long[] keys = offsets;
+        final int[] values = packed;
+        for (int i = 0; i < keys.length; i++) {
+            if (keys[i] != EMPTY) {
+                visitor.visit(keys[i], values[i] >>> SLOT_BITS, values[i] & SLOT_MASK);
             }
         }
     }

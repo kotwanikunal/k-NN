@@ -100,7 +100,17 @@ public class KNNStatsTests extends KNNTestCase {
 
         final Map<String, Map<String, Object>> directIO = (Map<String, Map<String, Object>>) stat.getValue();
         assertEquals(Set.of("dispatch", "reads", "memory", "cache"), directIO.keySet());
-        for (final String required : new String[] { "live_bytes", "peak_bytes", "declined_budget", "budget_bytes", "wall_bytes" }) {
+        for (final String required : new String[] {
+            "live_bytes",
+            "peak_bytes",
+            "declined_budget",
+            "budget_bytes",
+            "wall_bytes",
+            // O2's four, which are 16-I's I7 names: the wide-group buffers and their own ceiling.
+            "wide_buffer_bytes",
+            "wide_buffer_peak_bytes",
+            "wide_buffer_budget_bytes",
+            "declined_wide_budget" }) {
             assertTrue(
                 "memory." + required + " must be exposed, saw " + directIO.get("memory").keySet(),
                 directIO.get("memory").containsKey(required)
@@ -120,7 +130,10 @@ public class KNNStatsTests extends KNNTestCase {
                 "reclaimed_slabs",
                 "readmissions",
                 "span_fills",
-                "slab_alloc_failures"
+                "slab_alloc_failures",
+                // O3: the entries a closed .vec gave back, and the files they came from.
+                "closed_files",
+                "closed_file_entries"
             ),
             directIO.get("cache").keySet()
         );
@@ -155,7 +168,13 @@ public class KNNStatsTests extends KNNTestCase {
             "readahead_reads",
             "served_bytes",
             "queue_peak",
-            "pool_rebuilds" }) {
+            "pool_rebuilds",
+            // O1's four, which are 16-I's I6 names: the pair that shows a rollback reaching open segments,
+            // and the route changes themselves.
+            "fallback_reads",
+            "fallback_bytes",
+            "switched_to_mmap",
+            "switched_to_direct" }) {
             assertTrue(
                 "reads." + required + " must be exposed, saw " + directIO.get("reads").keySet(),
                 directIO.get("reads").containsKey(required)

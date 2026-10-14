@@ -233,12 +233,16 @@ public class DirectIOCacheHitIdentityTests extends KNNTestCase {
         final float[] first = new float[dimension];
         final float[] second = new float[dimension];
 
-        try (DirectIOVectorIndexInput writer = DirectIOVectorIndexInput.open(path)) {
+        // Both held open: the claim is that a second reader of a file another reader cached gets the same
+        // bits. Since O3 the owning input's close frees that file's entries, so the writer stays open here
+        // (a reopened file refills instead, which DirectIOClosedFileReleaseTests covers).
+        try (
+            DirectIOVectorIndexInput writer = DirectIOVectorIndexInput.open(path);
+            DirectIOVectorIndexInput reader = DirectIOVectorIndexInput.open(path)
+        ) {
             assertNotNull(writer);
-            readVector(writer, 9, dimension, first);
-        }
-        try (DirectIOVectorIndexInput reader = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(reader);
+            readVector(writer, 9, dimension, first);
             final long hitsBefore = DirectIOVectorCache.hits();
             readVector(reader, 9, dimension, second);
             assertEquals("the second reader must hit", hitsBefore + 1, DirectIOVectorCache.hits());

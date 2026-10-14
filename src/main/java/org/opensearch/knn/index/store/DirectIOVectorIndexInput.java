@@ -2224,11 +2224,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * @param vectorBytes that vector's length in bytes, which is the field's
      */
     private void spanFill(final StagedRange range, final long runStart, final int vectorBytes) {
-        if (range == null
-            || range.spanFilled
-            || vectorBytes <= 0
-            || DirectIOVectorCache.isSpanFillOn() == false
-            || DirectIOVectorCache.belowSlabTarget() == false) {
+        if (range == null || range.spanFilled || vectorBytes <= 0 || DirectIOVectorCache.isSpanFillOn() == false
+        // O3: or a closed file has given slots back, which is room nothing was pushed out to get.
+        // Approximate on purpose, because this runs before the write lock; putRun re-asks precisely.
+            || DirectIOVectorCache.mayAdmitSpanFillApproximately() == false) {
             return;
         }
         // Set before the geometry, so a range whose span offers nothing is not walked again by the next
@@ -2778,6 +2777,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 mmapFallback.close();
             }
             handle.channel.close();
+            // O3: the file is closed for good, so its cached vectors are cold for ever and the slots they
+            // hold are room the store can have back without evicting anything. Only here, in the
+            // ownsHandle branch: a clone or a slice closing would otherwise free bytes its parent is still
+            // reading. After the channel close rather than before it, because nothing may read the file
+            // through this input again either way and the cheaper of the two orderings is the one where a
+            // concurrent lookup on another input's clone can still be served until the last moment.
+            DirectIOVectorCache.releaseFile(handle.fileId);
             // One snapshot per file closed, and deliberately not per burst or per clone: clones close once
             // per query thread per segment, and a line there would be per-query log traffic inside the very
             // blocks whose latency is being measured. {@link #STATS} is node wide and cumulative, so a

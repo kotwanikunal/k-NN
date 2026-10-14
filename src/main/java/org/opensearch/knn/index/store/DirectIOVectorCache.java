@@ -126,14 +126,21 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * Phase 15's Guava cache could not do that — {@code maximumWeight} is fixed at {@code CacheBuilder#build()},
  * so a change dropped the whole cache and warmed it again.
  *
- * <h2>Entries of a file that has been closed: they age out, and the index cell goes with the last one</h2>
- * Nothing invalidates a merged-away segment's entries at close time, and they are <b>never wrong</b> — the
- * key says which file's bytes they are and that file's bytes are immutable. They are only <em>cold</em>, so
- * the FIFO reaches them without a second chance (nothing reads them, so no hit flag is ever set) and they
- * become free slots. What is new against phase 15 is the second half: the index is per file, so when the last
- * slot belonging to a file is freed, that file's whole {@link DirectIOSlotMap} is dropped from the index
- * ({@link #detach}). A dead file therefore costs bounded eviction pressure and then nothing, with no per-file
- * reference counting of open handles and no work on the close path.
+ * <h2>Entries of a file that has been closed are freed at the close (O3)</h2>
+ * A merged-away segment's entries are <b>never wrong</b> — the key says which file's bytes they are and that
+ * file's bytes are immutable — only <em>cold</em>. M2 therefore left them to age out: the FIFO reaches them
+ * without a second chance (nothing reads them, so no hit flag is ever set) and they become free slots, and
+ * when the last slot belonging to a file goes, that file's whole {@link DirectIOSlotMap} is dropped from the
+ * index ({@link #detach}).
+ *
+ * <p>That is bounded but it is not free, and O3 is what the merge analysis (ref/MERGE-NOTE.md section 4)
+ * found it costing: until the FIFO cycles past them the store <b>sits at its target</b>, and span fill only
+ * runs below the target, so it does not re-arm for the merged segment and that segment refills at one vector
+ * per miss. So {@link #releaseFile} now frees a file's slots when the routed input that owned its
+ * {@code O_DIRECT} handle closes — its index table goes, its slots go back to their slabs' free lists, and
+ * {@link #place} hands those slots out before it grows or evicts ({@link #RECYCLED}). The ageing-out path
+ * above stays, because it is what covers an entry whose cell was already invalidated and a file nobody
+ * closes.
  *
  * <h2>Off is off</h2>
  * {@code knn.direct_io.rescore.cache.max_bytes} defaults to {@code 0b}. When it is zero there are no slabs
@@ -156,6 +163,27 @@ public final class DirectIOVectorCache {
 
     /** The one slab currently being appended to, per vector byte length. */
     private static final Map<Integer, Slab> OPEN_SLABS = new HashMap<>();
+
+    /**
+     * Slabs that hold free slots a closed file gave back, per vector byte length, waiting to be reopened for
+     * appending. O3.
+     *
+     * <p>Without this the slots {@link #releaseFile} frees would be unreachable until their slab came to the
+     * head of {@link #FIFO}, because {@link #place} only appends to {@link #OPEN_SLABS}. A fill arriving
+     * straight after a close would then grow or evict while the store had room it had just been given, which
+     * is the opposite of what O3 is for.
+     *
+     * <p>Entries are validated on the way out rather than removed on every event that could stale one (a
+     * reclaim reopening the slab for another length, a {@link #configure} releasing it): see
+     * {@link #recycledSlab}.
+     */
+    private static final Map<Integer, ArrayDeque<Slab>> RECYCLED = new HashMap<>();
+
+    /**
+     * How many slabs sit in {@link #RECYCLED}. Written under the write lock and read without it by
+     * {@link #mayAdmitSpanFillApproximately}, which is the input's pre-check. O3.
+     */
+    private static volatile int recycledSlabs;
 
     /** Slabs by id, so an index entry can be one int. Null where an id is not in use. */
     private static Slab[] slabsById = new Slab[0];
@@ -248,6 +276,9 @@ public final class DirectIOVectorCache {
     private static final LongAdder slabAllocFailures = new LongAdder();
     /** Write-lock time spent reclaiming slabs, which is the figure a node has to be able to read. */
     private static final LongAdder reclaimNanos = new LongAdder();
+    /** Files whose entries were freed at close, and the entries that went with them. O3. */
+    private static final LongAdder closedFiles = new LongAdder();
+    private static final LongAdder closedFileEntries = new LongAdder();
 
     private DirectIOVectorCache() {}
 
@@ -272,6 +303,12 @@ public final class DirectIOVectorCache {
          */
         private int[] free;
         private int freeCount;
+        /**
+         * Whether this slab is sitting in {@link #RECYCLED} waiting to be reopened for appending. A flag
+         * rather than a containment test, so a closed file that freed slots in the same slab twice cannot
+         * queue it twice. O3.
+         */
+        private boolean recycled;
 
         private Slab(final int id, final DirectIOSlab memory) {
             this.id = id;
@@ -587,6 +624,65 @@ public final class DirectIOVectorCache {
     }
 
     /**
+     * Whether span fill may admit a vector of {@code length} bytes: the store is below its slab target, or a
+     * closed file has given back slots of that length (O3). Called under the write lock.
+     *
+     * <h4>Why the second clause is not simply "the open slab has a free slot"</h4>
+     * At the target the open slab's free slots are what a reclaim has just produced, and the requested fills
+     * are entitled to them: letting span fill take them would be span fill running at the target, which is
+     * the scan-resistance question (agenda item 4) this phase is not deciding. Slots a closed file vacated
+     * are a different thing. Nothing is pushed out to use them, because what held them is gone, so admitting
+     * into them cannot displace a working set. That is the whole of O3: after a merge the store would
+     * otherwise sit at its target holding dead vectors, span fill would not re-arm, and the merged segment
+     * would refill at one vector per miss.
+     *
+     * <h4>What this does widen, MEASURED in {@code DirectIOClosedFileReleaseTests}</h4>
+     * While a close's room is still there this says yes, and {@link #place} then uses whatever free slot it
+     * finds first -- which may be a leftover in the open slab rather than one of the freed ones. In the test
+     * fixture a close freeing 66 slots let span fill admit 190 vectors. That is wider than "the slots the
+     * close freed" and it is deliberate: {@link #place} is called with eviction refused either way, so
+     * nothing can be displaced, and refusing a free slot because of which event produced it would leave the
+     * store holding room it could have warmed with. Once the free slots are gone this says no again, which
+     * is what the test pins.
+     */
+    private static boolean mayAdmitSpanFill(final int length) {
+        return belowSlabTarget() || hasRecycledRoom(length);
+    }
+
+    /**
+     * Whether a queued recycled slab still has a free slot of {@code length} bytes. Called under the write
+     * lock. The queue holds at most one entry per slab, so this is bounded by the slab count, and it is
+     * walked once per span-fill run rather than once per vector.
+     *
+     * <p>Validating rather than counting, because a queued slab can be reopened for another vector length by
+     * a reclaim or released by a {@link #configure} with no hook here, and a counter that drifted would make
+     * span fill run at the target.
+     */
+    private static boolean hasRecycledRoom(final int length) {
+        final ArrayDeque<Slab> queue = RECYCLED.get(length);
+        if (queue == null) {
+            return false;
+        }
+        for (final Slab slab : queue) {
+            if (slabAt(slab.id) == slab && slab.slotBytes == length && slab.freeSlots() > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The lock-free form of {@link #mayAdmitSpanFill}'s question, for the input's pre-check before it takes
+     * the write lock. Approximate in one direction only: it can say yes where
+     * {@link #mayAdmitSpanFill} then says no, which costs one lock acquisition and admits nothing. It cannot
+     * say no where the precise answer is yes, because {@link #recycledSlabs} is only cleared for a slab that
+     * has left the queue.
+     */
+    static boolean mayAdmitSpanFillApproximately() {
+        return belowSlabTarget() || recycledSlabs > 0;
+    }
+
+    /**
      * Admits the {@code count} consecutive vectors starting at {@code (fileId, firstOffset)} from
      * {@code source}, under <b>one</b> write-lock acquisition, and only while the store is below its slab
      * target. M4's span fill, ported from 16-I F5.
@@ -636,7 +732,7 @@ public final class DirectIOVectorCache {
             while (next < count) {
                 LOCK.writeLock().lock();
                 try {
-                    if (belowSlabTarget() == false) {
+                    if (mayAdmitSpanFill(length) == false) {
                         break;
                     }
                     for (; next < count; next++) {
@@ -782,6 +878,12 @@ public final class DirectIOVectorCache {
         }
         Slab slab = OPEN_SLABS.get(length);
         if (slab == null || slab.freeSlots() == 0) {
+            // O3: slots a closed file gave back come first, before any growth and before any eviction. The
+            // store has room it has already been given, and using it is what lets span fill re-arm for a
+            // merged segment without displacing a live vector.
+            slab = recycledSlab(length);
+        }
+        if (slab == null) {
             slab = allowEviction ? obtainSlab(length, request) : growSlabs(length, request);
         }
         if (slab == null) {
@@ -792,6 +894,140 @@ public final class DirectIOVectorCache {
         }
         final int slot = slab.allocSlot();
         return slot < 0 ? null : new Placement(map, slab, slot);
+    }
+
+    /**
+     * A slab with free slots of {@code length} bytes that a closed file gave back, reopened for appending, or
+     * {@code null} when there is none. Called under the write lock. O3.
+     *
+     * <p>Queue entries are validated here rather than removed wherever a slab's state could change: a slab
+     * that has since been reclaimed for another vector length, released by a {@link #configure}, or refilled
+     * is simply dropped on the way out. That keeps the release path to the slots it frees and leaves no
+     * bookkeeping for {@link #obtainSlab} or {@link #configure} to remember.
+     */
+    private static Slab recycledSlab(final int length) {
+        final ArrayDeque<Slab> queue = RECYCLED.get(length);
+        if (queue == null) {
+            return null;
+        }
+        while (true) {
+            // Peek and leave it queued: a slab stays in the queue until its freed slots are gone, which is
+            // what keeps mayAdmitSpanFill true for as long as there is genuinely room a close gave back.
+            final Slab candidate = queue.peek();
+            if (candidate == null) {
+                RECYCLED.remove(length, queue);
+                return null;
+            }
+            if (slabAt(candidate.id) == candidate && candidate.slotBytes == length && candidate.freeSlots() > 0) {
+                // Appending resumes here, so the next fills for this length need no second trip through the
+                // queue. The slab it displaces is full by construction: place() only asks when it is.
+                OPEN_SLABS.put(length, candidate);
+                return candidate;
+            }
+            queue.poll();
+            candidate.recycled = false;
+            recycledSlabs--;
+        }
+    }
+
+    /** Queues {@code slab} as holding free slots, once. Called under the write lock. O3. */
+    private static void offerRecycled(final Slab slab) {
+        if (slab.recycled || slab.freeSlots() <= 0 || OPEN_SLABS.get(slab.slotBytes) == slab) {
+            return;
+        }
+        slab.recycled = true;
+        RECYCLED.computeIfAbsent(slab.slotBytes, length -> new ArrayDeque<>()).add(slab);
+        recycledSlabs++;
+    }
+
+    /**
+     * Frees every entry of {@code fileId} and drops its index table, because the input that owned the file's
+     * {@code O_DIRECT} handle has closed and nothing will read those vectors again. O3, the merge note's
+     * fix 1.
+     *
+     * <h4>What it is for (CODE, ref/MERGE-NOTE.md section 4)</h4>
+     * Before this, a merged-away segment's entries stayed in their slots until the FIFO cycled past them,
+     * and they were never <em>wrong</em> -- the key says which file's bytes they are and that file's bytes
+     * are immutable -- only cold. But the store therefore sat at its target after a merge, and span fill runs
+     * only below the target, so it did not re-arm for the merged segment and that segment refilled at one
+     * vector per miss. Freeing them at close puts the store below its target again, which is what lets span
+     * fill warm the new segment. A reopened file simply refills.
+     *
+     * <h4>Why no reader can see a torn or a foreign vector</h4>
+     * This holds the <b>write</b> lock, and {@link #getFloats} copies the vector out of the slab into the
+     * caller's array under the <b>read</b> lock (the copy is one statement inside that lock). So a reader
+     * either completes before this begins or starts after it ends; there is no window in which a reader
+     * holds a resolved slot across the free. A reader that arrives afterwards misses, because the index
+     * table is gone, and reads the device.
+     *
+     * <h4>Why the slots are freed and not evicted</h4>
+     * {@code evictions} counts vectors the store had to displace to make room, which is the figure an
+     * operator sizes the cache by. These were not displaced, so they are counted under their own two keys
+     * and {@code evictions} does not move.
+     *
+     * @param fileId the file's identity, from {@link #fileId}
+     * @return how many entries were freed
+     */
+    static long releaseFile(final String fileId) {
+        if (maxSlabs == 0) {
+            // The cheap pre-check every entry point to this class has: with the store off there is no index
+            // and no lock worth taking, and a close is on a path that may be serving a query.
+            return 0;
+        }
+        final long started = System.nanoTime();
+        long freedEntries = 0;
+        long freedBytes = 0;
+        LOCK.writeLock().lock();
+        try {
+            final DirectIOSlotMap map = INDEX.remove(fileId);
+            if (map == null) {
+                return 0;
+            }
+            final long[] freed = new long[2];
+            final List<Slab> touched = new ArrayList<>();
+            map.forEachCell((offset, slabId, slot) -> {
+                final Slab slab = slabAt(slabId);
+                if (slab == null || slot >= slab.slotCount) {
+                    return;
+                }
+                if (slab.owner[slot] != map || slab.offset[slot] != offset) {
+                    // An invalidated cell: the slot has been taken by another file, or by this file at
+                    // another offset. Either way it is not ours to free, and nulling it would hand out a
+                    // slot somebody is using.
+                    return;
+                }
+                slab.owner[slot] = null;
+                if (slab.freeCount < slab.free.length) {
+                    slab.free[slab.freeCount++] = slot;
+                }
+                if (slab.recycled == false) {
+                    touched.add(slab);
+                }
+                freed[0]++;
+                freed[1] += slab.slotBytes;
+            });
+            freedEntries = freed[0];
+            freedBytes = freed[1];
+            liveEntries -= freedEntries;
+            liveEntryBytes -= freedBytes;
+            for (final Slab slab : touched) {
+                offerRecycled(slab);
+            }
+        } finally {
+            LOCK.writeLock().unlock();
+        }
+        if (freedEntries > 0) {
+            closedFiles.increment();
+            closedFileEntries.add(freedEntries);
+            log.debug(
+                "Freed {} cached vectors ({} B) of [{}] at close, in {} us of write lock",
+                freedEntries,
+                freedBytes,
+                fileId,
+                (System.nanoTime() - started) / 1_000
+            );
+        }
+        return freedEntries;
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -904,6 +1140,8 @@ public final class DirectIOVectorCache {
                 if (wanted == 0) {
                     INDEX.clear();
                     OPEN_SLABS.clear();
+                    RECYCLED.clear();
+                    recycledSlabs = 0;
                     log.info("The k-NN Direct I/O vector cache is off (knn.direct_io.rescore.cache.max_bytes=0)");
                 } else {
                     log.info("The k-NN Direct I/O vector cache holds up to {} slabs of {} bytes", wanted, slabBytes);
@@ -1326,6 +1564,21 @@ public final class DirectIOVectorCache {
     }
 
     /**
+     * Files whose cached vectors were freed because the input owning their {@code O_DIRECT} handle closed
+     * (O3). Counts a close that freed at least one entry, so a {@code .vec} the store never held does not
+     * move it. On a merging node this rises with the merges, and {@code evictions} standing still while it
+     * does is what says the merged-away segments cost the live ones nothing.
+     */
+    public static long closedFiles() {
+        return closedFiles.sum();
+    }
+
+    /** Cached vectors freed at a close, which is room the store got back without evicting anything. O3. */
+    public static long closedFileEntries() {
+        return closedFileEntries.sum();
+    }
+
+    /**
      * How this node allocates off-heap slabs for cached vectors: {@code "ffm"} when
      * {@code java.lang.foreign.Arena} resolved and proved itself on this runtime, else
      * {@code "direct_buffer"}. Reported as {@code direct_io_stats.cache.slab_memory} because the two differ
@@ -1374,6 +1627,8 @@ public final class DirectIOVectorCache {
         reclaimNanos.reset();
         spanFills.reset();
         slabAllocFailures.reset();
+        closedFiles.reset();
+        closedFileEntries.reset();
     }
 
     /**

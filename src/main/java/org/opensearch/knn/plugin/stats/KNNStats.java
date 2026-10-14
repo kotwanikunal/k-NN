@@ -241,6 +241,11 @@ public class KNNStats {
         cache.put("readmissions", DirectIOVectorCache.readmissions());
         cache.put("span_fills", DirectIOVectorCache.spanFills());
         cache.put("slab_alloc_failures", DirectIOVectorCache.slabAllocFailures());
+        // O3: the entries a merged-away or otherwise closed .vec gave back at close, and the files they came
+        // from. closed_file_entries rising while evictions stands still is what says the dead segments cost
+        // the live ones nothing.
+        cache.put("closed_files", DirectIOVectorCache.closedFiles());
+        cache.put("closed_file_entries", DirectIOVectorCache.closedFileEntries());
 
         final Map<String, Map<String, Object>> directIOStats = new HashMap<>();
         directIOStats.put("dispatch", dispatch);

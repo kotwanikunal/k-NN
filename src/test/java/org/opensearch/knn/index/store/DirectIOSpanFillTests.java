@@ -400,21 +400,32 @@ public class DirectIOSpanFillTests extends KNNTestCase {
         assertEquals("the two fixtures are the same size, which is the hard case", Files.size(other), Files.size(path));
         spanFillOn(4);
 
-        try (DirectIOVectorIndexInput first = DirectIOVectorIndexInput.open(other)) {
-            assertNotNull(first);
-            readVector(first, offsetOf(33), new float[DIMENSION]);
-        }
         final float[] scratch = new float[DIMENSION];
-        try (DirectIOVectorIndexInput second = DirectIOVectorIndexInput.open(path)) {
+        final float[] fromFirst = new float[DIMENSION];
+        // Both open: since O3 the first input's close would free its file's span-filled entries, and the
+        // claim here is that the two files' entries cannot be confused while both are cached.
+        try (
+            DirectIOVectorIndexInput first = DirectIOVectorIndexInput.open(other);
+            DirectIOVectorIndexInput second = DirectIOVectorIndexInput.open(path)
+        ) {
+            assertNotNull(first);
             assertNotNull(second);
+            readVector(first, offsetOf(33), new float[DIMENSION]);
+
             readVector(second, offsetOf(34), scratch);
             assertArrayEquals("the second file's own bytes, not the first file's span fill", vectors[34], scratch, 0.0f);
+
+            assertTrue(
+                DirectIOVectorCache.getFloats(
+                    DirectIOVectorCache.fileId(other, Files.size(other)),
+                    offsetOf(34),
+                    VECTOR_BYTES,
+                    fromFirst,
+                    0
+                )
+            );
+            assertArrayEquals("and the first file's span fill is still the first file's bytes", otherVectors[34], fromFirst, 0.0f);
         }
-        final float[] fromFirst = new float[DIMENSION];
-        assertTrue(
-            DirectIOVectorCache.getFloats(DirectIOVectorCache.fileId(other, Files.size(other)), offsetOf(34), VECTOR_BYTES, fromFirst, 0)
-        );
-        assertArrayEquals("and the first file's span fill is still the first file's bytes", otherVectors[34], fromFirst, 0.0f);
     }
 
     // -----------------------------------------------------------------------------------------------
