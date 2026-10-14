@@ -197,6 +197,14 @@ public class KNNStats {
         reads.put("declined_span_bytes", stats.declinedSpanBytes());
         reads.put("queue_peak", stats.queuePeak());
         reads.put("pool_rebuilds", stats.poolRebuilds());
+        // O1, D2's rollback: fallback_reads and fallback_bytes rise, while staged_reads, blocking_reads and
+        // dispatch.routed_opens stand still, exactly when knn.direct_io.rescore.enabled has been turned off
+        // under readers that are already open. switched_to_mmap and switched_to_direct count the route
+        // changes themselves, one per input per flip. 16-I's names.
+        reads.put("fallback_reads", stats.fallbackReads());
+        reads.put("fallback_bytes", stats.fallbackBytes());
+        reads.put("switched_to_mmap", stats.switchedToMmap());
+        reads.put("switched_to_direct", stats.switchedToDirect());
 
         final Map<String, Object> memory = new HashMap<>();
         // Drain first, so the number an operator reads is not stale by however long it has been since the

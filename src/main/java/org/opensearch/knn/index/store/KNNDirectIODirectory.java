@@ -228,7 +228,7 @@ public final class KNNDirectIODirectory extends FilterDirectory {
         // Conditions 1 and 2 first, and in this order: the name test is a string comparison and the
         // setting read is a map lookup, so a file this never routes costs no filesystem call at all.
         if (isFaissVectorData(name) && directIORescoreEnabled.getAsBoolean()) {
-            final IndexInput direct = directIOInput(name);
+            final IndexInput direct = directIOInput(name, context);
             if (direct != null) {
                 routedOpens.incrementAndGet();
                 DirectIOVectorIndexInput.STATS.recordRoutedOpen();
@@ -241,11 +241,12 @@ public final class KNNDirectIODirectory extends FilterDirectory {
 
     /**
      * Conditions 3 to 6, or {@code null} when any of them declines — in which case exactly one reason
-     * counter has been incremented. The returned input owns its own file handle and is closed by whoever
-     * closes the input, which is the same ownership {@link Directory#openInput} always has.
+     * counter has been incremented. The returned input owns its own file handle <b>and the delegate's input
+     * beside it</b> (O1), and both are closed by whoever closes the input, which is the same ownership
+     * {@link Directory#openInput} always has.
      */
     @Nullable
-    private IndexInput directIOInput(final String name) {
+    private IndexInput directIOInput(final String name, final IOContext context) {
         // (3a) the compound case, taken BEFORE the chain walk. A CompoundDirectory is not a FilterDirectory,
         // so the walk below would decline it anyway and count declinedChain -- but that conflates the one
         // decline reason that is EXPECTED with the one that means "a layer nobody has read yet is in the
@@ -307,17 +308,52 @@ public final class KNNDirectIODirectory extends FilterDirectory {
             return null;
         }
         // (6) the open, which is the last thing that can decline and the only one that touches the device.
+        // Two inputs are opened rather than one, and that is O1 (D2): the delegate's own input is kept
+        // beside the O_DIRECT channel so that knn.direct_io.rescore.enabled can be turned off under a
+        // reader that is already open and the read path changes at that reader's next prefetch burst, with
+        // no reopen. Its cost is one file handle per routed .vec per reader, and it is paid only by a node
+        // that is routing. The delegate is opened first, because a failure there must leave nothing behind:
+        // the O_DIRECT channel would otherwise have to be closed by hand on a path that has no input to
+        // close it with.
+        IndexInput fallback = null;
         try {
-            final DirectIOVectorIndexInput direct = DirectIOVectorIndexInput.open(path);
+            fallback = in.openInput(name, context);
+        } catch (IOException | RuntimeException e) {
+            // Routing without a fallback is still correct, only not switchable: an input with no fallback
+            // stays on O_DIRECT for its life. Declining here instead would give up read-ahead for a reason
+            // the operator never asked about.
+            log.warn(
+                "k-NN Direct I/O [{}]: could not open a delegate input for [{}]; the switch will not reach this input",
+                segmentName,
+                name,
+                e
+            );
+        }
+        try {
+            final DirectIOVectorIndexInput direct = DirectIOVectorIndexInput.open(path, fallback, directIORescoreEnabled);
             if (direct == null) {
                 decline(declinedOpenFailed, DirectIOVectorIndexInput.DeclineReason.OPEN_FAILED);
                 log.warn("k-NN Direct I/O [{}]: Direct I/O is not available for [{}]", segmentName, path);
+                closeQuietly(fallback);
             }
             return direct;
         } catch (RuntimeException e) {
             decline(declinedOpenFailed, DirectIOVectorIndexInput.DeclineReason.OPEN_FAILED);
             log.warn("k-NN Direct I/O [{}]: could not open [{}] with Direct I/O", segmentName, path, e);
+            closeQuietly(fallback);
             return null;
+        }
+    }
+
+    /** Closes a delegate input no routed input took ownership of, because the Direct I/O open declined. */
+    private void closeQuietly(@Nullable final IndexInput input) {
+        if (input == null) {
+            return;
+        }
+        try {
+            input.close();
+        } catch (IOException | RuntimeException e) {
+            log.debug("k-NN Direct I/O [{}]: could not close an abandoned delegate input", segmentName, e);
         }
     }
 

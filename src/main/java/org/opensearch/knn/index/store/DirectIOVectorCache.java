@@ -805,12 +805,30 @@ public final class DirectIOVectorCache {
      * boundary — the same cadence and the same contract as {@code DirectIOReadPool#executor()}, so an
      * operator's change takes effect on the next burst with no restart and there is no startup gap for a
      * value that was already persisted. A setting that cannot be read leaves the store exactly as it is.
+     *
+     * @param routeActive whether the calling input is reading through {@code O_DIRECT} right now. {@code false}
+     *                    means {@code knn.direct_io.rescore.enabled} has been turned off under an open routed
+     *                    input (O1), and the store is released rather than resized.
      */
-    static void applyConfiguredSize() {
+    static void applyConfiguredSize(final boolean routeActive) {
         try {
             spanFill = KNNSettings.isDirectIORescoreCacheSpanFillEnabled();
         } catch (RuntimeException e) {
             log.debug("Could not read knn.direct_io.rescore.cache.span_fill; leaving span fill as it is", e);
+        }
+        if (routeActive == false) {
+            // The caller is reading through its delegate input because knn.direct_io.rescore.enabled is off
+            // (O1), so nothing will be admitted and nothing will be looked up: slabs held here serve
+            // nothing. Releasing them is what makes the rollback give the memory back as well as the device
+            // traffic, which is the same choice 16-I's NativeMemoryCacheManager#updateVectorCacheTarget
+            // made. Going back on re-reads max_bytes below and the store grows again on its next fill.
+            //
+            // It is the caller's route and not a second read of the setting, because an input with no
+            // delegate to fall back to stays on O_DIRECT whatever the setting says (see
+            // DirectIOVectorIndexInput#mmapFallback) and its store must stay with it. That is every probe
+            // and bench driver in this package, which open a path directly.
+            configure(0L);
+            return;
         }
         final long wanted;
         try {
