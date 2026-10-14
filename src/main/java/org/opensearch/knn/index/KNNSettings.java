@@ -325,6 +325,22 @@ public class KNNSettings {
     public static final String KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL = "knn.direct_io.rescore.cache.span_fill";
     public static final boolean KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_DEFAULT_VALUE = true;
 
+    // O5, CHALLENGES.md item 18. How wide a staged MISS read may be made while the store is below its target
+    // and the whole file would still fit in the room the target leaves, so that the whole vectors around the
+    // one being fetched are admitted with it. One read per miss stays one read; only its size changes.
+    //
+    // MEASURED on the EBS node (ref/RESULTS-N.md section 5): N1 made each miss one 12 KB read, which removed
+    // the first build's accidental read-around (it staged whole 65 KB coalesced groups), and on dio-1m
+    // coverage after 20,000 queries fell from 97.1% to 93.4% while the tail got worse (p99 30.5 against 25.8
+    // ms) even though the median and the throughput improved. This is that coverage bought back deliberately
+    // and with a bound, instead of as a side effect of grouping.
+    //
+    // 0b turns it off, which is exactly N1's read. The gate is the whole file fitting in the room left, not
+    // merely the store being below its target, because that is what makes it impossible for a read-around to
+    // evict a live vector: if the file fits, nothing has to be displaced to hold it.
+    public static final String KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES = "knn.direct_io.rescore.cache.read_around_bytes";
+    public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES_DEFAULT_VALUE = new ByteSizeValue(64, ByteSizeUnit.KB);
+
     public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN = "knn.direct_io.rescore.prefetch.max_span_bytes";
     public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_DEFAULT_VALUE = new ByteSizeValue(
         128 * 1024 + 4096,
@@ -787,6 +803,21 @@ public class KNNSettings {
     public static final Setting<Boolean> KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_SETTING = Setting.boolSetting(
         KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL,
         KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_DEFAULT_VALUE,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
+     * How wide a staged miss read may be made so that the vectors around the one being fetched are admitted
+     * with it, while the store is below its target and the whole file would still fit in the room left. O5.
+     *
+     * <p>{@code 0b} turns it off, which is exactly N1's one read per miss. See the comment on the key for
+     * what the node measured N1's narrow reads costing in coverage, and for why the gate is the file fitting
+     * rather than merely the store being below its target.
+     */
+    public static final Setting<ByteSizeValue> KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES_SETTING = Setting.byteSizeSetting(
+        KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES,
+        KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES_DEFAULT_VALUE,
         NodeScope,
         Dynamic
     );
@@ -1314,6 +1345,10 @@ public class KNNSettings {
             return KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET_SETTING;
         }
 
+        if (KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES.equals(key)) {
+            return KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES_SETTING;
+        }
+
         if (KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES.equals(key)) {
             return KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_SETTING;
         }
@@ -1379,6 +1414,7 @@ public class KNNSettings {
             KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_SETTING,
             KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING,
             KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET_SETTING,
+            KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES_SETTING,
             KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING,
             KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING,
             KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_SETTING,
@@ -1625,6 +1661,16 @@ public class KNNSettings {
      */
     public static ByteSizeValue getDirectIORescorePrefetchWideBufferBudget() {
         return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET_SETTING);
+    }
+
+    /**
+     * How wide a staged miss read may be made to admit the vectors around the one being fetched; {@code 0b}
+     * is off. O5.
+     *
+     * @return the configured read-around width
+     */
+    public static ByteSizeValue getDirectIORescoreCacheReadAroundBytes() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES_SETTING);
     }
 
     /**

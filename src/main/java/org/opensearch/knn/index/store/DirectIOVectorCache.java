@@ -689,6 +689,60 @@ public final class DirectIOVectorCache {
     }
 
     /**
+     * How wide a staged miss read of a file of {@code fileBytes} bytes may be made, or {@code 0} for "do not
+     * widen it". O5.
+     *
+     * <h4>The three gates, and why the second is the whole file rather than the target</h4>
+     * <ul>
+     *   <li>{@code knn.direct_io.rescore.cache.read_around_bytes} is not {@code 0b};</li>
+     *   <li><b>the whole file would still fit in the room the target leaves</b>, which is what makes it
+     *       impossible for a read-around to evict a live vector: if the file fits, nothing has to be
+     *       displaced to hold it. Merely being below the target would not do, because a store one vector
+     *       below its target would widen a read whose neighbours then evict the working set, and scan
+     *       resistance (agenda item 4) is undecided;</li>
+     *   <li>span fill is on, because the widened bytes are admitted by span fill and a wider read nobody
+     *       harvests is device traffic for nothing.</li>
+     * </ul>
+     *
+     * <p>The fit test is deliberately <b>conservative</b>: it counts the bytes this file already holds
+     * against the room as well, so it can turn read-around off slightly early for a file that is a large
+     * fraction of the target. The alternative needs a per-file byte count, and a file can carry several
+     * fields of different dimensions, so there is no one vector length to multiply by. Costing a nearly-full
+     * store some coverage is the right direction for a gate whose job is to never evict.
+     *
+     * <p>Asked once per prefetch burst, not once per read: see {@code DirectIOVectorIndexInput#beginBurst}.
+     *
+     * @param fileBytes the whole file's length
+     * @return the read-around width in bytes, or 0
+     */
+    static int readAroundBytes(final long fileBytes) {
+        if (isSpanFillOn() == false) {
+            return 0;
+        }
+        final long configured;
+        try {
+            final ByteSizeValue value = KNNSettings.getDirectIORescoreCacheReadAroundBytes();
+            configured = value == null ? 0L : value.getBytes();
+        } catch (RuntimeException e) {
+            log.debug("Could not read knn.direct_io.rescore.cache.read_around_bytes; not widening this read", e);
+            return 0;
+        }
+        if (configured <= 0 || fileBytes <= 0) {
+            return 0;
+        }
+        final long target = (long) maxSlabs * slabBytes;
+        LOCK.readLock().lock();
+        try {
+            if (liveEntryBytes + fileBytes > target) {
+                return 0;
+            }
+        } finally {
+            LOCK.readLock().unlock();
+        }
+        return (int) Math.min(configured, Integer.MAX_VALUE / 2);
+    }
+
+    /**
      * Whether span fill may admit a vector of {@code length} bytes: the store is below its slab target, or a
      * closed file has given back slots of that length (O3). Called under the write lock.
      *

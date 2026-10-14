@@ -176,7 +176,9 @@ public class KNNStatsTests extends KNNTestCase {
             "fallback_reads",
             "fallback_bytes",
             "switched_to_mmap",
-            "switched_to_direct" }) {
+            "switched_to_direct",
+            // O5's: staged miss reads widened to admit their neighbours.
+            "read_around_reads" }) {
             assertTrue(
                 "reads." + required + " must be exposed, saw " + directIO.get("reads").keySet(),
                 directIO.get("reads").containsKey(required)

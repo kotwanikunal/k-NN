@@ -205,6 +205,9 @@ public class KNNStats {
         reads.put("fallback_bytes", stats.fallbackBytes());
         reads.put("switched_to_mmap", stats.switchedToMmap());
         reads.put("switched_to_direct", stats.switchedToDirect());
+        // O5: staged miss reads widened to admit their neighbours. Against staged_reads this says how much
+        // of the staging was widened, and it is 0 whenever any of the three gates is shut.
+        reads.put("read_around_reads", stats.readAroundReads());
 
         final Map<String, Object> memory = new HashMap<>();
         // Drain first, so the number an operator reads is not stale by however long it has been since the

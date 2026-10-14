@@ -329,6 +329,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         private final AtomicLong wideBufferLive = new AtomicLong();
         private final AtomicLong wideBufferPeak = new AtomicLong();
         private final AtomicLong declinedWideBudget = new AtomicLong();
+        private final AtomicLong readAroundReads = new AtomicLong();
 
         private void recordInFlightPeak() {
             final long now = inFlightNow.get();
@@ -429,6 +430,21 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         /** Counts one range not staged because the wide-group sub-budget was reached. */
         void recordDeclinedWideBudget() {
             declinedWideBudget.incrementAndGet();
+        }
+
+        /** Counts one staged miss read widened by O5's read-around. */
+        void recordReadAround() {
+            readAroundReads.incrementAndGet();
+        }
+
+        /**
+         * Staged miss reads widened by {@code knn.direct_io.rescore.cache.read_around_bytes} (O5). Against
+         * {@code staged_reads} this says how much of the staging was widened; it is 0 at the setting's
+         * {@code 0b}, 0 once the store's target no longer leaves room for the whole file, and 0 with span
+         * fill off, which are the three gates.
+         */
+        public long readAroundReads() {
+            return readAroundReads.get();
         }
 
         /** Wide-group staging buffers held right now, in bytes. */
@@ -807,6 +823,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             switchedToDirect.set(0);
             wideBufferPeak.set(0);
             declinedWideBudget.set(0);
+            readAroundReads.set(0);
             // wideBufferLive is NOT reset here, for the reason directMemoryLive is not: it is a live gauge.
             // resetWideGaugeForTesting is the seam a test that measures an absolute against the cap uses.
             // directMemoryLive is NOT reset: it is a live gauge, not a counter, and zeroing it while buffers
@@ -829,7 +846,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                     + "directMemoryLive=%d directMemoryPeak=%d declinedBudget=%d "
                     + "arenasAllocated=%d arenasReused=%d arenasRetired=%d foreignThreadReads=%d "
                     + "fallbackReads=%d fallbackBytes=%d switchedToMmap=%d switchedToDirect=%d "
-                    + "wideBufferLive=%d wideBufferPeak=%d declinedWideBudget=%d amplification=%.3f",
+                    + "wideBufferLive=%d wideBufferPeak=%d declinedWideBudget=%d readAroundReads=%d amplification=%.3f",
                 routedOpens.get(),
                 declinedCompound.get(),
                 declinedChain.get(),
@@ -868,6 +885,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 wideBufferLive.get(),
                 wideBufferPeak.get(),
                 declinedWideBudget.get(),
+                readAroundReads.get(),
                 served == 0 ? 0.0 : (double) read / served
             );
         }
@@ -1094,6 +1112,14 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      */
     private long[] filteredOffsets;
     private int filteredCount;
+
+    /**
+     * How wide this burst may make a staged miss read so that the vectors around the one being fetched are
+     * admitted with it, or 0 for "do not widen it". O5. Read once per burst by {@link #beginBurst}, because
+     * the gates are a settings read and a store-wide byte comparison and the answer cannot change inside a
+     * burst without the staged geometry changing under a read.
+     */
+    private int burstReadAroundBytes;
 
     // -- Sequential read-ahead ring. Distinct from the burst table above: it holds no state in common with
     // it, is scanned independently in source(), and neither mechanism resets the other. Allocated lazily
@@ -1671,12 +1697,30 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         if (DirectIOVectorCache.isOn() && DirectIOVectorCache.contains(handle.fileId, absolute, Math.toIntExact(length))) {
             return;
         }
-        final long alignedStart = absolute - Math.floorMod(absolute, (long) blockSize);
-        final int alignedLength = alignUp(Math.toIntExact(absolute + length - alignedStart), blockSize);
+        long alignedStart = absolute - Math.floorMod(absolute, (long) blockSize);
+        int alignedLength = alignUp(Math.toIntExact(absolute + length - alignedStart), blockSize);
         if (alignedLength > maxStagedRangeBytes) {
             STATS.stageDeclined.incrementAndGet();
             STATS.declinedSpanBytes.addAndGet(length);
             return;
+        }
+        // O5: past here this range is a MISS -- the store does not hold it whole -- so while the whole file
+        // would still fit in the room the target leaves, widen it and let span fill harvest the neighbours.
+        // One read per miss stays one read; only its size changes. The widened window is still one aligned
+        // range, so nothing downstream changes: the span-fill walk clips to the reading slice and ends at
+        // the bytes the read returned, exactly as it does for a narrow one.
+        if (burstReadAroundBytes > alignedLength) {
+            final int want = Math.min(alignUp(burstReadAroundBytes, blockSize), maxStagedRangeBytes);
+            if (want > alignedLength) {
+                // Half the extra behind the request and the rest in front, clipped at the start of the file.
+                // Behind as well as in front because a candidate batch is scattered, so the next miss is as
+                // likely to be below this one as above it. The window still covers the request: the step
+                // back is at most the extra, and the window is `want` from the new start.
+                final long back = Math.min(alignedStart, alignUp((want - alignedLength) / 2, blockSize));
+                alignedStart -= back;
+                alignedLength = want;
+                STATS.recordReadAround();
+            }
         }
         final DirectIOStagingLease lease = ensureStagingTable();
         if (lease == null) {
@@ -2035,6 +2079,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             // that.
             refreshRoute();
             DirectIOVectorCache.applyConfiguredSize(directIOActive);
+            // O5, after the size refresh so the fit test is against the target the operator has just set.
+            burstReadAroundBytes = directIOActive ? DirectIOVectorCache.readAroundBytes(handle.fileLength) : 0;
         }
     }
 
