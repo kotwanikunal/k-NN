@@ -268,7 +268,7 @@ final class DirectIOStagingLease {
      * The buffer the next range of {@code alignedLength} bytes must be read into: this burst's next arena
      * slot when the range fits in one, else that slot's wide buffer, grown on demand.
      *
-     * @return null when the direct-memory budget refused a wide buffer
+     * @return null when the direct-memory budget or the wide-group sub-budget refused a wide buffer
      */
     ByteBuffer bufferFor(final int alignedLength) {
         if (alignedLength <= slotBytes) {
@@ -278,7 +278,17 @@ final class DirectIOStagingLease {
             if (DirectIOVectorIndexInput.fitsBudget(alignedLength, blockSize) == false) {
                 return null;
             }
-            wideBuffers[count] = DirectIOVectorIndexInput.trackedAllocate(alignedLength, blockSize);
+            // D3d (O2): and the wide buffers' own sub-budget, because these are the allocations a lease
+            // keeps for the life of its arena while the arena itself is reused. Declining costs this range
+            // its staging and nothing else -- the bytes are then served by a blocking read, the same
+            // fallback the overall budget's decline takes.
+            final ByteBuffer wide = DirectIOVectorIndexInput.allocateWideBuffer(alignedLength, blockSize);
+            if (wide == null) {
+                return null;
+            }
+            // Dropping the old buffer here is what returns its bytes: both charges hang off the one
+            // ByteBuffer, so the reclamation that returns it to the overall budget returns it to this one.
+            wideBuffers[count] = wide;
             wideFloats[count] = wideBuffers[count].asFloatBuffer();
         }
         return wideBuffers[count];

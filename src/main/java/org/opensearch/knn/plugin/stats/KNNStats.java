@@ -218,6 +218,14 @@ public class KNNStats {
         memory.put("arenas_reused", stats.arenasReused());
         memory.put("arenas_retired", stats.arenasRetired());
         memory.put("foreign_thread_reads", stats.foreignThreadReads());
+        // O2, D3d: the wide-group buffers a lease keeps beside its arena, and their own ceiling.
+        // wide_buffer_bytes against wide_buffer_budget_bytes is the headroom; declined_wide_budget rising
+        // while declined_budget stands still says the sub-budget and not the overall one is the bound that
+        // bit. 16-I's names.
+        memory.put("wide_buffer_bytes", stats.wideBufferLive());
+        memory.put("wide_buffer_peak_bytes", stats.wideBufferPeak());
+        memory.put("wide_buffer_budget_bytes", DirectIOVectorIndexInput.wideBufferBudgetBytes());
+        memory.put("declined_wide_budget", stats.declinedWideBudget());
 
         final Map<String, Object> cache = new HashMap<>();
         cache.put("hits", DirectIOVectorCache.hits());

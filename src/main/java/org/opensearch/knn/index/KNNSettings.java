@@ -331,6 +331,34 @@ public class KNNSettings {
         ByteSizeUnit.BYTES
     );
 
+    // D3d, phase 16-I I7, ported in O2. The wide-group buffers a DirectIOStagingLease keeps beside its
+    // arena: one per staged_ranges slot, each grown on demand to at most max_span_bytes, kept for the life
+    // of the arena and never shrunk. At the defaults that is 64 x 135,168 B = 8.25 MiB PER THREAD, and a
+    // lease is per thread with no bound on the number of leases, so 225 search threads reach 1.95 GB
+    // (MEASURED as arithmetic in phase 16-I FINDINGS I0.1; the buffers are grown lazily, so it is the worst
+    // case rather than the common one).
+    //
+    // knn.direct_io.direct_memory_budget already counts them, but that is one pot shared with the arenas and
+    // the read-ahead rings, and a wide buffer is held for the life of its lease while an arena is reused:
+    // wide buffers accumulating to the budget would leave no room for an arena, and then EVERY prefetch
+    // declines. A budget that wedges the feature is not a bound on it. So the wide buffers get a sub-budget
+    // of their own, checked with the overall one and never instead of it.
+    //
+    // 0b means DERIVE it: one quarter of knn.direct_io.direct_memory_budget, so an operator who has already
+    // sized that one does not have to size this. A quarter and not a half because the arenas are the
+    // mechanism's common case (phase 12 S3.1 measured the mean aligned span at 7,310 B, i.e. nearly every
+    // group fits an arena slot and needs no wide buffer at all) and they must always have room. With the
+    // direct-memory budget itself off the derived value is off too, which keeps the rule the budget has
+    // always had: a budget must never be the reason a shard cannot read its vectors.
+    //
+    // Past the cap bufferFor declines, the range is not staged, and the bytes are served by a blocking read
+    // -- the same fallback a queue-capacity or budget decline takes, already exercised on every arm.
+    public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET = "knn.direct_io.rescore.prefetch.wide_buffer_budget";
+    public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET_DEFAULT_VALUE = new ByteSizeValue(
+        0,
+        ByteSizeUnit.BYTES
+    );
+
     // Sequential read-ahead for DirectIOVectorIndexInput, a mechanism SEPARATE from the burst table above.
     // The burst table (staged_ranges / max_span_bytes) serves the rescore seam, whose access is random and
     // bursty and declared by prefetch() calls. A sequential bulk consumer -- a merge, the faiss-unquantized
@@ -674,6 +702,22 @@ public class KNNSettings {
     public static final Setting<ByteSizeValue> KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING = Setting.byteSizeSetting(
         KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN,
         KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_DEFAULT_VALUE,
+        NodeScope,
+        Dynamic
+    );
+
+    /**
+     * The node-wide ceiling on the wide-group buffers a {@code DirectIOStagingLease} holds beside its arena,
+     * past which the range is not staged and its bytes are served by a blocking read. D3d, phase 16-I I7,
+     * ported in O2.
+     *
+     * <p><b>{@code 0b} derives it</b> as a quarter of {@code knn.direct_io.direct_memory_budget} rather than
+     * disabling it, which is the opposite of what {@code 0b} means for that setting. See the comment on the
+     * key for why these buffers need a sub-budget at all when the overall one already counts them.
+     */
+    public static final Setting<ByteSizeValue> KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET_SETTING = Setting.byteSizeSetting(
+        KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET,
+        KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET_DEFAULT_VALUE,
         NodeScope,
         Dynamic
     );
@@ -1266,6 +1310,10 @@ public class KNNSettings {
             return KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING;
         }
 
+        if (KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET.equals(key)) {
+            return KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET_SETTING;
+        }
+
         if (KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES.equals(key)) {
             return KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_SETTING;
         }
@@ -1330,6 +1378,7 @@ public class KNNSettings {
             // The directory design's read-ahead channel: staging table size and the waste guard
             KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_SETTING,
             KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING,
+            KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET_SETTING,
             KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING,
             KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING,
             KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_SETTING,
@@ -1566,6 +1615,16 @@ public class KNNSettings {
      */
     public static ByteSizeValue getDirectIORescorePrefetchMaxSpan() {
         return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING);
+    }
+
+    /**
+     * The node-wide ceiling on wide-group staging buffers; {@code 0b} means derive it from
+     * {@code knn.direct_io.direct_memory_budget}. D3d.
+     *
+     * @return the configured wide-buffer budget, {@code 0b} for the derived one
+     */
+    public static ByteSizeValue getDirectIORescorePrefetchWideBufferBudget() {
+        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET_SETTING);
     }
 
     /**

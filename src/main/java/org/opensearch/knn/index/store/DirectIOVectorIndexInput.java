@@ -325,6 +325,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         private final AtomicLong fallbackBytes = new AtomicLong();
         private final AtomicLong switchedToMmap = new AtomicLong();
         private final AtomicLong switchedToDirect = new AtomicLong();
+        private final AtomicLong wideBufferLive = new AtomicLong();
+        private final AtomicLong wideBufferPeak = new AtomicLong();
+        private final AtomicLong declinedWideBudget = new AtomicLong();
 
         private void recordInFlightPeak() {
             final long now = inFlightNow.get();
@@ -363,6 +366,83 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         /** Returns {@code bytes} to the budget, when the buffer holding them has been reclaimed. */
         void recordDirectFree(final long bytes) {
             directMemoryLive.addAndGet(-bytes);
+        }
+
+        /** Charges {@code bytes} of wide-group buffer to its sub-budget and raises that peak. D3d, O2. */
+        void recordWideAllocation(final long bytes) {
+            raiseWidePeak(wideBufferLive.addAndGet(bytes));
+        }
+
+        /**
+         * Charges {@code bytes} of wide-group buffer only if the total stays at or under {@code cap}.
+         *
+         * <p>A compare-and-set loop rather than a read followed by an add, because a read-then-add is a
+         * check-then-act that every thread passes at once: MEASURED by 16-I at 64 threads against a 16 MiB
+         * cap, the advisory form reached 18,788,213 B, a 12% overshoot. It is the same protocol
+         * {@link DirectIOVectorCache}'s pending-allocation count uses to stop concurrent fills overshooting
+         * the slab target (N3), and for the same reason.
+         *
+         * @return true when the charge was taken, false when it would have exceeded {@code cap}
+         */
+        boolean reserveWide(final long bytes, final long cap) {
+            while (true) {
+                final long live = wideBufferLive.get();
+                if (live + bytes > cap) {
+                    return false;
+                }
+                if (wideBufferLive.compareAndSet(live, live + bytes)) {
+                    raiseWidePeak(live + bytes);
+                    return true;
+                }
+            }
+        }
+
+        private void raiseWidePeak(final long now) {
+            long peak = wideBufferPeak.get();
+            while (now > peak && wideBufferPeak.compareAndSet(peak, now) == false) {
+                peak = wideBufferPeak.get();
+            }
+        }
+
+        /**
+         * Returns {@code bytes} of wide-group buffer, when the buffer holding them has been reclaimed.
+         *
+         * <p>Floored at zero. A gauge that a reservation can bound must not be driveable negative by a
+         * return that is counted twice, because a negative gauge is room the cap would then hand out.
+         */
+        void recordWideFree(final long bytes) {
+            wideBufferLive.updateAndGet(live -> Math.max(0L, live - bytes));
+        }
+
+        /**
+         * Test seam: zeroes the wide-group gauge. The counter is node wide and its charges are returned by
+         * reachability, so without this one test's buffers are still charged while the next test measures --
+         * and the next test's claim is about an absolute figure against a cap. Safe because
+         * {@link #recordWideFree} is floored: a reclamation that arrives after a reset leaves it at zero.
+         */
+        void resetWideGaugeForTesting() {
+            wideBufferLive.set(0L);
+            wideBufferPeak.set(0L);
+        }
+
+        /** Counts one range not staged because the wide-group sub-budget was reached. */
+        void recordDeclinedWideBudget() {
+            declinedWideBudget.incrementAndGet();
+        }
+
+        /** Wide-group staging buffers held right now, in bytes. */
+        public long wideBufferLive() {
+            return wideBufferLive.get();
+        }
+
+        /** The high-water mark of {@link #wideBufferLive()}. */
+        public long wideBufferPeak() {
+            return wideBufferPeak.get();
+        }
+
+        /** Ranges not staged because the wide-group sub-budget was reached. */
+        public long declinedWideBudget() {
+            return declinedWideBudget.get();
         }
 
         /** Counts one prefetch declined because the direct-memory budget was reached. */
@@ -724,6 +804,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             fallbackBytes.set(0);
             switchedToMmap.set(0);
             switchedToDirect.set(0);
+            wideBufferPeak.set(0);
+            declinedWideBudget.set(0);
+            // wideBufferLive is NOT reset here, for the reason directMemoryLive is not: it is a live gauge.
+            // resetWideGaugeForTesting is the seam a test that measures an absolute against the cap uses.
             // directMemoryLive is NOT reset: it is a live gauge, not a counter, and zeroing it while buffers
             // are still held would make the budget let through exactly as much again.
         }
@@ -743,7 +827,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                     + "stagedWaitTimeouts=%d queuePeak=%d poolRebuilds=%d "
                     + "directMemoryLive=%d directMemoryPeak=%d declinedBudget=%d "
                     + "arenasAllocated=%d arenasReused=%d arenasRetired=%d foreignThreadReads=%d "
-                    + "fallbackReads=%d fallbackBytes=%d switchedToMmap=%d switchedToDirect=%d amplification=%.3f",
+                    + "fallbackReads=%d fallbackBytes=%d switchedToMmap=%d switchedToDirect=%d "
+                    + "wideBufferLive=%d wideBufferPeak=%d declinedWideBudget=%d amplification=%.3f",
                 routedOpens.get(),
                 declinedCompound.get(),
                 declinedChain.get(),
@@ -779,6 +864,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 fallbackBytes.get(),
                 switchedToMmap.get(),
                 switchedToDirect.get(),
+                wideBufferLive.get(),
+                wideBufferPeak.get(),
+                declinedWideBudget.get(),
                 served == 0 ? 0.0 : (double) read / served
             );
         }
@@ -819,10 +907,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      */
     private static final class Charge extends PhantomReference<ByteBuffer> {
         private final int bytes;
+        /** Whether this buffer is also charged to the wide-group sub-budget. D3d, O2. */
+        private final boolean wide;
 
-        private Charge(final ByteBuffer buffer, final int bytes) {
+        private Charge(final ByteBuffer buffer, final int bytes, final boolean wide) {
             super(buffer, RECLAIMED);
             this.bytes = bytes;
+            this.wide = wide;
         }
     }
 
@@ -859,6 +950,12 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * and when it does fire, the fallback is one {@code pread} of a few kilobytes.
      */
     static final long STAGED_READ_WAIT_MILLIS = 1000L;
+
+    /**
+     * What fraction of {@code knn.direct_io.direct_memory_budget} the wide-group buffers may hold when their
+     * own setting is at its {@code 0b} default: one in {@value}. See {@link #allocateWideBuffer}.
+     */
+    static final int WIDE_BUFFER_BUDGET_SHARE = 4;
 
     /** Hands out {@link #inputId}. Node wide, because a lease is per thread and meets inputs from anywhere. */
     private static final AtomicLong INPUT_IDS = new AtomicLong();
@@ -1540,8 +1637,12 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             STATS.recordDeclinedBudget();
             STATS.stageDeclined.incrementAndGet();
             log.debug(
-                "knn.direct_io.direct_memory_budget reached ({} B live); a wide prefetch range of {} declines",
+                "a direct-memory bound was reached ({} B live of the overall budget, {} B of the {} B "
+                    + "wide-group sub-budget); a wide prefetch range of {} declines. declined_wide_budget "
+                    + "says which of the two it was",
                 STATS.directMemoryLive(),
+                STATS.wideBufferLive(),
+                wideBufferBudgetBytes(),
                 handle.path
             );
             return;
@@ -1698,6 +1799,17 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * as real as the rest of it.
      */
     static ByteBuffer trackedAllocate(final int usableBytes, final int blockSize) {
+        return trackedAllocate(usableBytes, blockSize, false);
+    }
+
+    /**
+     * As {@link #trackedAllocate(int, int)}, tagging the charge as a wide-group buffer when {@code wide} so
+     * that one reclamation returns the bytes to both the overall budget and the sub-budget. D3d, O2.
+     *
+     * <p>The sub-budget is <b>not</b> charged here: {@link #allocateWideBuffer} has already reserved it, so
+     * that the cap is a bound rather than a hint.
+     */
+    static ByteBuffer trackedAllocate(final int usableBytes, final int blockSize, final boolean wide) {
         // D3c: drain here, on every allocation, and not only from fitsBudget. With the budget off fitsBudget
         // short-circuits, which left the phantom queue draining on stats reads alone -- and the node then
         // reported peak_bytes of 7.46 GB, 9.0 GB and 28 GB against a 2 GB wall. The drain is a non-blocking
@@ -1706,8 +1818,73 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final int bytes = Math.toIntExact(allocationBytes(usableBytes, blockSize));
         final ByteBuffer buffer = ByteBuffer.allocateDirect(bytes).alignedSlice(blockSize).order(ByteOrder.LITTLE_ENDIAN);
         STATS.recordDirectAllocation(bytes);
-        CHARGES.add(new Charge(buffer, bytes));
+        CHARGES.add(new Charge(buffer, bytes, wide));
         return buffer;
+    }
+
+    /**
+     * One block-aligned direct buffer for a coalesced group too wide for an arena slot, charged to the
+     * wide-group sub-budget as well as the overall one, or {@code null} when the sub-budget refuses it.
+     * D3d, phase 16-I's I7, ported in O2.
+     *
+     * <h4>Why these buffers need a cap of their own</h4>
+     * A {@link DirectIOStagingLease} keeps one wide buffer per {@code staged_ranges} slot, grown on demand
+     * to at most {@code max_span_bytes} and then <b>kept for the life of the arena</b>. At the defaults that
+     * is 64 x 135,168 B = 8.25 MiB per thread, and a lease is per thread with no bound on the number of
+     * threads: 225 search threads on a 64-vCPU node reach 1.95 GB. {@code knn.direct_io.direct_memory_budget}
+     * counts them, but it is one pot shared with the arenas, which are reused while these are held -- so wide
+     * buffers accumulating to the overall budget would leave no room for an arena and then every prefetch
+     * would decline. A budget that wedges the feature is not a bound on it.
+     *
+     * <p>{@code 0b} <b>derives</b> the cap as a quarter of the overall budget rather than disabling it, and
+     * a quarter because the arenas are the common case and must always have room: phase 12 S3.1 measured the
+     * mean aligned span at 7,310 B against an arena slot of 8,192, i.e. nearly every group needs no wide
+     * buffer at all. With the overall budget off the derived cap is off too, which keeps the rule the budget
+     * has always had: it must never be the reason a shard cannot read its vectors.
+     */
+    @Nullable
+    static ByteBuffer allocateWideBuffer(final int usableBytes, final int blockSize) {
+        final long charge = allocationBytes(usableBytes, blockSize);
+        final long cap = wideBufferBudgetBytes();
+        if (cap > 0) {
+            // Drain first, so the reservation is taken against a figure that does not count buffers the
+            // collector has already reclaimed; then reserve atomically, so the cap is a bound.
+            reclaim();
+            if (STATS.reserveWide(charge, cap) == false) {
+                STATS.recordDeclinedWideBudget();
+                return null;
+            }
+        } else {
+            STATS.recordWideAllocation(charge);
+        }
+        try {
+            return trackedAllocate(usableBytes, blockSize, true);
+        } catch (RuntimeException | OutOfMemoryError e) {
+            // The reservation outlives nothing: there is no buffer for a reclamation to hang on.
+            STATS.recordWideFree(charge);
+            throw e;
+        }
+    }
+
+    /**
+     * The wide-group sub-budget in bytes, derived from the overall budget when the setting is {@code 0b},
+     * and {@code 0} when it is off. A setting that cannot be read is treated as off, for the same reason
+     * {@link #fitsBudget} treats one that way.
+     */
+    public static long wideBufferBudgetBytes() {
+        try {
+            final ByteSizeValue configured = KNNSettings.getDirectIORescorePrefetchWideBufferBudget();
+            final long explicit = configured == null ? 0L : configured.getBytes();
+            if (explicit > 0) {
+                return explicit;
+            }
+            final ByteSizeValue overall = KNNSettings.getDirectIODirectMemoryBudget();
+            final long budget = overall == null ? 0L : overall.getBytes();
+            return budget <= 0 ? 0L : budget / WIDE_BUFFER_BUDGET_SHARE;
+        } catch (RuntimeException e) {
+            log.debug("Could not read the wide-group buffer budget; not bounding this allocation", e);
+            return 0L;
+        }
     }
 
     /**
@@ -1737,6 +1914,11 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             final Charge charge = (Charge) reference;
             if (CHARGES.remove(charge)) {
                 STATS.recordDirectFree(charge.bytes);
+                if (charge.wide) {
+                    // One reclamation, two counters: both charges hang off the one ByteBuffer, so the
+                    // sub-budget is returned exactly when the overall budget is. D3d, O2.
+                    STATS.recordWideFree(charge.bytes);
+                }
             }
         }
         return STATS.directMemoryLive();
