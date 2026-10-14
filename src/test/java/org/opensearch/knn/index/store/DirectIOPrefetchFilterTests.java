@@ -399,6 +399,142 @@ public class DirectIOPrefetchFilterTests extends KNNTestCase {
         }
     }
 
+    /**
+     * O4: the race's synchronous read is <b>admitted</b>, so the vector stops being a miss.
+     *
+     * <p>Before O4 it was not. M3 admits only from a staged read covering the vector whole, and a vector the
+     * filter dropped is not staged, so a vector the store lost between the filter and the read was fetched
+     * synchronously and its bytes thrown away. The one thing that makes this admissible without reopening
+     * that rule is the gate: only an offset <b>this burst's own filter call</b> dropped, which can only be a
+     * rescore candidate the store was holding moments ago.
+     *
+     * <p>The eviction here is driven through the store directly rather than through the input, because a read
+     * through the input would end the burst and the filter's answers belong to the burst that asked.
+     */
+    @SneakyThrows
+    public void testTheRacesSynchronousReadIsAdmitted() {
+        assumeDirectIOWorksHere();
+        writeFixture(12L);
+        configure(1, false);
+        final int slotsPerSlab = TEST_SLAB_BYTES / VECTOR_BYTES;
+
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+            assertNotNull(input);
+            final int[] batch = { 3, 9, 17 };
+            warm(input, batch);
+            final int[] uncached = new int[batch.length];
+            assertEquals(
+                "every candidate is cached, so the filter drops them all",
+                0,
+                input.selectUncachedOrdinals(HEADER_LENGTH, VECTOR_BYTES, batch, batch.length, uncached)
+            );
+
+            // Lose them, without touching the input: fills straight into the store reclaim its one slab.
+            final ByteBuffer staging = ByteBuffer.allocate(VECTOR_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+            for (int ordinal = 500; ordinal < 500 + 2 * slotsPerSlab; ordinal++) {
+                for (int i = 0; i < DIMENSION; i++) {
+                    staging.putFloat(i * Float.BYTES, vectors[ordinal][i]);
+                }
+                DirectIOVectorCache.put(fileId(), offsetOf(ordinal), staging, 0, VECTOR_BYTES);
+            }
+            assertFalse(
+                "the race is set up: the filter said cached and it is not",
+                DirectIOVectorCache.contains(fileId(), offsetOf(3), VECTOR_BYTES)
+            );
+
+            final long readmissionsBefore = DirectIOVectorCache.readmissions();
+            final long blockingBefore = DirectIOVectorIndexInput.STATS.blockingReads();
+            final float[] scratch = new float[DIMENSION];
+            input.seek(offsetOf(3));
+            input.readFloats(scratch, 0, DIMENSION);
+
+            assertArrayEquals("the bytes are the vector's own either way", vectors[3], scratch, 0.0f);
+            assertTrue("it went to the device synchronously", DirectIOVectorIndexInput.STATS.blockingReads() > blockingBefore);
+            assertTrue("and its bytes were kept", DirectIOVectorCache.contains(fileId(), offsetOf(3), VECTOR_BYTES));
+            assertEquals("counted as a race readmission", 1L, DirectIOVectorCache.raceReadmissions());
+            assertEquals(
+                "and under the existing readmissions key too, as BACKLOG asks",
+                readmissionsBefore + 1,
+                DirectIOVectorCache.readmissions()
+            );
+            // And it is the right bytes when served from the store afterwards.
+            final float[] fromStore = new float[DIMENSION];
+            assertTrue(DirectIOVectorCache.getFloats(fileId(), offsetOf(3), VECTOR_BYTES, fromStore, 0));
+            assertArrayEquals(vectors[3], fromStore, 0.0f);
+            DirectIOVectorCache.checkInvariantsForTesting();
+        }
+    }
+
+    /**
+     * O4's gate: a blocking read the filter never spoke about is still not admitted. That is the sequential
+     * channels' rule and O4 does not touch it -- the read-ahead ring buys a cache nothing and a blocking read
+     * is the fallback the cache exists to avoid.
+     */
+    @SneakyThrows
+    public void testABlockingReadWithNoFilterCallIsStillNotAdmitted() {
+        assumeDirectIOWorksHere();
+        writeFixture(13L);
+        configure(1, false);
+
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+            assertNotNull(input);
+            final float[] scratch = new float[DIMENSION];
+            // No prefetch and no filter call: a blocking read, which is what a sequential consumer makes.
+            input.seek(offsetOf(42));
+            input.readFloats(scratch, 0, DIMENSION);
+
+            assertArrayEquals(vectors[42], scratch, 0.0f);
+            assertTrue(DirectIOVectorIndexInput.STATS.blockingReads() > 0);
+            assertFalse("a blocking read is not admitted", DirectIOVectorCache.contains(fileId(), offsetOf(42), VECTOR_BYTES));
+            assertEquals(0L, DirectIOVectorCache.raceReadmissions());
+            assertEquals(0L, DirectIOVectorCache.insertions());
+        }
+    }
+
+    /**
+     * The filter's answers do not outlive their burst: a blocking read in a later burst for an offset an
+     * earlier burst's filter dropped is not this race and is not admitted. Without that, one filter call
+     * would make every later blocking read of those offsets admissible, which is the sequential rule gone.
+     */
+    @SneakyThrows
+    public void testTheFiltersAnswersDoNotOutliveTheirBurst() {
+        assumeDirectIOWorksHere();
+        writeFixture(14L);
+        configure(1, false);
+        final int slotsPerSlab = TEST_SLAB_BYTES / VECTOR_BYTES;
+
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+            assertNotNull(input);
+            final int[] batch = { 5 };
+            warm(input, batch);
+            final int[] uncached = new int[1];
+            assertEquals(0, input.selectUncachedOrdinals(HEADER_LENGTH, VECTOR_BYTES, batch, 1, uncached));
+
+            final ByteBuffer staging = ByteBuffer.allocate(VECTOR_BYTES).order(ByteOrder.LITTLE_ENDIAN);
+            for (int ordinal = 700; ordinal < 700 + 2 * slotsPerSlab; ordinal++) {
+                for (int i = 0; i < DIMENSION; i++) {
+                    staging.putFloat(i * Float.BYTES, vectors[ordinal][i]);
+                }
+                DirectIOVectorCache.put(fileId(), offsetOf(ordinal), staging, 0, VECTOR_BYTES);
+            }
+            assertFalse(DirectIOVectorCache.contains(fileId(), offsetOf(5), VECTOR_BYTES));
+
+            // Two unrelated reads, which is what it takes to get past the burst the filter answered in: the
+            // first joins that burst (nothing had been read since the filter call, so it is still open) and
+            // the second's prefetch is the boundary that ends it.
+            readVector(input, offsetOf(900), new float[DIMENSION]);
+            readVector(input, offsetOf(901), new float[DIMENSION]);
+            final long raceBefore = DirectIOVectorCache.raceReadmissions();
+
+            final float[] scratch = new float[DIMENSION];
+            input.seek(offsetOf(5));
+            input.readFloats(scratch, 0, DIMENSION);
+            assertArrayEquals(vectors[5], scratch, 0.0f);
+            assertEquals("the previous burst's filter must not make this admissible", raceBefore, DirectIOVectorCache.raceReadmissions());
+            assertFalse(DirectIOVectorCache.contains(fileId(), offsetOf(5), VECTOR_BYTES));
+        }
+    }
+
     /** Eight threads filtering, filling and evicting the same store: no wrong vector, no broken invariant. */
     @SneakyThrows
     public void testConcurrentFilterFillAndEvict() {

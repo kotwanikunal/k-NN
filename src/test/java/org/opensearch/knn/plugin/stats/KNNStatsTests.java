@@ -133,7 +133,9 @@ public class KNNStatsTests extends KNNTestCase {
                 "slab_alloc_failures",
                 // O3: the entries a closed .vec gave back, and the files they came from.
                 "closed_files",
-                "closed_file_entries"
+                "closed_file_entries",
+                // O4: the filter-then-read race's re-admissions, also inside readmissions.
+                "race_readmissions"
             ),
             directIO.get("cache").keySet()
         );

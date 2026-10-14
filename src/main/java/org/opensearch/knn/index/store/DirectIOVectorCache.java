@@ -279,6 +279,8 @@ public final class DirectIOVectorCache {
     /** Files whose entries were freed at close, and the entries that went with them. O3. */
     private static final LongAdder closedFiles = new LongAdder();
     private static final LongAdder closedFileEntries = new LongAdder();
+    /** Vectors put back after the filter-then-read race lost them. Also counted in readmissions. O4. */
+    private static final LongAdder raceReadmissions = new LongAdder();
 
     private DirectIOVectorCache() {}
 
@@ -604,6 +606,69 @@ public final class DirectIOVectorCache {
                     return;
                 }
             }
+        } finally {
+            request.finish();
+        }
+    }
+
+    /**
+     * Admits the vector a blocking read had to fetch because the store lost it between N1's prefetch filter
+     * and {@code readFloats}, <b>without evicting anything</b>. O4, {@code CHALLENGES.md} item 13.
+     *
+     * <h4>The race, and why it leaves a vector uncached without this</h4>
+     * Since N1 the prefetch filter asks {@link #contains} and drops the ordinals the store holds, so those
+     * vectors are not staged. A vector evicted in the window between that check and the read is then a
+     * <em>blocking</em> read, and M3's admission rule is "only from a staged read covering the vector whole",
+     * so its bytes were thrown away. The next batch asking for it would stage and admit it, so this
+     * self-heals; what it costs until then is one synchronous device read, which is the 12 to 22 per 5,000
+     * queries the node measured in S2 and S3 (ref/RESULTS-N.md).
+     *
+     * <h4>Why this does not reopen the "a blocking read is not admitted" rule</h4>
+     * That rule is about the sequential channels: the read-ahead ring buys a cache nothing and would evict
+     * the random path's working set, and a blocking read is the fallback the cache exists to avoid. This is
+     * neither. The caller admits only an offset <b>its own prefetch filter dropped in this burst</b>
+     * ({@code DirectIOVectorIndexInput#wasFilteredAsCached}), which can only be a rescore candidate the
+     * store was holding moments ago, i.e. exactly the working set. And it places with eviction refused, so
+     * it can take a free slot or a slab the target allows and nothing else: a vector the store lost cannot
+     * cost another vector its slot.
+     *
+     * @return whether the vector was admitted
+     */
+    static boolean readmitAfterRace(final String fileId, final long offset, final ByteBuffer source, final int position, final int length) {
+        if (maxSlabs == 0 || length <= 0 || (length & 3) != 0 || offset < 0 || length > slabBytes) {
+            return false;
+        }
+        final SlabRequest request = new SlabRequest();
+        try {
+            for (int round = 0; round < 2; round++) {
+                LOCK.writeLock().lock();
+                try {
+                    if (locate(INDEX.get(fileId), offset, length) >= 0) {
+                        // Another thread put it back while this read was in flight, which is the same race
+                        // one turn later and needs nothing from this one.
+                        return false;
+                    }
+                    request.wanted = false;
+                    final Placement placement = place(fileId, length, false, request);
+                    if (placement != null) {
+                        placement.slab.memory.bytes().put(placement.slot * length, source, position, length);
+                        attach(placement.slab, placement.slot, placement.map, offset);
+                        insertions.increment();
+                        // Both counters: BACKLOG asks for this under the existing readmissions key, and
+                        // race_readmissions keeps the two sources separable, because readmissions otherwise
+                        // means second chances alone and the re-proof reads it arm against arm.
+                        readmissions.increment();
+                        raceReadmissions.increment();
+                        return true;
+                    }
+                } finally {
+                    LOCK.writeLock().unlock();
+                }
+                if (request.wanted == false || allocateOutsideLock(request) == false) {
+                    return false;
+                }
+            }
+            return false;
         } finally {
             request.finish();
         }
@@ -1579,6 +1644,20 @@ public final class DirectIOVectorCache {
     }
 
     /**
+     * Vectors a blocking read put back after the filter-then-read race lost them (O4). These are also
+     * counted in {@link #readmissions()}, which BACKLOG asks for; this key is what keeps the two sources of
+     * a readmission separable, because the other one is the second chance.
+     *
+     * <p>What it says: the race happened this often and cost a synchronous device read each time, and the
+     * vector is cached again rather than staying a miss. Non-zero and rising with a <em>stable</em> hit rate
+     * is the race doing what it does; non-zero and rising while the hit rate falls means the store is
+     * thrashing and the eviction, not the race, is the thing to look at.
+     */
+    public static long raceReadmissions() {
+        return raceReadmissions.sum();
+    }
+
+    /**
      * How this node allocates off-heap slabs for cached vectors: {@code "ffm"} when
      * {@code java.lang.foreign.Arena} resolved and proved itself on this runtime, else
      * {@code "direct_buffer"}. Reported as {@code direct_io_stats.cache.slab_memory} because the two differ
@@ -1629,6 +1708,7 @@ public final class DirectIOVectorCache {
         slabAllocFailures.reset();
         closedFiles.reset();
         closedFileEntries.reset();
+        raceReadmissions.reset();
     }
 
     /**

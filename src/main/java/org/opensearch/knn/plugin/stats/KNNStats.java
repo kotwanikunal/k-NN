@@ -246,6 +246,9 @@ public class KNNStats {
         // the live ones nothing.
         cache.put("closed_files", DirectIOVectorCache.closedFiles());
         cache.put("closed_file_entries", DirectIOVectorCache.closedFileEntries());
+        // O4: vectors put back after the filter-then-read race lost them. Also inside readmissions, which
+        // BACKLOG asks for; this key is what keeps the race separable from the second chance.
+        cache.put("race_readmissions", DirectIOVectorCache.raceReadmissions());
 
         final Map<String, Map<String, Object>> directIOStats = new HashMap<>();
         directIOStats.put("dispatch", dispatch);

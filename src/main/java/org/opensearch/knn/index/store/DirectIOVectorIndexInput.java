@@ -24,6 +24,7 @@ import java.nio.file.Files;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.Arrays;
 import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.Callable;
@@ -1081,6 +1082,19 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      */
     private boolean burstConfigured;
 
+    /**
+     * The absolute file offsets N1's prefetch filter dropped as cached in this burst, sorted ascending, and
+     * how many of them are valid. Cleared by {@link #endBurst}. O4.
+     *
+     * <p>This is what makes the filter-then-read race recoverable. A vector the filter dropped is not staged,
+     * so if the store loses it before {@link #readFloats} the read is a blocking one and M3's rule throws its
+     * bytes away. Knowing that <em>this</em> blocking read is for a vector the filter believed cached is what
+     * distinguishes it from a sequential scan's blocking read, which must still not be admitted. Bounded by
+     * the batch the caller hands in, so one long per candidate and nothing per burst that has no filter call.
+     */
+    private long[] filteredOffsets;
+    private int filteredCount;
+
     // -- Sequential read-ahead ring. Distinct from the burst table above: it holds no state in common with
     // it, is scanned independently in source(), and neither mechanism resets the other. Allocated lazily
     // on the first arm, so a non-sequential input never pays for it; null until then. --
@@ -1546,7 +1560,56 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         if (sliceOffset < 0 || base < 0) {
             return -1;
         }
-        return DirectIOVectorCache.selectMissing(handle.fileId, base, (int) vectorBytes, ords, numOrds, uncached);
+        final int missing = DirectIOVectorCache.selectMissing(handle.fileId, base, (int) vectorBytes, ords, numOrds, uncached);
+        if (missing >= 0 && missing < numOrds) {
+            recordFilteredAsCached(base, (int) vectorBytes, ords, numOrds, uncached, missing);
+        }
+        return missing;
+    }
+
+    /**
+     * Remembers the offsets this filter call dropped, which is {@code ords \ uncached}, so that a blocking
+     * read for one of them can be admitted rather than thrown away (O4). Sorted, so the read path's check is
+     * a binary search.
+     *
+     * <p>{@code uncached[0..missing)} is a subsequence of {@code ords[0..numOrds)} in order -- the store
+     * writes the misses out as it walks the batch -- so the complement is found in one pass over both, with
+     * no set and no allocation beyond growing the scratch once per input.
+     */
+    private void recordFilteredAsCached(
+        final long base,
+        final int vectorBytes,
+        final int[] ords,
+        final int numOrds,
+        final int[] uncached,
+        final int missing
+    ) {
+        final int dropped = numOrds - missing;
+        if (filteredOffsets == null || filteredOffsets.length < dropped) {
+            filteredOffsets = new long[Math.max(dropped, 64)];
+        }
+        int at = 0;
+        int next = 0;
+        for (int i = 0; i < numOrds && at < dropped; i++) {
+            if (next < missing && uncached[next] == ords[i]) {
+                next++;
+                continue;
+            }
+            filteredOffsets[at++] = base + (long) ords[i] * vectorBytes;
+        }
+        filteredCount = at;
+        // The batch's ordinals are not sorted when the filter runs -- PrefetchHelper sorts what is left of
+        // them afterwards -- so this does its own sort, over at most the batch's size.
+        Arrays.sort(filteredOffsets, 0, filteredCount);
+    }
+
+    /**
+     * Whether N1's prefetch filter dropped the vector at {@code absoluteOffset} as cached in this burst. The
+     * gate on O4's re-admission: a blocking read for one of these is the filter-then-read race and its bytes
+     * are worth keeping, where any other blocking read is a sequential channel's and is not.
+     */
+    private boolean wasFilteredAsCached(final long absoluteOffset) {
+        return filteredCount > 0 && Arrays.binarySearch(filteredOffsets, 0, filteredCount, absoluteOffset) >= 0;
     }
 
     /**
@@ -2056,6 +2119,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         leaseThreadId = -1;
         readSincePrefetch = false;
         burstConfigured = false;
+        // O4: the filter's answers belong to the burst that asked. A blocking read in the next burst for an
+        // offset this one dropped is not this race.
+        filteredCount = 0;
         // The burst boundary is also where the pool reference is dropped, so the next burst picks up a pool
         // rebuilt by a capacity change. See ensureStagingTable.
         pool = null;
@@ -2169,6 +2235,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 // already holds (M4). Done here rather than anywhere else because this is the one point
                 // where the bytes are known to be valid, the vector length is known, and the range is known.
                 spanFill(source.range, runStart, requested);
+            } else if (written == 0 && usableFloats == count && wasFilteredAsCached(runStart)) {
+                // O4: the filter-then-read race. This vector was cached when N1's filter checked it, so it
+                // was not staged, and it is not cached now -- the store lost it in between and this read went
+                // to the device synchronously. Keeping its bytes is what stops it staying a miss. It is
+                // admitted without evicting anything; see DirectIOVectorCache#readmitAfterRace for why this
+                // is not the "a blocking read is not admitted" rule being reopened.
+                DirectIOVectorCache.readmitAfterRace(handle.fileId, runStart, source.buffer, source.position, requested);
             }
             filePointer += (long) usableFloats * Float.BYTES;
             written += usableFloats;
