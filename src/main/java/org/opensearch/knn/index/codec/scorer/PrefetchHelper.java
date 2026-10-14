@@ -137,6 +137,10 @@ public class PrefetchHelper {
      * pass the cap rather than handed over to be declined (P1): one more staged read of the same bytes,
      * where before there was one blocking read per vector and no admission. Every other input keeps today's
      * grouping exactly, because {@link #spanCap} answers {@link Long#MAX_VALUE} for it.
+     * <p>
+     * Under the {@code bytes} read profile (P2) a Direct I/O input's group is also closed whenever the next
+     * vector's first block does not overlap or touch the group's last, so that no read carries a block
+     * holding no byte of a missing vector. {@code ops}, the default, is the grouping above unchanged.
      *
      * @param indexInput the index input to prefetch from
      * @param baseOffset the base offset in the file where vectors start
@@ -154,6 +158,9 @@ public class PrefetchHelper {
     ) throws IOException {
         final DirectIOVectorIndexInput directIOInput = indexInput instanceof DirectIOVectorIndexInput in ? in : null;
         final long spanCap = spanCap(directIOInput);
+        // Both read once per batch rather than per candidate: the span cap comes from a setting the input
+        // read at open and the profile is static, so neither can change under one grouping pass.
+        final boolean byBytes = directIOInput != null && directIOInput.groupsByBytes();
         int groupCount = 1;
         long groupStartOffset = baseOffset + (long) ordsToPrefetch[0] * oneVectorByteSize;
         long groupEndOffset = groupStartOffset + oneVectorByteSize;
@@ -161,12 +168,14 @@ public class PrefetchHelper {
         for (int i = 1; i < numOrds; i++) {
             long currentOffset = baseOffset + (long) ordsToPrefetch[i] * oneVectorByteSize;
             long currentEndOffset = currentOffset + oneVectorByteSize;
-            // Two reasons to close the group, and the second one never fires for an input with no span cap:
-            // the 128 KB group budget, and the span the input would actually have to stage for it. A group of
-            // one is always handed over whatever its aligned length, because splitting cannot make a single
-            // vector smaller.
+            // Three reasons to close the group, and the last two never fire for an input with no span cap and
+            // no profile: the 128 KB group budget; the span the input would actually have to stage for it
+            // (P1); and, under the bytes profile, a gap of a whole block or more between this vector and the
+            // group (P2). A group of one is always handed over whatever its aligned length, because splitting
+            // cannot make a single vector smaller.
             if ((currentEndOffset - groupStartOffset) > BYTES_128
-                || exceedsSpanCap(directIOInput, spanCap, groupStartOffset, currentEndOffset - groupStartOffset)) {
+                || exceedsSpanCap(directIOInput, spanCap, groupStartOffset, currentEndOffset - groupStartOffset)
+                || (byBytes && leavesAGapBlock(directIOInput, groupEndOffset, currentOffset))) {
                 indexInput.prefetch(groupStartOffset, groupEndOffset - groupStartOffset);
                 groupCount++;
                 groupStartOffset = currentOffset;
@@ -191,5 +200,22 @@ public class PrefetchHelper {
     /** Whether staging {@code [offset, offset + length)} on {@code input} would be declined by its cap. */
     private static boolean exceedsSpanCap(final DirectIOVectorIndexInput input, final long spanCap, final long offset, final long length) {
         return input != null && input.alignedSpanBytes(offset, length) > spanCap;
+    }
+
+    /**
+     * Whether adding the vector at {@code nextOffset} to a group ending at {@code groupEndOffset} would put a
+     * block carrying none of the group's bytes and none of that vector's into the read. P2's {@code bytes}
+     * rule.
+     *
+     * <p>The comparison is on block <em>indexes</em> and not on byte distance, because what the device reads
+     * is whole blocks: two misses 10 bytes apart across a boundary are in adjacent blocks and share a read,
+     * while two misses 4,000 bytes apart can be too. The group's last block is the one holding
+     * {@code groupEndOffset - 1}, its last byte; the vector's first block is the one holding its first byte.
+     * They may be the same block (two misses in one block, one read) or adjacent (one read); a difference of
+     * two or more means at least one block in between holds nothing either of them needs, and the group
+     * closes.
+     */
+    private static boolean leavesAGapBlock(final DirectIOVectorIndexInput input, final long groupEndOffset, final long nextOffset) {
+        return input.blockIndexOf(nextOffset) > input.blockIndexOf(groupEndOffset - 1) + 1;
     }
 }

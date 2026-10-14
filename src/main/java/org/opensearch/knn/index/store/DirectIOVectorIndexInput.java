@@ -979,6 +979,12 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     /** Hands out {@link #inputId}. Node wide, because a lease is per thread and meets inputs from anywhere. */
     private static final AtomicLong INPUT_IDS = new AtomicLong();
 
+    /**
+     * The resolved {@code knn.direct_io.rescore.read_profile}, or null until it has been read once. P2. See
+     * {@link #readProfile()} for why it is cached and why an unresolvable read is not.
+     */
+    private static volatile String readProfile;
+
     private final Handle handle;
     /**
      * The delegate's own input over the same bytes, kept open beside the {@code O_DIRECT} channel, or
@@ -1543,6 +1549,77 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final long alignedStart = absolute - Math.floorMod(absolute, blockSize);
         final long span = absolute + length - alignedStart;
         return ((span + blockSize - 1) / blockSize) * blockSize;
+    }
+
+    /**
+     * Which block of the file the byte at {@code sliceOffset} lies in, counted from the start of the file.
+     *
+     * <p><b>P2's accessor.</b> The {@code bytes} profile groups by blocks rather than by span: a missing
+     * vector joins the current group only when its first block overlaps or touches the group's last, so that
+     * no read carries a block holding no byte of a missing vector. Like {@link #alignedSpanBytes} it is taken
+     * over the absolute offset, for the same reason, and it reads nothing.
+     *
+     * @param sliceOffset a byte offset relative to this input
+     * @return the index of the block containing it
+     */
+    public long blockIndexOf(final long sliceOffset) {
+        return Math.floorDiv(this.offset + sliceOffset, (long) handle.blockSize);
+    }
+
+    /**
+     * Whether this input's reads are shaped by the {@code bytes} profile rather than by {@code ops}.
+     *
+     * <p>Node wide and read once (see {@link #readProfile()}), but asked of the input because the profile
+     * applies <b>only</b> to Direct I/O inputs: an mmap input keeps today's grouping whatever the profile is
+     * set to, so that the baseline every measurement is taken against cannot move.
+     *
+     * @return true for {@code bytes}
+     */
+    public boolean groupsByBytes() {
+        return KNNSettings.KNN_DIRECT_IO_RESCORE_READ_PROFILE_BYTES.equals(readProfile());
+    }
+
+    /**
+     * The node's read profile, {@code ops} or {@code bytes}, read from the node's own settings once.
+     *
+     * <p><b>Once, and cached, because the setting is static.</b> It is not {@code Dynamic}: a
+     * {@code _cluster/settings} PUT reaches every node, and in a cluster of mixed instance types that would
+     * flatten one device's profile onto the other's nodes. So there is no burst boundary at which it could
+     * change and no reason to read it per batch.
+     *
+     * <p>Resolution is lazy rather than in a static initializer, and an unresolvable read is <b>not</b>
+     * cached: {@link KNNSettings#getDirectIORescoreReadProfileOrNull} answers null while the plugin has no
+     * cluster service, which happens in harnesses and during node construction, and caching the default
+     * answered then would pin it for the life of the JVM. A node that never initializes the plugin reads
+     * {@code ops} every time, which is the default anyway.
+     *
+     * @return {@code ops} or {@code bytes}
+     */
+    public static String readProfile() {
+        final String cached = readProfile;
+        if (cached != null) {
+            return cached;
+        }
+        final String resolved = KNNSettings.getDirectIORescoreReadProfileOrNull();
+        if (resolved == null) {
+            return KNNSettings.KNN_DIRECT_IO_RESCORE_READ_PROFILE_DEFAULT_VALUE;
+        }
+        readProfile = resolved;
+        log.info(
+            "Direct I/O rescore reads use the [{}] read profile ({} = {}); {}",
+            resolved,
+            KNNSettings.KNN_DIRECT_IO_RESCORE_READ_PROFILE,
+            resolved,
+            KNNSettings.KNN_DIRECT_IO_RESCORE_READ_PROFILE_BYTES.equals(resolved)
+                ? "a staged read carries no block without a missing vector's bytes in it"
+                : "a staged read coalesces a group of up to 128 KB, gap bytes included"
+        );
+        return resolved;
+    }
+
+    /** Test seam: forget the resolved profile, so the next read takes it from the settings again. */
+    static void resetReadProfileForTesting() {
+        readProfile = null;
     }
 
     /** Windows the sequential read-ahead ring keeps in flight, after the setting was read at open. */

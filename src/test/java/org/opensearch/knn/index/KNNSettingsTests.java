@@ -343,10 +343,54 @@ public class KNNSettingsTests extends KNNTestCase {
             KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS,
             KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES,
             KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN,
+            KNNSettings.KNN_DIRECT_IO_RESCORE_READ_PROFILE,
             KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW,
             KNNSettings.KNN_DIRECT_IO_READAHEAD_TRIGGER
         )) {
             assertTrue(key + " is not registered", registeredKeys.contains(key));
+        }
+    }
+
+    /**
+     * P2's read profile: two values, {@code ops} by default, and <b>not</b> dynamic.
+     *
+     * <p>The static property is the load-bearing one. A {@code _cluster/settings} PUT reaches every node in
+     * the cluster, and the profile is a property of a node's <em>device</em>: in a cluster of mixed instance
+     * types a dynamic key would flatten one device's profile onto the other's nodes. The control plane writes
+     * it to {@code opensearch.yml} per instance type, and an instance type change is a blue/green.
+     */
+    public void testDirectIOReadProfile_isAStaticNodeSettingWithTwoValues() {
+        final Setting<String> setting = KNNSettings.KNN_DIRECT_IO_RESCORE_READ_PROFILE_SETTING;
+        final EnumSet<Setting.Property> properties = setting.getProperties();
+        assertTrue(properties.contains(Setting.Property.NodeScope));
+        assertFalse("the read profile must not be dynamic", properties.contains(Setting.Property.Dynamic));
+        assertFalse(properties.contains(Setting.Property.IndexScope));
+        assertFalse(properties.contains(Setting.Property.Final));
+        assertFalse("and so a cluster settings PUT must not be able to carry it", setting.isDynamic());
+
+        assertEquals("ops", setting.getDefault(Settings.EMPTY));
+        assertEquals("ops", setting.get(Settings.EMPTY));
+        assertEquals("ops", setting.get(Settings.builder().put(setting.getKey(), "ops").build()));
+        assertEquals("bytes", setting.get(Settings.builder().put(setting.getKey(), "bytes").build()));
+        // Whitespace an operator's yaml may leave behind is not a different profile.
+        assertEquals("bytes", setting.get(Settings.builder().put(setting.getKey(), " bytes ").build()));
+    }
+
+    /**
+     * Any other value fails, and the message names both profiles. Thrown from the setting's own parser, so
+     * {@code SettingsModule}'s validation of registered node settings fails node start rather than letting
+     * a typo silently read as one of the two.
+     */
+    public void testDirectIOReadProfile_rejectsAnythingElse() {
+        final Setting<String> setting = KNNSettings.KNN_DIRECT_IO_RESCORE_READ_PROFILE_SETTING;
+        for (String bad : List.of("nvme", "ebs", "auto", "OPS", "Bytes", "iops", "")) {
+            final IllegalArgumentException thrown = expectThrows(
+                IllegalArgumentException.class,
+                () -> setting.get(Settings.builder().put(setting.getKey(), bad).build())
+            );
+            assertTrue("the message must name ops: " + thrown.getMessage(), thrown.getMessage().contains("[ops]"));
+            assertTrue("and bytes: " + thrown.getMessage(), thrown.getMessage().contains("[bytes]"));
+            assertTrue("and the key: " + thrown.getMessage(), thrown.getMessage().contains(setting.getKey()));
         }
     }
 

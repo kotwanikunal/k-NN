@@ -341,6 +341,42 @@ public class KNNSettings {
     public static final String KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES = "knn.direct_io.rescore.cache.read_around_bytes";
     public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES_DEFAULT_VALUE = new ByteSizeValue(64, ByteSizeUnit.KB);
 
+    // P2, P16-2. The shape of a staged read, which has to follow the device, and which device a node has is
+    // the deployer's knowledge and not the plugin's.
+    //
+    // MEASURED. The same build wins on an EBS node (r7g.xlarge, gp3 3,000 IOPS: throughput +35 / +43 / +48%
+    // against mmap in three regimes) and loses or ties on an instance-store node (r7gd.xlarge, nvme1n1,
+    // 67,083 rated random 4 KiB read IOPS, about 275-295 MB/s measured byte cap: -25 / -6 / -8.5%), for one
+    // reason (ref/RESULTS-NVME.md). A staged read carries the gaps between the misses it coalesces: in the
+    // r3 regime 63 reads a query at 12.2 KB is 772 KB a query, 2.44x mmap's 314-340 KB, at 1.22 misses a
+    // read, and that device is limited by bytes. On gp3 the reads are the scarce resource and the same
+    // coalescing is why the slab wins there.
+    //
+    // So this is an operator setting, NOT device sensing (Kunal, 2026-10-14: sensing the device is beyond the
+    // scope of k-NN). The AOS control plane sets it per instance type, the way it sets the heap and
+    // node.search.cache.size. There is no `auto` value and nothing is read from /sys, /proc, statfs,
+    // FileStore or a mount table to pick it.
+    //
+    // ops (default) today's coalescing, plus P1's split at the span cap. For a read-limited device: a
+    // read carries whatever gaps lie inside its 128 KB group, which is how 63 reads a query serve
+    // 77 missing vectors.
+    // bytes a missing vector joins the current group only if its aligned block range overlaps or touches
+    // the group's last block, so no read carries a block holding no byte of a missing vector. Two
+    // misses in one block, or in adjacent blocks, still share one read. Every miss is still staged,
+    // so admission and span fill work exactly as they do under `ops`.
+    //
+    // NodeScope and STATIC, deliberately. A _cluster/settings PUT reaches every node, and in a cluster of
+    // mixed instance types that would flatten the setting onto nodes whose device wants the other profile;
+    // the control plane writes it to opensearch.yml, and an instance type change is a blue/green. An
+    // unknown value fails node start, naming the two values, because SettingsModule validates every
+    // registered NodeScope setting against the node's settings at startup.
+    public static final String KNN_DIRECT_IO_RESCORE_READ_PROFILE = "knn.direct_io.rescore.read_profile";
+    /** Today's coalescing: a read may carry the gap bytes between the misses it coalesces. */
+    public static final String KNN_DIRECT_IO_RESCORE_READ_PROFILE_OPS = "ops";
+    /** No gap blocks: a read carries only blocks that hold a byte of some missing vector. */
+    public static final String KNN_DIRECT_IO_RESCORE_READ_PROFILE_BYTES = "bytes";
+    public static final String KNN_DIRECT_IO_RESCORE_READ_PROFILE_DEFAULT_VALUE = KNN_DIRECT_IO_RESCORE_READ_PROFILE_OPS;
+
     public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN = "knn.direct_io.rescore.prefetch.max_span_bytes";
     public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_DEFAULT_VALUE = new ByteSizeValue(
         128 * 1024 + 4096,
@@ -806,6 +842,43 @@ public class KNNSettings {
         NodeScope,
         Dynamic
     );
+
+    /**
+     * The read profile: see {@link #KNN_DIRECT_IO_RESCORE_READ_PROFILE} for the measurement it exists for and
+     * why it is static. {@code NodeScope} and <b>not</b> {@code Dynamic}.
+     */
+    public static final Setting<String> KNN_DIRECT_IO_RESCORE_READ_PROFILE_SETTING = new Setting<>(
+        KNN_DIRECT_IO_RESCORE_READ_PROFILE,
+        KNN_DIRECT_IO_RESCORE_READ_PROFILE_DEFAULT_VALUE,
+        KNNSettings::parseReadProfile,
+        NodeScope
+    );
+
+    /**
+     * Accepts only {@code ops} and {@code bytes}, and names both in the failure.
+     *
+     * <p>Thrown from the setting's own parser, so a node whose {@code opensearch.yml} carries a typo fails to
+     * start rather than reading whichever profile the typo happened to fall back to. {@code SettingsModule}
+     * validates every registered {@code NodeScope} setting against the node's settings during node
+     * construction, which is where this runs.
+     */
+    static String parseReadProfile(final String value) {
+        final String trimmed = value == null ? "" : value.trim();
+        if (KNN_DIRECT_IO_RESCORE_READ_PROFILE_OPS.equals(trimmed) || KNN_DIRECT_IO_RESCORE_READ_PROFILE_BYTES.equals(trimmed)) {
+            return trimmed;
+        }
+        throw new IllegalArgumentException(
+            "["
+                + KNN_DIRECT_IO_RESCORE_READ_PROFILE
+                + "] must be ["
+                + KNN_DIRECT_IO_RESCORE_READ_PROFILE_OPS
+                + "] or ["
+                + KNN_DIRECT_IO_RESCORE_READ_PROFILE_BYTES
+                + "], but was ["
+                + value
+                + "]"
+        );
+    }
 
     /**
      * How wide a staged miss read may be made so that the vectors around the one being fetched are admitted
@@ -1419,6 +1492,8 @@ public class KNNSettings {
             KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING,
             KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_SETTING,
             KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_SETTING,
+            // P2: the read shape, static because a cluster can hold more than one instance type
+            KNN_DIRECT_IO_RESCORE_READ_PROFILE_SETTING,
             // Sequential read-ahead ring: window and arm trigger
             KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING,
             KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_SETTING,
@@ -1644,6 +1719,38 @@ public class KNNSettings {
      */
     public static boolean isDirectIORescoreCacheSpanFillEnabled() {
         return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_SETTING);
+    }
+
+    /**
+     * The read profile as this node's own settings spell it, or {@code null} when they cannot be read yet.
+     *
+     * <p><b>Read from {@code clusterService.getSettings()}, which is the node's settings, and deliberately
+     * not through {@link #getNodeSettingValueOrDefault}.</b> That helper answers a setting's default whenever
+     * there is no cluster service, which is right for a dynamic setting that will be re-read on the next
+     * burst and wrong for this one: the profile is read once and cached, so a default answered because the
+     * plugin was not initialized yet would be cached for the life of the node. A {@code null} here means
+     * "not resolvable yet, ask again", and the caller is {@code DirectIOVectorIndexInput#readProfile}.
+     *
+     * <p>A {@code Settings} that does not carry the key answers the setting's default, {@code ops}, which is
+     * the node saying it was not set. That is not the same thing as not being able to ask.
+     *
+     * @return {@code ops}, {@code bytes}, or {@code null} when the node's settings are not available
+     */
+    public static String getDirectIORescoreReadProfileOrNull() {
+        try {
+            final ClusterService currentClusterService = state().clusterService;
+            if (currentClusterService == null) {
+                return null;
+            }
+            final Settings nodeSettings = currentClusterService.getSettings();
+            if (nodeSettings == null) {
+                return null;
+            }
+            return KNN_DIRECT_IO_RESCORE_READ_PROFILE_SETTING.get(nodeSettings);
+        } catch (Exception e) {
+            logger.warn("Could not read setting [" + KNN_DIRECT_IO_RESCORE_READ_PROFILE + "]", e);
+            return null;
+        }
     }
 
     /**

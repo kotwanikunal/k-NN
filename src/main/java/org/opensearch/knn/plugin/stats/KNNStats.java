@@ -112,7 +112,14 @@ public class KNNStats {
      *       and 783k device reads per 5,000 queries at an effective capacity of 64 against 0% and 707k at
      *       1,024. {@code queue_peak} is the occupancy high-water mark the derived default is validated
      *       against, and {@code pool_rebuilds} is how an operator sees that a live capacity change took
-     *       effect.</li>
+     *       effect.
+     *       <p>{@code read_profile} is the one string in this section: {@code ops} or {@code bytes}, the
+     *       shape of a staged read (P2). It is reported because
+     *       {@code knn.direct_io.rescore.read_profile} is static, so reading it back is the only way to see
+     *       that a restart picked up what the control plane wrote. What the profile did is read off the
+     *       counters that are already here: {@code staged_reads} and {@code staged_bytes} give bytes a read,
+     *       and {@code cache.misses} against {@code staged_reads} gives misses a read, which is the ratio
+     *       the two profiles move.</li>
      *   <li><b>memory</b> — how much off-heap is it holding, and is the budget biting? {@code live_bytes}
      *       against {@code budget_bytes} (the setting, echoed so one GET answers both halves),
      *       {@code peak_bytes} for the high-water mark, and {@code declined_budget} for prefetches the
@@ -208,6 +215,12 @@ public class KNNStats {
         // O5: staged miss reads widened to admit their neighbours. Against staged_reads this says how much
         // of the staging was widened, and it is 0 whenever any of the three gates is shut.
         reads.put("read_around_reads", stats.readAroundReads());
+        // P2: which read shape this node is using, ops or bytes. A string and not a counter, and reported
+        // because it is the one Direct I/O setting an operator cannot change at runtime -- it is static, so
+        // the only way to know a restart picked it up is to read it back. staged_reads, staged_bytes,
+        // blocking_reads and the cache counters already give reads, bytes and misses per read, so no further
+        // counter is needed to measure what the profile did.
+        reads.put("read_profile", DirectIOVectorIndexInput.readProfile());
 
         final Map<String, Object> memory = new HashMap<>();
         // Drain first, so the number an operator reads is not stale by however long it has been since the
