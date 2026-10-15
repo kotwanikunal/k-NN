@@ -135,7 +135,23 @@ public class KNNStatsTests extends KNNTestCase {
                 "closed_files",
                 "closed_file_entries",
                 // O4: the filter-then-read race's re-admissions, also inside readmissions.
-                "race_readmissions"
+                "race_readmissions",
+                // Q (C6): the segmented store. segments is the count in force; the contended counts and the
+                // wait nanos are what say whether the segmentation is doing its job; the entry spread is
+                // the skew the hit-rate cost is priced against; slab_transfers is the broker's lending;
+                // the two close-hold keys are C4's bound; segment_count_changes is a re-warm an operator
+                // caused.
+                "segments",
+                "contended_read_acquisitions",
+                "contended_write_acquisitions",
+                "read_lock_wait_nanos",
+                "write_lock_wait_nanos",
+                "max_segment_entries",
+                "min_segment_entries",
+                "slab_transfers",
+                "longest_close_hold_nanos",
+                "longest_close_hold_entries",
+                "segment_count_changes"
             ),
             directIO.get("cache").keySet()
         );
@@ -146,6 +162,10 @@ public class KNNStatsTests extends KNNTestCase {
         directIO.get("cache").forEach((name, value) -> {
             if ("slab_memory".equals(name)) {
                 assertTrue("cache.slab_memory must name a backend, saw " + value, Set.of("ffm", "direct_buffer").contains(value));
+            } else if ("segments".equals(name)) {
+                // Not a counter either: it is the segment count in force, and with the cache off that is
+                // one, which is the unsegmented store exactly (Q, C1b).
+                assertEquals("cache.segments is one with the cache off", 1, (int) (Integer) value);
             } else {
                 assertEquals("cache." + name + " must start at zero", 0L, (long) (Long) value);
             }

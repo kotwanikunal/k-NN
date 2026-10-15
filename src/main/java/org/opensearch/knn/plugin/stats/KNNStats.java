@@ -265,6 +265,37 @@ public class KNNStats {
         // O4: vectors put back after the filter-then-read race lost them. Also inside readmissions, which
         // BACKLOG asks for; this key is what keeps the race separable from the second chance.
         cache.put("race_readmissions", DirectIOVectorCache.raceReadmissions());
+        // Q (C6): the segmented store. segments is the count in force, derived from the node's cores and
+        // the configured size; the rest is what a hot node needs to read to know whether the segmentation
+        // is doing its job.
+        //
+        // contended_* count the acquisitions that found a thread already queued on a segment's lock, from
+        // one hasQueuedThreads() volatile read, and *_lock_wait_nanos is the time those acquisitions then
+        // waited. Only a contended acquisition is timed: MEASURED, an uncontended one waited 0.045 us
+        // against 20.3 us contended at the core count and 168.3 us at 128 threads, so the uncontended ones
+        // have nothing worth two System.nanoTime calls to measure. The denominator for the contended counts
+        // is about one read acquisition per lookup (hits + misses) and one write acquisition per fill.
+        //
+        // max_segment_entries against min_segment_entries is the entry skew the hit-rate cost of segmenting
+        // the eviction is priced against: MEASURED +-7% at the chosen eight slabs per segment, carrying
+        // -0.08 hit-rate points. slab_transfers is the broker lending a slab from the segment holding the
+        // most to a segment holding none, which MEASURED as a cold-start transient and zero in the steady
+        // state. longest_close_hold_nanos and longest_close_hold_entries are C4's bound: a close takes one
+        // segment's write lock at a time over a 1/N share of the file, MEASURED at 110 us and 1,280 entries
+        // against 10,739 us and 131,072 unsegmented. segment_count_changes is an operator having moved
+        // max_bytes across a factor-of-eight-slab boundary, which costs the store a re-warm and should
+        // never be a surprise.
+        cache.put("segments", DirectIOVectorCache.segmentCount());
+        cache.put("contended_read_acquisitions", DirectIOVectorCache.contendedReadAcquisitions());
+        cache.put("contended_write_acquisitions", DirectIOVectorCache.contendedWriteAcquisitions());
+        cache.put("read_lock_wait_nanos", DirectIOVectorCache.readLockWaitNanos());
+        cache.put("write_lock_wait_nanos", DirectIOVectorCache.writeLockWaitNanos());
+        cache.put("max_segment_entries", DirectIOVectorCache.maxSegmentEntries());
+        cache.put("min_segment_entries", DirectIOVectorCache.minSegmentEntries());
+        cache.put("slab_transfers", DirectIOVectorCache.slabTransfers());
+        cache.put("longest_close_hold_nanos", DirectIOVectorCache.longestCloseHoldNanos());
+        cache.put("longest_close_hold_entries", DirectIOVectorCache.longestCloseHoldEntries());
+        cache.put("segment_count_changes", DirectIOVectorCache.segmentCountChanges());
 
         final Map<String, Map<String, Object>> directIOStats = new HashMap<>();
         directIOStats.put("dispatch", dispatch);

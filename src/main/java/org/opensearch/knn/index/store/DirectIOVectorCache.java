@@ -1457,12 +1457,12 @@ public final class DirectIOVectorCache {
     }
 
     /** The segment count in force, which {@code direct_io_stats.cache.segments} reports. */
-    static int segmentCount() {
+    public static int segmentCount() {
         return segments.length;
     }
 
     /** Slabs the broker lent from one segment to another because the borrower held none. */
-    static long slabTransfers() {
+    public static long slabTransfers() {
         return slabTransfers.sum();
     }
 
@@ -1475,7 +1475,7 @@ public final class DirectIOVectorCache {
      * <p>A lock-free sum of volatile counters, like {@link #entries()}, so a wide spread between the two is
      * readable on a node without the stats endpoint competing with the query path.
      */
-    static long maxSegmentEntries() {
+    public static long maxSegmentEntries() {
         long most = 0;
         for (final DirectIOCacheSegment segment : segments) {
             most = Math.max(most, segment.liveEntries());
@@ -1484,7 +1484,7 @@ public final class DirectIOVectorCache {
     }
 
     /** The fewest vectors any one segment holds right now. See {@link #maxSegmentEntries()}. */
-    static long minSegmentEntries() {
+    public static long minSegmentEntries() {
         long fewest = Long.MAX_VALUE;
         for (final DirectIOCacheSegment segment : segments) {
             fewest = Math.min(fewest, segment.liveEntries());
@@ -1493,12 +1493,12 @@ public final class DirectIOVectorCache {
     }
 
     /** Read acquisitions that found a thread already queued on a segment's lock. */
-    static long contendedReadAcquisitions() {
+    public static long contendedReadAcquisitions() {
         return contendedReadAcquisitions.sum();
     }
 
     /** Write acquisitions that found a thread already queued on a segment's lock. */
-    static long contendedWriteAcquisitions() {
+    public static long contendedWriteAcquisitions() {
         return contendedWriteAcquisitions.sum();
     }
 
@@ -1507,12 +1507,12 @@ public final class DirectIOVectorCache {
      * uncontended one waited 0.045 us (MEASURED) and is not timed, because timing it would cost 62 ns of
      * {@code System.nanoTime} to measure 45.
      */
-    static long readLockWaitNanos() {
+    public static long readLockWaitNanos() {
         return readLockWaitNanos.sum();
     }
 
     /** {@link #readLockWaitNanos()} for the write lock. */
-    static long writeLockWaitNanos() {
+    public static long writeLockWaitNanos() {
         return writeLockWaitNanos.sum();
     }
 
@@ -1547,7 +1547,7 @@ public final class DirectIOVectorCache {
     }
 
     /** Resizes that crossed a segment-count boundary, each of which cost the store a re-warm. */
-    static long segmentCountChanges() {
+    public static long segmentCountChanges() {
         return segmentCountChanges.sum();
     }
 
@@ -1555,12 +1555,12 @@ public final class DirectIOVectorCache {
      * The longest a close has held one segment's write lock, which is the longest a lookup in that segment
      * could have waited behind one. Lookups in the other {@code N - 1} segments wait for nothing at all.
      */
-    static long longestCloseHoldNanos() {
+    public static long longestCloseHoldNanos() {
         return longestCloseHoldNanos.get();
     }
 
     /** The most entries one segment's write lock was held for by a close. See the field's javadoc. */
-    static long longestCloseHoldEntries() {
+    public static long longestCloseHoldEntries() {
         return longestCloseHoldEntries.get();
     }
 
