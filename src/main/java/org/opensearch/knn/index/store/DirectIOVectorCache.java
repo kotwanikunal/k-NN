@@ -10,16 +10,9 @@ import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.knn.index.KNNSettings;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * The one cache of individual vectors on the Direct I/O random rescore path, for the whole node: a slab store
@@ -106,18 +99,28 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * layout changes, so there is nowhere for a survivor to stay, and those entries are dropped. The case needs
  * two vector lengths competing for the same slabs, which is rare, and costs a refill rather than an answer.
  *
- * <h2>One lock, and no view of slab memory leaves the store</h2>
+ * <h2>Segments, one lock each, and no view of slab memory leaves the store (Q)</h2>
  * A reader must not be shown a slot while another thread is overwriting it, and the index must not be read
- * half-rebuilt. One {@link ReentrantReadWriteLock} over the whole store solves both: a lookup takes the read
- * lock, and insert, eviction, resize and release take the write lock. Lookups therefore run concurrently with
- * each other and never with a mutation, which is what lets the index be a plain {@link HashMap} of
- * {@link DirectIOSlotMap}s with no per-entry synchronisation. Inserts serialise against each other, which is
- * affordable because an insert only ever follows a read miss, so its rate is bounded by the device.
+ * half-rebuilt. One {@code ReentrantReadWriteLock} solves both: a lookup takes the read lock, and insert,
+ * eviction, resize and release take the write lock. Lookups therefore run concurrently with each other and
+ * never with a mutation, which is what lets the index be a plain {@code HashMap} of {@link DirectIOSlotMap}s
+ * with no per-entry synchronisation.
+ *
+ * <p>Until Q that lock was <b>one lock for the whole store</b>, and MEASURED on the dev desktop
+ * ({@code output/bench/q-baseline}) that store peaked at one thread: 1,529,026 serving lookups/s on one
+ * thread against 320 to 375K from four threads up, with every read acquisition finding a writer already
+ * queued and more than 90% of all thread time spent waiting. So the store is split into
+ * {@link DirectIOCacheSegment}s, each owning its lock, its index, its slabs and its eviction, with one
+ * {@link DirectIOSlabBroker} owning the node's total slab target. A key's segment is a pure function of
+ * {@code (fileId, offset)} ({@link #segmentFor}), so nothing about it is stored and a vector can only ever be
+ * admitted into the segment a later lookup of that offset will consult. <b>Not one byte of the decode, the
+ * admission geometry or the read path moves</b>, so a hit is still the same bytes decoded the same way and
+ * scores identically by construction.
  *
  * <p>A lookup copies the vector into the caller's {@code float[]} while it holds the read lock and hands back
  * no view of slab memory at all. That is what makes a use after free unreachable rather than merely unlikely:
  * there is no buffer for a caller to stash and read after the lock is dropped. It is also why a slab needs no
- * lock of its own — it is closed only under this store's write lock.
+ * lock of its own — it is closed only under its segment's write lock.
  *
  * <h2>A size change resizes; it does not rebuild</h2>
  * {@code knn.direct_io.rescore.cache.max_bytes} is read once per prefetch burst
@@ -131,65 +134,34 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * file's bytes are immutable — only <em>cold</em>. M2 therefore left them to age out: the FIFO reaches them
  * without a second chance (nothing reads them, so no hit flag is ever set) and they become free slots, and
  * when the last slot belonging to a file goes, that file's whole {@link DirectIOSlotMap} is dropped from the
- * index ({@link #detach}).
+ * index.
  *
  * <p>That is bounded but it is not free, and O3 is what the merge analysis (ref/MERGE-NOTE.md section 4)
  * found it costing: until the FIFO cycles past them the store <b>sits at its target</b>, and span fill only
  * runs below the target, so it does not re-arm for the merged segment and that segment refills at one vector
  * per miss. So {@link #releaseFile} now frees a file's slots when the routed input that owned its
- * {@code O_DIRECT} handle closes — its index table goes, its slots go back to their slabs' free lists, and
- * {@link #place} hands those slots out before it grows or evicts ({@link #RECYCLED}). The ageing-out path
- * above stays, because it is what covers an entry whose cell was already invalidated and a file nobody
- * closes.
+ * {@code O_DIRECT} handle closes — its index tables go, its slots go back to their slabs' free lists, and a
+ * fill hands those slots out before it grows or evicts. The ageing-out path above stays, because it is what
+ * covers an entry whose cell was already invalidated and a file nobody closes.
  *
  * <h2>Off is off</h2>
  * {@code knn.direct_io.rescore.cache.max_bytes} defaults to {@code 0b}. When it is zero there are no slabs
- * and every lookup is one volatile read and a compare — no key built, no lock taken, no counter touched.
- * The shipped default is the node arm's to decide; this phase ships the mechanism and the correctness proof.
+ * and every lookup is one volatile read and a compare — no key built, no segment selected, no lock taken, no
+ * counter touched. The shipped default is the node arm's to decide; this phase ships the mechanism and the
+ * correctness proof.
  */
 @Log4j2
 public final class DirectIOVectorCache {
 
-    /** Set once per node, and only by a test, so a suite can exercise eviction without 32 MiB of slabs. */
-    private static volatile int slabBytes = DirectIOSlab.SLAB_BYTES;
-
-    private static final ReentrantReadWriteLock LOCK = new ReentrantReadWriteLock();
-
-    /** File index. Mutated under the write lock, read under the read lock, so a plain map is enough. */
-    private static final Map<String, DirectIOSlotMap> INDEX = new HashMap<>();
-
-    /** Slabs in service, oldest first. The head is the eviction unit. */
-    private static final ArrayDeque<Slab> FIFO = new ArrayDeque<>();
-
-    /** The one slab currently being appended to, per vector byte length. */
-    private static final Map<Integer, Slab> OPEN_SLABS = new HashMap<>();
+    /** The node's total slab target and slab supply, which is the one thing a segment cannot own. */
+    private static final DirectIOSlabBroker BROKER = new DirectIOSlabBroker();
 
     /**
-     * Slabs that hold free slots a closed file gave back, per vector byte length, waiting to be reopened for
-     * appending. O3.
-     *
-     * <p>Without this the slots {@link #releaseFile} frees would be unreachable until their slab came to the
-     * head of {@link #FIFO}, because {@link #place} only appends to {@link #OPEN_SLABS}. A fill arriving
-     * straight after a close would then grow or evict while the store had room it had just been given, which
-     * is the opposite of what O3 is for.
-     *
-     * <p>Entries are validated on the way out rather than removed on every event that could stale one (a
-     * reclaim reopening the slab for another length, a {@link #configure} releasing it): see
-     * {@link #recycledSlab}.
+     * The segments. Replaced only by {@link #configure(long)} under the broker's lock, which is why it is a
+     * volatile reference to an array that is never mutated in place: every reader takes one consistent
+     * snapshot of it and the array it sees stays the array it saw.
      */
-    private static final Map<Integer, ArrayDeque<Slab>> RECYCLED = new HashMap<>();
-
-    /**
-     * How many slabs sit in {@link #RECYCLED}. Written under the write lock and read without it by
-     * {@link #mayAdmitSpanFillApproximately}, which is the input's pre-check. O3.
-     */
-    private static volatile int recycledSlabs;
-
-    /** Slabs by id, so an index entry can be one int. Null where an id is not in use. */
-    private static Slab[] slabsById = new Slab[0];
-
-    /** Slabs the store may hold, from {@link #configure(long)}. Zero means off, and is the default. */
-    private static volatile int maxSlabs;
+    private static volatile DirectIOCacheSegment[] segments = { new DirectIOCacheSegment(BROKER) };
 
     /**
      * Whether span fill is on, refreshed once per prefetch burst by {@link #applyConfiguredSize(boolean)}. Starts at
@@ -197,39 +169,11 @@ public final class DirectIOVectorCache {
      */
     private static volatile boolean spanFill = KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_DEFAULT_VALUE;
 
-    private static int liveSlabs;
-    private static long liveEntries;
-    private static long liveEntryBytes;
-
-    /**
-     * Set when an allocation failed, so the store stops asking for a slab it cannot have (N2). Cleared when
-     * the target changes or a slab is released, which are the two events that can make the answer different.
-     *
-     * <p>MEASURED by the orchestrator (2026-10-12, desktop, {@code -Xmx256m} with
-     * {@code -XX:MaxDirectMemorySize=96m}): a failed reservation blocks the caller for 515 to 525 ms and runs
-     * one {@code Pause Full (System.gc())}, for {@code allocateDirect} on JDK 21 and 25 and for FFM on JDK 21,
-     * because {@code java.nio.Bits#reserveMemory} calls {@code System.gc()} and then sleeps nine times with
-     * backoff. Retrying it on every fill below the target costs that once per fill, under this class's write
-     * lock, and the answer is the same every time.
-     *
-     * <p>Only read and written under the write lock, like {@link #liveSlabs}.
-     */
-    private static boolean growthLatched;
-
-    /**
-     * Slabs other fills have allocated and not yet registered (N3). Counted so that fills growing the store
-     * concurrently cannot overshoot the target between them: each reserves its headroom under the write lock
-     * before leaving it to allocate.
-     *
-     * <p>Only read and written under the write lock.
-     */
-    private static int pendingSlabs;
-
     /**
      * Where a slab's memory comes from and goes back to. A seam, and the only reason it is one is that N3's
-     * property is about <b>where</b> these two calls run: neither may run while the caller holds this store's
-     * lock, and a test can only see that if it can observe the calling thread at the moment of the call.
-     * Production has exactly one implementation.
+     * property is about <b>where</b> these two calls run: neither may run while the caller holds a segment's
+     * lock or the broker's, and a test can only see that if it can observe the calling thread at the moment
+     * of the call. Production has exactly one implementation.
      */
     interface SlabMemory {
         /**
@@ -248,104 +192,32 @@ public final class DirectIOVectorCache {
         void release(DirectIOSlab slab);
     }
 
-    private static final SlabMemory DIRECT_SLABS = new SlabMemory() {
-        @Override
-        public DirectIOSlab allocate(final int bytes) {
-            return DirectIOSlab.allocate(bytes);
-        }
-
-        @Override
-        public void release(final DirectIOSlab slab) {
-            slab.close();
-        }
-    };
-
-    private static volatile SlabMemory slabMemory = DIRECT_SLABS;
-
-    /** Release threads still giving memory back, so a test can wait for it. */
-    private static final AtomicInteger releasesRunning = new AtomicInteger();
+    // ---------------------------------------------------------------------------------------------------
+    // Counters. KNNStats publishes these through direct_io_stats.cache.
+    //
+    // Package private rather than private because the work they count happens inside a segment or inside
+    // the broker now, and keeping them here is what keeps every published key in the one file the stats
+    // layer reads. A LongAdder is safe to increment from anywhere: it is striped and takes no lock.
+    // ---------------------------------------------------------------------------------------------------
 
     private static final LongAdder hits = new LongAdder();
     private static final LongAdder misses = new LongAdder();
-    private static final LongAdder insertions = new LongAdder();
-    private static final LongAdder reclaimedSlabs = new LongAdder();
-    private static final LongAdder readmissions = new LongAdder();
-    private static final LongAdder droppedEntries = new LongAdder();
+    static final LongAdder insertions = new LongAdder();
+    static final LongAdder reclaimedSlabs = new LongAdder();
+    static final LongAdder readmissions = new LongAdder();
+    static final LongAdder droppedEntries = new LongAdder();
     private static final LongAdder spanFills = new LongAdder();
     /** Allocations that failed, which is one per latch and so also how often growth was given up on. */
-    private static final LongAdder slabAllocFailures = new LongAdder();
+    static final LongAdder slabAllocFailures = new LongAdder();
     /** Write-lock time spent reclaiming slabs, which is the figure a node has to be able to read. */
-    private static final LongAdder reclaimNanos = new LongAdder();
+    static final LongAdder reclaimNanos = new LongAdder();
     /** Files whose entries were freed at close, and the entries that went with them. O3. */
     private static final LongAdder closedFiles = new LongAdder();
     private static final LongAdder closedFileEntries = new LongAdder();
     /** Vectors put back after the filter-then-read race lost them. Also counted in readmissions. O4. */
-    private static final LongAdder raceReadmissions = new LongAdder();
+    static final LongAdder raceReadmissions = new LongAdder();
 
     private DirectIOVectorCache() {}
-
-    /**
-     * One slab in service: its memory, the slot layout it was opened for, and one back pointer per slot so
-     * that eviction can find the index entry that owns it and a lookup can confirm it has not been taken.
-     */
-    private static final class Slab {
-        private final int id;
-        private final DirectIOSlab memory;
-        private int slotBytes;
-        private int slotCount;
-        /** High-water mark: slots {@code [0, used)} have been written since the slab was opened. */
-        private int used;
-        private DirectIOSlotMap[] owner;
-        private long[] offset;
-        /** 1 once the slot has been read, which is what buys it a second chance. */
-        private byte[] hit;
-        /**
-         * Slots below {@link #used} that a reclaim freed, so that a survivor can stay where it is instead of
-         * being copied to the front. {@code [0, freeCount)} is the live part of the stack.
-         */
-        private int[] free;
-        private int freeCount;
-        /**
-         * Whether this slab is sitting in {@link #RECYCLED} waiting to be reopened for appending. A flag
-         * rather than a containment test, so a closed file that freed slots in the same slab twice cannot
-         * queue it twice. O3.
-         */
-        private boolean recycled;
-
-        private Slab(final int id, final DirectIOSlab memory) {
-            this.id = id;
-            this.memory = memory;
-        }
-
-        /** Re-opens the slab for {@code bytes}-long vectors, discarding the previous slot layout. */
-        private void openFor(final int bytes) {
-            final int count = Math.min(memory.capacity() / bytes, DirectIOSlotMap.MAX_SLOTS);
-            if (owner == null || count > owner.length) {
-                owner = new DirectIOSlotMap[count];
-                offset = new long[count];
-                hit = new byte[count];
-                free = new int[count];
-            } else {
-                Arrays.fill(owner, null);
-            }
-            slotBytes = bytes;
-            slotCount = count;
-            used = 0;
-            freeCount = 0;
-        }
-
-        /** A slot to write a vector into, or {@code -1} when the slab is full. */
-        private int allocSlot() {
-            if (freeCount > 0) {
-                return free[--freeCount];
-            }
-            return used < slotCount ? used++ : -1;
-        }
-
-        private int freeSlots() {
-            return freeCount + (slotCount - used);
-        }
-    }
 
     /** The identity {@link DirectIOSlotMap} uses for a file: two opens of one {@code .vec} give one string. */
     static String fileId(final java.nio.file.Path path, final long fileLength) {
@@ -354,7 +226,59 @@ public final class DirectIOVectorCache {
 
     /** Whether a lookup can succeed at all, so a caller can skip the work of asking. */
     static boolean isOn() {
-        return maxSlabs != 0;
+        return BROKER.maxSlabs() != 0;
+    }
+
+    // ---------------------------------------------------------------------------------------------------
+    // Segment selection
+    // ---------------------------------------------------------------------------------------------------
+
+    /**
+     * The 256 KiB stripe an offset lies in, which is the unit of segmentation (Q, section 2.1).
+     *
+     * <p>A stripe and not a vector, because a staged span is at most
+     * {@code knn.direct_io.rescore.prefetch.max_span_bytes} = 135,168 B and 135,168 &lt; 262,144, so a span
+     * lies in at most <b>two</b> stripes wherever it starts and {@link #putRun} keeps essentially the one
+     * write-lock acquisition it has. A per-vector key would scatter a 43-vector run across up to 43 segments
+     * and turn one acquisition into 43. MEASURED (output/bench/q-baseline/q-seghitrate.out): the two keys give
+     * the same hit rate to within 0.01 points at every segment count from 1 to 256, so the read side does not
+     * pay for the choice.
+     */
+    private static final int STRIPE_SHIFT = 18;
+
+    /**
+     * The segment a key belongs to: {@code mix(fileIdHash, offset >>> 18) & (segments - 1)}.
+     *
+     * <p><b>Its own multipliers, and the top bits.</b> Inside a segment every offset shares its stripe bits,
+     * and {@link DirectIOSlotMap}'s own hash is Fibonacci over the whole 64 bits with multiplier
+     * {@code 0x9E3779B97F4A7C15}. A selector that folded the slot map's bits would put a segment's offsets
+     * through one stretch of its table, so this one uses different multipliers and takes the <b>top</b> bits.
+     *
+     * @param fileId the file's identity, from {@link #fileId}
+     * @param offset the vector's byte offset in that file
+     * @return the segment that owns the key
+     */
+    static DirectIOCacheSegment segmentFor(final String fileId, final long offset) {
+        final DirectIOCacheSegment[] all = segments;
+        if (all.length == 1) {
+            return all[0];
+        }
+        return all[segmentIndex(fileId.hashCode(), offset, all.length)];
+    }
+
+    /**
+     * {@link #segmentFor}'s arithmetic, separately so a test can assert it without a store. Byte for byte
+     * the form {@code bench/q-baseline/SegmentedHitRateBench#segmentOf} measured the hit-rate cost of, so
+     * the implementation and the design run's emulation select the same segment for the same key.
+     *
+     * @param fileIdHash the file identity's {@code hashCode}
+     * @param offset     the vector's byte offset
+     * @param count      the segment count, a power of two
+     * @return the segment index
+     */
+    static int segmentIndex(final int fileIdHash, final long offset, final int count) {
+        final long mixed = ((offset >>> STRIPE_SHIFT) ^ ((long) fileIdHash * 0x2545F4914F6CDD1DL)) * 0xBF58476D1CE4E5B9L;
+        return (int) ((mixed >>> 40) & (count - 1));
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -388,57 +312,50 @@ public final class DirectIOVectorCache {
      * <p>A run of one vector is the single lookup this method used to be, so the key's meaning is unchanged
      * and a caller asking about one vector asks exactly as before.
      *
+     * <p>Since Q the run is walked segment by segment: a 135,168 B span lies in at most two 256 KiB stripes,
+     * so this takes at most <b>two</b> read acquisitions and releases each before taking the next, which is
+     * the no-two-segment-locks rule.
+     *
      * @param fileId the file's identity, from {@link #fileId}
      * @param offset the first vector's byte offset in that file
      * @param length the run's length in bytes, one or more whole vectors
      * @return whether a {@link #getFloats} would hit for every vector in the run
      */
     static boolean contains(final String fileId, final long offset, final int length) {
-        if (maxSlabs == 0 || length <= 0) {
+        if (BROKER.maxSlabs() == 0 || length <= 0) {
             return false;
         }
-        LOCK.readLock().lock();
-        try {
-            final DirectIOSlotMap map = INDEX.get(fileId);
-            if (map == null) {
+        final long end = offset + length;
+        long at = offset;
+        while (at < end) {
+            final long reached = segmentFor(fileId, at).containsUpTo(fileId, at, end);
+            if (reached <= at) {
+                // A miss, or a slot of zero length, which cannot happen but must not loop if it did.
                 return false;
             }
-            final long end = offset + length;
-            long at = offset;
-            while (at < end) {
-                final int cell = map.find(at);
-                if (cell < 0) {
-                    return false;
-                }
-                final Slab slab = slabAt(map.slabIdAt(cell));
-                final int slot = map.slotAt(cell);
-                if (slab == null || slot >= slab.slotCount || slab.owner[slot] != map || slab.offset[slot] != at) {
-                    return false;
-                }
-                // The slot's own length is the stride: the caller does not know the field's vector length at
-                // this point and must not have to guess it.
-                at += slab.slotBytes;
-            }
-            // Exactly tiled, or not cached: a run whose last vector overshoots the range is a different
-            // layout than the one being asked about, and the honest answer for one is no.
-            return at == end;
-        } finally {
-            LOCK.readLock().unlock();
+            at = reached;
         }
+        // Exactly tiled, or not cached: a run whose last vector overshoots the range is a different
+        // layout than the one being asked about, and the honest answer for one is no.
+        return at == end;
     }
 
     /**
      * Writes into {@code missing} the members of {@code ords[0..numOrds)} whose vector this store does not
      * hold whole and returns how many, or returns {@code -1} when it holds nothing of {@code fileId} at all.
      *
-     * <p>One read-lock acquisition for the batch, and like {@link #contains} it <b>counts nothing</b>: the
-     * caller ({@code DirectIOVectorIndexInput#selectUncachedOrdinals}, N1) is deciding what to prefetch, not
-     * serving bytes. {@code -1} rather than a copy of every ordinal is what lets a cold file take the
-     * caller's unfiltered path with no array to walk.
+     * <p>Like {@link #contains} it <b>counts nothing</b>: the caller
+     * ({@code DirectIOVectorIndexInput#selectUncachedOrdinals}, N1) is deciding what to prefetch, not serving
+     * bytes. {@code -1} rather than a copy of every ordinal is what lets a cold file take the caller's
+     * unfiltered path with no array to walk.
      *
      * <p>A vector held at a different length than {@code vectorBytes} counts as missing, for the same reason
      * {@link #getFloats} answers a length mismatch with a miss: a caller asking about a layout this store did
      * not cache is a caller it was not designed for.
+     *
+     * <p>The misses come out <b>in the caller's ordinal order</b> whatever the segmentation does, because
+     * {@code DirectIOVectorIndexInput#recordFilteredAsCached} finds the complement in one pass over both
+     * arrays and so needs {@code missing[0..found)} to be a subsequence of {@code ords[0..numOrds)}.
      *
      * @param fileId      the file's identity, from {@link #fileId}
      * @param baseOffset  the byte offset of ordinal zero in that file
@@ -456,25 +373,28 @@ public final class DirectIOVectorCache {
         final int numOrds,
         final int[] missing
     ) {
-        if (maxSlabs == 0) {
+        if (BROKER.maxSlabs() == 0) {
             return -1;
         }
-        int found = 0;
-        LOCK.readLock().lock();
-        try {
-            final DirectIOSlotMap map = INDEX.get(fileId);
-            if (map == null) {
-                return -1;
-            }
-            for (int i = 0; i < numOrds; i++) {
-                if (locate(map, baseOffset + (long) ords[i] * vectorBytes, vectorBytes) < 0) {
-                    missing[found++] = ords[i];
-                }
-            }
-        } finally {
-            LOCK.readLock().unlock();
+        final DirectIOCacheSegment[] all = segments;
+        if (all.length == 1) {
+            // One read acquisition for the batch, which is the batching this method exists to keep.
+            return all[0].selectMissing(fileId, baseOffset, vectorBytes, ords, 0, numOrds, missing, 0);
         }
-        return found;
+        int found = 0;
+        boolean anyIndexed = false;
+        for (int i = 0; i < numOrds; i++) {
+            final long offset = baseOffset + (long) ords[i] * vectorBytes;
+            final int written = segmentFor(fileId, offset).selectMissing(fileId, baseOffset, vectorBytes, ords, i, i + 1, missing, found);
+            if (written < 0) {
+                // That segment holds nothing of this file, so its ordinals are missing from it.
+                missing[found++] = ords[i];
+            } else {
+                anyIndexed = true;
+                found = written;
+            }
+        }
+        return anyIndexed ? found : -1;
     }
 
     /**
@@ -504,26 +424,10 @@ public final class DirectIOVectorCache {
         // even number of bytes (an FP16 vector of an odd dimension is 2 x dim bytes), and the
         // {@link DirectIOSlab#floats} view below indexes in floats, so a slot that is not float-aligned must
         // never be reachable through this method. The FP16 path reads through {@link #getBytes} instead.
-        if (maxSlabs == 0 || (length & 3) != 0) {
+        if (BROKER.maxSlabs() == 0 || (length & 3) != 0) {
             return false;
         }
-        boolean hit = false;
-        LOCK.readLock().lock();
-        try {
-            final DirectIOSlotMap map = INDEX.get(fileId);
-            final int packedSlot = locate(map, offset, length);
-            if (packedSlot >= 0) {
-                final Slab slab = slabsById[packedSlot >>> SLOT_SHIFT];
-                final int slot = packedSlot & SLOT_LOW_MASK;
-                slab.memory.floats().get((slot * slab.slotBytes) >> 2, destination, destinationOffset, length >> 2);
-                // A plain write, and a lost one only costs a second chance. Readers run concurrently with
-                // each other but never with the reclaim that reads this, which holds the write lock.
-                slab.hit[slot] = 1;
-                hit = true;
-            }
-        } finally {
-            LOCK.readLock().unlock();
-        }
+        final boolean hit = segmentFor(fileId, offset).getFloats(fileId, offset, length, destination, destinationOffset);
         if (hit) {
             hits.increment();
         } else {
@@ -565,65 +469,16 @@ public final class DirectIOVectorCache {
         final byte[] destination,
         final int destinationOffset
     ) {
-        if (maxSlabs == 0 || length <= 0 || (length & 1) != 0) {
+        if (BROKER.maxSlabs() == 0 || length <= 0 || (length & 1) != 0) {
             return false;
         }
-        boolean hit = false;
-        LOCK.readLock().lock();
-        try {
-            final DirectIOSlotMap map = INDEX.get(fileId);
-            final int packedSlot = locate(map, offset, length);
-            if (packedSlot >= 0) {
-                final Slab slab = slabsById[packedSlot >>> SLOT_SHIFT];
-                final int slot = packedSlot & SLOT_LOW_MASK;
-                // An absolute get out of the shared byte view, so no position is touched and no view of slab
-                // memory leaves the store -- the same discipline getFloats keeps.
-                slab.memory.bytes().get(slot * slab.slotBytes, destination, destinationOffset, length);
-                slab.hit[slot] = 1;
-                hit = true;
-            }
-        } finally {
-            LOCK.readLock().unlock();
-        }
+        final boolean hit = segmentFor(fileId, offset).getBytes(fileId, offset, length, destination, destinationOffset);
         if (hit) {
             hits.increment();
         } else {
             misses.increment();
         }
         return hit;
-    }
-
-    /** How {@link #locate} packs its answer, which is the same shape {@link DirectIOSlotMap} stores. */
-    private static final int SLOT_SHIFT = 20;
-    private static final int SLOT_LOW_MASK = (1 << SLOT_SHIFT) - 1;
-
-    /**
-     * The {@code (slabId << 20) | slot} holding {@code offset} at {@code length} bytes, or {@code -1}.
-     * Called under either lock.
-     *
-     * <p>Two checks past the index cell, and both are load bearing. The slot's back pointer is the proof that
-     * the cell is not stale: a cell can outlive the slot it names, because eviction does not walk the index
-     * (see {@link DirectIOSlotMap}). The slot length check is what keeps a caller asking for a different
-     * length than was cached from being handed a neighbour's bytes.
-     */
-    private static int locate(final DirectIOSlotMap map, final long offset, final int length) {
-        if (map == null) {
-            return -1;
-        }
-        final int cell = map.find(offset);
-        if (cell < 0) {
-            return -1;
-        }
-        final int slabId = map.slabIdAt(cell);
-        final int slot = map.slotAt(cell);
-        final Slab slab = slabAt(slabId);
-        if (slab == null || slot >= slab.slotCount || slab.owner[slot] != map || slab.offset[slot] != offset) {
-            return -1;
-        }
-        if (slab.slotBytes != length) {
-            return -1;
-        }
-        return (slabId << SLOT_SHIFT) | slot;
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -650,34 +505,10 @@ public final class DirectIOVectorCache {
      * @param length the vector's length in bytes
      */
     static void put(final String fileId, final long offset, final ByteBuffer source, final int position, final int length) {
-        if (maxSlabs == 0 || length <= 0 || (length & 1) != 0 || offset < 0 || length > slabBytes) {
+        if (BROKER.maxSlabs() == 0 || length <= 0 || (length & 1) != 0 || offset < 0 || length > BROKER.slabBytes()) {
             return;
         }
-        final SlabRequest request = new SlabRequest();
-        try {
-            // At most twice round: once with nothing in hand, and once with the slab that round asked for.
-            // See SlabRequest for why the allocation cannot happen inside the lock.
-            for (int round = 0; round < 2; round++) {
-                LOCK.writeLock().lock();
-                try {
-                    request.wanted = false;
-                    final Placement placement = place(fileId, length, true, request);
-                    if (placement != null) {
-                        placement.slab.memory.bytes().put(placement.slot * length, source, position, length);
-                        attach(placement.slab, placement.slot, placement.map, offset);
-                        insertions.increment();
-                        return;
-                    }
-                } finally {
-                    LOCK.writeLock().unlock();
-                }
-                if (request.wanted == false || allocateOutsideLock(request) == false) {
-                    return;
-                }
-            }
-        } finally {
-            request.finish();
-        }
+        segmentFor(fileId, offset).put(fileId, offset, source, position, length);
     }
 
     /**
@@ -704,43 +535,10 @@ public final class DirectIOVectorCache {
      * @return whether the vector was admitted
      */
     static boolean readmitAfterRace(final String fileId, final long offset, final ByteBuffer source, final int position, final int length) {
-        if (maxSlabs == 0 || length <= 0 || (length & 1) != 0 || offset < 0 || length > slabBytes) {
+        if (BROKER.maxSlabs() == 0 || length <= 0 || (length & 1) != 0 || offset < 0 || length > BROKER.slabBytes()) {
             return false;
         }
-        final SlabRequest request = new SlabRequest();
-        try {
-            for (int round = 0; round < 2; round++) {
-                LOCK.writeLock().lock();
-                try {
-                    if (locate(INDEX.get(fileId), offset, length) >= 0) {
-                        // Another thread put it back while this read was in flight, which is the same race
-                        // one turn later and needs nothing from this one.
-                        return false;
-                    }
-                    request.wanted = false;
-                    final Placement placement = place(fileId, length, false, request);
-                    if (placement != null) {
-                        placement.slab.memory.bytes().put(placement.slot * length, source, position, length);
-                        attach(placement.slab, placement.slot, placement.map, offset);
-                        insertions.increment();
-                        // Both counters: BACKLOG asks for this under the existing readmissions key, and
-                        // race_readmissions keeps the two sources separable, because readmissions otherwise
-                        // means second chances alone and the re-proof reads it arm against arm.
-                        readmissions.increment();
-                        raceReadmissions.increment();
-                        return true;
-                    }
-                } finally {
-                    LOCK.writeLock().unlock();
-                }
-                if (request.wanted == false || allocateOutsideLock(request) == false) {
-                    return false;
-                }
-            }
-            return false;
-        } finally {
-            request.finish();
-        }
+        return segmentFor(fileId, offset).readmitAfterRace(fileId, offset, source, position, length);
     }
 
     /**
@@ -748,13 +546,13 @@ public final class DirectIOVectorCache {
      * slab target. This is the condition span fill admits under; see {@link #putRun}.
      *
      * <p>A volatile read of each of two ints and no lock, because the caller is the read path asking once per
-     * staged span whether to bother, and the answer is advisory: {@link #putRun} re-checks it under the write
-     * lock, which is where it has to hold.
+     * staged span whether to bother, and the answer is advisory: {@link #putRun} re-checks it under a segment's
+     * write lock, which is where it has to hold.
      *
      * @return whether a fill may still allocate a slab
      */
     static boolean belowSlabTarget() {
-        return maxSlabs != 0 && liveSlabs < maxSlabs;
+        return BROKER.belowTarget();
     }
 
     /**
@@ -779,7 +577,10 @@ public final class DirectIOVectorCache {
      * fields of different dimensions, so there is no one vector length to multiply by. Costing a nearly-full
      * store some coverage is the right direction for a gate whose job is to never evict.
      *
-     * <p>Asked once per prefetch burst, not once per read: see {@code DirectIOVectorIndexInput#beginBurst}.
+     * <p>The fit test is a lock-free sum of the segments' volatile byte counts since Q, where it took the
+     * store's one read lock: it is a global question and it is asked once per prefetch burst, not once per
+     * read (see {@code DirectIOVectorIndexInput#beginBurst}), so it has no business competing with the query
+     * path for a lock.
      *
      * @param fileBytes the whole file's length
      * @return the read-around width in bytes, or 0
@@ -799,60 +600,25 @@ public final class DirectIOVectorCache {
         if (configured <= 0 || fileBytes <= 0) {
             return 0;
         }
-        final long target = (long) maxSlabs * slabBytes;
-        LOCK.readLock().lock();
-        try {
-            if (liveEntryBytes + fileBytes > target) {
-                return 0;
-            }
-        } finally {
-            LOCK.readLock().unlock();
+        final long target = maxBytes();
+        if (bytes() + fileBytes > target) {
+            return 0;
         }
         return (int) Math.min(configured, Integer.MAX_VALUE / 2);
     }
 
     /**
-     * Whether span fill may admit a vector of {@code length} bytes: the store is below its slab target, or a
-     * closed file has given back slots of that length (O3). Called under the write lock.
-     *
-     * <h4>Why the second clause is not simply "the open slab has a free slot"</h4>
-     * At the target the open slab's free slots are what a reclaim has just produced, and the requested fills
-     * are entitled to them: letting span fill take them would be span fill running at the target, which is
-     * the scan-resistance question (agenda item 4) this phase is not deciding. Slots a closed file vacated
-     * are a different thing. Nothing is pushed out to use them, because what held them is gone, so admitting
-     * into them cannot displace a working set. That is the whole of O3: after a merge the store would
-     * otherwise sit at its target holding dead vectors, span fill would not re-arm, and the merged segment
-     * would refill at one vector per miss.
-     *
-     * <h4>What this does widen, MEASURED in {@code DirectIOClosedFileReleaseTests}</h4>
-     * While a close's room is still there this says yes, and {@link #place} then uses whatever free slot it
-     * finds first -- which may be a leftover in the open slab rather than one of the freed ones. In the test
-     * fixture a close freeing 66 slots let span fill admit 190 vectors. That is wider than "the slots the
-     * close freed" and it is deliberate: {@link #place} is called with eviction refused either way, so
-     * nothing can be displaced, and refusing a free slot because of which event produced it would leave the
-     * store holding room it could have warmed with. Once the free slots are gone this says no again, which
-     * is what the test pins.
+     * The lock-free form of a segment's span-fill question, for the input's pre-check before it takes any
+     * write lock. Approximate in one direction only: it can say yes where the segment then says no, which
+     * costs one lock acquisition and admits nothing. It cannot say no where the precise answer is yes,
+     * because a segment's recycled count is only cleared for a slab that has left its queue.
      */
-    private static boolean mayAdmitSpanFill(final int length) {
-        return belowSlabTarget() || hasRecycledRoom(length);
-    }
-
-    /**
-     * Whether a queued recycled slab still has a free slot of {@code length} bytes. Called under the write
-     * lock. The queue holds at most one entry per slab, so this is bounded by the slab count, and it is
-     * walked once per span-fill run rather than once per vector.
-     *
-     * <p>Validating rather than counting, because a queued slab can be reopened for another vector length by
-     * a reclaim or released by a {@link #configure} with no hook here, and a counter that drifted would make
-     * span fill run at the target.
-     */
-    private static boolean hasRecycledRoom(final int length) {
-        final ArrayDeque<Slab> queue = RECYCLED.get(length);
-        if (queue == null) {
-            return false;
+    static boolean mayAdmitSpanFillApproximately() {
+        if (belowSlabTarget()) {
+            return true;
         }
-        for (final Slab slab : queue) {
-            if (slabAt(slab.id) == slab && slab.slotBytes == length && slab.freeSlots() > 0) {
+        for (final DirectIOCacheSegment segment : segments) {
+            if (segment.recycledSlabs() > 0) {
                 return true;
             }
         }
@@ -860,20 +626,9 @@ public final class DirectIOVectorCache {
     }
 
     /**
-     * The lock-free form of {@link #mayAdmitSpanFill}'s question, for the input's pre-check before it takes
-     * the write lock. Approximate in one direction only: it can say yes where
-     * {@link #mayAdmitSpanFill} then says no, which costs one lock acquisition and admits nothing. It cannot
-     * say no where the precise answer is yes, because {@link #recycledSlabs} is only cleared for a slab that
-     * has left the queue.
-     */
-    static boolean mayAdmitSpanFillApproximately() {
-        return belowSlabTarget() || recycledSlabs > 0;
-    }
-
-    /**
      * Admits the {@code count} consecutive vectors starting at {@code (fileId, firstOffset)} from
-     * {@code source}, under <b>one</b> write-lock acquisition, and only while the store is below its slab
-     * target. M4's span fill, ported from 16-I F5.
+     * {@code source}, under <b>one</b> write-lock acquisition per segment the run touches, and only while the
+     * store is below its slab target. M4's span fill, ported from 16-I F5.
      *
      * <p><b>Three rules, and each is a thing this must not do rather than a thing it does.</b>
      * <ul>
@@ -885,14 +640,16 @@ public final class DirectIOVectorCache {
      *   <li><b>It skips an offset that is already cached.</b> The requested fill has just put this read's
      *       vector in, and the span it was staged for contains it; admitting it again would spend a slot on a
      *       vector the store already holds.</li>
-     *   <li><b>It stops at the first refusal.</b> Once {@link #place} has nowhere to put a vector it has
-     *       nowhere to put the next one either, so walking the rest of the run would be an index scan under
-     *       the write lock for nothing.</li>
+     *   <li><b>It stops at the first refusal.</b> Once a segment has nowhere to put a vector it has nowhere
+     *       to put the next one either, so walking the rest of the run would be an index scan under the write
+     *       lock for nothing.</li>
      * </ul>
      *
      * <p>One acquisition per run rather than per vector is what bounds the hold to one span's worth of
      * copying: a run is the whole vectors of one staged span, about two at the measured mean aligned span of
-     * 7,310 B for a 3,072 B vector and at most {@code max_span_bytes / length} (43 at the defaults).
+     * 7,310 B for a 3,072 B vector and at most {@code max_span_bytes / length} (43 at the defaults). Since Q
+     * the run is split at 256 KiB stripe boundaries into at most <b>two</b> per-segment sub-runs, taken
+     * sequentially, because 135,168 &lt; 262,144; see {@link #segmentFor}.
      *
      * @param fileId the file's identity, from {@link #fileId}
      * @param firstOffset the byte offset of the first vector in the run
@@ -910,226 +667,57 @@ public final class DirectIOVectorCache {
         final int position,
         final int length
     ) {
-        if (maxSlabs == 0 || count <= 0 || length <= 0 || (length & 1) != 0 || firstOffset < 0 || length > slabBytes) {
+        if (BROKER.maxSlabs() == 0 || count <= 0 || length <= 0 || (length & 1) != 0 || firstOffset < 0 || length > BROKER.slabBytes()) {
             return 0;
         }
         int admitted = 0;
         int next = 0;
-        final SlabRequest request = new SlabRequest();
-        try {
-            while (next < count) {
-                LOCK.writeLock().lock();
-                try {
-                    if (mayAdmitSpanFill(length) == false) {
-                        break;
-                    }
-                    for (; next < count; next++) {
-                        final long offset = firstOffset + (long) next * length;
-                        if (locate(INDEX.get(fileId), offset, length) >= 0) {
-                            continue;
-                        }
-                        request.wanted = false;
-                        final Placement placement = place(fileId, length, false, request);
-                        if (placement == null) {
-                            // Either there is nowhere at all, or the store would take a slab and this thread
-                            // has to leave the lock to get one. Both stop the run here; the second resumes it
-                            // at the same vector on the next round.
-                            break;
-                        }
-                        placement.slab.memory.bytes().put(placement.slot * length, source, position + next * length, length);
-                        attach(placement.slab, placement.slot, placement.map, offset);
-                        insertions.increment();
-                        admitted++;
-                    }
-                } finally {
-                    LOCK.writeLock().unlock();
-                }
-                // One acquisition per span is the rule, and this is the one thing that can need a second:
-                // a span that fills the open slab. The staged bytes are still the caller's and still valid
-                // across the gap, and the alternative is an 8 ms allocation inside the hold (N3).
-                if (next >= count || request.wanted == false || allocateOutsideLock(request) == false) {
-                    break;
-                }
+        while (next < count) {
+            final long at = firstOffset + (long) next * length;
+            final DirectIOCacheSegment segment = segmentFor(fileId, at);
+            final int subRunEnd = runEndIn(fileId, firstOffset, next, count, length, segment);
+            final long[] admittedHere = new long[1];
+            final int reached = segment.putRun(fileId, firstOffset, next, subRunEnd, source, position, length, admittedHere);
+            admitted += (int) admittedHere[0];
+            if (reached <= next) {
+                // The segment admitted nothing and made no progress, which is a refusal: it has nowhere to
+                // put this vector and so has nowhere to put the next one either.
+                break;
             }
-        } finally {
-            request.finish();
+            next = reached;
+            if (reached < subRunEnd) {
+                // It stopped inside its own sub-run, which is the same refusal one vector later.
+                break;
+            }
         }
         spanFills.add(admitted);
         return admitted;
     }
 
     /**
-     * One fill's slab request, carried across a release of the write lock.
-     *
-     * <p><b>Why the lock has to be released at all.</b> A 32 MiB slab takes about 7 to 10 ms to allocate
-     * (MEASURED, M1 and output/bench/n2: FFM zero-fills it; 16-I's JNI took 7.6 us), and before N3
-     * {@code growSlabs} did that with the write lock held, so every lookup on the node waited behind it.
-     * A fill that needs a slab therefore reserves its headroom under the lock ({@link #pendingSlabs}), leaves
-     * the lock, allocates, and comes back with the slab in hand.
-     *
-     * <p><b>Why the reservation.</b> Without it two fills leaving the lock at the same time would both see
-     * room for one slab and both allocate one, so a 2 slab target could end up holding 3. The reservation is
-     * taken under the lock and counted against the target by every other fill.
-     *
-     * <p>An allocation nobody wanted any more, because the target shrank while this fill was outside the lock,
-     * is released by {@link #finish} and also outside the lock.
+     * One past the last index of the run {@code [from, count)} whose vectors all belong to {@code segment}.
+     * At most two stripes can be touched by a staged span, so this answers {@code count} or one boundary in.
      */
-    private static final class SlabRequest {
-        /** Allocated outside the lock and not yet registered. */
-        private DirectIOSlab spare;
-        /** Set by {@link #growSlabs} to mean "bring me a slab and ask again". */
-        private boolean wanted;
-        /** Whether this request holds one of {@link #pendingSlabs}. */
-        private boolean reserved;
-
-        /** Gives back the headroom and any slab that went unused. Called with no lock held. */
-        private void finish() {
-            if (reserved == false && spare == null) {
-                return;
-            }
-            final DirectIOSlab unused;
-            LOCK.writeLock().lock();
-            try {
-                if (reserved) {
-                    pendingSlabs--;
-                    reserved = false;
-                }
-                unused = spare;
-                spare = null;
-            } finally {
-                LOCK.writeLock().unlock();
-            }
-            if (unused != null) {
-                slabMemory.release(unused);
-            }
+    private static int runEndIn(
+        final String fileId,
+        final long firstOffset,
+        final int from,
+        final int count,
+        final int length,
+        final DirectIOCacheSegment segment
+    ) {
+        if (segments.length == 1) {
+            return count;
         }
+        int end = from + 1;
+        while (end < count && segmentFor(fileId, firstOffset + (long) end * length) == segment) {
+            end++;
+        }
+        return end;
     }
 
     /**
-     * Allocates the slab {@code request} asked for, with no lock held, and says whether to ask the store
-     * again. A refusal latches growth (N2) so that no later fill pays for the same answer.
-     */
-    private static boolean allocateOutsideLock(final SlabRequest request) {
-        request.spare = slabMemory.allocate(slabBytes);
-        if (request.spare != null) {
-            return true;
-        }
-        LOCK.writeLock().lock();
-        try {
-            if (growthLatched == false) {
-                growthLatched = true;
-                slabAllocFailures.increment();
-                log.warn(
-                    "A k-NN Direct I/O vector cache slab of {} bytes could not be allocated from {}; the cache will hold the {} "
-                        + "slabs it has until knn.direct_io.rescore.cache.max_bytes changes or a slab is released",
-                    slabBytes,
-                    DirectIOSlab.backend(),
-                    liveSlabs
-                );
-            }
-        } finally {
-            LOCK.writeLock().unlock();
-        }
-        return false;
-    }
-
-    /** Where a fill is about to write: the file's index, a slab and a slot in it. */
-    private record Placement(DirectIOSlotMap map, Slab slab, int slot) {
-    }
-
-    /**
-     * Finds room for one vector of {@code length} bytes, evicting a slab if {@code allowEviction} and that is
-     * what it takes, and returns where to write it or {@code null} when there is nowhere. Called under the
-     * write lock; the caller writes the bytes and then {@link #attach}es the slot.
-     *
-     * <p>With {@code allowEviction} false the fill must displace nothing: it may use a free slot of the slab
-     * already open for this length, or a slab the target still allows, and nothing else.
-     *
-     * <p>{@code request} is how a fill that needs a new slab is told to go and get one: this returns null with
-     * {@link SlabRequest#wanted} set, and the caller allocates outside the lock and asks again.
-     */
-    private static Placement place(final String fileId, final int length, final boolean allowEviction, final SlabRequest request) {
-        if (maxSlabs == 0) {
-            return null;
-        }
-        DirectIOSlotMap map = INDEX.get(fileId);
-        if (map == null) {
-            map = new DirectIOSlotMap(fileId);
-            INDEX.put(fileId, map);
-        }
-        if (map.needsCompaction()) {
-            final DirectIOSlotMap compacting = map;
-            map.compact((offset, slabId, slot) -> {
-                final Slab slab = slabAt(slabId);
-                return slab != null && slot < slab.slotCount && slab.owner[slot] == compacting && slab.offset[slot] == offset;
-            });
-        }
-        Slab slab = OPEN_SLABS.get(length);
-        if (slab == null || slab.freeSlots() == 0) {
-            // O3: slots a closed file gave back come first, before any growth and before any eviction. The
-            // store has room it has already been given, and using it is what lets span fill re-arm for a
-            // merged segment without displacing a live vector.
-            slab = recycledSlab(length);
-        }
-        if (slab == null) {
-            slab = allowEviction ? obtainSlab(length, request) : growSlabs(length, request);
-        }
-        if (slab == null) {
-            // A file that got an index entry and no slot is left in the index with nothing in it, which costs
-            // one empty table until the next fill for that file uses it. Dropping it here would need the
-            // live count to distinguish "never had an entry" from "lost its last one".
-            return null;
-        }
-        final int slot = slab.allocSlot();
-        return slot < 0 ? null : new Placement(map, slab, slot);
-    }
-
-    /**
-     * A slab with free slots of {@code length} bytes that a closed file gave back, reopened for appending, or
-     * {@code null} when there is none. Called under the write lock. O3.
-     *
-     * <p>Queue entries are validated here rather than removed wherever a slab's state could change: a slab
-     * that has since been reclaimed for another vector length, released by a {@link #configure}, or refilled
-     * is simply dropped on the way out. That keeps the release path to the slots it frees and leaves no
-     * bookkeeping for {@link #obtainSlab} or {@link #configure} to remember.
-     */
-    private static Slab recycledSlab(final int length) {
-        final ArrayDeque<Slab> queue = RECYCLED.get(length);
-        if (queue == null) {
-            return null;
-        }
-        while (true) {
-            // Peek and leave it queued: a slab stays in the queue until its freed slots are gone, which is
-            // what keeps mayAdmitSpanFill true for as long as there is genuinely room a close gave back.
-            final Slab candidate = queue.peek();
-            if (candidate == null) {
-                RECYCLED.remove(length, queue);
-                return null;
-            }
-            if (slabAt(candidate.id) == candidate && candidate.slotBytes == length && candidate.freeSlots() > 0) {
-                // Appending resumes here, so the next fills for this length need no second trip through the
-                // queue. The slab it displaces is full by construction: place() only asks when it is.
-                OPEN_SLABS.put(length, candidate);
-                return candidate;
-            }
-            queue.poll();
-            candidate.recycled = false;
-            recycledSlabs--;
-        }
-    }
-
-    /** Queues {@code slab} as holding free slots, once. Called under the write lock. O3. */
-    private static void offerRecycled(final Slab slab) {
-        if (slab.recycled || slab.freeSlots() <= 0 || OPEN_SLABS.get(slab.slotBytes) == slab) {
-            return;
-        }
-        slab.recycled = true;
-        RECYCLED.computeIfAbsent(slab.slotBytes, length -> new ArrayDeque<>()).add(slab);
-        recycledSlabs++;
-    }
-
-    /**
-     * Frees every entry of {@code fileId} and drops its index table, because the input that owned the file's
+     * Frees every entry of {@code fileId} and drops its index tables, because the input that owned the file's
      * {@code O_DIRECT} handle has closed and nothing will read those vectors again. O3, the merge note's
      * fix 1.
      *
@@ -1142,11 +730,16 @@ public final class DirectIOVectorCache {
      * fill warm the new segment. A reopened file simply refills.
      *
      * <h4>Why no reader can see a torn or a foreign vector</h4>
-     * This holds the <b>write</b> lock, and {@link #getFloats} copies the vector out of the slab into the
-     * caller's array under the <b>read</b> lock (the copy is one statement inside that lock). So a reader
-     * either completes before this begins or starts after it ends; there is no window in which a reader
-     * holds a resolved slot across the free. A reader that arrives afterwards misses, because the index
-     * table is gone, and reads the device.
+     * This holds each segment's <b>write</b> lock in turn, and {@link #getFloats} copies the vector out of the
+     * slab into the caller's array under that segment's <b>read</b> lock (the copy is one statement inside
+     * that lock). So a reader either completes before this begins on its segment or starts after it ends;
+     * there is no window in which a reader holds a resolved slot across the free. A reader that arrives
+     * afterwards misses, because the index table is gone, and reads the device.
+     *
+     * <h4>Why one segment at a time</h4>
+     * Nothing waits behind a close that is not in the segment being drained, and the segment being drained
+     * waits for one {@code N}th of the work. MEASURED unsegmented in the readiness doc at 37 ms per 500K
+     * entries, which is about 16 ms per shard when a tenant leaves hot.
      *
      * <h4>Why the slots are freed and not evicted</h4>
      * {@code evictions} counts vectors the store had to displace to make room, which is the figure an
@@ -1157,65 +750,28 @@ public final class DirectIOVectorCache {
      * @return how many entries were freed
      */
     static long releaseFile(final String fileId) {
-        if (maxSlabs == 0) {
+        if (BROKER.maxSlabs() == 0) {
             // The cheap pre-check every entry point to this class has: with the store off there is no index
             // and no lock worth taking, and a close is on a path that may be serving a query.
             return 0;
         }
         final long started = System.nanoTime();
-        long freedEntries = 0;
-        long freedBytes = 0;
-        LOCK.writeLock().lock();
-        try {
-            final DirectIOSlotMap map = INDEX.remove(fileId);
-            if (map == null) {
-                return 0;
-            }
-            final long[] freed = new long[2];
-            final List<Slab> touched = new ArrayList<>();
-            map.forEachCell((offset, slabId, slot) -> {
-                final Slab slab = slabAt(slabId);
-                if (slab == null || slot >= slab.slotCount) {
-                    return;
-                }
-                if (slab.owner[slot] != map || slab.offset[slot] != offset) {
-                    // An invalidated cell: the slot has been taken by another file, or by this file at
-                    // another offset. Either way it is not ours to free, and nulling it would hand out a
-                    // slot somebody is using.
-                    return;
-                }
-                slab.owner[slot] = null;
-                if (slab.freeCount < slab.free.length) {
-                    slab.free[slab.freeCount++] = slot;
-                }
-                if (slab.recycled == false) {
-                    touched.add(slab);
-                }
-                freed[0]++;
-                freed[1] += slab.slotBytes;
-            });
-            freedEntries = freed[0];
-            freedBytes = freed[1];
-            liveEntries -= freedEntries;
-            liveEntryBytes -= freedBytes;
-            for (final Slab slab : touched) {
-                offerRecycled(slab);
-            }
-        } finally {
-            LOCK.writeLock().unlock();
+        final long[] freed = new long[2];
+        for (final DirectIOCacheSegment segment : segments) {
+            segment.releaseFile(fileId, freed);
         }
-        if (freedEntries > 0) {
+        if (freed[0] > 0) {
             closedFiles.increment();
-            closedFileEntries.add(freedEntries);
+            closedFileEntries.add(freed[0]);
             log.debug(
                 "Freed {} cached vectors ({} B) of [{}] at close, in {} us of write lock",
-                freedEntries,
-                freedBytes,
+                freed[0],
+                freed[1],
                 fileId,
                 (System.nanoTime() - started) / 1_000
             );
         }
-        return freedEntries;
+        return freed[0];
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -1277,7 +833,7 @@ public final class DirectIOVectorCache {
      * @return whether a staged span may admit the whole vectors inside it
      */
     static boolean isSpanFillOn() {
-        return spanFill && maxSlabs != 0;
+        return spanFill && BROKER.maxSlabs() != 0;
     }
 
     /**
@@ -1293,20 +849,25 @@ public final class DirectIOVectorCache {
      * difference from phase 15, whose Guava cache had to be rebuilt because {@code maximumWeight} is fixed at
      * {@code build()}, so every change cost the whole cache and a re-warm.
      *
+     * <p>Shrinking drops the oldest slabs <b>of the fullest segments</b> rather than the oldest globally,
+     * which is the same "keeps what fits" guarantee with a different tie-break and is what each segment
+     * owning its slabs implies.
+     *
      * @param maxBytes the wanted ceiling in bytes; {@code 0} or less turns the cache off
      */
     static void configure(final long maxBytes) {
+        final int slabBytes = BROKER.slabBytes();
         final int wanted = (int) Math.min(DirectIOSlotMap.MAX_SLABS, Math.max(0, maxBytes) / slabBytes);
-        if (wanted == maxSlabs) {
+        if (wanted == BROKER.maxSlabs()) {
             // Before the lock and not after it, because this is called once per prefetch burst from the read
             // path to pick up a setting change, and in the steady state the answer is always no change.
-            // Taking the write lock to find that out would put every burst through the lock a fill uses.
+            // Taking any lock to find that out would put every burst through a lock a fill uses.
             return;
         }
         final List<DirectIOSlab> detached = new ArrayList<>();
-        LOCK.writeLock().lock();
+        BROKER.lock().lock();
         try {
-            if (wanted != maxSlabs) {
+            if (wanted != BROKER.maxSlabs()) {
                 if (maxBytes > 0 && wanted == 0) {
                     log.warn(
                         "A vector cache target of {} bytes is under one {} byte slab, so the cache will hold nothing",
@@ -1314,325 +875,46 @@ public final class DirectIOVectorCache {
                         slabBytes
                     );
                 }
-                maxSlabs = wanted;
+                BROKER.setMaxSlabs(wanted);
                 // A new target is a new question, so an earlier allocation failure stops standing (N2).
-                growthLatched = false;
-                while (liveSlabs > wanted) {
-                    final Slab oldest = FIFO.poll();
-                    if (oldest == null) {
+                BROKER.unlatchGrowth();
+                while (BROKER.liveSlabs() > wanted) {
+                    final DirectIOCacheSegment fullest = fullestSegment();
+                    if (fullest == null || fullest.releaseOldestSlab(detached) == false) {
                         break;
                     }
-                    dropAll(oldest);
-                    detached.add(detach(oldest));
                 }
                 if (wanted == 0) {
-                    INDEX.clear();
-                    OPEN_SLABS.clear();
-                    RECYCLED.clear();
-                    recycledSlabs = 0;
+                    for (final DirectIOCacheSegment segment : segments) {
+                        segment.clearIndex();
+                    }
                     log.info("The k-NN Direct I/O vector cache is off (knn.direct_io.rescore.cache.max_bytes=0)");
                 } else {
                     log.info("The k-NN Direct I/O vector cache holds up to {} slabs of {} bytes", wanted, slabBytes);
                 }
             }
         } finally {
-            LOCK.writeLock().unlock();
+            BROKER.lock().unlock();
         }
-        releaseDetached(detached);
+        BROKER.releaseDetached(detached);
     }
 
     /**
-     * Gives back the memory of slabs a release has detached, with no lock held and not on the calling thread.
-     *
-     * <p><b>Why not under the lock.</b> An FFM arena takes about 2.2 ms to close (MEASURED, M1), so before N3
-     * a {@code configure(0)} at a 4 GB target held the write lock for about 0.26 s and a 12 GB one for about
-     * 0.8 s, and every lookup on the node waited behind it. Detaching is what makes the close safe to do
-     * outside the lock: it clears the slab's {@code slabsById} entry under the write lock, so its index cells
-     * go stale and no reader that arrives afterwards can reach it, while a reader already inside holds the
-     * read lock the detaching thread had to wait for.
-     *
-     * <p><b>Why not on the calling thread.</b> Every production call to {@link #configure} arrives from
-     * {@code DirectIOVectorIndexInput#beginBurst}, which is to say on a thread serving a query, so an
-     * operator turning the cache off would spend that query's latency closing arenas. A thread per release
-     * rather than a pool, because a release happens when an operator changes a setting: there is no steady
-     * state to amortise a pool over, and a thread that does not exist cannot be left running.
+     * The segment holding the most slabs, which is the one a shrink takes from. Called under the broker's
+     * lock, and it takes no segment lock: the counts are volatile and a stale one only costs the shrink a
+     * second pass round the loop.
      */
-    private static void releaseDetached(final List<DirectIOSlab> detached) {
-        if (detached.isEmpty()) {
-            return;
-        }
-        final SlabMemory backend = slabMemory;
-        releasesRunning.incrementAndGet();
-        final Thread releaser = new Thread(() -> {
-            try {
-                for (final DirectIOSlab memory : detached) {
-                    backend.release(memory);
-                }
-            } finally {
-                releasesRunning.decrementAndGet();
-            }
-        }, "knn-dio-slab-release");
-        releaser.setDaemon(true);
-        releaser.start();
-    }
-
-    // ---------------------------------------------------------------------------------------------------
-    // Slab supply and eviction
-    // ---------------------------------------------------------------------------------------------------
-
-    /**
-     * A slab with room for a {@code length}-byte vector, by allocating one while the store is under its
-     * target and otherwise by reclaiming the oldest. Returns {@code null} only when the allocation failed and
-     * there was nothing to reclaim. Called under the write lock.
-     */
-    private static Slab obtainSlab(final int length, final SlabRequest request) {
-        final Slab grown = growSlabs(length, request);
-        if (grown != null) {
-            return grown;
-        }
-        if (request != null && request.wanted) {
-            // The target allows another slab and this fill has to leave the lock to get one. Reclaiming
-            // instead would throw away a slab's worth of vectors the target says the store may keep.
-            return null;
-        }
-        if (pendingSlabs > 0 && liveSlabs < maxSlabs) {
-            // Another fill is already fetching a slab the target allows, so this fill waits for it by
-            // simply not being cached. Reclaiming now would evict vectors the store is about to have room
-            // for, and a fill that does not happen costs a future hit and nothing else.
-            return null;
-        }
-        final Slab oldest = FIFO.poll();
-        if (oldest == null) {
-            return null;
-        }
-        reclaimedSlabs.increment();
-        final long started = System.nanoTime();
-        if (oldest.slotBytes == length) {
-            // The common case, and the only one in which a second chance can do anything: the reclaimed slab
-            // is reopened for the vectors it already holds, so the ones that were read stay in their slots
-            // and the rest become the free slots this call came for.
-            reclaimInPlace(oldest);
-            OPEN_SLABS.put(length, oldest);
-        } else {
-            // Reopened for a different vector length, so the slot layout changes and a survivor has nowhere
-            // to stay. See the class javadoc for why they are dropped rather than copied.
-            dropAll(oldest);
-            OPEN_SLABS.remove(oldest.slotBytes, oldest);
-            open(oldest, length);
-        }
-        FIFO.add(oldest);
-        reclaimNanos.add(System.nanoTime() - started);
-        return oldest;
-    }
-
-    /**
-     * Registers the slab {@code request} is carrying and opens it for {@code length}-byte vectors, or returns
-     * {@code null}: at the target, with growth latched, or -- the interesting case -- with
-     * {@link SlabRequest#wanted} set to tell the caller to allocate one outside the lock and ask again. The
-     * half of {@link #obtainSlab} that displaces nothing, which is the only half span fill is allowed. Called
-     * under the write lock.
-     *
-     * <p>Nothing here allocates: that is N3. The target check counts the slabs other fills are allocating
-     * right now ({@link #pendingSlabs}) as well as the live ones, so concurrent growth cannot overshoot.
-     *
-     * <p>One allocation attempt per latch, not one per fill: see {@link #growthLatched} for what a failed
-     * attempt costs the caller. The store then stays the size it is, keeps serving the slabs it holds, and
-     * the cost is hit rate -- which is what a cache that cannot grow should cost.
-     */
-    private static Slab growSlabs(final int length, final SlabRequest request) {
-        if (growthLatched || request == null) {
-            return null;
-        }
-        // This request's own reservation does not count against it; every other fill's does.
-        final int others = pendingSlabs - (request.reserved ? 1 : 0);
-        if (liveSlabs + others >= maxSlabs) {
-            return null;
-        }
-        if (request.spare == null) {
-            if (others > 0) {
-                // One pending allocation at a time, because one slab holds thousands of vectors and the
-                // fills waiting for it will all fit in it. Letting every concurrent fill fetch its own was
-                // MEASURED on the re-proof's arm E: the first burst's threads each reserved a slab, a 64mb
-                // store reached its 2 slab target before a single vector had been cached, span fill stopped
-                // (it only runs below the target) and the arm's hit count fell from 2,921 to 832. Before N3
-                // the write lock enforced this for free, because only one fill could be allocating.
-                return null;
-            }
-            pendingSlabs++;
-            request.reserved = true;
-            request.wanted = true;
-            return null;
-        }
-        final Slab fresh = register(request.spare);
-        request.spare = null;
-        if (request.reserved) {
-            pendingSlabs--;
-            request.reserved = false;
-        }
-        open(fresh, length);
-        return fresh;
-    }
-
-    /**
-     * Gives {@code slab}'s second chance: the slots read since they were written keep both their vector and
-     * their slot, up to half the slab, and every other slot joins the free list. No byte moves and no index
-     * entry changes.
-     */
-    private static void reclaimInPlace(final Slab slab) {
-        // Half the slots, rounded down, so that a slab with a single slot keeps nothing and the caller is
-        // always handed room for the vector it came to write.
-        final int keep = slab.slotCount / 2;
-        int kept = 0;
-        int dropped = 0;
-        final DirectIOSlotMap[] owners = slab.owner;
-        final byte[] hitFlags = slab.hit;
-        final int[] free = slab.free;
-        int freeCount = 0;
-        List<DirectIOSlotMap> emptied = null;
-        for (int slot = 0; slot < slab.used; slot++) {
-            final DirectIOSlotMap owner = owners[slot];
-            if (owner == null) {
-                free[freeCount++] = slot;
-                continue;
-            }
-            if (hitFlags[slot] == 0 || kept >= keep) {
-                // The bookkeeping of detach(), with the counters accumulated rather than published per slot:
-                // the two LongAdder writes per slot were a measurable part of the write-lock hold on a slab
-                // with ten thousand of them.
-                owners[slot] = null;
-                owner.noteInvalidated();
-                if (owner.noteDetached()) {
-                    emptied = emptied == null ? new ArrayList<>() : emptied;
-                    emptied.add(owner);
-                }
-                dropped++;
-                free[freeCount++] = slot;
-                continue;
-            }
-            hitFlags[slot] = 0;
-            kept++;
-        }
-        slab.freeCount = freeCount;
-        liveEntries -= dropped;
-        liveEntryBytes -= (long) dropped * slab.slotBytes;
-        droppedEntries.add(dropped);
-        readmissions.add(kept);
-        if (emptied != null) {
-            // The closed-file rule's second half, done once per reclaim rather than once per slot: a file
-            // whose last cached vector has just gone loses its index table too.
-            for (final DirectIOSlotMap owner : emptied) {
-                if (owner.liveEntries() <= 0) {
-                    INDEX.remove(owner.fileId(), owner);
-                }
+    private static DirectIOCacheSegment fullestSegment() {
+        DirectIOCacheSegment fullest = null;
+        int most = 0;
+        for (final DirectIOCacheSegment segment : segments) {
+            final int held = segment.liveSlabs();
+            if (held > most) {
+                most = held;
+                fullest = segment;
             }
         }
-    }
-
-    /** Frees every live slot of {@code slab} and empties it. Called under the write lock. */
-    private static void dropAll(final Slab slab) {
-        slab.freeCount = 0;
-        for (int slot = 0; slot < slab.used; slot++) {
-            detach(slab, slot, true);
-        }
-        slab.used = 0;
-    }
-
-    /**
-     * Stops counting {@code slot} as live, and drops its file's index table when that was the file's last
-     * entry. {@code leaveCellStale} says whether the index cell naming the slot is being left behind, which
-     * is the case for an eviction and not for a re-cache that is about to overwrite the cell.
-     */
-    private static void detach(final Slab slab, final int slot, final boolean leaveCellStale) {
-        final DirectIOSlotMap owner = slab.owner[slot];
-        if (owner == null) {
-            return;
-        }
-        slab.owner[slot] = null;
-        liveEntries--;
-        liveEntryBytes -= slab.slotBytes;
-        droppedEntries.increment();
-        if (leaveCellStale) {
-            owner.noteInvalidated();
-        }
-        if (owner.noteDetached()) {
-            INDEX.remove(owner.fileId(), owner);
-        }
-    }
-
-    /** Records that {@code slot} of {@code slab} now holds the vector at {@code offset} of {@code map}. */
-    private static void attach(final Slab slab, final int slot, final DirectIOSlotMap map, final long offset) {
-        final int previous = map.find(offset);
-        if (previous >= 0) {
-            final int previousSlabId = map.slabIdAt(previous);
-            final int previousSlot = map.slotAt(previous);
-            final Slab previousSlab = slabAt(previousSlabId);
-            if (previousSlab != null
-                && previousSlot < previousSlab.slotCount
-                && previousSlab.owner[previousSlot] == map
-                && previousSlab.offset[previousSlot] == offset) {
-                // The cell is about to be overwritten, so it is not left stale. The map cannot empty here,
-                // because this very offset is about to be attached again, but detach's INDEX.remove would
-                // fire if it did; re-attaching below puts it back, so the map object stays the one the slot
-                // points at either way.
-                detach(previousSlab, previousSlot, false);
-            }
-        }
-        if (INDEX.get(map.fileId()) != map) {
-            INDEX.put(map.fileId(), map);
-        }
-        map.put(offset, slab.id, slot);
-        map.noteAttached();
-        slab.owner[slot] = map;
-        slab.offset[slot] = offset;
-        slab.hit[slot] = 0;
-        liveEntries++;
-        liveEntryBytes += slab.slotBytes;
-    }
-
-    private static Slab slabAt(final int id) {
-        final Slab[] slabs = slabsById;
-        return id >= 0 && id < slabs.length ? slabs[id] : null;
-    }
-
-    /** Opens {@code slab} for {@code length}-byte vectors and makes it the one being appended to. */
-    private static void open(final Slab slab, final int length) {
-        slab.openFor(length);
-        OPEN_SLABS.put(length, slab);
-    }
-
-    private static Slab register(final DirectIOSlab memory) {
-        int id = 0;
-        while (id < slabsById.length && slabsById[id] != null) {
-            id++;
-        }
-        if (id == slabsById.length) {
-            final Slab[] grown = new Slab[Math.max(4, slabsById.length * 2)];
-            System.arraycopy(slabsById, 0, grown, 0, slabsById.length);
-            slabsById = grown;
-        }
-        final Slab slab = new Slab(id, memory);
-        slabsById[id] = slab;
-        liveSlabs++;
-        FIFO.add(slab);
-        return slab;
-    }
-
-    /**
-     * Takes a slab out of service under the write lock and hands its memory back to the caller to release
-     * outside the lock (N3). Clearing {@code slabsById} is what makes that safe: every lookup resolves a slab
-     * through {@link #slabAt} under the read lock, so a reader arriving after this cannot reach the slab and a
-     * reader already inside held the read lock this thread had to wait for.
-     *
-     * @param slab the slab to detach
-     * @return its memory, for {@link #releaseDetached}
-     */
-    private static DirectIOSlab detach(final Slab slab) {
-        slabsById[slab.id] = null;
-        OPEN_SLABS.remove(slab.slotBytes, slab);
-        liveSlabs--;
-        // Memory is coming back, so an earlier allocation failure may not stand any more (N2).
-        growthLatched = false;
-        return slab.memory;
+        return fullest;
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -1677,47 +959,42 @@ public final class DirectIOVectorCache {
     /**
      * Slot bytes held by live vectors right now. Payload, not the slab total: see {@link #slabBytes()} for
      * what the node is actually holding, which is the figure a memory budget cares about.
+     *
+     * <p>A lock-free sum of the segments' volatile counters since Q, where it took the store's one read lock.
      */
     public static long bytes() {
-        LOCK.readLock().lock();
-        try {
-            return liveEntryBytes;
-        } finally {
-            LOCK.readLock().unlock();
+        long total = 0;
+        for (final DirectIOCacheSegment segment : segments) {
+            total += segment.liveEntryBytes();
         }
+        return total;
     }
 
-    /** Vectors held right now. */
+    /** Vectors held right now. A lock-free sum of the segments' volatile counters. */
     public static long entries() {
-        LOCK.readLock().lock();
-        try {
-            return liveEntries;
-        } finally {
-            LOCK.readLock().unlock();
+        long total = 0;
+        for (final DirectIOCacheSegment segment : segments) {
+            total += segment.liveEntries();
         }
+        return total;
     }
 
     /** The store's byte target, rounded down to whole slabs; {@code 0} when the cache is off. */
     public static long maxBytes() {
-        return (long) maxSlabs * slabBytes;
+        return (long) BROKER.maxSlabs() * BROKER.slabBytes();
     }
 
-    /** Slabs held right now. */
+    /** Slabs held right now, which the broker counts for the node. */
     public static long slabs() {
-        LOCK.readLock().lock();
-        try {
-            return liveSlabs;
-        } finally {
-            LOCK.readLock().unlock();
-        }
+        return BROKER.liveSlabs();
     }
 
     /** Bytes of off-heap slab held right now, which is what the node is paying for. */
     public static long slabBytes() {
-        return slabs() * slabBytes;
+        return slabs() * BROKER.slabBytes();
     }
 
-    /** Slabs taken from the head of the FIFO queue to make room. */
+    /** Slabs taken from the head of a FIFO queue to make room. */
     public static long reclaimedSlabs() {
         return reclaimedSlabs.sum();
     }
@@ -1795,31 +1072,25 @@ public final class DirectIOVectorCache {
 
     /** Heap held by the index itself, for the bytes-per-entry figure M2's bench reports. */
     static long indexBytes() {
-        LOCK.readLock().lock();
-        try {
-            long total = 48L * INDEX.size();
-            for (final DirectIOSlotMap map : INDEX.values()) {
-                total += map.indexBytes();
-            }
-            for (final Slab slab : FIFO) {
-                if (slab.owner != null) {
-                    total += 48 + 4L * slab.owner.length + 16 + 8L * slab.offset.length + 16 + slab.hit.length;
-                    total += 16 + 4L * slab.free.length;
-                }
-            }
-            return total;
-        } finally {
-            LOCK.readLock().unlock();
+        long total = 0;
+        for (final DirectIOCacheSegment segment : segments) {
+            total += segment.indexBytes();
         }
+        return total;
     }
+
+    // ---------------------------------------------------------------------------------------------------
+    // Test seams
+    // ---------------------------------------------------------------------------------------------------
 
     /** Test seam: empties the store, releases every slab, and zeroes every counter. */
     static void resetForTesting() {
-        slabMemory = DIRECT_SLABS;
+        BROKER.resetSlabMemory();
         configure(0);
         awaitReleasesForTesting();
-        slabBytes = DirectIOSlab.SLAB_BYTES;
+        BROKER.setSlabBytes(DirectIOSlab.SLAB_BYTES);
         spanFill = KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_DEFAULT_VALUE;
+        segments = new DirectIOCacheSegment[] { new DirectIOCacheSegment(BROKER) };
         hits.reset();
         misses.reset();
         insertions.reset();
@@ -1842,34 +1113,34 @@ public final class DirectIOVectorCache {
      * @param memory the allocate and release pair to use until the next reset
      */
     static void setSlabMemoryForTesting(final SlabMemory memory) {
-        LOCK.writeLock().lock();
-        try {
-            slabMemory = memory;
-            growthLatched = false;
-        } finally {
-            LOCK.writeLock().unlock();
-        }
+        BROKER.setSlabMemory(memory);
     }
 
     /**
-     * Test seam: waits for every release in flight to have given its memory back, because
-     * {@link #releaseDetached} does that on a thread of its own.
+     * Test seam: waits for every release in flight to have given its memory back, because the broker does
+     * that on a thread of its own.
      */
     static void awaitReleasesForTesting() {
-        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
-        while (releasesRunning.get() > 0 && System.nanoTime() < deadline) {
-            Thread.onSpinWait();
-        }
+        BROKER.awaitReleases();
     }
 
     /**
-     * Test seam: whether the calling thread is inside this store's lock in either mode. N3's property is that
-     * neither a slab allocation nor a slab release ever runs while it is.
+     * Test seam: whether the calling thread is inside this store's locks at all, which since Q means the
+     * broker's lock or any segment's lock in either mode. N3's property is that neither a slab allocation
+     * nor a slab release ever runs while it is.
      *
-     * @return whether this thread holds the read or the write lock
+     * @return whether this thread holds any of the store's locks
      */
     static boolean lockHeldByCurrentThreadForTesting() {
-        return LOCK.isWriteLockedByCurrentThread() || LOCK.getReadHoldCount() > 0;
+        if (BROKER.lockHeldByCurrentThread()) {
+            return true;
+        }
+        for (final DirectIOCacheSegment segment : segments) {
+            if (segment.lockHeldByCurrentThread()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -1879,104 +1150,88 @@ public final class DirectIOVectorCache {
      * @param bytes the slab size to use until the next reset
      */
     static void setSlabBytesForTesting(final int bytes) {
-        if (maxSlabs != 0) {
+        if (BROKER.maxSlabs() != 0) {
             throw new IllegalStateException("The slab size can only be changed while the cache is off");
         }
-        slabBytes = bytes;
+        BROKER.setSlabBytes(bytes);
     }
 
     /** Test seam: the number of slots {@code length}-byte vectors get in one slab. */
     static int slotsPerSlab(final int length) {
-        return Math.min(slabBytes / length, DirectIOSlotMap.MAX_SLOTS);
+        return Math.min(BROKER.slabBytes() / length, DirectIOSlotMap.MAX_SLOTS);
     }
 
-    /** Test seam: files with an index table right now, so a test can assert a dead one's table is gone. */
+    /** Test seam: index tables right now, which is one per (segment, file), so a dead one's going shows. */
     static int indexedFiles() {
-        LOCK.readLock().lock();
-        try {
-            return INDEX.size();
-        } finally {
-            LOCK.readLock().unlock();
+        int total = 0;
+        for (final DirectIOCacheSegment segment : segments) {
+            total += segment.indexedFiles();
         }
+        return total;
     }
 
-    /** Test seam: whether {@code fileId} has an index table right now. */
+    /** Test seam: whether {@code fileId} has an index table in any segment right now. */
     static boolean hasIndexFor(final String fileId) {
-        LOCK.readLock().lock();
-        try {
-            return INDEX.containsKey(fileId);
-        } finally {
-            LOCK.readLock().unlock();
+        for (final DirectIOCacheSegment segment : segments) {
+            if (segment.hasIndexFor(fileId)) {
+                return true;
+            }
         }
+        return false;
+    }
+
+    /** Test seam: the segment count in force. */
+    static int segmentCount() {
+        return segments.length;
     }
 
     /**
      * Test seam: re-derives the live entry count and byte total from the slabs themselves and checks them
      * against the running counters, so a test can assert that no path has lost or double counted a slot.
-     * Every slot that still carries a back pointer must also be the slot its file's index names for it.
+     * Every slot that still carries a back pointer must also be the slot its file's index names for it, and
+     * that index must be its own segment's.
+     *
+     * <p>Takes the broker's lock and then every segment's write lock, <b>in index order</b>, so the check is
+     * atomic against the store. That is the one place more than one segment lock is held at once, and it is
+     * deadlock free for the same reason the production order is: the broker's lock comes first and the
+     * segments are always taken in the same order.
      *
      * @throws IllegalStateException on any disagreement, naming it
      */
     static void checkInvariantsForTesting() {
-        LOCK.writeLock().lock();
+        final DirectIOCacheSegment[] all = segments;
+        final long[] totals = new long[3];
+        BROKER.lock().lock();
         try {
-            long entries = 0;
-            long entryBytes = 0;
-            final Map<DirectIOSlotMap, Integer> counted = new HashMap<>();
-            for (final Slab slab : FIFO) {
-                if (slab.used > slab.slotCount) {
-                    throw new IllegalStateException("slab " + slab.id + " used " + slab.used + " of " + slab.slotCount);
+            int locked = 0;
+            try {
+                for (; locked < all.length; locked++) {
+                    all[locked].lockForInvariantCheck();
                 }
-                for (int slot = 0; slot < slab.used; slot++) {
-                    final DirectIOSlotMap owner = slab.owner[slot];
-                    if (owner == null) {
-                        continue;
-                    }
-                    final int cell = owner.find(slab.offset[slot]);
-                    if (cell < 0 || owner.slabIdAt(cell) != slab.id || owner.slotAt(cell) != slot) {
-                        throw new IllegalStateException("slab " + slab.id + " slot " + slot + " is not named by its index entry");
-                    }
-                    if (INDEX.get(owner.fileId()) != owner) {
-                        throw new IllegalStateException("slab " + slab.id + " slot " + slot + " is owned by an unindexed file");
-                    }
-                    counted.merge(owner, 1, Integer::sum);
-                    entries++;
-                    entryBytes += slab.slotBytes;
+                for (final DirectIOCacheSegment segment : all) {
+                    segment.checkInvariantsUnderLock(totals);
                 }
-                for (int i = 0; i < slab.freeCount; i++) {
-                    // A slot on the free list and still live would be handed to a fill that overwrites a
-                    // vector the index still names, which is the one way the free list could corrupt a read.
-                    if (slab.owner[slab.free[i]] != null) {
-                        throw new IllegalStateException("slab " + slab.id + " slot " + slab.free[i] + " is both free and live");
-                    }
-                }
-            }
-            if (entries != liveEntries) {
-                throw new IllegalStateException("counted " + entries + " live entries but the counter says " + liveEntries);
-            }
-            if (entryBytes != liveEntryBytes) {
-                throw new IllegalStateException("counted " + entryBytes + " live bytes but the counter says " + liveEntryBytes);
-            }
-            if (FIFO.size() != liveSlabs) {
-                throw new IllegalStateException("queue holds " + FIFO.size() + " slabs but the counter says " + liveSlabs);
-            }
-            if (pendingSlabs < 0 || liveSlabs + pendingSlabs > Math.max(maxSlabs, liveSlabs)) {
-                throw new IllegalStateException(liveSlabs + " live and " + pendingSlabs + " pending slabs against a target of " + maxSlabs);
-            }
-            for (final Map.Entry<DirectIOSlotMap, Integer> entry : counted.entrySet()) {
-                if (entry.getKey().liveEntries() != entry.getValue()) {
+                // Both global checks inside the locks, because outside them a fill in flight makes either
+                // one false for a moment and a stress test would read that as a corruption.
+                if (totals[2] != BROKER.liveSlabs()) {
                     throw new IllegalStateException(
-                        "file "
-                            + entry.getKey().fileId()
-                            + " holds "
-                            + entry.getValue()
-                            + " slots but its map says "
-                            + entry.getKey().liveEntries()
+                        "the segments hold " + totals[2] + " slabs but the broker counts " + BROKER.liveSlabs()
                     );
+                }
+                final int pending = BROKER.pendingSlabs();
+                final int live = BROKER.liveSlabs();
+                if (pending < 0 || live + pending > Math.max(BROKER.maxSlabs(), live)) {
+                    throw new IllegalStateException(
+                        live + " live and " + pending + " pending slabs against a target of " + BROKER.maxSlabs()
+                    );
+                }
+            } finally {
+                for (int i = locked - 1; i >= 0; i--) {
+                    all[i].unlockAfterInvariantCheck();
                 }
             }
         } finally {
-            LOCK.writeLock().unlock();
+            BROKER.lock().unlock();
         }
     }
 }
