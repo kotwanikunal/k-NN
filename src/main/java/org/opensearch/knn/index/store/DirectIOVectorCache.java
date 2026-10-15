@@ -1419,6 +1419,32 @@ public final class DirectIOVectorCache {
         return slabTransfers.sum();
     }
 
+    /**
+     * The most and the fewest vectors any one segment holds right now, which is the entry skew the hit-rate
+     * cost of segmenting the eviction is priced against (C3). MEASURED by the design run's emulation at the
+     * chosen operating point of eight slabs per segment: 597 to 680 entries per segment against a mean of
+     * 638, which is +-7%, and the hit-rate loss that skew carries is -0.08 points.
+     *
+     * <p>A lock-free sum of volatile counters, like {@link #entries()}, so a wide spread between the two is
+     * readable on a node without the stats endpoint competing with the query path.
+     */
+    static long maxSegmentEntries() {
+        long most = 0;
+        for (final DirectIOCacheSegment segment : segments) {
+            most = Math.max(most, segment.liveEntries());
+        }
+        return most;
+    }
+
+    /** The fewest vectors any one segment holds right now. See {@link #maxSegmentEntries()}. */
+    static long minSegmentEntries() {
+        long fewest = Long.MAX_VALUE;
+        for (final DirectIOCacheSegment segment : segments) {
+            fewest = Math.min(fewest, segment.liveEntries());
+        }
+        return fewest == Long.MAX_VALUE ? 0 : fewest;
+    }
+
     /** Read acquisitions that found a thread already queued on a segment's lock. */
     static long contendedReadAcquisitions() {
         return contendedReadAcquisitions.sum();
