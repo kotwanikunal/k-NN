@@ -174,22 +174,26 @@ public class DirectIOSegmentedStatsTests extends KNNTestCase {
         for (int rep = 0; rep < 2; rep++) {
             lookupBurst(file, keys, read, 200_000);
         }
-        long withTiming = 0;
-        long withoutTiming = 0;
-        for (int rep = 0; rep < 5; rep++) {
+        // Seven alternating repetitions and the MINIMUM of each arm, not the sum. The minimum is the
+        // pause-free run by construction, which is the statistic for "what does this code path cost"; a sum
+        // or a mean prices whatever else the JVM was doing, and MEASURED that is the difference between
+        // 0.12% and 5.11% depending on whether this test ran alone or with the rest of the store suite.
+        long withTiming = Long.MAX_VALUE;
+        long withoutTiming = Long.MAX_VALUE;
+        for (int rep = 0; rep < 7; rep++) {
             DirectIOVectorCache.setLockTimingForTesting(true);
-            withTiming += lookupBurst(file, keys, read, 200_000);
+            withTiming = Math.min(withTiming, lookupBurst(file, keys, read, 200_000));
             DirectIOVectorCache.setLockTimingForTesting(false);
-            withoutTiming += lookupBurst(file, keys, read, 200_000);
+            withoutTiming = Math.min(withoutTiming, lookupBurst(file, keys, read, 200_000));
         }
         DirectIOVectorCache.setLockTimingForTesting(true);
         assertEquals("no acquisition was contended, so nothing was timed", 0L, DirectIOVectorCache.readLockWaitNanos());
         assertEquals(0L, DirectIOVectorCache.contendedReadAcquisitions());
         final double ratio = (double) withTiming / withoutTiming;
         logger.info(
-            "1,000,000 uncontended lookups: {} ms with the timing on, {} ms with it off, a factor of {}",
-            withTiming / 1_000_000,
-            withoutTiming / 1_000_000,
+            "200,000 uncontended lookups, best of seven: {} us with the timing on, {} us with it off, a factor of {}",
+            withTiming / 1_000,
+            withoutTiming / 1_000,
             String.format("%.4f", ratio)
         );
         assertTrue(
