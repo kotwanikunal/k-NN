@@ -262,6 +262,71 @@ final class DirectIOCacheSegment {
     }
 
     // ---------------------------------------------------------------------------------------------------
+    // The lock, and what it costs (C2; published by KNNStats, see DirectIOVectorCache)
+    // ---------------------------------------------------------------------------------------------------
+
+    /**
+     * Takes the read lock, counting the acquisition if it had to queue behind another thread and timing it
+     * if it did.
+     *
+     * <h4>Why the wait is timed on a contended acquisition and not sampled over all of them</h4>
+     * The design run proposed sampling one acquisition in 1,024, because the instrumented baseline build
+     * timed <b>every</b> acquisition with two {@code System.nanoTime} calls (31 ns each on this host) and
+     * cost 26% of the plain build's one-thread throughput. Timing only the contended ones is both exact and
+     * cheaper than sampling, and the measurement is why: a contended acquisition waits 20.3 us at the core
+     * count and 168.3 us at 128 threads on the unsegmented store (MEASURED, output/bench/q-c1b), against
+     * <b>0.045 us</b> uncontended. All of the wait is in the contended acquisitions, so an uncontended one
+     * has nothing worth timing, and 62 ns against a 0.7 us wait is 9% of a figure that is 1.9% of
+     * acquisitions at the core count. The uncontended path therefore costs one
+     * {@code hasQueuedThreads()} volatile read and a branch, which is what the design wanted the counts to
+     * cost and now also what the timing costs.
+     */
+    private void lockRead() {
+        if (lock.hasQueuedThreads()) {
+            DirectIOVectorCache.contendedReadAcquisitions.increment();
+            if (DirectIOVectorCache.lockTimingEnabled) {
+                final long started = System.nanoTime();
+                lock.readLock().lock();
+                DirectIOVectorCache.readLockWaitNanos.add(System.nanoTime() - started);
+            } else {
+                lock.readLock().lock();
+            }
+        } else {
+            lock.readLock().lock();
+        }
+        if (DirectIOVectorCache.acquisitionCounting) {
+            DirectIOVectorCache.readAcquisitions.increment();
+        }
+    }
+
+    private void unlockRead() {
+        lock.readLock().unlock();
+    }
+
+    /** {@link #lockRead}'s counterpart for the write lock. */
+    private void lockWrite() {
+        if (lock.hasQueuedThreads()) {
+            DirectIOVectorCache.contendedWriteAcquisitions.increment();
+            if (DirectIOVectorCache.lockTimingEnabled) {
+                final long started = System.nanoTime();
+                lock.writeLock().lock();
+                DirectIOVectorCache.writeLockWaitNanos.add(System.nanoTime() - started);
+            } else {
+                lock.writeLock().lock();
+            }
+        } else {
+            lock.writeLock().lock();
+        }
+        if (DirectIOVectorCache.acquisitionCounting) {
+            DirectIOVectorCache.writeAcquisitions.increment();
+        }
+    }
+
+    private void unlockWrite() {
+        lock.writeLock().unlock();
+    }
+
+    // ---------------------------------------------------------------------------------------------------
     // The read path
     // ---------------------------------------------------------------------------------------------------
 
@@ -277,7 +342,7 @@ final class DirectIOCacheSegment {
      * @return the offset reached, or {@code -1}
      */
     long containsUpTo(final String fileId, final long at, final long end) {
-        lock.readLock().lock();
+        lockRead();
         try {
             final DirectIOSlotMap map = index.get(fileId);
             if (map == null) {
@@ -305,13 +370,13 @@ final class DirectIOCacheSegment {
             }
             return next;
         } finally {
-            lock.readLock().unlock();
+            unlockRead();
         }
     }
 
     /** {@link DirectIOVectorCache#getFloats}'s body, for the one segment the offset belongs to. */
     boolean getFloats(final String fileId, final long offset, final int length, final float[] destination, final int destinationOffset) {
-        lock.readLock().lock();
+        lockRead();
         try {
             final DirectIOSlotMap map = index.get(fileId);
             final int packedSlot = locate(map, offset, length);
@@ -326,13 +391,13 @@ final class DirectIOCacheSegment {
             }
             return false;
         } finally {
-            lock.readLock().unlock();
+            unlockRead();
         }
     }
 
     /** {@link DirectIOVectorCache#getBytes}'s body, for the one segment the offset belongs to. */
     boolean getBytes(final String fileId, final long offset, final int length, final byte[] destination, final int destinationOffset) {
-        lock.readLock().lock();
+        lockRead();
         try {
             final DirectIOSlotMap map = index.get(fileId);
             final int packedSlot = locate(map, offset, length);
@@ -347,7 +412,7 @@ final class DirectIOCacheSegment {
             }
             return false;
         } finally {
-            lock.readLock().unlock();
+            unlockRead();
         }
     }
 
@@ -371,7 +436,7 @@ final class DirectIOCacheSegment {
         final int found
     ) {
         int writing = found;
-        lock.readLock().lock();
+        lockRead();
         try {
             final DirectIOSlotMap map = index.get(fileId);
             if (map == null) {
@@ -383,9 +448,48 @@ final class DirectIOCacheSegment {
                 }
             }
         } finally {
-            lock.readLock().unlock();
+            unlockRead();
         }
         return writing;
+    }
+
+    /**
+     * Records in {@code miss} whether this segment holds each of the ordinals {@code ords[order[k]]} for
+     * {@code k} in {@code [from, to)}, under <b>one</b> read-lock acquisition, and says whether it holds an
+     * index for the file at all. C2's batched probe: {@code order} is the batch grouped by segment, so this
+     * segment's members of the batch are a contiguous run of it and the caller's ordinal order is recovered
+     * from {@code miss} afterwards.
+     *
+     * @param miss written at index {@code order[k]}, never read
+     * @return whether this segment has an index table for {@code fileId}
+     */
+    boolean probeMissing(
+        final String fileId,
+        final long baseOffset,
+        final int vectorBytes,
+        final int[] ords,
+        final int[] order,
+        final int from,
+        final int to,
+        final boolean[] miss
+    ) {
+        lockRead();
+        try {
+            final DirectIOSlotMap map = index.get(fileId);
+            if (map == null) {
+                for (int k = from; k < to; k++) {
+                    miss[order[k]] = true;
+                }
+                return false;
+            }
+            for (int k = from; k < to; k++) {
+                final int i = order[k];
+                miss[i] = locate(map, baseOffset + (long) ords[i] * vectorBytes, vectorBytes) < 0;
+            }
+            return true;
+        } finally {
+            unlockRead();
+        }
     }
 
     /**
@@ -428,7 +532,7 @@ final class DirectIOCacheSegment {
             // At most twice round: once with nothing in hand, and once with the slab that round asked for.
             // See Request for why the allocation cannot happen inside the lock.
             for (int round = 0; round < 2; round++) {
-                lock.writeLock().lock();
+                lockWrite();
                 try {
                     request.wanted = false;
                     final Placement placement = place(fileId, length, true, request);
@@ -439,7 +543,7 @@ final class DirectIOCacheSegment {
                         return;
                     }
                 } finally {
-                    lock.writeLock().unlock();
+                    unlockWrite();
                 }
                 if (request.wanted == false || broker.allocateOutsideLock(request) == false) {
                     return;
@@ -455,7 +559,7 @@ final class DirectIOCacheSegment {
         final Request request = new Request(broker);
         try {
             for (int round = 0; round < 2; round++) {
-                lock.writeLock().lock();
+                lockWrite();
                 try {
                     if (locate(index.get(fileId), offset, length) >= 0) {
                         // Another thread put it back while this read was in flight, which is the same race
@@ -476,7 +580,7 @@ final class DirectIOCacheSegment {
                         return true;
                     }
                 } finally {
-                    lock.writeLock().unlock();
+                    unlockWrite();
                 }
                 if (request.wanted == false || broker.allocateOutsideLock(request) == false) {
                     return false;
@@ -513,7 +617,7 @@ final class DirectIOCacheSegment {
         final Request request = new Request(broker);
         try {
             while (next < lastIndex) {
-                lock.writeLock().lock();
+                lockWrite();
                 try {
                     if (mayAdmitSpanFill(length) == false) {
                         break;
@@ -537,7 +641,7 @@ final class DirectIOCacheSegment {
                         admitted[0]++;
                     }
                 } finally {
-                    lock.writeLock().unlock();
+                    unlockWrite();
                 }
                 // One acquisition per span is the rule, and this is the one thing that can need a second:
                 // a span that fills the open slab. The staged bytes are still the caller's and still valid
@@ -713,7 +817,7 @@ final class DirectIOCacheSegment {
      * @param freed  {@code {entries, bytes}}, added to
      */
     void releaseFile(final String fileId, final long[] freed) {
-        lock.writeLock().lock();
+        lockWrite();
         try {
             final DirectIOSlotMap map = index.remove(fileId);
             if (map == null) {
@@ -750,7 +854,7 @@ final class DirectIOCacheSegment {
             freed[0] += here[0];
             freed[1] += here[1];
         } finally {
-            lock.writeLock().unlock();
+            unlockWrite();
         }
     }
 
@@ -864,11 +968,11 @@ final class DirectIOCacheSegment {
 
     /** Gives one pending reservation back. Called by {@link Request#finish} with no lock held. */
     private void cancelPending() {
-        lock.writeLock().lock();
+        lockWrite();
         try {
             pendingSlabs--;
         } finally {
-            lock.writeLock().unlock();
+            unlockWrite();
         }
     }
 
@@ -1030,7 +1134,7 @@ final class DirectIOCacheSegment {
      * @return whether a slab was released, i.e. whether this segment had one
      */
     boolean releaseOldestSlab(final List<DirectIOSlab> detached) {
-        lock.writeLock().lock();
+        lockWrite();
         try {
             final Slab oldest = fifo.poll();
             if (oldest == null) {
@@ -1044,7 +1148,7 @@ final class DirectIOCacheSegment {
             detached.add(oldest.memory);
             return true;
         } finally {
-            lock.writeLock().unlock();
+            unlockWrite();
         }
     }
 
@@ -1063,7 +1167,7 @@ final class DirectIOCacheSegment {
      * @return the slab's memory, or null
      */
     DirectIOSlab detachOldestForTransfer() {
-        lock.writeLock().lock();
+        lockWrite();
         try {
             final Slab oldest = fifo.poll();
             if (oldest == null) {
@@ -1075,7 +1179,7 @@ final class DirectIOCacheSegment {
             liveSlabs--;
             return oldest.memory;
         } finally {
-            lock.writeLock().unlock();
+            unlockWrite();
         }
     }
 
@@ -1084,24 +1188,24 @@ final class DirectIOCacheSegment {
      * it. Its slabs and its index are drained by the caller; see {@link #retired}.
      */
     void retire() {
-        lock.writeLock().lock();
+        lockWrite();
         try {
             retired = true;
         } finally {
-            lock.writeLock().unlock();
+            unlockWrite();
         }
     }
 
     /** Drops this segment's index, open slabs and recycled queue. Called when the store goes off. */
     void clearIndex() {
-        lock.writeLock().lock();
+        lockWrite();
         try {
             index.clear();
             openSlabs.clear();
             recycled.clear();
             recycledSlabs = 0;
         } finally {
-            lock.writeLock().unlock();
+            unlockWrite();
         }
     }
 

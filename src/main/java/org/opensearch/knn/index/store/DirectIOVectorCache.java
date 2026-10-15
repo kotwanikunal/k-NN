@@ -11,6 +11,7 @@ import org.opensearch.knn.index.KNNSettings;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.LongAdder;
 
@@ -246,6 +247,31 @@ public final class DirectIOVectorCache {
     static final LongAdder slabTransfers = new LongAdder();
     /** Resizes that crossed a segment-count boundary and so cost a re-warm (Q, C1b). */
     static final LongAdder segmentCountChanges = new LongAdder();
+    /**
+     * Acquisitions that found a thread already queued on the segment's lock, and the nanoseconds they then
+     * waited (C2). Only a contended acquisition is counted and only a contended one is timed, which is why
+     * both are free on the path that matters; see {@link DirectIOCacheSegment}'s {@code lockRead}.
+     */
+    static final LongAdder contendedReadAcquisitions = new LongAdder();
+    static final LongAdder contendedWriteAcquisitions = new LongAdder();
+    static final LongAdder readLockWaitNanos = new LongAdder();
+    static final LongAdder writeLockWaitNanos = new LongAdder();
+
+    /**
+     * Every acquisition, contended or not, counted only while {@link #setAcquisitionCountingForTesting} has
+     * turned it on. Off in production, where it would be a {@link LongAdder} increment on every lookup for a
+     * figure no operator reads: the contended counts above are the ones that say something, and a test that
+     * needs the denominator can ask for it.
+     */
+    static final LongAdder readAcquisitions = new LongAdder();
+    static final LongAdder writeAcquisitions = new LongAdder();
+    static volatile boolean acquisitionCounting;
+
+    /**
+     * Whether a contended acquisition is timed. Always true in production; a test and the C6 overhead
+     * measurement turn it off to price the timing against a build that does none.
+     */
+    static volatile boolean lockTimingEnabled = true;
 
     private DirectIOVectorCache() {}
 
@@ -468,21 +494,85 @@ public final class DirectIOVectorCache {
             // One read acquisition for the batch, which is the batching this method exists to keep.
             return all[0].selectMissing(fileId, baseOffset, vectorBytes, ords, 0, numOrds, missing, 0);
         }
-        int found = 0;
-        boolean anyIndexed = false;
+        // C2: bucket the batch by segment, walk each touched segment under ONE read acquisition, and write
+        // the misses out in the caller's ordinal order. A counting sort, so the bucketing is
+        // O(batch + segments) with no comparison, and the scratch is one set of arrays per thread.
+        //
+        // MEASURED (output/bench/q-baseline): a contended read acquisition on the unsegmented lock waited
+        // 8.9 us at 8 threads and 168.8 us at 128, against 0.045 us uncontended. A 190-candidate batch over
+        // 128 segments touches about 103 of them, so this trades one contended acquisition for about 103
+        // uncontended ones.
+        final SelectScratch scratch = SELECT_SCRATCH.get().sized(numOrds, all.length);
+        final int[] segmentOf = scratch.segmentOf;
+        final int[] bounds = scratch.bounds;
+        final int[] order = scratch.order;
+        final boolean[] miss = scratch.miss;
+        Arrays.fill(bounds, 0, all.length, 0);
+        final int hash = fileId.hashCode();
         for (int i = 0; i < numOrds; i++) {
-            final long offset = baseOffset + (long) ords[i] * vectorBytes;
-            final int written = segmentFor(fileId, offset).selectMissing(fileId, baseOffset, vectorBytes, ords, i, i + 1, missing, found);
-            if (written < 0) {
-                // That segment holds nothing of this file, so its ordinals are missing from it.
+            final int segment = segmentIndex(hash, baseOffset + (long) ords[i] * vectorBytes, all.length);
+            segmentOf[i] = segment;
+            bounds[segment]++;
+        }
+        int running = 0;
+        for (int segment = 0; segment < all.length; segment++) {
+            final int here = bounds[segment];
+            bounds[segment] = running;
+            running += here;
+        }
+        for (int i = 0; i < numOrds; i++) {
+            order[bounds[segmentOf[i]]++] = i;
+        }
+        // bounds[s] is now one past segment s's group, so its group is [the previous bound, bounds[s]).
+        boolean anyIndexed = false;
+        int from = 0;
+        for (int segment = 0; segment < all.length; segment++) {
+            final int to = bounds[segment];
+            if (to == from) {
+                continue;
+            }
+            anyIndexed |= all[segment].probeMissing(fileId, baseOffset, vectorBytes, ords, order, from, to, miss);
+            from = to;
+        }
+        int found = 0;
+        for (int i = 0; i < numOrds; i++) {
+            if (miss[i]) {
                 missing[found++] = ords[i];
-            } else {
-                anyIndexed = true;
-                found = written;
             }
         }
         return anyIndexed ? found : -1;
     }
+
+    /**
+     * {@link #selectMissing}'s working arrays, one set per thread because the batch is per thread and the
+     * alternative is four allocations per prefetch filter call. Grown to the largest batch and the largest
+     * segment count a thread has seen and <b>never shrunk</b>, which is the device
+     * {@code PrefetchHelper#missScratch} uses for its own miss list; a search thread's batch is Lucene's bulk
+     * size, so this settles at a few hundred ints.
+     *
+     * <p>{@code miss} needs no clearing between calls: every ordinal of the batch belongs to exactly one
+     * segment's group, so every one of its {@code numOrds} entries is written before any is read.
+     */
+    private static final class SelectScratch {
+        private int[] segmentOf = new int[0];
+        private int[] order = new int[0];
+        private int[] bounds = new int[0];
+        private boolean[] miss = new boolean[0];
+
+        private SelectScratch sized(final int ords, final int segments) {
+            if (segmentOf.length < ords) {
+                segmentOf = new int[ords];
+                order = new int[ords];
+                miss = new boolean[ords];
+            }
+            if (bounds.length < segments) {
+                bounds = new int[segments];
+            }
+            return this;
+        }
+    }
+
+    private static final ThreadLocal<SelectScratch> SELECT_SCRATCH = ThreadLocal.withInitial(SelectScratch::new);
 
     /**
      * Copies the cached vector into {@code destination} and returns true, or returns false and leaves
@@ -1234,6 +1324,14 @@ public final class DirectIOVectorCache {
         raceReadmissions.reset();
         slabTransfers.reset();
         segmentCountChanges.reset();
+        contendedReadAcquisitions.reset();
+        contendedWriteAcquisitions.reset();
+        readLockWaitNanos.reset();
+        writeLockWaitNanos.reset();
+        readAcquisitions.reset();
+        writeAcquisitions.reset();
+        acquisitionCounting = false;
+        lockTimingEnabled = true;
     }
 
     /**
@@ -1319,6 +1417,55 @@ public final class DirectIOVectorCache {
     /** Slabs the broker lent from one segment to another because the borrower held none. */
     static long slabTransfers() {
         return slabTransfers.sum();
+    }
+
+    /** Read acquisitions that found a thread already queued on a segment's lock. */
+    static long contendedReadAcquisitions() {
+        return contendedReadAcquisitions.sum();
+    }
+
+    /** Write acquisitions that found a thread already queued on a segment's lock. */
+    static long contendedWriteAcquisitions() {
+        return contendedWriteAcquisitions.sum();
+    }
+
+    /**
+     * Nanoseconds spent waiting for a segment's read lock, over the <b>contended</b> acquisitions only: an
+     * uncontended one waited 0.045 us (MEASURED) and is not timed, because timing it would cost 62 ns of
+     * {@code System.nanoTime} to measure 45.
+     */
+    static long readLockWaitNanos() {
+        return readLockWaitNanos.sum();
+    }
+
+    /** {@link #readLockWaitNanos()} for the write lock. */
+    static long writeLockWaitNanos() {
+        return writeLockWaitNanos.sum();
+    }
+
+    /**
+     * Test seam: counts every acquisition, not only the contended ones, so a test can assert the BACKLOG's
+     * C2 criterion -- write acquisitions per burst no more than the segments the burst touched.
+     *
+     * @param on whether to count
+     */
+    static void setAcquisitionCountingForTesting(final boolean on) {
+        acquisitionCounting = on;
+        readAcquisitions.reset();
+        writeAcquisitions.reset();
+    }
+
+    static long readAcquisitionsForTesting() {
+        return readAcquisitions.sum();
+    }
+
+    static long writeAcquisitionsForTesting() {
+        return writeAcquisitions.sum();
+    }
+
+    /** Test seam: whether a contended acquisition is timed, so the timing can be priced against no timing. */
+    static void setLockTimingForTesting(final boolean on) {
+        lockTimingEnabled = on;
     }
 
     /** Resizes that crossed a segment-count boundary, each of which cost the store a re-warm. */
