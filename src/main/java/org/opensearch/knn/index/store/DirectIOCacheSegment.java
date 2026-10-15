@@ -817,6 +817,7 @@ final class DirectIOCacheSegment {
      * @param freed  {@code {entries, bytes}}, added to
      */
     void releaseFile(final String fileId, final long[] freed) {
+        long entriesFreedHere = 0;
         lockWrite();
         final long started = System.nanoTime();
         try {
@@ -854,14 +855,16 @@ final class DirectIOCacheSegment {
             }
             freed[0] += here[0];
             freed[1] += here[1];
+            entriesFreedHere = here[0];
         } finally {
             final long held = System.nanoTime() - started;
+            final long walked = entriesFreedHere;
             unlockWrite();
             // The hold and not the wait for the lock: what a lookup in this segment waits behind is the
             // time this thread owns the lock, and a close that itself waited for a reader has not made that
             // reader wait. One segment at a time is the whole point of C4 and this is the figure that makes
             // the claim readable on a node.
-            DirectIOVectorCache.noteCloseHold(held);
+            DirectIOVectorCache.noteCloseHold(held, walked);
         }
     }
 

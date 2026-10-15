@@ -156,7 +156,16 @@ final class DirectIOSlabBroker {
         return target != 0 && liveSlabs() < target;
     }
 
+    /**
+     * The resize lock. Taken by {@link DirectIOVectorCache#configure(long)} and by {@link #lend}, and by
+     * nothing else; see the class javadoc for the order it comes in. Counted while a test has asked for
+     * acquisition counting, because C5's criterion is that a {@code configure} with an unchanged target
+     * takes <b>no lock at all</b>, and that is the once-per-prefetch-burst path.
+     */
     ReentrantLock lock() {
+        if (DirectIOVectorCache.acquisitionCounting) {
+            DirectIOVectorCache.brokerLockAcquisitions.increment();
+        }
         return lock;
     }
 

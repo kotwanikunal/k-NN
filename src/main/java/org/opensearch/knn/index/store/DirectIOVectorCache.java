@@ -260,11 +260,24 @@ public final class DirectIOVectorCache {
      */
     static final AtomicLong longestCloseHoldNanos = new AtomicLong();
 
+    /**
+     * The most entries one segment's write lock has been held for by a close. The work behind
+     * {@link #longestCloseHoldNanos}, and the figure a test can assert on: it is exactly the fullest
+     * segment's share of the file and so is a deterministic function of the segment count, where the nanos
+     * are a wall-clock maximum that picks up a collection pause whole.
+     */
+    static final AtomicLong longestCloseHoldEntries = new AtomicLong();
+
     /** Records one segment's close hold, keeping the longest. Called with no lock held. */
-    static void noteCloseHold(final long nanos) {
-        long longest = longestCloseHoldNanos.get();
-        while (nanos > longest && longestCloseHoldNanos.compareAndSet(longest, nanos) == false) {
-            longest = longestCloseHoldNanos.get();
+    static void noteCloseHold(final long nanos, final long entries) {
+        keepMax(longestCloseHoldNanos, nanos);
+        keepMax(longestCloseHoldEntries, entries);
+    }
+
+    private static void keepMax(final AtomicLong at, final long value) {
+        long longest = at.get();
+        while (value > longest && at.compareAndSet(longest, value) == false) {
+            longest = at.get();
         }
     }
 
@@ -286,6 +299,8 @@ public final class DirectIOVectorCache {
      */
     static final LongAdder readAcquisitions = new LongAdder();
     static final LongAdder writeAcquisitions = new LongAdder();
+    /** Returns of {@link DirectIOSlabBroker#lock()}, which is every intent to take the resize lock. */
+    static final LongAdder brokerLockAcquisitions = new LongAdder();
     static volatile boolean acquisitionCounting;
 
     /**
@@ -1121,6 +1136,10 @@ public final class DirectIOVectorCache {
      */
     private static void resegment(final int wantedSegments, final List<DirectIOSlab> detached) {
         final DirectIOCacheSegment[] old = segments;
+        // Whether this change costs anything. Going from the off state to a count is free -- there is
+        // nothing to lose -- and counting it would make segment_count_changes non-zero on every node at
+        // startup, which is the opposite of what the key is for.
+        final boolean costly = BROKER.liveSlabs() > 0;
         BROKER.setMaxSlabs(0);
         for (final DirectIOCacheSegment segment : old) {
             segment.retire();
@@ -1134,8 +1153,12 @@ public final class DirectIOVectorCache {
             fresh[i] = new DirectIOCacheSegment(BROKER);
         }
         segments = fresh;
-        segmentCountChanges.increment();
-        log.info("The k-NN Direct I/O vector cache is now {} segments, from {}; it refills", wantedSegments, old.length);
+        if (costly) {
+            segmentCountChanges.increment();
+            log.info("The k-NN Direct I/O vector cache is now {} segments, from {}; it refills", wantedSegments, old.length);
+        } else {
+            log.debug("The k-NN Direct I/O vector cache is now {} segments, from {}; it held nothing", wantedSegments, old.length);
+        }
     }
 
     /**
@@ -1351,9 +1374,11 @@ public final class DirectIOVectorCache {
         writeLockWaitNanos.reset();
         readAcquisitions.reset();
         writeAcquisitions.reset();
+        brokerLockAcquisitions.reset();
         acquisitionCounting = false;
         lockTimingEnabled = true;
         longestCloseHoldNanos.set(0);
+        longestCloseHoldEntries.set(0);
     }
 
     /**
@@ -1501,6 +1526,7 @@ public final class DirectIOVectorCache {
         acquisitionCounting = on;
         readAcquisitions.reset();
         writeAcquisitions.reset();
+        brokerLockAcquisitions.reset();
     }
 
     static long readAcquisitionsForTesting() {
@@ -1509,6 +1535,10 @@ public final class DirectIOVectorCache {
 
     static long writeAcquisitionsForTesting() {
         return writeAcquisitions.sum();
+    }
+
+    static long brokerLockAcquisitionsForTesting() {
+        return brokerLockAcquisitions.sum();
     }
 
     /** Test seam: whether a contended acquisition is timed, so the timing can be priced against no timing. */
@@ -1527,6 +1557,11 @@ public final class DirectIOVectorCache {
      */
     static long longestCloseHoldNanos() {
         return longestCloseHoldNanos.get();
+    }
+
+    /** The most entries one segment's write lock was held for by a close. See the field's javadoc. */
+    static long longestCloseHoldEntries() {
+        return longestCloseHoldEntries.get();
     }
 
     /**
