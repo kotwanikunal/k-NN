@@ -114,6 +114,18 @@ final class DirectIOCacheSegment {
      */
     private int pendingSlabs;
 
+    /**
+     * Set when a segment-count change has taken this segment out of the array, so a fill that read the old
+     * array before the swap cannot register a slab into a segment no lookup will ever consult again. Without
+     * it such a fill would leave a slab the broker counts and no segment holds, which is both a leak and a
+     * broken invariant.
+     *
+     * <p>Only read and written under the write lock, which is why it is a plain field: a fill that could
+     * register a slab holds that lock, so it either sees this set or was already inside when it was set and
+     * its slab is released by the drain that follows.
+     */
+    private boolean retired;
+
     DirectIOCacheSegment(final DirectIOSlabBroker broker) {
         this.broker = broker;
     }
@@ -199,12 +211,20 @@ final class DirectIOCacheSegment {
      */
     static final class Request {
         private final DirectIOSlabBroker broker;
-        /** Allocated outside the lock and not yet registered. */
+        /** Allocated or borrowed outside the lock and not yet registered. */
         DirectIOSlab spare;
         /** Set by {@link DirectIOCacheSegment#growSlabs} to mean "bring me a slab and ask again". */
         boolean wanted;
-        /** The segment this request holds a reservation in, or null when it holds none. */
+        /**
+         * Whether the slab is to be <b>borrowed</b> from another segment rather than allocated, which is what
+         * a segment holding no slab at all asks for when the store is already at its target (Q, section 2.2
+         * step 3). Set by {@link DirectIOCacheSegment#obtainSlab}.
+         */
+        boolean wantsTransfer;
+        /** The segment whose one pending slot this request holds, or null when it holds none. */
         private DirectIOCacheSegment reservedIn;
+        /** Whether this request holds one of the broker's reservations. */
+        private boolean brokerPending;
 
         Request(final DirectIOSlabBroker broker) {
             this.broker = broker;
@@ -212,7 +232,7 @@ final class DirectIOCacheSegment {
 
         /** Gives back the headroom and any slab that went unused. Called with no lock held. */
         void finish() {
-            if (reservedIn == null && spare == null) {
+            if (reservedIn == null && brokerPending == false && spare == null) {
                 return;
             }
             final DirectIOSlab unused = spare;
@@ -220,11 +240,24 @@ final class DirectIOCacheSegment {
             if (reservedIn != null) {
                 reservedIn.cancelPending();
                 reservedIn = null;
+            }
+            if (brokerPending) {
+                brokerPending = false;
                 broker.cancelReservation();
             }
             if (unused != null) {
+                // A borrowed slab nobody could use goes back to the backend rather than to its donor: the
+                // store is then one slab below its target and the next fill that wants one allocates it,
+                // which is simpler than a hand-back path and costs one allocation on a transient.
                 broker.release(unused);
             }
+        }
+
+        /** Called by the broker when a transfer has handed this request a slab and its reservation. */
+        void tookTransfer(final DirectIOSlab memory) {
+            spare = memory;
+            brokerPending = true;
+            wantsTransfer = false;
         }
     }
 
@@ -592,7 +625,7 @@ final class DirectIOCacheSegment {
      * {@link Request#wanted} set, and the caller allocates outside the lock and asks again.
      */
     private Placement place(final String fileId, final int length, final boolean allowEviction, final Request request) {
-        if (broker.maxSlabs() == 0) {
+        if (broker.maxSlabs() == 0 || retired) {
             return null;
         }
         DirectIOSlotMap map = index.get(fileId);
@@ -748,6 +781,16 @@ final class DirectIOCacheSegment {
         }
         final Slab oldest = fifo.poll();
         if (oldest == null) {
+            // This segment holds no slab at all and the store is at its target, so there is nothing here to
+            // reclaim and growing is refused. Ask the broker to lend one from the segment holding the most
+            // (Q, section 2.2 step 3). INFERRED: with 128 segments and 1,120 slabs every segment reaches
+            // about eight during the ramp, so this is a cold-start transient and not a steady-state path.
+            if (request != null && pendingSlabs == 0 && retired == false && broker.maxSlabs() > 0) {
+                pendingSlabs++;
+                request.reservedIn = this;
+                request.wantsTransfer = true;
+                request.wanted = true;
+            }
             return null;
         }
         DirectIOVectorCache.reclaimedSlabs.increment();
@@ -785,7 +828,7 @@ final class DirectIOCacheSegment {
      * the cost is hit rate -- which is what a cache that cannot grow should cost.
      */
     private Slab growSlabs(final int length, final Request request) {
-        if (broker.growthLatched() || request == null) {
+        if (request == null || retired) {
             return null;
         }
         if (request.spare == null) {
@@ -793,15 +836,19 @@ final class DirectIOCacheSegment {
                 // One pending allocation at a time per segment. See pendingSlabs for the measured reason.
                 return null;
             }
-            if (broker.reserve() == false) {
+            if (broker.growthLatched() || broker.reserve() == false) {
+                // The latch is checked here and not on the path below, because what it says is "an
+                // allocation failed" (N2) and a fill arriving with a slab in hand has had one succeed. A
+                // borrowed slab is likewise unaffected: it needs no allocation at all.
                 return null;
             }
             pendingSlabs++;
             request.reservedIn = this;
+            request.brokerPending = true;
             request.wanted = true;
             return null;
         }
-        if (request.reservedIn != this || broker.belowTarget() == false) {
+        if (request.reservedIn != this || request.brokerPending == false || broker.belowTarget() == false) {
             // The target shrank while this fill was outside the lock, so the slab it is carrying is one the
             // store may not have. Request#finish gives it back, outside every lock.
             return null;
@@ -809,6 +856,7 @@ final class DirectIOCacheSegment {
         final Slab fresh = register(request.spare);
         request.spare = null;
         request.reservedIn = null;
+        request.brokerPending = false;
         pendingSlabs--;
         open(fresh, length);
         return fresh;
@@ -995,6 +1043,50 @@ final class DirectIOCacheSegment {
             broker.releaseLive();
             detached.add(oldest.memory);
             return true;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Hands this segment's oldest slab to another segment, dropping its entries, and returns its memory, or
+     * {@code null} when this segment has none to give. Called by {@link DirectIOSlabBroker} with the broker's
+     * lock held and <b>no other segment's lock</b>, which is the order the whole design turns on.
+     *
+     * <p>A transfer has no second chance, because a survivor has nowhere to stay: the recipient reopens the
+     * slab for its own vectors. That is the same reason a reopen for a different vector length drops them.
+     *
+     * <p>The slab stays live as far as the broker is concerned -- it becomes one of its reservations, which
+     * the recipient then commits -- so the sum of the segments' slab counts plus the reservations in flight
+     * is what the broker counts at every instant, including mid-transfer.
+     *
+     * @return the slab's memory, or null
+     */
+    DirectIOSlab detachOldestForTransfer() {
+        lock.writeLock().lock();
+        try {
+            final Slab oldest = fifo.poll();
+            if (oldest == null) {
+                return null;
+            }
+            dropAll(oldest);
+            slabsById[oldest.id] = null;
+            openSlabs.remove(oldest.slotBytes, oldest);
+            liveSlabs--;
+            return oldest.memory;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Takes this segment out of service ahead of a segment-count change, so no later fill can put a slab in
+     * it. Its slabs and its index are drained by the caller; see {@link #retired}.
+     */
+    void retire() {
+        lock.writeLock().lock();
+        try {
+            retired = true;
         } finally {
             lock.writeLock().unlock();
         }

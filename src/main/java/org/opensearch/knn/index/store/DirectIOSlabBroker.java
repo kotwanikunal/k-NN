@@ -221,6 +221,24 @@ final class DirectIOSlabBroker {
         }
     }
 
+    /**
+     * Turns a live slab a donor segment has just given up into a reservation the recipient will commit, in
+     * one step, so that "the segments' slab counts sum to the broker's live count" holds at every instant
+     * including mid-transfer.
+     */
+    private void transferOut() {
+        while (true) {
+            final long current = supply.get();
+            final int live = liveOf(current);
+            if (live <= 0) {
+                throw new IllegalStateException("transferred a slab the broker was not counting");
+            }
+            if (supply.compareAndSet(current, packed(live - 1, pendingOf(current) + 1))) {
+                return;
+            }
+        }
+    }
+
     /** Stops counting a slab a segment has just detached. */
     void releaseLive() {
         while (true) {
@@ -267,6 +285,9 @@ final class DirectIOSlabBroker {
      * @return whether a slab was allocated
      */
     boolean allocateOutsideLock(final DirectIOCacheSegment.Request request) {
+        if (request.wantsTransfer) {
+            return lend(request);
+        }
         final int bytes = slabBytes;
         request.spare = slabMemory.allocate(bytes);
         if (request.spare != null) {
@@ -287,6 +308,52 @@ final class DirectIOSlabBroker {
 
     void release(final DirectIOSlab slab) {
         slabMemory.release(slab);
+    }
+
+    /**
+     * Lends {@code request}'s segment a slab from the segment holding the most, because the requesting
+     * segment holds none and the store is already at its target (Q, section 2.2 step 3).
+     *
+     * <p><b>The donor keeps at least one slab</b>, which is what bounds this: a segment that has just been
+     * lent one holds exactly one and so can never be the next donor, and with the segment count capped at
+     * {@code maxSlabs / 8} the average segment holds eight, so a donor always exists while any segment holds
+     * none. The design says "above its fair share"; the fair share is not the test used here, because every
+     * segment can hold exactly its share while one holds none, and then nothing would ever be lent.
+     *
+     * <p>This lock, then the donor's write lock, and no other segment lock: the requesting segment's lock is
+     * released before this is called, which is what keeps the one-segment-lock rule.
+     *
+     * @param request the fill's request, which carries the slab back to it
+     * @return whether a slab was lent
+     */
+    private boolean lend(final DirectIOCacheSegment.Request request) {
+        lock.lock();
+        try {
+            DirectIOCacheSegment donor = null;
+            int most = 1;
+            for (final DirectIOCacheSegment candidate : DirectIOVectorCache.segmentsSnapshot()) {
+                final int held = candidate.liveSlabs();
+                if (held > most) {
+                    most = held;
+                    donor = candidate;
+                }
+            }
+            if (donor == null) {
+                request.wantsTransfer = false;
+                return false;
+            }
+            final DirectIOSlab memory = donor.detachOldestForTransfer();
+            if (memory == null) {
+                request.wantsTransfer = false;
+                return false;
+            }
+            transferOut();
+            DirectIOVectorCache.slabTransfers.increment();
+            request.tookTransfer(memory);
+            return true;
+        } finally {
+            lock.unlock();
+        }
     }
 
     /**

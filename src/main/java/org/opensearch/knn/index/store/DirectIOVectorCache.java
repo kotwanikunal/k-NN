@@ -122,6 +122,29 @@ import java.util.concurrent.atomic.LongAdder;
  * there is no buffer for a caller to stash and read after the lock is dropped. It is also why a slab needs no
  * lock of its own — it is closed only under its segment's write lock.
  *
+ * <h2>The lock order, which is the whole deadlock proof</h2>
+ * <b>The broker's lock, then at most one segment's lock.</b> Three rules, and every path below satisfies all
+ * three:
+ * <ol>
+ *   <li><b>No path holds two segment locks.</b> A run that crosses a 256 KiB stripe releases one segment's
+ *       lock before it takes the next ({@link #contains}, {@link #putRun}); a close walks the segments one at
+ *       a time ({@link #releaseFile}); a shrink takes one segment's lock per slab it drops; and a slab lent
+ *       from one segment to another is detached under the donor's lock alone, with the borrower's lock
+ *       already released, and registered under the borrower's lock alone afterwards.</li>
+ *   <li><b>No path takes the broker's lock while holding a segment's.</b> The only production path that
+ *       takes the broker's lock is {@link #configure(long)}, which takes nothing beforehand, and the slab
+ *       lending it performs. That is why the slab <em>reservation</em> is lock free: a fill has to reserve
+ *       while it holds its own segment's write lock, which this rule would otherwise forbid. See
+ *       {@link DirectIOSlabBroker}.</li>
+ *   <li><b>Nothing that can block runs under either lock.</b> A slab allocation (7 to 10 ms, MEASURED) and a
+ *       slab release (2.2 ms per arena) both run with no lock held, which is N3 and is asserted by a probe
+ *       {@link SlabMemory} in the suite; so is "at most one segment lock", through
+ *       {@link #segmentLocksHeldByCurrentThreadForTesting()}.</li>
+ * </ol>
+ * The one exception is the test-only {@link #checkInvariantsForTesting()}, which takes the broker's lock and
+ * then every segment's write lock <b>in index order</b> so that it reads one consistent state. That is the
+ * same order, so it cannot cycle with anything above.
+ *
  * <h2>A size change resizes; it does not rebuild</h2>
  * {@code knn.direct_io.rescore.cache.max_bytes} is read once per prefetch burst
  * ({@link #applyConfiguredSize(boolean)}). Growing lets the next miss allocate a slab and keeps every cached vector;
@@ -168,6 +191,9 @@ public final class DirectIOVectorCache {
      * the setting's default so that a store filled before the first refresh behaves as the setting says.
      */
     private static volatile boolean spanFill = KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_DEFAULT_VALUE;
+
+    /** A segment count pinned by a test, or 0 to derive it from the node. See {@link #setSegmentsForTesting}. */
+    private static volatile int segmentsForTesting;
 
     /**
      * Where a slab's memory comes from and goes back to. A seam, and the only reason it is one is that N3's
@@ -216,6 +242,10 @@ public final class DirectIOVectorCache {
     private static final LongAdder closedFileEntries = new LongAdder();
     /** Vectors put back after the filter-then-read race lost them. Also counted in readmissions. O4. */
     static final LongAdder raceReadmissions = new LongAdder();
+    /** Slabs the broker lent from one segment to another because the borrower held none (Q, C1b). */
+    static final LongAdder slabTransfers = new LongAdder();
+    /** Resizes that crossed a segment-count boundary and so cost a re-warm (Q, C1b). */
+    static final LongAdder segmentCountChanges = new LongAdder();
 
     private DirectIOVectorCache() {}
 
@@ -264,6 +294,63 @@ public final class DirectIOVectorCache {
             return all[0];
         }
         return all[segmentIndex(fileId.hashCode(), offset, all.length)];
+    }
+
+    /** The segments in force, for {@link DirectIOSlabBroker}'s lending. */
+    static DirectIOCacheSegment[] segmentsSnapshot() {
+        return segments;
+    }
+
+    /**
+     * How many segments a store of {@code maxSlabs} slabs gets on a node of {@code cores} cores
+     * (Q, section 2.1):
+     *
+     * <pre>
+     * coreSegments = clamp(nextPowerOfTwo(8 * cores), 8, 256)
+     * segments     = max(1, min(coreSegments, previousPowerOfTwo(maxSlabs / 8)))
+     * </pre>
+     *
+     * <p><b>Both terms, because the slab floor binds before the core count does.</b> The {@code 8 * cores}
+     * term aims at about one thread per segment, which is where the measurement says contention disappears:
+     * at one thread the unsegmented store was 13.1% lock wait with <b>zero</b> contended acquisitions, and at
+     * two it was already 53% contended (MEASURED, output/bench/q-baseline). The {@code maxSlabs / 8} term is
+     * what the hit rate requires: MEASURED by an exact emulation of this policy over M2's trace, the loss
+     * against an unsegmented store is governed by <b>slabs per segment</b> and not by the segment count, and
+     * it is -0.08 points at eight slabs per segment against C3's 0.2-point bar (-0.16 at four, -0.36 at two,
+     * -0.87 at one, where a segment evicts its whole contents at once).
+     *
+     * <p>Worked: 64 cores and 35 GB (1,120 slabs) gives 128; 32 cores and 18 GB (576 slabs) gives 64; this
+     * desktop's 16 cores at a 32 GB target (1,024 slabs) gives 128, which is the hot node's count and is what
+     * makes a desktop stress a real proof; 16 cores at 4 GB (128 slabs) gives 16; 256 MB (8 slabs) gives 1,
+     * which is the unsegmented store exactly, so no configuration gets worse than it was.
+     *
+     * @param cores    the node's available processors
+     * @param maxSlabs the store's slab target
+     * @return the segment count, a power of two, at least 1
+     */
+    static int derivedSegmentCount(final int cores, final int maxSlabs) {
+        if (maxSlabs <= 0) {
+            return 1;
+        }
+        final int coreSegments = Math.min(256, Math.max(8, nextPowerOfTwo(8 * Math.max(1, cores))));
+        return Math.max(1, Math.min(coreSegments, previousPowerOfTwo(maxSlabs / 8)));
+    }
+
+    private static int nextPowerOfTwo(final int value) {
+        return value <= 1 ? 1 : Integer.highestOneBit(value - 1) << 1;
+    }
+
+    private static int previousPowerOfTwo(final int value) {
+        return value <= 0 ? 0 : Integer.highestOneBit(value);
+    }
+
+    /** The count a resize should move to, honouring {@link #setSegmentsForTesting}. */
+    private static int wantedSegmentCount(final int maxSlabs) {
+        final int pinned = segmentsForTesting;
+        if (pinned > 0) {
+            return pinned;
+        }
+        return derivedSegmentCount(Runtime.getRuntime().availableProcessors(), maxSlabs);
     }
 
     /**
@@ -875,6 +962,10 @@ public final class DirectIOVectorCache {
                         slabBytes
                     );
                 }
+                final int wantedSegments = wantedSegmentCount(wanted);
+                if (wantedSegments != segments.length) {
+                    resegment(wantedSegments, detached);
+                }
                 BROKER.setMaxSlabs(wanted);
                 // A new target is a new question, so an earlier allocation failure stops standing (N2).
                 BROKER.unlatchGrowth();
@@ -897,6 +988,43 @@ public final class DirectIOVectorCache {
             BROKER.lock().unlock();
         }
         BROKER.releaseDetached(detached);
+    }
+
+    /**
+     * Moves the store to {@code wantedSegments} segments, which <b>releases every slab and every index and
+     * costs a re-warm</b>. Called under the broker's lock, from {@link #configure(long)} only.
+     *
+     * <h4>Why a re-warm, and why that is the right choice</h4>
+     * A key's segment is a function of the segment count, so after a change every cached vector would be in
+     * the wrong segment. The stripe key makes a cheap rehash <em>possible</em> for powers of two
+     * ({@code segment' = segment & (N'-1)}, so halving merges segments pairwise and doubling splits each in
+     * two), but it is an O(entries) walk under locks and this happens only when an operator moves
+     * {@code max_bytes} across a factor-of-eight-slab boundary. The fork ships one value per tier, so on a
+     * node it happens once, at startup, from an empty store.
+     *
+     * <h4>Why the target goes to zero first</h4>
+     * It is the one volatile read every entry point makes, so zeroing it stops every fill that has not yet
+     * taken a segment lock. A fill already inside finishes and its slab is released by the drain below; a
+     * fill that read the old array and arrives late is stopped by {@link DirectIOCacheSegment#retire()},
+     * which is what keeps it from leaving a slab the broker counts and no live segment holds.
+     */
+    private static void resegment(final int wantedSegments, final List<DirectIOSlab> detached) {
+        final DirectIOCacheSegment[] old = segments;
+        BROKER.setMaxSlabs(0);
+        for (final DirectIOCacheSegment segment : old) {
+            segment.retire();
+            while (segment.releaseOldestSlab(detached)) {
+                // Every slab, one write-lock acquisition at a time.
+            }
+            segment.clearIndex();
+        }
+        final DirectIOCacheSegment[] fresh = new DirectIOCacheSegment[wantedSegments];
+        for (int i = 0; i < wantedSegments; i++) {
+            fresh[i] = new DirectIOCacheSegment(BROKER);
+        }
+        segments = fresh;
+        segmentCountChanges.increment();
+        log.info("The k-NN Direct I/O vector cache is now {} segments, from {}; it refills", wantedSegments, old.length);
     }
 
     /**
@@ -1090,6 +1218,7 @@ public final class DirectIOVectorCache {
         awaitReleasesForTesting();
         BROKER.setSlabBytes(DirectIOSlab.SLAB_BYTES);
         spanFill = KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_DEFAULT_VALUE;
+        segmentsForTesting = 0;
         segments = new DirectIOCacheSegment[] { new DirectIOCacheSegment(BROKER) };
         hits.reset();
         misses.reset();
@@ -1103,6 +1232,8 @@ public final class DirectIOVectorCache {
         closedFiles.reset();
         closedFileEntries.reset();
         raceReadmissions.reset();
+        slabTransfers.reset();
+        segmentCountChanges.reset();
     }
 
     /**
@@ -1180,9 +1311,55 @@ public final class DirectIOVectorCache {
         return false;
     }
 
-    /** Test seam: the segment count in force. */
+    /** The segment count in force, which {@code direct_io_stats.cache.segments} reports. */
     static int segmentCount() {
         return segments.length;
+    }
+
+    /** Slabs the broker lent from one segment to another because the borrower held none. */
+    static long slabTransfers() {
+        return slabTransfers.sum();
+    }
+
+    /** Resizes that crossed a segment-count boundary, each of which cost the store a re-warm. */
+    static long segmentCountChanges() {
+        return segmentCountChanges.sum();
+    }
+
+    /**
+     * Test seam: pins the segment count, so the suite and the stress can exercise a count this desktop would
+     * not derive. Only valid with the cache off, which {@link #resetForTesting()} guarantees, and only a
+     * power of two, because the selector masks rather than divides.
+     *
+     * @param count the count to pin, or 0 to go back to deriving it from the node
+     */
+    static void setSegmentsForTesting(final int count) {
+        if (BROKER.maxSlabs() != 0) {
+            throw new IllegalStateException("The segment count can only be changed while the cache is off");
+        }
+        if (count < 0 || (count > 0 && Integer.bitCount(count) != 1)) {
+            throw new IllegalArgumentException("The segment count must be 0 or a power of two, not " + count);
+        }
+        segmentsForTesting = count;
+    }
+
+    /**
+     * Test seam: how many of the store's segment locks the calling thread holds. <b>The design's one
+     * invariant is that this is never more than one</b> on any production path, which is the whole of the
+     * deadlock proof, and a probe {@link SlabMemory} asserting it at every allocate and release is what pins
+     * it. The test-only {@link #checkInvariantsForTesting()} is the one exception and takes them all, in
+     * index order.
+     *
+     * @return the number of segment locks held, in either mode
+     */
+    static int segmentLocksHeldByCurrentThreadForTesting() {
+        int held = 0;
+        for (final DirectIOCacheSegment segment : segments) {
+            if (segment.lockHeldByCurrentThread()) {
+                held++;
+            }
+        }
+        return held;
     }
 
     /**
