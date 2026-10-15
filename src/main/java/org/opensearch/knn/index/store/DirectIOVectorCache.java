@@ -13,6 +13,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
@@ -247,6 +248,26 @@ public final class DirectIOVectorCache {
     static final LongAdder slabTransfers = new LongAdder();
     /** Resizes that crossed a segment-count boundary and so cost a re-warm (Q, C1b). */
     static final LongAdder segmentCountChanges = new LongAdder();
+
+    /**
+     * The longest one segment's write lock has been held by a close, which is C4's bound made readable on a
+     * node (Q, section 2.4). An {@link AtomicLong} kept at its maximum rather than a {@link LongAdder},
+     * because what an operator needs is the worst one a lookup could have waited behind, not the total.
+     *
+     * <p>Unsegmented, the readiness doc prices a close of 500K entries at 37 ms, about 16 ms per shard when a
+     * tenant leaves hot. Segmented, a close takes one segment's lock at a time and each holds about a
+     * {@code 1/N} share of the cells.
+     */
+    static final AtomicLong longestCloseHoldNanos = new AtomicLong();
+
+    /** Records one segment's close hold, keeping the longest. Called with no lock held. */
+    static void noteCloseHold(final long nanos) {
+        long longest = longestCloseHoldNanos.get();
+        while (nanos > longest && longestCloseHoldNanos.compareAndSet(longest, nanos) == false) {
+            longest = longestCloseHoldNanos.get();
+        }
+    }
+
     /**
      * Acquisitions that found a thread already queued on the segment's lock, and the nanoseconds they then
      * waited (C2). Only a contended acquisition is counted and only a contended one is timed, which is why
@@ -1332,6 +1353,7 @@ public final class DirectIOVectorCache {
         writeAcquisitions.reset();
         acquisitionCounting = false;
         lockTimingEnabled = true;
+        longestCloseHoldNanos.set(0);
     }
 
     /**
@@ -1497,6 +1519,14 @@ public final class DirectIOVectorCache {
     /** Resizes that crossed a segment-count boundary, each of which cost the store a re-warm. */
     static long segmentCountChanges() {
         return segmentCountChanges.sum();
+    }
+
+    /**
+     * The longest a close has held one segment's write lock, which is the longest a lookup in that segment
+     * could have waited behind one. Lookups in the other {@code N - 1} segments wait for nothing at all.
+     */
+    static long longestCloseHoldNanos() {
+        return longestCloseHoldNanos.get();
     }
 
     /**
