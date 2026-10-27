@@ -100,15 +100,17 @@ public class KNNStats {
      *
      * <p>Two groups, because they answer two different questions.
      * <ul>
-     *   <li><b>dispatch</b> — is the seam engaging, and if not, why? {@code routed_opens} against the six
-     *       decline reasons, which want six different operator responses: a compound segment, i.e. every
-     *       flushed segment at the shipped defaults and nothing to act on
-     *       ({@code declined_compound}); an unsupported substrate ({@code declined_chain}); a bug
-     *       ({@code declined_missing}); the size floor working as designed ({@code declined_too_small}); a
-     *       filesystem with no {@code O_DIRECT} ({@code declined_open_failed}); or a layer of the shard's
-     *       directory chain that transforms the bytes a reader sees, such as encryption at rest
-     *       ({@code declined_content}), which is the one reason that says Direct I/O <b>must not</b> serve
-     *       the file rather than that it cannot.</li>
+     *   <li><b>dispatch</b> — is the seam engaging, and if not, why? {@code routed_opens} against
+     *       {@code declined_opens} and the {@code declined} map, which holds one entry per reason with that
+     *       reason's {@code count} and the {@code outermost} wrapper of the last chain to decline under it.
+     *       The six reasons want six different operator responses: {@code COMPOUND} is every flushed segment
+     *       at the shipped defaults and nothing to act on; {@code CHAIN} is an unsupported substrate;
+     *       {@code MISSING} is a bug; {@code TOO_SMALL} is the size floor working as designed;
+     *       {@code OPEN_FAILED} is a filesystem with no {@code O_DIRECT}; and {@code CONTENT} is a layer of
+     *       the shard's directory chain that transforms the bytes a reader sees, such as encryption at rest,
+     *       which is the one reason that says Direct I/O <b>must not</b> serve the file rather than that it
+     *       cannot. {@code outermost} is what makes {@code CHAIN} and {@code CONTENT} diagnosable without a
+     *       debug log, because for both the useful question is which substrate it was.</li>
      *   <li><b>reads</b> — once engaged, what is it doing? The staged/blocking/read-ahead channels and the
      *       byte counters behind the amplification ratio. {@code stage_declined} against
      *       {@code staged_reads} is the queue-capacity decline rate phase 13's audit row 7 measured as the
@@ -190,12 +192,7 @@ public class KNNStats {
         final Map<String, Object> dispatch = new HashMap<>();
         dispatch.put("routed_opens", stats.routedOpens());
         dispatch.put("declined_opens", stats.declinedOpens());
-        dispatch.put("declined_compound", stats.declinedCompound());
-        dispatch.put("declined_chain", stats.declinedChain());
-        dispatch.put("declined_missing", stats.declinedMissing());
-        dispatch.put("declined_too_small", stats.declinedTooSmall());
-        dispatch.put("declined_open_failed", stats.declinedOpenFailed());
-        dispatch.put("declined_content", stats.declinedContent());
+        dispatch.put("declined", stats.declines());
 
         final Map<String, Object> reads = new HashMap<>();
         reads.put("blocking_reads", stats.blockingReads());

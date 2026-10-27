@@ -24,7 +24,9 @@ import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
@@ -293,6 +295,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         private final AtomicLong declinedTooSmall = new AtomicLong();
         private final AtomicLong declinedOpenFailed = new AtomicLong();
         private final AtomicLong declinedContent = new AtomicLong();
+        /** The outermost wrapper of the last chain to decline under each reason. See {@link #declines()}. */
+        private final Map<DeclineReason, String> declinedBy = new ConcurrentHashMap<>();
         private final AtomicLong blockingReads = new AtomicLong();
         private final AtomicLong stagedReads = new AtomicLong();
         private final AtomicLong stagedHits = new AtomicLong();
@@ -638,8 +642,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             routedOpens.incrementAndGet();
         }
 
-        /** Counts one decline, under one of the six reasons the dispatch rule distinguishes. */
-        void recordDecline(final DeclineReason reason) {
+        /**
+         * Counts one decline, under one of the six reasons the dispatch rule distinguishes, and remembers
+         * which directory declined it: {@code outermost} is the simple class name of the top of the delegate
+         * chain the declining directory wraps. Only the last one per reason is kept, because the counter
+         * answers "how often" and this answers "what substrate", and a node serves one substrate.
+         */
+        void recordDecline(final DeclineReason reason, final String outermost) {
             switch (reason) {
                 case COMPOUND -> declinedCompound.incrementAndGet();
                 case CHAIN -> declinedChain.incrementAndGet();
@@ -648,6 +657,36 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 case OPEN_FAILED -> declinedOpenFailed.incrementAndGet();
                 case CONTENT -> declinedContent.incrementAndGet();
             }
+            declinedBy.put(reason, outermost);
+        }
+
+        /**
+         * One entry per decline reason, each with the opens declined under it and the outermost wrapper of
+         * the last chain to decline under it ({@code ""} until one does). This is the shape
+         * {@code direct_io_stats.dispatch.declined} takes, and it is one map rather than six counters
+         * because an operator reads the reasons together: a zero {@code routed_opens} is diagnosed by
+         * finding which reason moved, and the wrapper names the substrate to look at next.
+         */
+        public Map<String, Object> declines() {
+            final Map<String, Object> byReason = new LinkedHashMap<>();
+            for (final DeclineReason reason : DeclineReason.values()) {
+                final Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("count", declinedUnder(reason));
+                entry.put("outermost", declinedBy.getOrDefault(reason, ""));
+                byReason.put(reason.name(), entry);
+            }
+            return byReason;
+        }
+
+        private long declinedUnder(final DeclineReason reason) {
+            return switch (reason) {
+                case COMPOUND -> declinedCompound.get();
+                case CHAIN -> declinedChain.get();
+                case MISSING -> declinedMissing.get();
+                case TOO_SMALL -> declinedTooSmall.get();
+                case OPEN_FAILED -> declinedOpenFailed.get();
+                case CONTENT -> declinedContent.get();
+            };
         }
 
         /** Node-wide {@code .vec} opens served with {@code O_DIRECT}. */
@@ -806,6 +845,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             declinedTooSmall.set(0);
             declinedOpenFailed.set(0);
             declinedContent.set(0);
+            declinedBy.clear();
             blockingReads.set(0);
             stagedReads.set(0);
             stagedHits.set(0);

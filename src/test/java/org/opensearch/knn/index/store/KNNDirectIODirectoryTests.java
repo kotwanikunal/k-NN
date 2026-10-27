@@ -43,6 +43,7 @@ import java.nio.file.Files;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.UnaryOperator;
 
@@ -839,9 +840,25 @@ public class KNNDirectIODirectoryTests extends KNNTestCase {
             assertEquals("no compound directory is involved in this test", 0L, DirectIOVectorIndexInput.STATS.declinedCompound());
             assertEquals(1L, DirectIOVectorIndexInput.STATS.declinedChain());
             assertEquals(1L, DirectIOVectorIndexInput.STATS.declinedTooSmall());
+
+            // F-08's map reports the same counts and, per reason, the substrate that declined under it. The
+            // two declines above came through two different delegates, so the two entries must differ: that
+            // is the whole point of recording the wrapper rather than this directory's own class.
+            final Map<String, Object> declined = DirectIOVectorIndexInput.STATS.declines();
+            assertEquals(1L, entryOf(declined, "CHAIN").get("count"));
+            assertEquals("ByteBuffersDirectory", entryOf(declined, "CHAIN").get("outermost"));
+            assertEquals(1L, entryOf(declined, "TOO_SMALL").get("count"));
+            assertEquals("MMapDirectory", entryOf(declined, "TOO_SMALL").get("outermost"));
+            assertEquals("a reason nothing declined under names no wrapper", "", entryOf(declined, "MISSING").get("outermost"));
+            assertEquals(0L, entryOf(declined, "MISSING").get("count"));
         } finally {
             DirectIOVectorIndexInput.STATS.reset();
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> entryOf(final Map<String, Object> declines, final String reason) {
+        return (Map<String, Object>) declines.get(reason);
     }
 
     /**

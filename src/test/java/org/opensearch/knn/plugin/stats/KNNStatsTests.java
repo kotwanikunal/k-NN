@@ -79,12 +79,11 @@ public class KNNStatsTests extends KNNTestCase {
      * node bench reading {@code direct_io_stats.dispatch.routed_opens} breaks silently if one is renamed.
      *
      * <p>The counters this pins by name are the four S4 asked for — {@code staged_reads},
-     * {@code stage_declined}, {@code routed_opens}, {@code declined_opens} — plus the <b>six</b> decline
-     * reasons, which are the ones that make a zero {@code routed_opens} diagnosable rather than mysterious.
-     * Phase 15 D2 added {@code declined_compound}: at the shipped defaults every flushed segment is
-     * compound, so that case is both the commonest decline and the one that means nothing is wrong, and it
-     * used to be indistinguishable from {@code declined_chain}. {@code declined_content} is the sixth: the
-     * reason a chain whose bytes are not the file's is refused.
+     * {@code stage_declined}, {@code routed_opens}, {@code declined_opens} — plus the {@code declined} map's
+     * six reason names, which are the ones that make a zero {@code routed_opens} diagnosable rather than
+     * mysterious: a compound segment is both the commonest decline and the one that means nothing is wrong,
+     * and it must not be confusable with a chain the feature cannot serve or with a chain whose bytes are not
+     * the file's.
      */
     @SuppressWarnings("unchecked")
     public void testDirectIOStatsAreReachableAndNamedStably() {
@@ -174,19 +173,18 @@ public class KNNStatsTests extends KNNTestCase {
             }
         });
 
-        assertEquals(
-            Set.of(
-                "routed_opens",
-                "declined_opens",
-                "declined_compound",
-                "declined_chain",
-                "declined_missing",
-                "declined_too_small",
-                "declined_open_failed",
-                "declined_content"
-            ),
-            directIO.get("dispatch").keySet()
-        );
+        assertEquals(Set.of("routed_opens", "declined_opens", "declined"), directIO.get("dispatch").keySet());
+        // F-08: the six reasons are one map keyed by the reason, each entry carrying its count and the
+        // outermost wrapper of the last chain to decline under it. The reason names are the API now, so they
+        // are asserted literally for the same reason the key names are.
+        final Map<String, Object> declined = (Map<String, Object>) directIO.get("dispatch").get("declined");
+        assertEquals(Set.of("COMPOUND", "CHAIN", "MISSING", "TOO_SMALL", "OPEN_FAILED", "CONTENT"), declined.keySet());
+        declined.forEach((reason, entry) -> {
+            final Map<String, Object> fields = (Map<String, Object>) entry;
+            assertEquals("declined." + reason + " must carry a count and a wrapper", Set.of("count", "outermost"), fields.keySet());
+            assertEquals("declined." + reason + ".count must start at zero", 0L, (long) (Long) fields.get("count"));
+            assertEquals("declined." + reason + ".outermost is empty until something declines", "", fields.get("outermost"));
+        });
         for (final String required : new String[] {
             "staged_reads",
             "stage_declined",
@@ -212,8 +210,13 @@ public class KNNStatsTests extends KNNTestCase {
             );
         }
         // On a node with the feature off -- the shipped default -- every counter reads zero, which is what
-        // makes "off" distinguishable from "on and declining".
-        directIO.get("dispatch").forEach((name, value) -> assertEquals(name + " must start at zero", 0L, (long) (Long) value));
+        // makes "off" distinguishable from "on and declining". The declined map's own zeros are asserted
+        // above, entry by entry.
+        directIO.get("dispatch").forEach((name, value) -> {
+            if ("declined".equals(name) == false) {
+                assertEquals(name + " must start at zero", 0L, (long) (Long) value);
+            }
+        });
     }
 
     /**

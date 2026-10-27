@@ -530,9 +530,11 @@ public final class KNNDirectIODirectory extends FilterDirectory {
      * reader by the codec seam and is discarded with that reader, so its instance counters can never be
      * reached from a REST API.
      */
-    private static void decline(final AtomicLong counter, final DirectIOVectorIndexInput.DeclineReason reason) {
+    private void decline(final AtomicLong counter, final DirectIOVectorIndexInput.DeclineReason reason) {
         counter.incrementAndGet();
-        DirectIOVectorIndexInput.STATS.recordDecline(reason);
+        // The delegate's own class, not this one's: an operator reading the node-wide map wants the substrate
+        // that declined, and every entry in it would otherwise read KNNDirectIODirectory.
+        DirectIOVectorIndexInput.STATS.recordDecline(reason, in.getClass().getSimpleName());
     }
 
     /** Flat vector data opens this directory served with {@code O_DIRECT}, at either precision. */
