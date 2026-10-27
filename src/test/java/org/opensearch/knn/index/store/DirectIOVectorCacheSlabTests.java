@@ -1069,7 +1069,16 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
         assertTrue("and release, saw " + releases.get(), releases.get() >= 4);
     }
 
-    /** Eight threads filling from empty never take more slabs than the target allows. */
+    /**
+     * Eight threads filling from empty never take more slabs than the target allows, and every slab they do
+     * take was allocated once.
+     *
+     * <p>The target is reached by a single-threaded top-up after the race rather than inside it. A segment
+     * allows one allocation in flight at a time ({@code DirectIOCacheSegment#growSlabs}, its
+     * {@code pendingSlabs} guard), so a concurrent fill that arrives while another is allocating is dropped
+     * instead of queued, and how many of them land before the threads run out of rounds is a scheduling
+     * question. One thread is never dropped: it is the only fill in the segment.
+     */
     public void testConcurrentFillsFromEmptyNeverExceedTheTarget() throws Exception {
         final int target = 3;
         final AtomicInteger allocations = new AtomicInteger();
@@ -1127,8 +1136,25 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
             throw new AssertionError(failure.get());
         }
         assertEquals("the target was never exceeded", 0, overshoot.get());
-        assertEquals((long) target, DirectIOVectorCache.slabs());
-        assertTrue("at most one allocation per slab the target allows, saw " + allocations.get(), allocations.get() <= target);
+        // One allocation per live slab, with none in flight now that the threads are done: a reservation is
+        // only handed out below the target and the target has not moved, so a fill that allocated has
+        // committed. A double allocation fails here; an overshoot fails at the probe inside the threads and
+        // at the target equality below.
+        assertEquals(
+            "one allocation per live slab, " + allocations.get() + " allocations against " + DirectIOVectorCache.slabs() + " slabs",
+            allocations.get(),
+            DirectIOVectorCache.slabs()
+        );
+
+        // And the target, single threaded, so that reaching it is a property of the grow path and not of the
+        // interleaving. Fresh ordinals, past the 4,096 the race used, so each put needs a slot of its own.
+        final int slots = DirectIOVectorCache.slotsPerSlab(128 * Float.BYTES);
+        final int bound = (target + 1) * slots;
+        for (int i = 0; i < bound && DirectIOVectorCache.slabs() < target; i++) {
+            put("race.vec#1", offsetOf(128, 4096 + i), 128);
+        }
+        assertEquals("the top-up has to reach the target", (long) target, DirectIOVectorCache.slabs());
+        assertEquals("and still one allocation per live slab", (long) target, (long) allocations.get());
         DirectIOVectorCache.checkInvariantsForTesting();
     }
 

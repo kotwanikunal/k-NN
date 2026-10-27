@@ -232,28 +232,72 @@ public class DirectIOClosedFileReleaseTests extends KNNTestCase {
      * ({@code DirectIOVectorCache#getFloats}, the copy inside the lock it takes) and a release holds the
      * write lock: a reader either finishes before the release starts or starts after it ends. A wrong vector
      * here would mean a slot was freed while a reader held it.
+     *
+     * <p>Each thread also serves itself one hit on a file of its own, before any thread enters the race, so
+     * that "a hit came back and it was the right bytes" is a property of this test and not of the
+     * interleaving. In the race a get can only hit a vector another thread put at the same offset, which is a
+     * scheduling question; that count is reported, not asserted. What the race itself still proves after it
+     * is over is the sweep below: every entry the store holds is the vector its key says, whatever the
+     * releases did to the rest.
      */
     public void testConcurrentReleaseAgainstLookupsAndFills() throws Exception {
         cacheOf(4);
         final int threads = 8;
         final int rounds = 400;
         final int files = 6;
+        final int offsets = 64;
+        final CountDownLatch ready = new CountDownLatch(threads);
         final CountDownLatch start = new CountDownLatch(1);
         final CountDownLatch done = new CountDownLatch(threads);
         final AtomicReference<String> wrong = new AtomicReference<>();
+        final AtomicReference<String> lostWarmUp = new AtomicReference<>();
         final AtomicInteger hits = new AtomicInteger();
+        final AtomicInteger warmupHits = new AtomicInteger();
         final AtomicInteger releases = new AtomicInteger();
         final List<Thread> workers = new ArrayList<>();
+
+        // One fill from the main thread first, which takes the store's first slab and leaves its other slots
+        // free. A segment allows one allocation in flight at a time, in DirectIOCacheSegment#growSlabs, and
+        // drops a fill that arrives while another is allocating, so without this the threads below would race
+        // for the first slab and some would lose their warm-up put.
+        put("concurrent-prefill.vec#1", offsetOf(0));
+        assertTrue("the first fill has to have taken a slab", DirectIOVectorCache.slabs() > 0);
 
         for (int t = 0; t < threads; t++) {
             final int seed = t;
             final Thread worker = new Thread(() -> {
                 final float[] into = new float[DIMENSION];
                 try {
+                    try {
+                        // This thread's own file, which the releasing thread never touches. The main thread's
+                        // slab has free slots for all eight of these, so none has to grow the store and none
+                        // can evict another; the ready latch below keeps the race out until all eight are
+                        // served.
+                        final String own = "concurrent-warm-" + seed + ".vec#1";
+                        final long ownOffset = offsetOf(seed);
+                        put(own, ownOffset);
+                        if (DirectIOVectorCache.getFloats(own, ownOffset, VECTOR_BYTES, into, 0)) {
+                            final float[] expected = vector(own, ownOffset);
+                            for (int i = 0; i < DIMENSION; i++) {
+                                if (into[i] != expected[i]) {
+                                    wrong.compareAndSet(
+                                        null,
+                                        "warm-up hit for " + own + " component " + i + ": " + into[i] + " not " + expected[i]
+                                    );
+                                    return;
+                                }
+                            }
+                            warmupHits.incrementAndGet();
+                        } else {
+                            lostWarmUp.compareAndSet(null, "thread " + seed + " was not served " + own + "@" + ownOffset);
+                        }
+                    } finally {
+                        ready.countDown();
+                    }
                     start.await();
                     for (int round = 0; round < rounds; round++) {
                         final String file = "concurrent-" + ((seed + round) % files) + ".vec#1";
-                        final long offset = offsetOf((seed * 7 + round * 3) % 64);
+                        final long offset = offsetOf((seed * 7 + round * 3) % offsets);
                         if ((round & 7) == 0 && seed == 0) {
                             // One thread also closes files, which is what a merge does on a node.
                             DirectIOVectorCache.releaseFile("concurrent-" + (round % files) + ".vec#1");
@@ -287,6 +331,7 @@ public class DirectIOClosedFileReleaseTests extends KNNTestCase {
             workers.add(worker);
             worker.start();
         }
+        assertTrue("the warm-ups did not finish", ready.await(30, TimeUnit.SECONDS));
         start.countDown();
         assertTrue("the workers did not finish", done.await(2, TimeUnit.MINUTES));
         for (final Thread worker : workers) {
@@ -294,7 +339,39 @@ public class DirectIOClosedFileReleaseTests extends KNNTestCase {
         }
         assertNull("a hit served the wrong bytes: " + wrong.get(), wrong.get());
         assertTrue("the run must have released something, it released " + releases.get(), releases.get() > 0);
-        assertTrue("and must have served some hits, it served " + hits.get(), hits.get() > 0);
+        assertNull("a warm-up vector did not come back: " + lostWarmUp.get(), lostWarmUp.get());
+        assertEquals("every thread must have been served its own vector", threads, warmupHits.get());
+
+        // What the store is left holding, swept now that it is quiet: every entry is the vector its key says,
+        // and every entry is one of the keys this test wrote. A release that freed a slot another file still
+        // owned, or left a mapping behind, fails here whatever the interleaving did. The race's own hit count
+        // is not asserted, because it is an interleaving: see the javadoc.
+        int swept = 0;
+        for (int file = 0; file < files; file++) {
+            for (int i = 0; i < offsets; i++) {
+                if (contains("concurrent-" + file + ".vec#1", offsetOf(i))) {
+                    assertVector("concurrent-" + file + ".vec#1", offsetOf(i));
+                    swept++;
+                }
+            }
+        }
+        for (int t = 0; t < threads; t++) {
+            if (contains("concurrent-warm-" + t + ".vec#1", offsetOf(t))) {
+                assertVector("concurrent-warm-" + t + ".vec#1", offsetOf(t));
+                swept++;
+            }
+        }
+        if (contains("concurrent-prefill.vec#1", offsetOf(0))) {
+            assertVector("concurrent-prefill.vec#1", offsetOf(0));
+            swept++;
+        }
+        assertEquals(
+            "every entry has to be one of the keys the test wrote, after " + hits.get() + " hits in the race",
+            DirectIOVectorCache.entries(),
+            (long) swept
+        );
+        assertTrue("the store cannot be empty: by the end it is at its target, where a fill reclaims rather than dropping", swept > 0);
+
         // The accounting must still add up after all of it.
         assertEquals(DirectIOVectorCache.entries() * VECTOR_BYTES, DirectIOVectorCache.bytes());
         assertTrue("entries must not be negative", DirectIOVectorCache.entries() >= 0);
