@@ -6,6 +6,8 @@
 package org.opensearch.knn.index;
 
 import lombok.SneakyThrows;
+import org.opensearch.knn.DirectIOArm;
+import org.opensearch.knn.DirectIOCounters;
 import org.opensearch.knn.DirectIONestedTestCase;
 import org.opensearch.knn.NestedDirectIOFixture;
 import org.opensearch.knn.NestedDirectIOFixture.DataType;
@@ -66,10 +68,10 @@ public class DirectIONestedIdentityIT extends DirectIONestedTestCase {
      */
     @SneakyThrows
     public void testNestedRadialIsIdenticalAcrossRoutesOrRecordedAsUnsupported() {
-        applyArm(Arm.DIO_CACHE);
-        final Counters beforeIndex = counters();
+        applyArm(DirectIOArm.DIO_CACHE);
+        final DirectIOCounters beforeIndex = counters();
         final NestedIndex index = createNestedIndex(DataType.FLOAT, Shape.SMALL);
-        final Counters opened = counters().since(beforeIndex);
+        final DirectIOCounters opened = counters().since(beforeIndex);
         assertTrue("this cluster routed nothing while the index was built: " + opened, opened.routedOpens > 0);
 
         final Object[] query = NestedDirectIOFixture.queries(DataType.FLOAT, 1).get(0);
@@ -84,7 +86,7 @@ public class DirectIONestedIdentityIT extends DirectIONestedTestCase {
             Arrays.toString(query)
         );
 
-        final Counters beforeDirect = counters();
+        final DirectIOCounters beforeDirect = counters();
         final String withDirectIO;
         try {
             withDirectIO = post(index.name(), body);
@@ -92,13 +94,13 @@ public class DirectIONestedIdentityIT extends DirectIONestedTestCase {
             logger.info("W4-RADIAL unsupported: {}", e.getMessage());
             return;
         }
-        final Counters direct = counters().since(beforeDirect);
+        final DirectIOCounters direct = counters().since(beforeDirect);
         assertTrue("the radial query read nothing from the device, so it proves nothing: " + direct, direct.deviceReads() > 0);
 
-        applyArm(Arm.MMAP);
-        final Counters beforeDelegate = counters();
+        applyArm(DirectIOArm.MMAP);
+        final DirectIOCounters beforeDelegate = counters();
         final String withDelegate = post(index.name(), body);
-        final Counters delegate = counters().since(beforeDelegate);
+        final DirectIOCounters delegate = counters().since(beforeDelegate);
         assertEquals("the delegate arm must not read the device, " + delegate, 0L, delegate.deviceReads());
         assertTrue("the delegate arm must have served the reads itself, " + delegate, delegate.fallbackReads > 0);
 
@@ -116,10 +118,10 @@ public class DirectIONestedIdentityIT extends DirectIONestedTestCase {
         for (final Shape shape : Shape.values()) {
             // On, before the index exists: the segment's inputs have to be routed inputs for a flip to mean
             // anything, and an input is routed at open.
-            applyArm(Arm.DIO_CACHE);
-            final Counters beforeIndex = counters();
+            applyArm(DirectIOArm.DIO_CACHE);
+            final DirectIOCounters beforeIndex = counters();
             final NestedIndex index = createNestedIndex(dataType, shape);
-            final Counters opened = counters().since(beforeIndex);
+            final DirectIOCounters opened = counters().since(beforeIndex);
             assertTrue(
                 String.format(Locale.ROOT, "%s/%s routed nothing while its index was built: %s", dataType, shape, opened),
                 opened.routedOpens > 0
@@ -128,12 +130,12 @@ public class DirectIONestedIdentityIT extends DirectIONestedTestCase {
             final List<Object[]> queries = NestedDirectIOFixture.queries(dataType, QUERIES);
             final List<Cell> cells = cells(dataType);
 
-            applyArm(Arm.MMAP);
+            applyArm(DirectIOArm.MMAP);
             final Map<String, Answers> reference = new LinkedHashMap<>();
             for (final Cell cell : cells) {
-                final Counters before = counters();
+                final DirectIOCounters before = counters();
                 reference.put(cell.name(), run(index.name(), cell, queries));
-                final Counters delta = counters().since(before);
+                final DirectIOCounters delta = counters().since(before);
                 final String where = String.format(Locale.ROOT, "%s/%s/mmap/%s", dataType, shape, cell.name());
                 assertEquals(where + ": the delegate arm must not read the device, " + delta, 0L, delta.deviceReads());
                 assertEquals(where + ": no reader may have been reopened, " + delta, 0L, delta.routedOpens + delta.declinedOpens);
@@ -147,8 +149,8 @@ public class DirectIONestedIdentityIT extends DirectIONestedTestCase {
                 }
             }
 
-            final Map<String, Answers> noStore = assertArmMatches(index, dataType, shape, Arm.DIO_0B, cells, queries, reference);
-            assertArmMatches(index, dataType, shape, Arm.DIO_CACHE, cells, queries, noStore);
+            final Map<String, Answers> noStore = assertArmMatches(index, dataType, shape, DirectIOArm.DIO_0B, cells, queries, reference);
+            assertArmMatches(index, dataType, shape, DirectIOArm.DIO_CACHE, cells, queries, noStore);
 
             // Whether an oversample factor changes the nested answer at all. Reported and not asserted: if the
             // three factors and the plain cell agree, the factor is not reaching the nested rescore pass, which
@@ -179,7 +181,7 @@ public class DirectIONestedIdentityIT extends DirectIONestedTestCase {
         final NestedIndex index,
         final DataType dataType,
         final Shape shape,
-        final Arm arm,
+        final DirectIOArm arm,
         final List<Cell> cells,
         final List<Object[]> queries,
         final Map<String, Answers> reference
@@ -190,9 +192,9 @@ public class DirectIONestedIdentityIT extends DirectIONestedTestCase {
         int differing = 0;
         int readingCells = 0;
         for (final Cell cell : cells) {
-            final Counters before = counters();
+            final DirectIOCounters before = counters();
             final Answers got = run(index.name(), cell, queries);
-            final Counters delta = counters().since(before);
+            final DirectIOCounters delta = counters().since(before);
             answers.put(cell.name(), got);
 
             final Answers want = reference.get(cell.name());

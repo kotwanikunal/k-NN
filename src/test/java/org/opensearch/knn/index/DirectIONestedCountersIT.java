@@ -6,6 +6,8 @@
 package org.opensearch.knn.index;
 
 import lombok.SneakyThrows;
+import org.opensearch.knn.DirectIOArm;
+import org.opensearch.knn.DirectIOCounters;
 import org.opensearch.knn.DirectIONestedTestCase;
 import org.opensearch.knn.NestedDirectIOFixture;
 import org.opensearch.knn.NestedDirectIOFixture.DataType;
@@ -54,10 +56,10 @@ public class DirectIONestedCountersIT extends DirectIONestedTestCase {
 
     private void reportCounters(final DataType dataType) throws Exception {
         for (final Shape shape : Shape.values()) {
-            applyArm(Arm.DIO_CACHE);
-            final Counters beforeIndex = counters();
+            applyArm(DirectIOArm.DIO_CACHE);
+            final DirectIOCounters beforeIndex = counters();
             final NestedIndex index = createNestedIndex(dataType, shape);
-            final Counters opened = counters().since(beforeIndex);
+            final DirectIOCounters opened = counters().since(beforeIndex);
             assertTrue(
                 String.format(Locale.ROOT, "%s/%s routed nothing while its index was built: %s", dataType, shape, opened),
                 opened.routedOpens > 0
@@ -76,16 +78,16 @@ public class DirectIONestedCountersIT extends DirectIONestedTestCase {
                 K
             );
 
-            final Counters beforeArms = counters();
-            for (final Arm arm : ARMS) {
+            final DirectIOCounters beforeArms = counters();
+            for (final DirectIOArm arm : ARMS) {
                 // The store is released going into the sized arm because the arm before it set max_bytes to
                 // 0b, which is why ARMS runs 0b before the sized store and why the sized arm starts cold.
                 applyArm(arm);
                 long deviceReads = 0;
                 for (final Cell cell : cells) {
-                    final Counters before = counters();
+                    final DirectIOCounters before = counters();
                     run(index.name(), cell, queries);
-                    final Counters delta = counters().since(before);
+                    final DirectIOCounters delta = counters().since(before);
                     deviceReads += delta.deviceReads();
                     logger.info(
                         "W4-COUNTERS {} {} {} {} per_query blocking_reads={} staged_reads={} cache_hits={} "
@@ -132,7 +134,7 @@ public class DirectIONestedCountersIT extends DirectIONestedTestCase {
                 }
             }
 
-            final Counters arms = counters().since(beforeArms);
+            final DirectIOCounters arms = counters().since(beforeArms);
             assertEquals("no reader may have been rebuilt while the arms ran, " + arms, 0L, arms.routedOpens + arms.declinedOpens);
             deleteKNNIndex(index.name());
         }

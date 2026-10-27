@@ -35,8 +35,26 @@ public class RootPerFieldDerivedVectorTransformer extends AbstractPerFieldDerive
 
     @Override
     public void setCurrentDoc(int offset, int docId) throws IOException {
-        vectorValues = vectorValuesSupplier.get();
-        vectorValues.advance(docId);
+        // One values object serves a whole scan, because the only thing it cannot do is go backwards: the
+        // iterator advances forward only, so a target behind the document it is on is the one case that needs
+        // a new one. Keeping it matters because every values object is a fresh slice of the vector file, and a
+        // slice that is asked for one vector reads that vector on its own.
+        if (vectorValues == null || docId < vectorValues.docId()) {
+            vectorValues = vectorValuesSupplier.get();
+        }
+        // Advancing to the document the iterator is already on is outside DocIdSetIterator's contract, and a
+        // sparse field reaches that case whenever the document after a gap is the one the iterator landed on;
+        // the vector already in hand is that document's.
+        if (docId > vectorValues.docId()) {
+            try {
+                vectorValues.advance(docId);
+            } catch (IOException e) {
+                // A failed advance leaves the iterator's position undefined, so it must not be reused: the
+                // next document would be served from a place no one knows.
+                vectorValues = null;
+                throw e;
+            }
+        }
     }
 
     @Override
