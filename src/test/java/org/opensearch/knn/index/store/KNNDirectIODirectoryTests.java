@@ -336,10 +336,17 @@ public class KNNDirectIODirectoryTests extends KNNTestCase {
 
     /**
      * Joint 6 of the design, as an assertion rather than a note: the production directory keeps no
-     * node-wide mutable state. Its spike predecessor has a static {@code AtomicBoolean INSTALLED_ON_NODE}
-     * so a test could tell "never installed" from "installed but unreachable"; on a node that static
-     * outlives every index that set it, and a later index's behaviour would depend on an earlier one's.
-     * This is a structural test because the failure it guards is a future edit, not current behaviour.
+     * node-wide mutable state <b>beyond the two node settings the dispatch rule asks about</b>. Its spike
+     * predecessor has a static {@code AtomicBoolean INSTALLED_ON_NODE} so a test could tell "never
+     * installed" from "installed but unreachable"; on a node that static outlives every index that set it,
+     * and a later index's behaviour would depend on an earlier one's. This is a structural test because the
+     * failure it guards is a future edit, not current behaviour.
+     *
+     * <p>W3 admits exactly two exceptions by name, {@code rescoreEnabled} and {@code minFileSizeBytes}, and
+     * each must be {@code volatile}: they hold one value for the node because the settings they carry have
+     * one value for the node, and the cluster applier publishes them from a thread that is never the reader.
+     * Anything else non-final is the state joint 6 forbids, which is why the allowance is a name list and
+     * not a modifier check.
      *
      * <p>A static {@link java.util.Collection} is admitted only if the <em>instance</em> rejects mutation,
      * which is checked rather than assumed, because a mutable collection would pass a check on the declared
@@ -348,11 +355,18 @@ public class KNNDirectIODirectoryTests extends KNNTestCase {
      */
     @SneakyThrows
     public void testTheDirectoryKeepsNoNodeWideState() {
+        final java.util.Set<String> publishedSettings = java.util.Set.of("rescoreEnabled", "minFileSizeBytes");
         for (final Field field : KNNDirectIODirectory.class.getDeclaredFields()) {
             if (Modifier.isStatic(field.getModifiers()) == false) {
                 continue;
             }
-            assertTrue("static field " + field.getName() + " must be final", Modifier.isFinal(field.getModifiers()));
+            if (Modifier.isFinal(field.getModifiers()) == false) {
+                assertTrue(
+                    "non-final static field " + field.getName() + " is not one of W3's two published settings",
+                    publishedSettings.contains(field.getName())
+                );
+                assertTrue("published setting " + field.getName() + " must be volatile", Modifier.isVolatile(field.getModifiers()));
+            }
             final Class<?> type = field.getType();
             // A logger carries nothing that varies with an index or a node's history, and it is generated
             // rather than written; everything else static would.

@@ -32,6 +32,10 @@ import org.opensearch.index.mapper.MapperService;
 import org.opensearch.knn.index.engine.MemoryOptimizedSearchSupportSpec;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManager;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManagerDto;
+import org.opensearch.knn.index.store.DirectIOReadPool;
+import org.opensearch.knn.index.store.DirectIOVectorCache;
+import org.opensearch.knn.index.store.DirectIOVectorIndexInput;
+import org.opensearch.knn.index.store.KNNDirectIODirectory;
 import org.opensearch.knn.index.util.IndexHyperParametersUtil;
 import org.opensearch.knn.quantization.models.quantizationState.QuantizationStateCacheManager;
 import org.opensearch.monitor.jvm.JvmInfo;
@@ -933,6 +937,54 @@ public class KNNSettings {
         clusterService.getClusterSettings().addSettingsUpdateConsumer(QUANTIZATION_STATE_CACHE_EXPIRY_TIME_MINUTES_SETTING, it -> {
             quantizationStateCacheManager.rebuildCache();
         });
+        // The dynamic Direct I/O settings. One consumer per setting, like the two quantization ones above
+        // and unlike the multi-setting cache consumer, because the component that owns each value is a
+        // different one and a single consumer could not tell which key had moved. Each publishes into a
+        // volatile field of its owner, so the read path -- per query, per burst, per open -- reads a field
+        // and never a settings map.
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(KNN_DIRECT_IO_RESCORE_ENABLED_SETTING, KNNDirectIODirectory::publishRescoreEnabled);
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(
+                KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING,
+                it -> KNNDirectIODirectory.publishMinFileSizeBytes(it.getBytes())
+            );
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING, DirectIOReadPool::publishThreads);
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(
+                KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_SETTING,
+                it -> DirectIOVectorCache.publishMaxBytes(it.getBytes())
+            );
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING, DirectIOVectorIndexInput::publishReadaheadWindow);
+        publishDirectIOSettings();
+    }
+
+    /**
+     * Publishes the current value of every dynamic Direct I/O setting into the component that owns it.
+     *
+     * <p>Called once from {@link #initialize}, immediately after the consumers are registered, because
+     * {@code addSettingsUpdateConsumer} does not fire at registration: without this a value an operator had
+     * already persisted would be ignored until the next time they changed it. A node that never initializes
+     * the plugin -- a unit test, a probe, a bench driver -- never calls this and runs on the owners' field
+     * initializers, which are these same defaults.
+     *
+     * <p>{@code knn.direct_io.rescore.read_profile}, the sixth Direct I/O setting, is static rather than
+     * dynamic and is resolved once per JVM where it is used
+     * ({@code DirectIOVectorIndexInput#readProfile()}), so it has neither a consumer nor a field here.
+     *
+     * <p><b>The route goes last on purpose.</b> Publishing {@code rescore.enabled} releases or restores the
+     * vector store with it, so it has to see the byte target the operator persisted rather than the one
+     * before it. A node with the route off therefore ends this method with the store at zero whatever
+     * {@code cache.max_bytes} says, which is also what it holds: nothing routes, so nothing fills.
+     */
+    public void publishDirectIOSettings() {
+        KNNDirectIODirectory.publishMinFileSizeBytes(getDirectIOMinFileSize().getBytes());
+        DirectIOReadPool.publishThreads(getDirectIORescorePrefetchThreads());
+        DirectIOVectorCache.publishMaxBytes(getDirectIORescoreCacheMaxBytes().getBytes());
+        DirectIOVectorIndexInput.publishReadaheadWindow(getDirectIOReadaheadWindow());
+        KNNDirectIODirectory.publishRescoreEnabled(isDirectIORescoreEnabled());
     }
 
     /**

@@ -95,7 +95,10 @@ public class KNNDirectIOCodecSeamTests extends KNNTestCase {
         final ClusterService clusterService = mock(ClusterService.class);
         when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(enabled, settings));
         KNNSettings.state().setClusterService(clusterService);
-        assertTrue(KNNSettings.isDirectIORescoreEnabled());
+        // The seeding a node does at startup, and the only way these two reach the dispatch rule: they live
+        // in volatile fields of the directory, so the rule no longer reads the settings itself.
+        KNNSettings.state().publishDirectIOSettings();
+        assertTrue(KNNDirectIODirectory.isRescoreEnabled());
     }
 
     private static byte[] contentOf(final int length) {

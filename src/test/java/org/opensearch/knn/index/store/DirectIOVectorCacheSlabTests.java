@@ -50,7 +50,7 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
     private void cacheOf(final int slabs) {
         DirectIOVectorCache.resetForTesting();
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
-        DirectIOVectorCache.configure((long) slabs * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes((long) slabs * TEST_SLAB_BYTES);
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -449,7 +449,7 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
         }
         assertEquals(5, DirectIOVectorCache.indexedFiles());
 
-        DirectIOVectorCache.configure(0);
+        DirectIOVectorCache.publishMaxBytes(0);
 
         assertEquals(0, DirectIOVectorCache.indexedFiles());
         assertEquals(0L, DirectIOVectorCache.entries());
@@ -472,7 +472,7 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
         assertEquals(1L, DirectIOVectorCache.slabs());
         final float[] read = new float[128];
 
-        DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(4L * TEST_SLAB_BYTES);
         assertEquals(4L * TEST_SLAB_BYTES, DirectIOVectorCache.maxBytes());
         assertEquals("growing must not drop a vector", slots, DirectIOVectorCache.entries());
         assertTrue(DirectIOVectorCache.getFloats(file, offsetOf(128, 0), 512, read, 0));
@@ -482,14 +482,14 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
         assertEquals(4L, DirectIOVectorCache.slabs());
         assertEquals(0L, DirectIOVectorCache.reclaimedSlabs());
 
-        DirectIOVectorCache.configure(2L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(2L * TEST_SLAB_BYTES);
         assertEquals(2L, DirectIOVectorCache.slabs());
         assertEquals(2L * TEST_SLAB_BYTES, DirectIOVectorCache.slabBytes());
         assertEquals("the two oldest slabs' vectors go", slots * 2, DirectIOVectorCache.entries());
         assertTrue("and the newest are the ones kept", DirectIOVectorCache.getFloats(file, offsetOf(128, slots * 4 - 1), 512, read, 0));
         DirectIOVectorCache.checkInvariantsForTesting();
 
-        DirectIOVectorCache.configure(0);
+        DirectIOVectorCache.publishMaxBytes(0);
         assertEquals(0L, DirectIOVectorCache.slabs());
         assertEquals(0L, DirectIOVectorCache.entries());
         assertEquals(0L, DirectIOVectorCache.bytes());
@@ -498,7 +498,7 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
 
     public void testATargetUnderOneSlabHoldsNothing() {
         cacheOf(0);
-        DirectIOVectorCache.configure(TEST_SLAB_BYTES - 1);
+        DirectIOVectorCache.publishMaxBytes(TEST_SLAB_BYTES - 1);
         assertEquals(0L, DirectIOVectorCache.maxBytes());
         assertFalse(DirectIOVectorCache.isOn());
     }
@@ -514,7 +514,7 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
         assertEquals(3L, DirectIOSlab.allocatedCount());
         assertEquals(0L, DirectIOSlab.freedCount());
 
-        DirectIOVectorCache.configure(0);
+        DirectIOVectorCache.publishMaxBytes(0);
         // The closes run on a release thread of their own since N3, so wait for them.
         DirectIOVectorCache.awaitReleasesForTesting();
 
@@ -612,7 +612,7 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
                     start.await();
                     for (int i = 0; i < 10_000; i++) {
                         if (seed == 0 && i % 200 == 0) {
-                            DirectIOVectorCache.configure((long) (1 + random.nextInt(4)) * TEST_SLAB_BYTES);
+                            DirectIOVectorCache.publishMaxBytes((long) (1 + random.nextInt(4)) * TEST_SLAB_BYTES);
                             continue;
                         }
                         final long offset = offsetOf(dimension, random.nextInt(5_000));
@@ -895,7 +895,7 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
         cacheOf(0);
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
         DirectIOVectorCache.setSlabMemoryForTesting(refusing(attempts));
-        DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(4L * TEST_SLAB_BYTES);
 
         final String file = "no-slab.vec#1";
         for (int i = 0; i < 200; i++) {
@@ -919,13 +919,13 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
         DirectIOVectorCache.setSlabMemoryForTesting(refusing(attempts));
         final String file = "rearm.vec#1";
 
-        DirectIOVectorCache.configure(2L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(2L * TEST_SLAB_BYTES);
         for (int i = 0; i < 20; i++) {
             put(file, offsetOf(128, i), 128);
         }
         assertEquals(1, attempts.get());
 
-        DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(4L * TEST_SLAB_BYTES);
         for (int i = 0; i < 20; i++) {
             put(file, offsetOf(128, i), 128);
         }
@@ -949,7 +949,7 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
 
         // The target goes up but the backend will not give the store a second slab.
         DirectIOVectorCache.setSlabMemoryForTesting(refusing(attempts));
-        DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(4L * TEST_SLAB_BYTES);
         assertTrue(DirectIOVectorCache.belowSlabTarget());
 
         final float[] read = new float[dimension];
@@ -988,15 +988,15 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
         // The target goes up and the backend refuses, so growth latches. The 4,096-dim fill needs a slab of
         // its own slot layout, which is what asks for one.
         DirectIOVectorCache.setSlabMemoryForTesting(refusing(attempts));
-        DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(4L * TEST_SLAB_BYTES);
         put(file, offsetOf(4096, 100), 4096);
         put(file, offsetOf(4096, 101), 4096);
         assertEquals("one attempt, and the second fill used the slab the first reclaimed", 1, attempts.get());
 
         // Every slab released, and then a cap again.
-        DirectIOVectorCache.configure(0);
+        DirectIOVectorCache.publishMaxBytes(0);
         assertEquals(0L, DirectIOVectorCache.slabs());
-        DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(4L * TEST_SLAB_BYTES);
         put(file, offsetOf(128, 0), 128);
         assertEquals("the release re-armed it", 2, attempts.get());
         assertEquals(2L, DirectIOVectorCache.slabAllocFailures());
@@ -1038,7 +1038,7 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
                 slab.close();
             }
         });
-        DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(4L * TEST_SLAB_BYTES);
 
         final String file = "lockfree.vec#1";
         final int dimension = 128;
@@ -1049,9 +1049,9 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
         }
         assertEquals(4L, DirectIOVectorCache.slabs());
         // And a span fill, which grows through the other half of place().
-        DirectIOVectorCache.configure(0);
+        DirectIOVectorCache.publishMaxBytes(0);
         DirectIOVectorCache.awaitReleasesForTesting();
-        DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(4L * TEST_SLAB_BYTES);
         for (int run = 0; run < 4; run++) {
             final long at = offsetOf(dimension, run * slots);
             DirectIOVectorCache.putRun(file, at, slots, runOf(file, at, slots, dimension), 0, dimension * Float.BYTES);
@@ -1060,8 +1060,8 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
         assertTrue(DirectIOVectorCache.spanFills() > 0);
 
         // Down, which releases some, and off, which releases the rest.
-        DirectIOVectorCache.configure(TEST_SLAB_BYTES);
-        DirectIOVectorCache.configure(0);
+        DirectIOVectorCache.publishMaxBytes(TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(0);
         DirectIOVectorCache.awaitReleasesForTesting();
 
         assertEquals("every allocate and release must run outside the lock", List.of(), violations);
@@ -1094,7 +1094,7 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
                 slab.close();
             }
         });
-        DirectIOVectorCache.configure((long) target * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes((long) target * TEST_SLAB_BYTES);
 
         final int threads = 8;
         final CountDownLatch start = new CountDownLatch(1);
@@ -1163,7 +1163,7 @@ public class DirectIOVectorCacheSlabTests extends KNNTestCase {
                 slab.close();
             }
         });
-        DirectIOVectorCache.configure(4L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(4L * TEST_SLAB_BYTES);
 
         final int threads = 8;
         final int perThread = 10;

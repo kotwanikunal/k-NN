@@ -623,8 +623,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
 
         /**
-         * Times the pool was rebuilt because {@code queue_capacity} changed. {@code 0} on a node that has
-         * never retuned it; each increment is one live capacity change that actually took effect.
+         * Times a read pool replaced one, rather than being resized in place. The first pool of the JVM
+         * replaces nothing and is not counted, and the queue's capacity is derived from the node's own search
+         * pools and cannot be set, so this stays 0 unless those pools were rebuilt under it; a thread-count
+         * change resizes and does not move it.
          */
         public long poolRebuilds() {
             return poolRebuilds.get();
@@ -1078,6 +1080,15 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      */
     private static volatile String readProfile;
 
+    /**
+     * {@code knn.direct_io.readahead.window}, as the node last published it. Published by
+     * {@link KNNSettings} on a change and seeded there at startup; until then it is the setting's own
+     * default, which is what a JVM with no cluster service runs on.
+     *
+     * @see #publishReadaheadWindow(int)
+     */
+    private static volatile int readaheadWindow = KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW_DEFAULT_VALUE;
+
     private final Handle handle;
     /**
      * The delegate's own input over the same bytes, kept open beside the {@code O_DIRECT} channel, or
@@ -1325,7 +1336,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * caller that has no second input to give gets. See {@link #mmapFallback}.
      */
     public static DirectIOVectorIndexInput open(final Path path, @Nullable final IndexInput mmapFallback) {
-        return open(path, mmapFallback, KNNSettings::isDirectIORescoreEnabled);
+        return open(path, mmapFallback, KNNDirectIODirectory::isRescoreEnabled);
     }
 
     /**
@@ -1352,19 +1363,23 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     }
 
     /**
-     * Windows the sequential read-ahead ring keeps in flight, from {@code knn.direct_io.readahead.window}.
-     * Read here, once per {@code .vec} open, like the staging bounds: the value sizes the ring's buffers,
-     * and a value that moved under a running ring would mean a buffer allocated for one count holding
-     * another. A setting that cannot be read falls back to its default — this must never be why a shard
-     * fails to open. 0 means the ring is off.
+     * Windows the sequential read-ahead ring keeps in flight, the published
+     * {@code knn.direct_io.readahead.window}. Read here, once per {@code .vec} open, and not per read: the
+     * value sizes the ring's buffers, and a value that moved under a running ring would mean a buffer
+     * allocated for one count holding another. 0 means the ring is off.
      */
     private static int configuredReadaheadWindow() {
-        try {
-            return Math.max(0, KNNSettings.getDirectIOReadaheadWindow());
-        } catch (RuntimeException e) {
-            log.debug("Could not read knn.direct_io.readahead.window; read-ahead disabled for this open", e);
-            return KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW_DEFAULT_VALUE;
-        }
+        return readaheadWindow;
+    }
+
+    /**
+     * Publishes {@code knn.direct_io.readahead.window}. Called by {@link KNNSettings} from the cluster
+     * applier thread; it does no work beyond the write, because the value is read at the next open and no
+     * ring already built for one window count is ever re-sized to another. Not clamped: the setting's own
+     * floor is 0, which turns the ring off.
+     */
+    public static void publishReadaheadWindow(final int windows) {
+        readaheadWindow = windows;
     }
 
     /**
@@ -1440,7 +1455,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         return open(
             path,
             null,
-            KNNSettings::isDirectIORescoreEnabled,
+            KNNDirectIODirectory::isRescoreEnabled,
             bufferSize,
             maxStagedRanges,
             maxStagedRangeBytes,
@@ -2374,10 +2389,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      *
      * <p>A burst has no explicit boundary, so it is recovered: the first of these after any read ends the
      * previous burst. Same move the rescore seam's {@code stage()} made by calling {@code abandonBatch()} on
-     * entry. The settings refresh then runs exactly once per burst, which is the same cadence and the same
-     * contract as {@link DirectIOReadPool#executor()}: an operator's change to
-     * {@code knn.direct_io.rescore.cache.max_bytes} or {@code .span_fill} takes effect on the next burst with
-     * no restart.
+     * entry. The store's target is then re-asserted exactly once per burst, which is the same cadence as
+     * {@link DirectIOReadPool#executor()}. An operator's change does not arrive this way -- the cluster
+     * applier publishes it -- so what the burst is for is a store that was released under a route that was
+     * off and has to grow back now the route is on.
      */
     private void beginBurst() {
         if (readSincePrefetch) {

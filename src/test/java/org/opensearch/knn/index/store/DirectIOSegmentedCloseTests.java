@@ -51,7 +51,7 @@ public class DirectIOSegmentedCloseTests extends KNNTestCase {
         if (segments > 0) {
             DirectIOVectorCache.setSegmentsForTesting(segments);
         }
-        DirectIOVectorCache.configure((long) SLABS * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes((long) SLABS * TEST_SLAB_BYTES);
     }
 
     /**

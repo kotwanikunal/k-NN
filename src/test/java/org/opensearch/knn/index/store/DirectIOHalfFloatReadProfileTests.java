@@ -333,9 +333,17 @@ public class DirectIOHalfFloatReadProfileTests extends KNNTestCase {
                 .filter(setting -> setting.getProperties().contains(Setting.Property.NodeScope))
                 .toList()
         );
-        when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(settings, registered));
-        when(clusterService.getSettings()).thenReturn(settings);
+        // The route is on unless the caller says otherwise. These cases read through O_DIRECT with no
+        // delegate to fall back to, which is the one shape the route switch does not reach, so the node
+        // they model is a node that is routing: publishing the route off would give the store back under
+        // them. A case whose subject is the switch puts its own value and that wins.
+        final Settings routed = Settings.builder().put(KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED, true).put(settings).build();
+        when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(routed, registered));
+        when(clusterService.getSettings()).thenReturn(routed);
         KNNSettings.state().setClusterService(clusterService);
+        // The seeding a node does at startup: the dynamic Direct I/O settings live in volatile fields of
+        // the components that own them, so publishing is how a setting reaches the read path.
+        KNNSettings.state().publishDirectIOSettings();
     }
 
     private void configure(final String profile, final int cap, final int slabs, final boolean spanFill) {
@@ -352,7 +360,7 @@ public class DirectIOHalfFloatReadProfileTests extends KNNTestCase {
         DirectIOVectorCache.setSpanFillForTesting(spanFill);
         DirectIOVectorCache.setReadAroundBytesForTesting(0L);
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
-        DirectIOVectorCache.configure(maxBytes);
+        DirectIOVectorCache.publishMaxBytes(maxBytes);
         DirectIOVectorIndexInput.STATS.reset();
         DirectIOVectorIndexInput.resetReadProfileForTesting();
     }

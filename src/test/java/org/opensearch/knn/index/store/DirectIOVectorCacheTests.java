@@ -89,8 +89,16 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
                 .filter(setting -> setting.getProperties().contains(Setting.Property.NodeScope))
                 .toList()
         );
-        when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(settings, registered));
+        // The route is on unless the caller says otherwise. These cases read through O_DIRECT with no
+        // delegate to fall back to, which is the one shape the route switch does not reach, so the node
+        // they model is a node that is routing: publishing the route off would give the store back under
+        // them. A case whose subject is the switch puts its own value and that wins.
+        final Settings routed = Settings.builder().put(KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED, true).put(settings).build();
+        when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(routed, registered));
         KNNSettings.state().setClusterService(clusterService);
+        // The seeding a node does at startup: the dynamic Direct I/O settings live in volatile fields of
+        // the components that own them, so publishing is how a setting reaches the read path.
+        KNNSettings.state().publishDirectIOSettings();
     }
 
     /**
@@ -113,7 +121,7 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
         // and a span admitting fifteen neighbours would hide all three.
         DirectIOVectorCache.setSpanFillForTesting(false);
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
-        DirectIOVectorCache.configure(maxBytes);
+        DirectIOVectorCache.publishMaxBytes(maxBytes);
     }
 
     @SneakyThrows
@@ -401,11 +409,11 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
     }
 
     /**
-     * A live change is applied at the next prefetch burst, and a change of size <b>resizes</b> rather than
-     * rebuilding: growing keeps every vector already held and lets the next miss take a slab. That is the M2
-     * change from phase 15, whose Guava cache had to be rebuilt because {@code maximumWeight} is fixed at
-     * {@code build()}, so every retune cost the whole cache and a re-warm. Asserted rather than assumed,
-     * because it is the difference an operator feels.
+     * A live change is applied when the cluster applier publishes it (W3), and a change of size
+     * <b>resizes</b> rather than rebuilding: growing keeps every vector already held and lets the next miss
+     * take a slab. That is the M2 change from phase 15, whose Guava cache had to be rebuilt because
+     * {@code maximumWeight} is fixed at {@code build()}, so every retune cost the whole cache and a re-warm.
+     * Asserted rather than assumed, because it is the difference an operator feels.
      */
     @SneakyThrows
     public void testALiveSizeChangeResizesAndKeepsTheEntries() {
@@ -421,8 +429,7 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
             assertEquals(1L, DirectIOVectorCache.entries());
             assertTrue(DirectIOVectorCache.bytes() > 0);
 
-            // The operator raises it. applyConfiguredSize runs at the next burst boundary, which the next
-            // prefetch after a read establishes.
+            // The operator raises it, and the applier publishes it: the target is live before the read below.
             withNodeSettings(
                 Settings.builder()
                     .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, (4 * TEST_SLAB_BYTES) + "b")

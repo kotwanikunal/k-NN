@@ -50,7 +50,7 @@ public class DirectIOClosedFileReleaseTests extends KNNTestCase {
     private void cacheOf(final int slabs) {
         DirectIOVectorCache.resetForTesting();
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
-        DirectIOVectorCache.configure((long) slabs * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes((long) slabs * TEST_SLAB_BYTES);
     }
 
     // ---------------------------------------------------------------------------------------------------

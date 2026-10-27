@@ -53,7 +53,7 @@ public class DirectIOCacheSegmentationTests extends KNNTestCase {
         DirectIOVectorCache.resetForTesting();
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
         DirectIOVectorCache.setSegmentsForTesting(segments);
-        DirectIOVectorCache.configure((long) slabs * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes((long) slabs * TEST_SLAB_BYTES);
         assertEquals("the pinned count is the count in force", segments, DirectIOVectorCache.segmentCount());
     }
 
@@ -174,12 +174,12 @@ public class DirectIOCacheSegmentationTests extends KNNTestCase {
     public void testTheStoreDerivesItsOwnCount() {
         DirectIOVectorCache.resetForTesting();
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
-        DirectIOVectorCache.configure(1_024L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(1_024L * TEST_SLAB_BYTES);
         assertEquals(
             DirectIOVectorCache.derivedSegmentCount(Runtime.getRuntime().availableProcessors(), 1_024),
             DirectIOVectorCache.segmentCount()
         );
-        DirectIOVectorCache.configure(0);
+        DirectIOVectorCache.publishMaxBytes(0);
         assertEquals("off is one segment", 1, DirectIOVectorCache.segmentCount());
     }
 
@@ -189,7 +189,7 @@ public class DirectIOCacheSegmentationTests extends KNNTestCase {
         expectThrows(IllegalArgumentException.class, () -> DirectIOVectorCache.setSegmentsForTesting(-1));
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
         DirectIOVectorCache.setSegmentsForTesting(4);
-        DirectIOVectorCache.configure(8L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(8L * TEST_SLAB_BYTES);
         expectThrows(IllegalStateException.class, () -> DirectIOVectorCache.setSegmentsForTesting(8));
     }
 
@@ -361,7 +361,7 @@ public class DirectIOCacheSegmentationTests extends KNNTestCase {
         // No pinned count: the derived one is what a node runs, and 128 test slabs derives 8 or 16
         // segments on any core count while 32 derives 4, so the shrink below is a real count change with
         // live slabs in it.
-        DirectIOVectorCache.configure(128L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(128L * TEST_SLAB_BYTES);
         assertTrue("the derived count must be more than one here", DirectIOVectorCache.segmentCount() > 1);
         final String file = "/index/locks.vec#1";
         // Enough fills to grow every segment, reclaim inside them, and reach the global target, which is
@@ -378,14 +378,14 @@ public class DirectIOCacheSegmentationTests extends KNNTestCase {
         // then a grow back across it, then off.
         DirectIOVectorCache.releaseFile(file);
         final int before = DirectIOVectorCache.segmentCount();
-        DirectIOVectorCache.configure(32L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(32L * TEST_SLAB_BYTES);
         assertEquals("32 test slabs is four segments at any core count", 4, DirectIOVectorCache.segmentCount());
         assertNotEquals("so the count changed", before, DirectIOVectorCache.segmentCount());
         for (int i = 0; i < 8 * slots; i++) {
             put(file, offsetOf(dimension, i), dimension);
         }
-        DirectIOVectorCache.configure(128L * TEST_SLAB_BYTES);
-        DirectIOVectorCache.configure(0);
+        DirectIOVectorCache.publishMaxBytes(128L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(0);
         DirectIOVectorCache.awaitReleasesForTesting();
 
         assertEquals("no path may hold two segment locks or allocate under one", List.of(), violations);

@@ -43,7 +43,7 @@ public class DirectIOFillBatchingTests extends KNNTestCase {
         DirectIOVectorCache.resetForTesting();
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
         DirectIOVectorCache.setSegmentsForTesting(segments);
-        DirectIOVectorCache.configure((long) slabs * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes((long) slabs * TEST_SLAB_BYTES);
         assertEquals(segments, DirectIOVectorCache.segmentCount());
     }
 

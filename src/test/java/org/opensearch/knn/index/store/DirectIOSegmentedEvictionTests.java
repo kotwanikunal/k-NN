@@ -46,7 +46,7 @@ public class DirectIOSegmentedEvictionTests extends KNNTestCase {
         DirectIOVectorCache.resetForTesting();
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
         DirectIOVectorCache.setSegmentsForTesting(SEGMENTS);
-        DirectIOVectorCache.configure((long) slabs * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes((long) slabs * TEST_SLAB_BYTES);
         assertEquals(SEGMENTS, DirectIOVectorCache.segmentCount());
     }
 
@@ -251,7 +251,7 @@ public class DirectIOSegmentedEvictionTests extends KNNTestCase {
         DirectIOVectorCache.resetForTesting();
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
         DirectIOVectorCache.setSegmentsForTesting(4);
-        DirectIOVectorCache.configure(2L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(2L * TEST_SLAB_BYTES);
         final String file = "lend.vec#1";
         final int slots = DirectIOVectorCache.slotsPerSlab(512);
 
@@ -314,7 +314,7 @@ public class DirectIOSegmentedEvictionTests extends KNNTestCase {
         DirectIOVectorCache.resetForTesting();
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
         DirectIOVectorCache.setSegmentsForTesting(4);
-        DirectIOVectorCache.configure(3L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(3L * TEST_SLAB_BYTES);
         final String file = "pingpong.vec#1";
         final int slots = DirectIOVectorCache.slotsPerSlab(512);
 
@@ -365,7 +365,7 @@ public class DirectIOSegmentedEvictionTests extends KNNTestCase {
         DirectIOVectorCache.resetForTesting();
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
         DirectIOVectorCache.setSegmentsForTesting(16);
-        DirectIOVectorCache.configure(64L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(64L * TEST_SLAB_BYTES);
         final String file = "skew.vec#1";
         // One vector in each of 4,096 stripes, so every segment gets about 256 of them.
         for (int stripe = 0; stripe < 4_096; stripe++) {

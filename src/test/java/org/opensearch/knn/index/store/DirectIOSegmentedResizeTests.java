@@ -47,7 +47,7 @@ public class DirectIOSegmentedResizeTests extends KNNTestCase {
         DirectIOVectorCache.resetForTesting();
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
         DirectIOVectorCache.setSegmentsForTesting(segments);
-        DirectIOVectorCache.configure((long) slabs * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes((long) slabs * TEST_SLAB_BYTES);
         assertEquals(segments, DirectIOVectorCache.segmentCount());
     }
 
@@ -65,7 +65,7 @@ public class DirectIOSegmentedResizeTests extends KNNTestCase {
         final long slabsBefore = DirectIOVectorCache.slabs();
         assertEquals("the fixture must fit", vectors, entriesBefore);
 
-        DirectIOVectorCache.configure(64L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(64L * TEST_SLAB_BYTES);
 
         assertEquals("the count did not change", 16, DirectIOVectorCache.segmentCount());
         assertEquals("no re-warm", 0L, DirectIOVectorCache.segmentCountChanges());
@@ -106,7 +106,7 @@ public class DirectIOSegmentedResizeTests extends KNNTestCase {
         final long perSlab = DirectIOVectorCache.slotsPerSlab(VECTOR_BYTES);
 
         final long target = slabsBefore / 2;
-        DirectIOVectorCache.configure(target * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(target * TEST_SLAB_BYTES);
 
         assertEquals("the count did not change", 16, DirectIOVectorCache.segmentCount());
         assertEquals(target, DirectIOVectorCache.slabs());
@@ -143,7 +143,7 @@ public class DirectIOSegmentedResizeTests extends KNNTestCase {
         final long allocated = DirectIOSlab.allocatedCount();
         assertTrue("the fixture must have allocated slabs", allocated > 0);
 
-        DirectIOVectorCache.configure(0);
+        DirectIOVectorCache.publishMaxBytes(0);
         DirectIOVectorCache.awaitReleasesForTesting();
 
         assertEquals("every slab released", 0L, DirectIOVectorCache.slabs());
@@ -183,7 +183,7 @@ public class DirectIOSegmentedResizeTests extends KNNTestCase {
     public void testATargetCrossingACountBoundaryResegments() {
         DirectIOVectorCache.resetForTesting();
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
-        DirectIOVectorCache.configure(128L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(128L * TEST_SLAB_BYTES);
         final int before = DirectIOVectorCache.segmentCount();
         assertTrue("128 test slabs derives more than one segment on any core count, saw " + before, before > 1);
         final String file = "/index/resegment.vec#1";
@@ -192,7 +192,7 @@ public class DirectIOSegmentedResizeTests extends KNNTestCase {
         assertTrue(DirectIOVectorCache.slabs() > 0);
         assertEquals(0L, DirectIOVectorCache.segmentCountChanges());
 
-        DirectIOVectorCache.configure(32L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(32L * TEST_SLAB_BYTES);
 
         assertEquals("32 test slabs is four segments at any core count", 4, DirectIOVectorCache.segmentCount());
         assertEquals("the change is counted", 1L, DirectIOVectorCache.segmentCountChanges());
@@ -214,7 +214,7 @@ public class DirectIOSegmentedResizeTests extends KNNTestCase {
         DirectIOVectorCache.checkInvariantsForTesting();
 
         // Back up across the boundary: the count changes again and is counted again.
-        DirectIOVectorCache.configure(128L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(128L * TEST_SLAB_BYTES);
         assertEquals(before, DirectIOVectorCache.segmentCount());
         assertEquals(2L, DirectIOVectorCache.segmentCountChanges());
         assertEquals(0L, DirectIOVectorCache.entries());
@@ -226,14 +226,14 @@ public class DirectIOSegmentedResizeTests extends KNNTestCase {
     public void testAResizeWithinABoundaryDoesNotResegment() {
         DirectIOVectorCache.resetForTesting();
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
-        DirectIOVectorCache.configure(32L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(32L * TEST_SLAB_BYTES);
         assertEquals(4, DirectIOVectorCache.segmentCount());
         final String file = "/index/within.vec#1";
         fill(file, 0, 2_000);
         final long entries = DirectIOVectorCache.entries();
 
         // 32 to 63 slabs are all four segments: previousPowerOfTwo(63 / 8) is 4.
-        DirectIOVectorCache.configure(63L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(63L * TEST_SLAB_BYTES);
 
         assertEquals(4, DirectIOVectorCache.segmentCount());
         assertEquals("no change to count", 0L, DirectIOVectorCache.segmentCountChanges());
@@ -255,7 +255,7 @@ public class DirectIOSegmentedResizeTests extends KNNTestCase {
         fill("/index/noop.vec#1", 0, 500);
         DirectIOVectorCache.setAcquisitionCountingForTesting(true);
         for (int i = 0; i < 10_000; i++) {
-            DirectIOVectorCache.configure(16L * TEST_SLAB_BYTES);
+            DirectIOVectorCache.publishMaxBytes(16L * TEST_SLAB_BYTES);
         }
         final long read = DirectIOVectorCache.readAcquisitionsForTesting();
         final long write = DirectIOVectorCache.writeAcquisitionsForTesting();
@@ -271,7 +271,7 @@ public class DirectIOSegmentedResizeTests extends KNNTestCase {
     public void testAChangedTargetTakesTheBrokersLock() {
         cacheOf(16, 16);
         DirectIOVectorCache.setAcquisitionCountingForTesting(true);
-        DirectIOVectorCache.configure(32L * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes(32L * TEST_SLAB_BYTES);
         final long broker = DirectIOVectorCache.brokerLockAcquisitionsForTesting();
         DirectIOVectorCache.setAcquisitionCountingForTesting(false);
         assertTrue("a real resize takes the resize lock, saw " + broker, broker >= 1);
@@ -332,7 +332,7 @@ public class DirectIOSegmentedResizeTests extends KNNTestCase {
                 final long[] targets = { 32, 48, 16, 64, 24, 32 };
                 for (int round = 0; round < 8; round++) {
                     for (final long slabs : targets) {
-                        DirectIOVectorCache.configure(slabs * TEST_SLAB_BYTES);
+                        DirectIOVectorCache.publishMaxBytes(slabs * TEST_SLAB_BYTES);
                         Thread.sleep(5);
                     }
                 }
@@ -353,7 +353,7 @@ public class DirectIOSegmentedResizeTests extends KNNTestCase {
             throw new AssertionError(failure.get());
         }
         DirectIOVectorCache.checkInvariantsForTesting();
-        DirectIOVectorCache.configure(0);
+        DirectIOVectorCache.publishMaxBytes(0);
         DirectIOVectorCache.awaitReleasesForTesting();
         assertEquals("no slab leaked across the race", 0L, DirectIOVectorCache.slabs());
         DirectIOVectorCache.checkInvariantsForTesting();

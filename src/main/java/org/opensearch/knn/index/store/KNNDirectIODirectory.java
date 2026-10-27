@@ -38,7 +38,7 @@ import java.util.function.LongSupplier;
  * <ol>
  *   <li>the file is a <b>faiss or memory-optimized-search</b> flat vector file, of either precision
  *       (O8 added the two FP16 formats) — see {@link #isFaissVectorData};
- *   <li>{@link KNNSettings#isDirectIORescoreEnabled()} is on — the per-substrate enablement rule, which
+ *   <li>{@code knn.direct_io.rescore.enabled} is on — the per-substrate enablement rule, which
  *       stays a setting because Direct I/O is a win only where the {@code .vec} working set cannot stay
  *       in the page cache;
  *   <li>the segment is <b>not compound</b> — a {@code CompoundDirectory} entry has no file of its own.
@@ -119,7 +119,15 @@ import java.util.function.LongSupplier;
  * The spike this design grew out of recorded every {@code openInput} in an unbounded list and set a
  * node-wide static flag so a test could tell "never installed" from "installed but unreachable".
  * Neither belongs on a production read path — the list grows for the life of the shard and the static
- * outlives every index that set it. This class keeps bounded counters and no static state at all.
+ * outlives every index that set it. This class keeps bounded counters and only the two node-wide
+ * settings the dispatch rule asks about.
+ *
+ * <h2>Why those two are static</h2>
+ * {@link #rescoreEnabled} and {@link #minFileSizeBytes} are node settings: one value for the node, not
+ * one per directory. {@link KNNSettings} publishes them here when the cluster applier accepts a change,
+ * so the dispatch rule reads a field rather than a settings map. A per-instance copy taken at
+ * construction would make a change reach only the readers opened after it, and a directory lives as long
+ * as its segment reader does.
  */
 @Log4j2
 public final class KNNDirectIODirectory extends FilterDirectory {
@@ -130,17 +138,28 @@ public final class KNNDirectIODirectory extends FilterDirectory {
     /** How deep the chain description will go. A log line must never be the thing that hangs a shard. */
     private static final int MAX_CHAIN_DEPTH = 16;
 
+    /**
+     * Condition 2 of the dispatch rule, {@code knn.direct_io.rescore.enabled}. Published by
+     * {@link KNNSettings} on a change and seeded there at startup; until then it is the setting's own
+     * default, which is what a JVM with no cluster service runs on.
+     */
+    private static volatile boolean rescoreEnabled = KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED_DEFAULT_VALUE;
+
+    /** Condition 6, {@code knn.direct_io.min_file_size}, published the same way. */
+    private static volatile long minFileSizeBytes = KNNSettings.KNN_DIRECT_IO_MIN_FILE_SIZE_DEFAULT_VALUE.getBytes();
+
     /** The segment this directory serves, so a log line can be attributed to one. */
     private final String segmentName;
 
     /**
-     * Condition 2 of the dispatch rule, read at every dispatch rather than captured once, because the
-     * setting is dynamic and a segment's {@code .vec} is opened once per reader.
+     * Where condition 2 is read from, at every dispatch rather than captured once, because the setting is
+     * dynamic and a segment's {@code .vec} is opened once per reader. Production reads
+     * {@link #rescoreEnabled}; a test substitutes its own answer through the four-argument constructor.
      */
     private final BooleanSupplier directIORescoreEnabled;
 
-    /** Condition 6, read at every dispatch for the same reason condition 2 is. */
-    private final LongSupplier minFileSizeBytes;
+    /** Where condition 6 is read from, at every dispatch for the same reason condition 2 is. */
+    private final LongSupplier minFileSize;
 
     private final AtomicLong routedOpens = new AtomicLong();
     private final AtomicLong declinedCompound = new AtomicLong();
@@ -151,7 +170,7 @@ public final class KNNDirectIODirectory extends FilterDirectory {
     private final AtomicLong declinedContent = new AtomicLong();
 
     public KNNDirectIODirectory(final Directory delegate, final String segmentName) {
-        this(delegate, segmentName, KNNSettings::isDirectIORescoreEnabled, () -> KNNSettings.getDirectIOMinFileSize().getBytes());
+        this(delegate, segmentName, KNNDirectIODirectory::isRescoreEnabled, KNNDirectIODirectory::minFileSizeBytes);
     }
 
     /** Visible for testing, so a test can drive the rule without a cluster service. */
@@ -159,12 +178,55 @@ public final class KNNDirectIODirectory extends FilterDirectory {
         final Directory delegate,
         final String segmentName,
         final BooleanSupplier directIORescoreEnabled,
-        final LongSupplier minFileSizeBytes
+        final LongSupplier minFileSize
     ) {
         super(delegate);
         this.segmentName = segmentName;
         this.directIORescoreEnabled = directIORescoreEnabled;
-        this.minFileSizeBytes = minFileSizeBytes;
+        this.minFileSize = minFileSize;
+    }
+
+    // -------------------------------------------------------------------------------------------------
+    // The two node settings the dispatch rule asks about
+    // -------------------------------------------------------------------------------------------------
+
+    /** Condition 2, as the node last published it. */
+    static boolean isRescoreEnabled() {
+        return rescoreEnabled;
+    }
+
+    /** Condition 6, as the node last published it. */
+    static long minFileSizeBytes() {
+        return minFileSizeBytes;
+    }
+
+    /**
+     * Publishes {@code knn.direct_io.rescore.enabled} <b>and gives the vector store back with it</b>, which
+     * is the whole point of the key being dynamic: the slabs serve routed reads only, so a node that has
+     * stopped routing is holding memory for nothing, and waiting for a burst to notice would never free it
+     * on a node that has stopped reading as well. Turning the route back on restores the target, so the
+     * store grows again at the next fill.
+     *
+     * <p>Called by {@link KNNSettings} from the cluster applier thread, and it does not wait:
+     * {@code DirectIOVectorCache} detaches the slabs under the broker's lock and frees them on its own
+     * release thread.
+     *
+     * <p>An input with no delegate to fall back to stays on {@code O_DIRECT} whatever this says, and its
+     * store goes with it (see {@code DirectIOVectorIndexInput#mmapFallback}). That is every probe and bench
+     * driver in this package, and none of them has a cluster service, so none of them reaches this method.
+     */
+    public static void publishRescoreEnabled(final boolean enabled) {
+        rescoreEnabled = enabled;
+        DirectIOVectorCache.applyConfiguredSize(enabled);
+    }
+
+    /**
+     * Publishes {@code knn.direct_io.min_file_size}. A change reaches the next open of a {@code .vec},
+     * which is the only cadence the condition is asked at. Not clamped: the setting is a byte size with a
+     * floor of {@code 0b}, so there is no negative value to defend against.
+     */
+    public static void publishMinFileSizeBytes(final long bytes) {
+        minFileSizeBytes = bytes;
     }
 
     public String segmentName() {
@@ -235,7 +297,7 @@ public final class KNNDirectIODirectory extends FilterDirectory {
         }
         // (5) and (6) in one syscall: Files.size throws NoSuchFileException for a missing file, which is a
         // different reason with a different cause and is counted apart from the floor.
-        final long minBytes = minFileSizeBytes.getAsLong();
+        final long minBytes = minFileSize.getAsLong();
         try {
             final long bytes = Files.size(path);
             if (bytes < minBytes) {
@@ -565,7 +627,7 @@ public final class KNNDirectIODirectory extends FilterDirectory {
      * becomes garbage with the reader — which is why it holds no resource of its own.
      */
     public static SegmentReadState routeVectorData(final SegmentReadState state) {
-        if (KNNSettings.isDirectIORescoreEnabled() == false) {
+        if (rescoreEnabled == false) {
             return state;
         }
         return new SegmentReadState(

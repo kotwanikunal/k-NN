@@ -124,6 +124,11 @@ public class KNNTestCase extends OpenSearchTestCase {
         );
         when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(Settings.EMPTY, defaultClusterSettings));
         KNNSettings.state().setClusterService(clusterService);
+        // W3: the dynamic Direct I/O settings live in volatile fields of the components that own them, and a
+        // node seeds them at startup from the same method. Seeding here against Settings.EMPTY puts every one
+        // of them back at its default, which is what a test that has not asked for Direct I/O must see
+        // whatever the test before it published. Called from setUp and from tearDown, like the rest of this.
+        KNNSettings.state().publishDirectIOSettings();
     }
 
     public Map<String, Object> xContentBuilderToMap(XContentBuilder xContentBuilder) {

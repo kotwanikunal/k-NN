@@ -46,7 +46,7 @@ public class DirectIOSegmentedStatsTests extends KNNTestCase {
         if (segments > 0) {
             DirectIOVectorCache.setSegmentsForTesting(segments);
         }
-        DirectIOVectorCache.configure((long) slabs * TEST_SLAB_BYTES);
+        DirectIOVectorCache.publishMaxBytes((long) slabs * TEST_SLAB_BYTES);
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -110,7 +110,7 @@ public class DirectIOSegmentedStatsTests extends KNNTestCase {
         assertTrue("and an eviction does move it", DirectIOVectorCache.evictions() > evictionsBefore);
 
         // 0b is off, and every one of the six goes with it.
-        DirectIOVectorCache.configure(0);
+        DirectIOVectorCache.publishMaxBytes(0);
         DirectIOVectorCache.awaitReleasesForTesting();
         assertEquals("max_bytes 0 with the cache off", 0L, DirectIOVectorCache.maxBytes());
         assertEquals(0L, DirectIOVectorCache.entries());

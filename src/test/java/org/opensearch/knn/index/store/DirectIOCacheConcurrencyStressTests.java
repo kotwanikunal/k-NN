@@ -214,7 +214,7 @@ public class DirectIOCacheConcurrencyStressTests extends KNNTestCase {
         nodeSettings(target, spanFill, readAround);
         DirectIOVectorCache.resetForTesting();
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
-        DirectIOVectorCache.configure(target);
+        DirectIOVectorCache.publishMaxBytes(target);
         DirectIOVectorCache.applyConfiguredSize(true);
         assertTrue("the store must be on for the stress", DirectIOVectorCache.isOn());
         assertEquals("span fill must be where the corner says", spanFill, DirectIOVectorCache.isSpanFillOn());
@@ -333,7 +333,7 @@ public class DirectIOCacheConcurrencyStressTests extends KNNTestCase {
                 final long[] targets = { 64, 48, 16, 128, 32, 64 };
                 int at = 0;
                 while (stop.get() == false) {
-                    DirectIOVectorCache.configure(targets[at % targets.length] * TEST_SLAB_BYTES);
+                    DirectIOVectorCache.publishMaxBytes(targets[at % targets.length] * TEST_SLAB_BYTES);
                     resizes.increment();
                     progress.increment();
                     at++;
@@ -345,7 +345,7 @@ public class DirectIOCacheConcurrencyStressTests extends KNNTestCase {
                     Thread.sleep(25);
                 }
                 // Leave the store on, at the phase's target, so the invariant check sees a live store.
-                DirectIOVectorCache.configure(target);
+                DirectIOVectorCache.publishMaxBytes(target);
             } catch (Throwable e) {
                 failure.compareAndSet(null, e);
             } finally {
@@ -433,7 +433,7 @@ public class DirectIOCacheConcurrencyStressTests extends KNNTestCase {
         assertTrue("span fill must have admitted something where it is on", spanFill == false || result.spanFills() > 0);
         assertEquals("and nothing where it is off", spanFill, result.spanFills() > 0);
         assertTrue("the resizer crossed a segment-count boundary, saw " + result.segmentChanges(), result.segmentChanges() > 0);
-        DirectIOVectorCache.configure(0);
+        DirectIOVectorCache.publishMaxBytes(0);
         DirectIOVectorCache.awaitReleasesForTesting();
         DirectIOVectorCache.checkInvariantsForTesting();
         return result;
@@ -496,7 +496,15 @@ public class DirectIOCacheConcurrencyStressTests extends KNNTestCase {
                 .filter(setting -> setting.getProperties().contains(Setting.Property.NodeScope))
                 .toList()
         );
-        when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(settings, registered));
+        // The route is on unless the caller says otherwise. These cases read through O_DIRECT with no
+        // delegate to fall back to, which is the one shape the route switch does not reach, so the node
+        // they model is a node that is routing: publishing the route off would give the store back under
+        // them. A case whose subject is the switch puts its own value and that wins.
+        final Settings routed = Settings.builder().put(KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED, true).put(settings).build();
+        when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(routed, registered));
         KNNSettings.state().setClusterService(clusterService);
+        // The seeding a node does at startup: the dynamic Direct I/O settings live in volatile fields of
+        // the components that own them, so publishing is how a setting reaches the read path.
+        KNNSettings.state().publishDirectIOSettings();
     }
 }

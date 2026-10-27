@@ -614,12 +614,15 @@ public class DirectIOPrefetchFilterTests extends KNNTestCase {
     }
 
     /**
-     * A batch whose every candidate is cached makes no prefetch call, so the burst boundary the settings
-     * refresh hangs off had to move to the filter: without that, an operator's {@code max_bytes} change
-     * would never be read on a node whose cache serves everything.
+     * A node whose cache serves every batch makes no prefetch call at all, and an operator's
+     * {@code max_bytes} change must still reach it. Before W3 the refresh hung off the burst boundary, which
+     * is why the boundary had to be recovered in the filter as well as in {@code prefetch}; now the cluster
+     * applier publishes the change and the slabs go back without a burst of any kind, and a burst afterwards
+     * must not put them back. The filter's own boundary still matters for the counters, which
+     * {@code testTheFiltersAnswersDoNotOutliveTheirBurst} pins; this case is about the setting.
      */
     @SneakyThrows
-    public void testASettingChangeIsPickedUpThroughTheFilterAlone() {
+    public void testASettingChangeReachesTheStoreWithNoBurstAtAll() {
         assumeDirectIOWorksHere();
         writeFixture(13L);
         configure(8, false);
@@ -630,16 +633,22 @@ public class DirectIOPrefetchFilterTests extends KNNTestCase {
             warm(input, batch);
             assertTrue(DirectIOVectorCache.slabs() > 0);
 
-            // The operator turns the cache off. Nothing but a fully cached batch happens afterwards.
+            // The operator turns the cache off, and nothing else happens: no prefetch, no read, no reopen.
             withNodeSettings(
                 Settings.builder()
                     .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, "0b")
                     .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
                     .build()
             );
-            PrefetchHelper.prefetch(input, HEADER_LENGTH, VECTOR_BYTES, batch.clone(), batch.length);
-            assertEquals("the store released its slabs at the next burst", 0L, DirectIOVectorCache.slabs());
+            assertEquals("the store released its slabs when the change was published", 0L, DirectIOVectorCache.slabs());
             assertEquals(0L, DirectIOVectorCache.entries());
+            assertEquals(0L, DirectIOVectorCache.configuredMaxBytes());
+
+            // And a burst afterwards must not put the store back: the boundary re-asserts the published
+            // target, which is now zero, so the slabs an operator asked for cannot come back by themselves.
+            PrefetchHelper.prefetch(input, HEADER_LENGTH, VECTOR_BYTES, batch.clone(), batch.length);
+            assertEquals("the burst did not re-arm the target", 0L, DirectIOVectorCache.slabs());
+            assertEquals(0L, DirectIOVectorCache.maxBytes());
         }
     }
 
@@ -773,8 +782,16 @@ public class DirectIOPrefetchFilterTests extends KNNTestCase {
                 .filter(setting -> setting.getProperties().contains(Setting.Property.NodeScope))
                 .toList()
         );
-        when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(settings, registered));
+        // The route is on unless the caller says otherwise. These cases read through O_DIRECT with no
+        // delegate to fall back to, which is the one shape the route switch does not reach, so the node
+        // they model is a node that is routing: publishing the route off would give the store back under
+        // them. A case whose subject is the switch puts its own value and that wins.
+        final Settings routed = Settings.builder().put(KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED, true).put(settings).build();
+        when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(routed, registered));
         KNNSettings.state().setClusterService(clusterService);
+        // The seeding a node does at startup: the dynamic Direct I/O settings live in volatile fields of
+        // the components that own them, so publishing is how a setting reaches the read path.
+        KNNSettings.state().publishDirectIOSettings();
     }
 
     private void configure(final int slabs, final boolean spanFill) {
@@ -788,7 +805,7 @@ public class DirectIOPrefetchFilterTests extends KNNTestCase {
         DirectIOVectorCache.resetForTesting();
         DirectIOVectorCache.setSpanFillForTesting(spanFill);
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
-        DirectIOVectorCache.configure(maxBytes);
+        DirectIOVectorCache.publishMaxBytes(maxBytes);
         DirectIOVectorIndexInput.STATS.reset();
     }
 

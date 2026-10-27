@@ -6,7 +6,6 @@
 package org.opensearch.knn.index.store;
 
 import lombok.extern.log4j.Log4j2;
-import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.knn.index.KNNSettings;
 
 import java.nio.ByteBuffer;
@@ -148,8 +147,10 @@ import java.util.concurrent.atomic.LongAdder;
  * same order, so it cannot cycle with anything above.
  *
  * <h2>A size change resizes; it does not rebuild</h2>
- * {@code knn.direct_io.rescore.cache.max_bytes} is read once per prefetch burst
- * ({@link #applyConfiguredSize(boolean)}). Growing lets the next miss allocate a slab and keeps every cached vector;
+ * {@code knn.direct_io.rescore.cache.max_bytes} is applied when the cluster applier accepts it
+ * ({@link #publishMaxBytes(long)}); the prefetch burst only re-asserts the target already published
+ * ({@link #applyConfiguredSize(boolean)}), which is how a store released under a route that was off grows
+ * back. Growing lets the next miss allocate a slab and keeps every cached vector;
  * shrinking releases the oldest slabs and keeps every vector that still fits; {@code 0b} releases every slab.
  * Phase 15's Guava cache could not do that — {@code maximumWeight} is fixed at {@code CacheBuilder#build()},
  * so a change dropped the whole cache and warmed it again.
@@ -180,6 +181,13 @@ public final class DirectIOVectorCache {
 
     /** The node's total slab target and slab supply, which is the one thing a segment cannot own. */
     private static final DirectIOSlabBroker BROKER = new DirectIOSlabBroker();
+
+    /**
+     * Serializes the two ways the published byte target is applied, so that the last value published is the
+     * one the store ends at. Held only across {@link #applyPublishedTarget}, which takes the broker's lock
+     * inside it and nothing else; no path takes the broker's lock and then this.
+     */
+    private static final Object SIZE_APPLY = new Object();
 
     /**
      * The segments. Replaced only by {@link #configure(long)} under the broker's lock, which is why it is a
@@ -227,6 +235,15 @@ public final class DirectIOVectorCache {
      * @see #setReadAroundBytesForTesting(long)
      */
     private static volatile long readAroundBytes = READ_AROUND_BYTES;
+
+    /**
+     * {@code knn.direct_io.rescore.cache.max_bytes}, as the node last published it. Published by
+     * {@link KNNSettings} on a change and seeded there at startup; until then it is the setting's own
+     * default, which is what a JVM with no cluster service runs on.
+     *
+     * @see #publishMaxBytes(long)
+     */
+    private static volatile long configuredMaxBytes = KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_DEFAULT_VALUE.getBytes();
 
     /** A segment count pinned by a test, or 0 to derive it from the node. See {@link #setSegmentsForTesting}. */
     private static volatile int segmentsForTesting;
@@ -1019,41 +1036,82 @@ public final class DirectIOVectorCache {
     // ---------------------------------------------------------------------------------------------------
 
     /**
-     * Reads {@code knn.direct_io.rescore.cache.max_bytes} and resizes the store if it has changed.
+     * Resizes the store to the published {@code knn.direct_io.rescore.cache.max_bytes} if it has changed.
      *
      * <p>Called once per prefetch burst, from {@code DirectIOVectorIndexInput#prefetch} at the burst
-     * boundary — the same cadence and the same contract as {@code DirectIOReadPool#executor()}, so an
-     * operator's change takes effect on the next burst with no restart and there is no startup gap for a
-     * value that was already persisted. A setting that cannot be read leaves the store exactly as it is.
+     * boundary. The burst is not how a change arrives — {@link #publishMaxBytes} applies it the moment the
+     * cluster applier accepts it — but it is how a store released under a route that was off grows back
+     * when the route comes on again, and in the steady state it costs one field read and one comparison.
      *
      * @param routeActive whether the calling input is reading through {@code O_DIRECT} right now. {@code false}
      *                    means {@code knn.direct_io.rescore.enabled} has been turned off under an open routed
-     *                    input (O1), and the store is released rather than resized.
+     *                    input, and the store is released rather than resized.
      */
     static void applyConfiguredSize(final boolean routeActive) {
         if (routeActive == false) {
-            // The caller is reading through its delegate input because knn.direct_io.rescore.enabled is off
-            // (O1), so nothing will be admitted and nothing will be looked up: slabs held here serve
-            // nothing. Releasing them is what makes the rollback give the memory back as well as the device
-            // traffic, which is the same choice 16-I's NativeMemoryCacheManager#updateVectorCacheTarget
-            // made. Going back on re-reads max_bytes below and the store grows again on its next fill.
+            // The caller is reading through its delegate input because knn.direct_io.rescore.enabled is off,
+            // so nothing will be admitted and nothing will be looked up: slabs held here serve nothing.
+            // Releasing them is what makes the rollback give the memory back as well as the device traffic.
+            // Going back on re-reads the published target and the store grows again on its next fill.
             //
             // It is the caller's route and not a second read of the setting, because an input with no
             // delegate to fall back to stays on O_DIRECT whatever the setting says (see
             // DirectIOVectorIndexInput#mmapFallback) and its store must stay with it. That is every probe
             // and bench driver in this package, which open a path directly.
-            configure(0L);
+            applyPublishedTarget(0L);
             return;
         }
-        final long wanted;
-        try {
-            final ByteSizeValue configured = KNNSettings.getDirectIORescoreCacheMaxBytes();
-            wanted = configured == null ? 0L : configured.getBytes();
-        } catch (RuntimeException e) {
-            log.debug("Could not read knn.direct_io.rescore.cache.max_bytes; leaving the vector cache as it is", e);
+        applyPublishedTarget(null);
+    }
+
+    /** The byte target the node last published, which {@link #maxBytes()} is the rounded-down form of. */
+    public static long configuredMaxBytes() {
+        return configuredMaxBytes;
+    }
+
+    /**
+     * Publishes {@code knn.direct_io.rescore.cache.max_bytes} and resizes the store to it. Called by
+     * {@link KNNSettings} from the cluster applier thread, and it must not wait: a shrink from a large cache
+     * is hundreds of slab frees. {@link #configure} is what guarantees that — it detaches the slabs under
+     * the broker's lock and hands them to the release thread — so this method returns as soon as the slabs
+     * have left the index, not as soon as the memory has gone back.
+     *
+     * <p>Not clamped: the setting is a byte size with a floor of {@code 0b}, and {@link #configure} floors
+     * at zero in any case.
+     */
+    public static void publishMaxBytes(final long maxBytes) {
+        configuredMaxBytes = maxBytes;
+        applyPublishedTarget(null);
+    }
+
+    /**
+     * Resizes the store to {@code explicitTarget}, or to the published target when it is {@code null}.
+     *
+     * <p><b>Why the published target is re-read inside this monitor.</b> Two threads reach here: the cluster
+     * applier, which has just written {@link #configuredMaxBytes}, and a reading thread at a burst boundary,
+     * which may have read that field before the applier wrote it. Without the monitor the reading thread
+     * could call {@link #configure} with the old target <em>after</em> the applier had already applied the
+     * new one, putting the store back to a size the operator has just asked it to leave — an operator who
+     * sets {@code 0b} under load would watch the slabs come back. Taking the monitor first and reading the
+     * field second makes the last write win whichever order the two threads arrive in.
+     *
+     * <p>The steady-state check is deliberately <b>outside</b> the monitor and on a stale read, because this
+     * runs once per prefetch burst and the answer is almost always "no change": a stale read can only be
+     * wrong when a change is in flight, and then it says "changed" and the monitor settles it.
+     */
+    private static void applyPublishedTarget(final Long explicitTarget) {
+        final long seen = explicitTarget != null ? explicitTarget : configuredMaxBytes;
+        if (wantedSlabs(seen) == BROKER.maxSlabs()) {
             return;
         }
-        configure(wanted);
+        synchronized (SIZE_APPLY) {
+            configure(explicitTarget != null ? explicitTarget : configuredMaxBytes);
+        }
+    }
+
+    /** Whole slabs a byte target buys, which is what {@link #configure} actually moves the store to. */
+    private static int wantedSlabs(final long maxBytes) {
+        return (int) Math.min(DirectIOSlotMap.MAX_SLABS, Math.max(0, maxBytes) / BROKER.slabBytes());
     }
 
     /**
@@ -1089,7 +1147,7 @@ public final class DirectIOVectorCache {
      */
     static void configure(final long maxBytes) {
         final int slabBytes = BROKER.slabBytes();
-        final int wanted = (int) Math.min(DirectIOSlotMap.MAX_SLABS, Math.max(0, maxBytes) / slabBytes);
+        final int wanted = wantedSlabs(maxBytes);
         if (wanted == BROKER.maxSlabs()) {
             // Before the lock and not after it, because this is called once per prefetch burst from the read
             // path to pick up a setting change, and in the steady state the answer is always no change.
@@ -1382,6 +1440,7 @@ public final class DirectIOVectorCache {
     /** Test seam: empties the store, releases every slab, and zeroes every counter. */
     static void resetForTesting() {
         BROKER.resetSlabMemory();
+        configuredMaxBytes = 0L;
         configure(0);
         awaitReleasesForTesting();
         BROKER.setSlabBytes(DirectIOSlab.SLAB_BYTES);

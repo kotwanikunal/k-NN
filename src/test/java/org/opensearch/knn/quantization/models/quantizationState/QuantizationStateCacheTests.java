@@ -10,6 +10,7 @@ import lombok.SneakyThrows;
 import org.junit.After;
 import org.junit.Before;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
@@ -465,9 +466,16 @@ public class QuantizationStateCacheTests extends KNNTestCase {
 
         // Configure settings
         Settings settings = Settings.builder().build();
+        // Every node-scoped plugin setting, not just the two this case changes: initialize() registers an
+        // update consumer per dynamic setting, and a consumer over a setting this ClusterSettings does not
+        // know throws. On a node the set is the same one, because KNNPlugin#getSettings returns it.
         ClusterSettings clusterSettings = new ClusterSettings(
             settings,
-            ImmutableSet.of(QUANTIZATION_STATE_CACHE_SIZE_LIMIT_SETTING, QUANTIZATION_STATE_CACHE_EXPIRY_TIME_MINUTES_SETTING)
+            KNNSettings.state()
+                .getSettings()
+                .stream()
+                .filter(s -> s.getProperties().contains(Setting.Property.NodeScope))
+                .collect(java.util.stream.Collectors.toUnmodifiableSet())
         );
 
         // Mocking ClusterService
@@ -526,9 +534,16 @@ public class QuantizationStateCacheTests extends KNNTestCase {
 
         // Configure settings
         Settings settings = Settings.builder().build();
+        // Every node-scoped plugin setting, not just the two this case changes: initialize() registers an
+        // update consumer per dynamic setting, and a consumer over a setting this ClusterSettings does not
+        // know throws. On a node the set is the same one, because KNNPlugin#getSettings returns it.
         ClusterSettings clusterSettings = new ClusterSettings(
             settings,
-            ImmutableSet.of(QUANTIZATION_STATE_CACHE_SIZE_LIMIT_SETTING, QUANTIZATION_STATE_CACHE_EXPIRY_TIME_MINUTES_SETTING)
+            KNNSettings.state()
+                .getSettings()
+                .stream()
+                .filter(s -> s.getProperties().contains(Setting.Property.NodeScope))
+                .collect(java.util.stream.Collectors.toUnmodifiableSet())
         );
 
         // Mocking ClusterService

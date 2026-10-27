@@ -26,7 +26,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * past the point where more in-flight I/O helps, and into the region where it measurably hurts: a
  * 200-wide fan-out measured p90 2.2x and p99 2.0x worse than a 64-wide one. A per-segment pool cannot
  * express that bound, because no segment knows how many others are being scored beside it. This one can,
- * and the bound is {@link KNNSettings#getDirectIORescorePrefetchThreads()}.
+ * and the bound is the published {@code knn.direct_io.rescore.prefetch_threads}.
  *
  * <h2>Lifecycle</h2>
  * Created on the first read that needs it and never shut down, because there is no node-lifecycle hook
@@ -68,18 +68,19 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 76k extra device reads are the declined bursts falling back to individual blocking reads. The claim is
  * withdrawn and the default is derived from burst demand — see {@link #queueCapacity()}.
  *
- * <h2>Both settings are live, and the queue is swapped rather than resized</h2>
- * A changed thread count resizes the pool in place ({@link #resize}). A changed capacity cannot —
- * {@link ArrayBlockingQueue} has no resize — so {@link #rebuild} builds a <em>new</em> executor at the new
- * capacity, publishes it so every later submit goes there, and {@code shutdown()}s the old one so reads
- * already queued on it run to completion on its own threads. Nothing waits on the old pool, and no read is
- * lost or run twice. Phase 14's JAR.md said a capacity change applied "on the next node restart or after
- * the pool has idled out"; the second half was false, and on the node a dynamic setting silently did
- * nothing. Now it applies on the next {@link #executor()} call, which
+ * <h2>The thread count is live, and the queue is swapped rather than resized</h2>
+ * A changed {@code knn.direct_io.rescore.prefetch_threads} resizes the pool in place
+ * ({@link #publishThreads}, {@link #resize}) the moment the cluster applier accepts it. A changed capacity
+ * cannot be applied that way — {@link ArrayBlockingQueue} has no resize — so {@link #rebuild} builds a
+ * <em>new</em> executor at the new capacity, publishes it so every later submit goes there, and
+ * {@code shutdown()}s the old one so reads already queued on it run to completion on its own threads.
+ * Nothing waits on the old pool, and no read is lost or run twice. The capacity is derived rather than set
+ * (see {@link #queueCapacity()}), so it moves only when the node's own search thread pools are rebuilt,
+ * and the swap then happens on the next {@link #executor()} call, which
  * {@code DirectIOVectorIndexInput#ensureStagingTable} makes once per prefetch burst.
  */
 @Log4j2
-final class DirectIOReadPool {
+public final class DirectIOReadPool {
 
     /** How long an idle reader thread is kept before it is reaped. */
     static final long KEEP_ALIVE_SECONDS = 60L;
@@ -117,33 +118,62 @@ final class DirectIOReadPool {
 
     private static volatile Pool pool;
 
+    /**
+     * {@code knn.direct_io.rescore.prefetch_threads}, as the node last published it. Published by
+     * {@link KNNSettings} on a change and seeded there at startup; until then it is the setting's own
+     * default, which is what a JVM with no cluster service runs on.
+     */
+    private static volatile int configuredThreads = KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_DEFAULT_VALUE;
+
     private DirectIOReadPool() {}
 
     /**
-     * The shared pool, resized to the current thread setting and rebuilt if the capacity setting has moved,
+     * The shared pool, resized to the published thread count and rebuilt if the derived capacity has moved,
      * or {@code null} when it cannot be provided — in which case the caller must read synchronously rather
      * than fail the query.
      */
     static ExecutorService executor() {
-        final int threads;
-        final int capacity;
-        try {
-            threads = KNNSettings.getDirectIORescorePrefetchThreads();
-            capacity = queueCapacity();
-        } catch (Exception e) {
-            log.debug("Could not read the Direct I/O rescore pool settings; reading without prefetch", e);
-            return null;
-        }
+        final int capacity = queueCapacity();
         try {
             final Pool current = pool;
             if (current != null && current.capacity == capacity) {
-                resize(current.executor, threads);
+                resize(current.executor);
                 return current.executor;
             }
-            return rebuild(threads, capacity).executor;
+            return rebuild(configuredThreads, capacity).executor;
         } catch (Exception e) {
             log.warn("Could not provide the Direct I/O rescore read pool; reading without prefetch", e);
             return null;
+        }
+    }
+
+    /** The thread count the node last published. */
+    public static int configuredThreads() {
+        return configuredThreads;
+    }
+
+    /**
+     * The live pool's maximum, or 0 when no burst has built one yet. What {@link #configuredThreads()} has
+     * actually been applied to, which is the pair an operator reads to see a change land.
+     */
+    public static int activeThreads() {
+        final Pool current = pool;
+        return current == null ? 0 : current.executor.getMaximumPoolSize();
+    }
+
+    /**
+     * Publishes {@code knn.direct_io.rescore.prefetch_threads} and applies it to the live pool. Called by
+     * {@link KNNSettings} from the cluster applier thread: {@link #resize} is a core-and-maximum change on
+     * a {@code ThreadPoolExecutor}, which does not wait for a running task, so there is nothing here to
+     * hand to another thread. With no pool yet, the next burst builds one at the new count.
+     *
+     * <p>Not clamped: the setting's own bounds are 2 to 1,024.
+     */
+    public static void publishThreads(final int threads) {
+        configuredThreads = threads;
+        final Pool current = pool;
+        if (current != null) {
+            resize(current.executor);
         }
     }
 
@@ -160,7 +190,9 @@ final class DirectIOReadPool {
     private static synchronized Pool rebuild(final int threads, final int capacity) {
         final Pool current = pool;
         if (current != null && current.capacity == capacity) {
-            resize(current.executor, threads);
+            // The caller's count, not the published one: the test seam builds at an explicit size, and this
+            // method already holds the monitor the published count is read under.
+            applyThreads(current.executor, threads);
             return current;
         }
         final ThreadPoolExecutor created = new ThreadPoolExecutor(
@@ -251,26 +283,42 @@ final class DirectIOReadPool {
     }
 
     /**
-     * Applies a changed thread count. Order matters when growing: the maximum has to rise before the core
-     * size, because {@code ThreadPoolExecutor} rejects a core size above the maximum.
+     * Applies the published thread count. Order matters when growing: the maximum has to rise before the
+     * core size, because {@code ThreadPoolExecutor} rejects a core size above the maximum.
+     *
+     * <p><b>The count is read inside the monitor, not passed in.</b> Two threads reach here: the cluster
+     * applier, which has just published a new count, and a reading thread at a burst boundary, which may
+     * have read the field before that. A count passed in from outside could be the stale one and would put
+     * the pool back to the size the operator has just changed — and would log that size as the one that took
+     * effect, which is the line the operations harness greps for. Reading the field here makes the last
+     * publish win whichever order the two threads arrive in.
      */
-    private static void resize(final ThreadPoolExecutor pool, final int threads) {
-        if (pool.getCorePoolSize() == threads) {
+    private static void resize(final ThreadPoolExecutor pool) {
+        if (pool.getCorePoolSize() == configuredThreads) {
             return;
         }
         synchronized (DirectIOReadPool.class) {
-            if (pool.getCorePoolSize() == threads) {
-                return;
-            }
-            if (threads > pool.getMaximumPoolSize()) {
-                pool.setMaximumPoolSize(threads);
-                pool.setCorePoolSize(threads);
-            } else {
-                pool.setCorePoolSize(threads);
-                pool.setMaximumPoolSize(threads);
-            }
-            log.info("Direct I/O rescore read pool resized to up to {} threads", threads);
+            applyThreads(pool, configuredThreads);
         }
+    }
+
+    /**
+     * Sets {@code pool}'s core and maximum to {@code threads}, with this class's monitor held. Order matters
+     * when growing: the maximum has to rise before the core size, because {@code ThreadPoolExecutor} rejects
+     * a core size above the maximum.
+     */
+    private static void applyThreads(final ThreadPoolExecutor pool, final int threads) {
+        if (pool.getCorePoolSize() == threads) {
+            return;
+        }
+        if (threads > pool.getMaximumPoolSize()) {
+            pool.setMaximumPoolSize(threads);
+            pool.setCorePoolSize(threads);
+        } else {
+            pool.setCorePoolSize(threads);
+            pool.setMaximumPoolSize(threads);
+        }
+        log.info("Direct I/O rescore read pool resized to up to {} threads", threads);
     }
 
     /** Test seam: drops the pool so that a test can observe it being created with a different size. */

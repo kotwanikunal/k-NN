@@ -125,6 +125,8 @@ public class KNNStatsTests extends KNNTestCase {
                 "bytes",
                 "entries",
                 "max_bytes",
+                // W3: the target the operator published, beside the one the store rounded it down to.
+                "configured_max_bytes",
                 "slab_memory",
                 "slabs",
                 "slab_bytes",
@@ -200,7 +202,10 @@ public class KNNStatsTests extends KNNTestCase {
             "switched_to_mmap",
             "switched_to_direct",
             // O5's: staged miss reads widened to admit their neighbours.
-            "read_around_reads" }) {
+            "read_around_reads",
+            // W3: the thread count the operator published, beside the live pool's maximum.
+            "configured_prefetch_threads",
+            "active_prefetch_threads" }) {
             assertTrue(
                 "reads." + required + " must be exposed, saw " + directIO.get("reads").keySet(),
                 directIO.get("reads").containsKey(required)

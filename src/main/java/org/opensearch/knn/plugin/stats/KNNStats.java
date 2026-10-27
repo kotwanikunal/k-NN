@@ -11,6 +11,7 @@ import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.index.KNNSettings;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.memory.NativeMemoryCacheManager;
+import org.opensearch.knn.index.store.DirectIOReadPool;
 import org.opensearch.knn.index.store.DirectIOVectorCache;
 import org.opensearch.knn.index.store.DirectIOVectorIndexInput;
 import org.opensearch.knn.indices.ModelCache;
@@ -116,6 +117,12 @@ public class KNNStats {
      *       1,024. {@code queue_peak} is the occupancy high-water mark the derived default is validated
      *       against, and {@code pool_rebuilds} is how an operator sees that a live capacity change took
      *       effect.
+     *       <p>{@code configured_prefetch_threads} is the thread count the node last published and
+     *       {@code active_prefetch_threads} the live pool's maximum. The second is {@code 0} until a burst
+     *       has built a pool; after that they are equal, so a node showing them apart has a pool that did
+     *       not take a change. {@code pool_rebuilds} counts pools that <em>replaced</em> one, and the queue's
+     *       capacity is derived rather than set, so it stays at 0 unless the node's own search pools were
+     *       rebuilt under it.
      *       <p>{@code read_profile} is the one string in this section: {@code ops} or {@code bytes}, the
      *       shape of a staged read (P2). It is reported because
      *       {@code knn.direct_io.rescore.read_profile} is static, so reading it back is the only way to see
@@ -124,7 +131,7 @@ public class KNNStats {
      *       and {@code cache.misses} against {@code staged_reads} gives misses a read, which is the ratio
      *       the two profiles move.</li>
      *   <li><b>memory</b> — how much off-heap is it holding, and is the budget biting? {@code live_bytes}
-     *       against {@code budget_bytes} (the setting, echoed so one GET answers both halves),
+     *       against {@code budget_bytes} (the derived ceiling, echoed so one GET answers both halves),
      *       {@code peak_bytes} for the high-water mark, and {@code declined_budget} for prefetches the
      *       budget refused. The node sat at 1.69 GB of live direct buffers against a 2g
      *       {@code MaxDirectMemorySize} before this section existed, which is the measurement that made it
@@ -154,7 +161,9 @@ public class KNNStats {
      *       slabs are whole and a partly filled one is charged in full, so {@code slab_bytes} is the figure
      *       to compare with a memory budget and {@code bytes} the one to compare with the working set.
      *       {@code max_bytes} is the target rounded down to whole slabs, which is why a target under one
-     *       slab reads {@code 0}. {@code reclaimed_slabs} is how often the FIFO had to take the oldest slab
+     *       slab reads {@code 0}, and {@code configured_max_bytes} is the target an operator actually set:
+     *       the two differ only by that rounding, so one moving while the other stands still says a target
+     *       bought no slab. {@code reclaimed_slabs} is how often the FIFO had to take the oldest slab
      *       and {@code readmissions} how many vectors a second chance kept; {@code evictions} is vectors
      *       dropped, by a reclaim or with a released slab. {@code span_fills} is vectors admitted because
      *       they lay inside a span a burst had already staged rather than because a read asked for them,
@@ -207,6 +216,12 @@ public class KNNStats {
         reads.put("declined_span_bytes", stats.declinedSpanBytes());
         reads.put("queue_peak", stats.queuePeak());
         reads.put("pool_rebuilds", stats.poolRebuilds());
+        // The configured count beside the live pool's maximum. They can differ in exactly two ways: no
+        // burst has built a pool yet, and the active count is 0; or a pool exists and did not take a
+        // change, which is a defect. Everything else keeps them equal, because a publish resizes the live
+        // pool before it returns.
+        reads.put("configured_prefetch_threads", DirectIOReadPool.configuredThreads());
+        reads.put("active_prefetch_threads", DirectIOReadPool.activeThreads());
         // O1, D2's rollback: fallback_reads and fallback_bytes rise, while staged_reads, blocking_reads and
         // dispatch.routed_opens stand still, exactly when knn.direct_io.rescore.enabled has been turned off
         // under readers that are already open. switched_to_mmap and switched_to_direct count the route
@@ -253,6 +268,10 @@ public class KNNStats {
         cache.put("bytes", DirectIOVectorCache.bytes());
         cache.put("entries", DirectIOVectorCache.entries());
         cache.put("max_bytes", DirectIOVectorCache.maxBytes());
+        // What the operator asked for beside what the store is holding to. They differ only where a target
+        // under one slab is rounded down, so configured_max_bytes moving while max_bytes stands still is a
+        // target that bought no slab.
+        cache.put("configured_max_bytes", DirectIOVectorCache.configuredMaxBytes());
         cache.put("slab_memory", DirectIOVectorCache.slabMemory());
         cache.put("slabs", DirectIOVectorCache.slabs());
         cache.put("slab_bytes", DirectIOVectorCache.slabBytes());
