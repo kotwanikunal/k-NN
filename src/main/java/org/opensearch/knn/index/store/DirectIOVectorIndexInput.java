@@ -842,68 +842,6 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             // directMemoryLive is NOT reset: it is a live gauge, not a counter, and zeroing it while buffers
             // are still held would make the budget let through exactly as much again.
         }
-
-        @Override
-        public String toString() {
-            // Read-ahead bytes join the numerator because they are traffic this object caused, the same as
-            // the staged and blocking channels; a window fetched and never served is amplification.
-            final long read = stagedBytes.get() + blockingBytes.get() + readaheadBytes.get();
-            final long served = servedBytes.get();
-            return String.format(
-                Locale.ROOT,
-                "routedOpens=%d declinedCompound=%d declinedChain=%d declinedMissing=%d declinedTooSmall=%d declinedOpenFailed=%d "
-                    + "declinedContent=%d "
-                    + "blockingReads=%d stagedReads=%d stagedHits=%d stageDeclined=%d prefetchCalls=%d inFlightPeak=%d "
-                    + "stagedBytes=%d blockingBytes=%d servedBytes=%d declinedSpanBytes=%d "
-                    + "readaheadReads=%d readaheadBytes=%d readaheadHits=%d readaheadDeclined=%d readaheadArmed=%d "
-                    + "stagedWaitTimeouts=%d queuePeak=%d poolRebuilds=%d "
-                    + "directMemoryLive=%d directMemoryPeak=%d declinedBudget=%d "
-                    + "arenasAllocated=%d arenasReused=%d arenasRetired=%d foreignThreadReads=%d "
-                    + "fallbackReads=%d fallbackBytes=%d switchedToMmap=%d switchedToDirect=%d "
-                    + "wideBufferLive=%d wideBufferPeak=%d declinedWideBudget=%d readAroundReads=%d amplification=%.3f",
-                routedOpens.get(),
-                declinedCompound.get(),
-                declinedChain.get(),
-                declinedMissing.get(),
-                declinedTooSmall.get(),
-                declinedOpenFailed.get(),
-                declinedContent.get(),
-                blockingReads.get(),
-                stagedReads.get(),
-                stagedHits.get(),
-                stageDeclined.get(),
-                prefetchCalls.get(),
-                inFlightPeak.get(),
-                stagedBytes.get(),
-                blockingBytes.get(),
-                served,
-                declinedSpanBytes.get(),
-                readaheadReads.get(),
-                readaheadBytes.get(),
-                readaheadHits.get(),
-                readaheadDeclined.get(),
-                readaheadArmed.get(),
-                stagedWaitTimeouts.get(),
-                queuePeak.get(),
-                poolRebuilds.get(),
-                directMemoryLive(),
-                directMemoryPeak(),
-                declinedBudget.get(),
-                arenasAllocated.get(),
-                arenasReused.get(),
-                arenasRetired.get(),
-                foreignThreadReads.get(),
-                fallbackReads.get(),
-                fallbackBytes.get(),
-                switchedToMmap.get(),
-                switchedToDirect.get(),
-                wideBufferLive.get(),
-                wideBufferPeak.get(),
-                declinedWideBudget.get(),
-                readAroundReads.get(),
-                served == 0 ? 0.0 : (double) read / served
-            );
-        }
     }
 
     /** Why the dispatch rule declined a {@code .vec} it matched on name and setting. */

@@ -285,10 +285,6 @@ public class KNNDirectIOCodecSeamTests extends KNNTestCase {
                 assertEquals(1L, DirectIOVectorIndexInput.STATS.declinedCompound());
                 assertEquals(0L, DirectIOVectorIndexInput.STATS.declinedChain());
                 assertEquals(1L, DirectIOVectorIndexInput.STATS.declinedOpens());
-                assertTrue(
-                    "and it is named in the stats line an operator sees at DEBUG: " + DirectIOVectorIndexInput.STATS,
-                    DirectIOVectorIndexInput.STATS.toString().contains("declinedCompound=1 declinedChain=0")
-                );
             }
         } finally {
             DirectIOVectorIndexInput.STATS.reset();
