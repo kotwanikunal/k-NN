@@ -132,22 +132,20 @@ public class KNNStatsTests extends KNNTestCase {
                 "reclaimed_slabs",
                 "readmissions",
                 "span_fills",
-                "slab_alloc_failures",
                 // O3: the entries a closed .vec gave back, and the files they came from.
                 "closed_files",
                 "closed_file_entries",
                 // O4: the filter-then-read race's re-admissions, also inside readmissions.
                 "race_readmissions",
                 // Q (C6): the segmented store. segments is the count in force; the contended counts and the
-                // wait nanos are what say whether the segmentation is doing its job; the entry spread is
-                // the skew the hit-rate cost is priced against; slab_transfers is the broker's lending;
+                // read wait nanos are what say whether the segmentation is doing its job; the entry spread
+                // is the skew the hit-rate cost is priced against; slab_transfers is the broker's lending;
                 // the two close-hold keys are C4's bound; segment_count_changes is a re-warm an operator
                 // caused.
                 "segments",
                 "contended_read_acquisitions",
                 "contended_write_acquisitions",
                 "read_lock_wait_nanos",
-                "write_lock_wait_nanos",
                 "max_segment_entries",
                 "min_segment_entries",
                 "slab_transfers",

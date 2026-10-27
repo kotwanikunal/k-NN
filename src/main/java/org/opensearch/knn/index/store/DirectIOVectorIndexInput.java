@@ -545,9 +545,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
         /**
          * Bursts that took their thread's existing arena back rather than carving one. On a healthy node this
-         * is almost every burst: {@code arenas_reused} should be orders of magnitude above
-         * {@code arenas_allocated}, and the ratio is the whole claim of the lease model expressed as one
-         * division.
+         * is almost every burst: this should be orders of magnitude above {@link #arenasAllocated()}, and
+         * the ratio is the whole claim of the lease model expressed as one division. Not reported at
+         * {@code _plugins/_knn/stats}: {@code arenas_allocated} settling at the reader-thread count says the
+         * same thing with one counter.
          */
         public long arenasReused() {
             return arenasReused.get();
@@ -556,7 +557,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         /**
          * Arenas dropped rather than reused, for one of two reasons: a range the previous burst left staged
          * would not quiesce within {@link #STAGED_READ_WAIT_MILLIS} (so a pool read may still write into its
-         * buffers — see {@code staged_wait_timeouts}, which moves with it), or the next burst wanted a
+         * buffers — see {@link #stagedWaitTimeouts()}, which moves with it), or the next burst wanted a
          * different geometry. The first is pathology and the second is a configuration change, so on a
          * settled node this stays flat.
          */

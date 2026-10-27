@@ -144,13 +144,9 @@ public class KNNStats {
      *       {@code live_bytes} nor {@code peak_bytes} is ever reported above {@code wall_bytes}: the node
      *       read a {@code peak_bytes} of 7.46 GB against a 2 GB wall before D3c, which was arithmetic rather
      *       than memory.
-     *       <p>{@code arenas_allocated} / {@code arenas_reused} / {@code arenas_retired} are the lease
-     *       model's own numbers (D3c). A healthy node allocates one arena per reader thread and reuses it
-     *       for every burst after, so {@code arenas_reused} should be orders of magnitude above
-     *       {@code arenas_allocated} and {@code arenas_retired} should stay flat — it moves only when a
-     *       staged read would not quiesce (watch {@code staged_wait_timeouts} with it) or when the burst
-     *       geometry changed. {@code foreign_thread_reads} is ~0 unless some caller prefetches an input on
-     *       one thread and reads it on another, which costs that read its read-ahead and nothing else.</li>
+     *       <p>{@code arenas_allocated} is the lease model's own number: a healthy node allocates one arena
+     *       per reader thread and never another, so this counter settling at the reader-thread count is what
+     *       says the leases are being reused rather than rebuilt per burst.</li>
      *   <li><b>cache</b> — the node-wide slab store of individual vectors, every counter {@code 0} while
      *       {@code knn.direct_io.rescore.cache.max_bytes} is at its default of {@code 0b}.
      *       {@code hits / (hits + misses)} is the hit rate and is directly comparable with the 40.3%
@@ -169,13 +165,9 @@ public class KNNStats {
      *       and {@code readmissions} how many vectors a second chance kept; {@code evictions} is vectors
      *       dropped, by a reclaim or with a released slab. {@code span_fills} is vectors admitted because
      *       they lay inside a span a burst had already staged rather than because a read asked for them,
-     *       which is {@code 0} while the store is off and once it is at its slab target. {@code slab_alloc_failures} counts the times the backend refused a
-     *       slab the store was below its target for; it is one per time growth was given up on, because the
-     *       store then stops asking until its target changes or it releases a slab, so non-zero means the
-     *       node is holding a smaller cache than {@code max_bytes} asked for. {@code slab_memory} names the
-     *       off-heap backend
-     *       ({@code ffm} or {@code direct_buffer}), which decides whether releasing memory is immediate and
-     *       whether the bytes sit inside {@code MaxDirectMemorySize}.</li>
+     *       which is {@code 0} while the store is off and once it is at its slab target. {@code slab_memory}
+     *       names the off-heap backend ({@code ffm} or {@code direct_buffer}), which decides whether releasing
+     *       memory is immediate and whether the bytes sit inside {@code MaxDirectMemorySize}.</li>
      * </ul>
      *
      * <p>Node level rather than cluster level, and cumulative since node start, because every counter is a
@@ -199,7 +191,6 @@ public class KNNStats {
         reads.put("staged_reads", stats.stagedReads());
         reads.put("staged_hits", stats.stagedHits());
         reads.put("stage_declined", stats.stageDeclined());
-        reads.put("staged_wait_timeouts", stats.stagedWaitTimeouts());
         reads.put("prefetch_calls", stats.prefetchCalls());
         reads.put("in_flight_peak", stats.inFlightPeak());
         reads.put("readahead_armed", stats.readaheadArmed());
@@ -246,9 +237,6 @@ public class KNNStats {
         memory.put("budget_bytes", DirectIOVectorIndexInput.directMemoryBudgetBytes());
         memory.put("wall_bytes", KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES);
         memory.put("arenas_allocated", stats.arenasAllocated());
-        memory.put("arenas_reused", stats.arenasReused());
-        memory.put("arenas_retired", stats.arenasRetired());
-        memory.put("foreign_thread_reads", stats.foreignThreadReads());
         // O2, D3d: the wide-group buffers a lease keeps beside its arena, and their own ceiling.
         // wide_buffer_bytes against wide_buffer_budget_bytes is the headroom; declined_wide_budget rising
         // while declined_budget stands still says the sub-budget and not the overall one is the bound that
@@ -275,7 +263,6 @@ public class KNNStats {
         cache.put("reclaimed_slabs", DirectIOVectorCache.reclaimedSlabs());
         cache.put("readmissions", DirectIOVectorCache.readmissions());
         cache.put("span_fills", DirectIOVectorCache.spanFills());
-        cache.put("slab_alloc_failures", DirectIOVectorCache.slabAllocFailures());
         // O3: the entries a merged-away or otherwise closed .vec gave back at close, and the files they came
         // from. closed_file_entries rising while evictions stands still is what says the dead segments cost
         // the live ones nothing.
@@ -308,7 +295,6 @@ public class KNNStats {
         cache.put("contended_read_acquisitions", DirectIOVectorCache.contendedReadAcquisitions());
         cache.put("contended_write_acquisitions", DirectIOVectorCache.contendedWriteAcquisitions());
         cache.put("read_lock_wait_nanos", DirectIOVectorCache.readLockWaitNanos());
-        cache.put("write_lock_wait_nanos", DirectIOVectorCache.writeLockWaitNanos());
         cache.put("max_segment_entries", DirectIOVectorCache.maxSegmentEntries());
         cache.put("min_segment_entries", DirectIOVectorCache.minSegmentEntries());
         cache.put("slab_transfers", DirectIOVectorCache.slabTransfers());
