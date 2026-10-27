@@ -326,11 +326,15 @@ public class DirectIORouteSwitchTests extends KNNTestCase {
     }
 
     /**
-     * An input opened with no delegate -- every caller outside the directory, and the directory itself when
-     * the delegate open failed -- stays on {@code O_DIRECT} whatever the switch says, because a read with
-     * nowhere to go is worse than a read on a channel the operator has turned off. The phase 9 probes and
-     * every existing measurement in this package open inputs this way, so this is also what keeps them
-     * measuring what they were taken against.
+     * An input opened with no delegate -- every caller outside the directory, which is the measurement and
+     * test entry points -- stays on {@code O_DIRECT} whatever the switch says, because a read with nowhere
+     * to go is worse than a read on a channel the operator has turned off. The phase 9 probes and every
+     * existing measurement in this package open inputs this way, so this is also what keeps them measuring
+     * what they were taken against.
+     *
+     * <p>The directory itself can no longer produce this shape: a delegate open it cannot complete declines
+     * the whole open, because without the delegate's input the file's bytes cannot be compared with what the
+     * chain serves.
      */
     @SneakyThrows
     public void testAnInputWithNoFallbackStaysOnDirectIO() {
@@ -408,9 +412,10 @@ public class DirectIORouteSwitchTests extends KNNTestCase {
      * The delegate's input is closed exactly once, and only by the input {@code open} returned: a clone or a
      * slice closing one would close bytes its parent is still reading. Driven through
      * {@link DirectIOVectorIndexInput#open(Path, IndexInput, java.util.function.BooleanSupplier)} rather
-     * than through the directory, because the dispatch rule's chain walk is an allowlist and declines an
-     * unknown {@code FilterDirectory} by design (condition 3), so a counting wrapper around the delegate
-     * would never be routed in the first place.
+     * than through the directory, so that the counting wrapper is the input under test rather than one more
+     * layer the dispatch rule has to resolve a path through. The directory's own side of the ownership — the
+     * release taken when an open is declined after both inputs are open — is pinned by
+     * {@code KNNDirectIODirectoryTests#testTheContentDeclineReleasesBothInputsAndEvictsNothing}.
      */
     @SneakyThrows
     public void testTheDelegateInputIsClosedExactlyOnceAndOnlyByItsOwner() {

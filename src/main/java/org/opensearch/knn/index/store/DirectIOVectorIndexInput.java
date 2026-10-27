@@ -296,6 +296,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         private final AtomicLong declinedMissing = new AtomicLong();
         private final AtomicLong declinedTooSmall = new AtomicLong();
         private final AtomicLong declinedOpenFailed = new AtomicLong();
+        private final AtomicLong declinedContent = new AtomicLong();
         private final AtomicLong blockingReads = new AtomicLong();
         private final AtomicLong stagedReads = new AtomicLong();
         private final AtomicLong stagedHits = new AtomicLong();
@@ -640,7 +641,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             routedOpens.incrementAndGet();
         }
 
-        /** Counts one decline, under one of the five reasons the dispatch rule distinguishes. */
+        /** Counts one decline, under one of the six reasons the dispatch rule distinguishes. */
         void recordDecline(final DeclineReason reason) {
             switch (reason) {
                 case COMPOUND -> declinedCompound.incrementAndGet();
@@ -648,6 +649,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 case MISSING -> declinedMissing.incrementAndGet();
                 case TOO_SMALL -> declinedTooSmall.incrementAndGet();
                 case OPEN_FAILED -> declinedOpenFailed.incrementAndGet();
+                case CONTENT -> declinedContent.incrementAndGet();
             }
         }
 
@@ -687,14 +689,27 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             return declinedTooSmall.get();
         }
 
-        /** Declines because the {@code O_DIRECT} open itself failed. */
+        /**
+         * Declines because one of the two opens failed: the {@code O_DIRECT} one, or the delegate's own
+         * input without which the content check cannot be made.
+         */
         public long declinedOpenFailed() {
             return declinedOpenFailed.get();
         }
 
+        /**
+         * Declines because the bytes the delegate chain serves are not the file's — a transforming layer
+         * such as encryption at rest or compression — or because the comparison could not be made. See
+         * {@link DirectIOVectorIndexInput#contentMatches}.
+         */
+        public long declinedContent() {
+            return declinedContent.get();
+        }
+
         /** Every decline, whatever the reason. */
         public long declinedOpens() {
-            return declinedCompound.get() + declinedChain.get() + declinedMissing.get() + declinedTooSmall.get() + declinedOpenFailed.get();
+            return declinedCompound.get() + declinedChain.get() + declinedMissing.get() + declinedTooSmall.get() + declinedOpenFailed.get()
+                + declinedContent.get();
         }
 
         /** Device reads issued on the calling thread, i.e. with no queue depth behind them. */
@@ -793,6 +808,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             declinedMissing.set(0);
             declinedTooSmall.set(0);
             declinedOpenFailed.set(0);
+            declinedContent.set(0);
             blockingReads.set(0);
             stagedReads.set(0);
             stagedHits.set(0);
@@ -839,6 +855,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             return String.format(
                 Locale.ROOT,
                 "routedOpens=%d declinedCompound=%d declinedChain=%d declinedMissing=%d declinedTooSmall=%d declinedOpenFailed=%d "
+                    + "declinedContent=%d "
                     + "blockingReads=%d stagedReads=%d stagedHits=%d stageDeclined=%d prefetchCalls=%d inFlightPeak=%d "
                     + "stagedBytes=%d blockingBytes=%d servedBytes=%d declinedSpanBytes=%d "
                     + "readaheadReads=%d readaheadBytes=%d readaheadHits=%d readaheadDeclined=%d readaheadArmed=%d "
@@ -853,6 +870,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 declinedMissing.get(),
                 declinedTooSmall.get(),
                 declinedOpenFailed.get(),
+                declinedContent.get(),
                 blockingReads.get(),
                 stagedReads.get(),
                 stagedHits.get(),
@@ -897,17 +915,25 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         /**
          * The segment is compound, so the {@code Directory} the codec was handed is a
          * {@code CompoundDirectory} and the {@code .vec} has no file of its own: condition 3, taken before
-         * the chain walk because it is the one case that is <b>expected</b> rather than diagnostic.
+         * the path resolution because it is the one case that is <b>expected</b> rather than diagnostic.
          */
         COMPOUND,
-        /** No {@link Path} resolvable through the delegate chain: condition 3. */
+        /** The delegate chain does not bottom out at an {@code FSDirectory}, so no {@link Path}: condition 4. */
         CHAIN,
-        /** The resolved path does not exist, or could not be sized: condition 4. */
+        /** The resolved path does not exist, or could not be sized: condition 5. */
         MISSING,
-        /** Below {@code knn.direct_io.min_file_size}: condition 5. */
+        /** Below {@code knn.direct_io.min_file_size}: condition 6. */
         TOO_SMALL,
-        /** The {@code O_DIRECT} open itself failed: condition 6. */
-        OPEN_FAILED
+        /**
+         * One of the two opens failed — the {@code O_DIRECT} one, or the delegate's own input, without
+         * which {@link #contentMatches} cannot be checked: condition 7.
+         */
+        OPEN_FAILED,
+        /**
+         * The bytes the delegate chain serves are not the bytes in the file, so a layer of that chain
+         * transforms them, or the comparison could not be made: condition 8. See {@link #contentMatches}.
+         */
+        CONTENT
     }
 
     public static final Stats STATS = new Stats();
@@ -988,7 +1014,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     private final Handle handle;
     /**
      * The delegate's own input over the same bytes, kept open beside the {@code O_DIRECT} channel, or
-     * {@code null} when the directory could not open one.
+     * {@code null} for a caller that has no second input to give, which is the sizing overloads the
+     * measurements use. An input the directory returns always has one: an open with no delegate input is an
+     * open whose bytes could not be compared with the chain's, and the directory declines it.
      *
      * <p><b>This is O1, D2's rollback half.</b> {@code knn.direct_io.rescore.enabled} has to reach segments
      * that are already open, because an operator who turns Direct I/O off wants the device traffic to stop
@@ -1481,6 +1509,102 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             log.warn("Direct I/O could not open [{}]", path, e);
             return null;
         }
+    }
+
+    /** Bytes compared at the head of the file: one page, which holds the codec header and the field data's start. */
+    static final int CONTENT_CHECK_HEAD_BYTES = 4096;
+
+    /** Bytes compared at the tail: the length of Lucene's codec footer, which carries the CRC. */
+    static final int CONTENT_CHECK_FOOTER_BYTES = 16;
+
+    /**
+     * Whether the file this input opened holds the bytes {@code delegate} serves for the same name:
+     * condition 8 of {@link KNNDirectIODirectory}'s dispatch rule, and the reason that rule can resolve a
+     * path with {@link org.apache.lucene.store.FilterDirectory#unwrap} rather than by the class names of the
+     * layers above it.
+     *
+     * <p>Three comparisons, in increasing cost: the length, the first {@value #CONTENT_CHECK_HEAD_BYTES}
+     * bytes and the last {@value #CONTENT_CHECK_FOOTER_BYTES}. A layer that transforms the bytes a reader
+     * sees — encryption at rest, compression — changes the header or the footer or both, because a codec
+     * file's header is a magic number and a name and its footer is a checksum of everything before it.
+     *
+     * <p><b>What it cannot catch.</b> A layer that leaves the header and the footer alone and transforms
+     * only interior bytes is routed, and would then serve transformed vectors. Sampling an interior block
+     * would narrow that without closing it, since a transform may be the identity on any block sampled, so
+     * the limit is documented instead: Direct I/O must not be combined with a layer that transforms interior
+     * bytes only.
+     *
+     * <p><b>Called on the input {@link #open} returned, before it is handed out, and exactly once.</b> It
+     * reads through {@link Handle#channel} with a buffer of its own rather than through this input's read
+     * path, so no {@link Stats} counter moves: {@code blocking_reads}, {@code blocking_bytes} and
+     * {@code served_bytes} stay comparable with every measurement taken before the check existed. The cost
+     * is two block-aligned device reads and one {@value #CONTENT_CHECK_HEAD_BYTES}-plus-footer read through
+     * the delegate, per routed open and never per query.
+     *
+     * @param delegate the delegate chain's own input over the same name, open and positioned anywhere
+     * @return true only if the file and the chain agree on all three comparisons
+     * @throws IOException if either route could not be read; the caller declines, because a comparison that
+     *                     could not be made has not passed
+     */
+    boolean contentMatches(final IndexInput delegate) throws IOException {
+        if (delegate.length() != length) {
+            log.warn("k-NN Direct I/O: [{}] is {} B on disk but {} B through the delegate chain", handle.path, length, delegate.length());
+            return false;
+        }
+        if (length == 0) {
+            // Nothing to compare, and nothing a transform could hide in.
+            return true;
+        }
+        final int head = Math.toIntExact(Math.min(CONTENT_CHECK_HEAD_BYTES, length));
+        if (regionMatches(delegate, 0L, head) == false) {
+            return false;
+        }
+        // The footer, whose region may be the head's own for a file smaller than the head: compared again
+        // rather than skipped, so that the check has one shape for every file.
+        final long footerStart = Math.max(0L, length - CONTENT_CHECK_FOOTER_BYTES);
+        return regionMatches(delegate, footerStart, Math.toIntExact(length - footerStart));
+    }
+
+    /**
+     * Whether {@code [start, start + bytes)} reads the same through the raw channel and through
+     * {@code delegate}. The channel read is of the block-aligned window holding the region, as every
+     * {@code O_DIRECT} read must be; the delegate is read through a clone, so the input the caller keeps is
+     * left where it was.
+     */
+    private boolean regionMatches(final IndexInput delegate, final long start, final int bytes) throws IOException {
+        final int blockSize = handle.blockSize;
+        final long alignedStart = start - Math.floorMod(start, (long) blockSize);
+        final int offset = Math.toIntExact(start - alignedStart);
+        final int alignedLength = alignUp(offset + bytes, blockSize);
+        // Untracked by knn.direct_io.direct_memory_budget, deliberately: the budget's accounting holds a
+        // charge until the collector reclaims the buffer, so charging a buffer that lives for one open would
+        // make live_bytes and peak_bytes a function of the open rate rather than of what is being read.
+        // It is at most two blocks, and it is unreachable the moment this method returns.
+        final ByteBuffer onDisk = ByteBuffer.allocateDirect(alignedLength + blockSize).alignedSlice(blockSize);
+        onDisk.clear().limit(alignedLength);
+        final int read = handle.channel.read(onDisk, alignedStart);
+        if (read < offset + bytes) {
+            log.warn(
+                "k-NN Direct I/O: a {} B read of [{}] at {} returned {} B, so its bytes cannot be compared " + "with the delegate chain's",
+                alignedLength,
+                handle.path,
+                alignedStart,
+                read
+            );
+            return false;
+        }
+        final byte[] fromFile = new byte[bytes];
+        onDisk.limit(offset + bytes).position(offset);
+        onDisk.get(fromFile, 0, bytes);
+        final byte[] fromChain = new byte[bytes];
+        final IndexInput clone = delegate.clone();
+        clone.seek(start);
+        clone.readBytes(fromChain, 0, bytes);
+        if (Arrays.equals(fromFile, fromChain)) {
+            return true;
+        }
+        log.warn("k-NN Direct I/O: [{}] differs from the delegate chain over {} B at {}", handle.path, bytes, start);
+        return false;
     }
 
     /** The filesystem block size every read of this input is aligned to. */
@@ -3139,6 +3263,33 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             // measurement reads this line before and after a block and takes the difference — which is why
             // the message says so rather than leaving a reader to assume the numbers are this file's.
             log.debug("Direct I/O vector reads (node totals, cumulative) at close of [{}]: {}", handle.path.getFileName(), STATS);
+        }
+    }
+
+    /**
+     * Releases an input the dispatch rule is abandoning before anything has read it — the delegate input it
+     * owns and its own channel — <b>without</b> the file-level cache release {@link #close()} performs.
+     *
+     * <p>The difference is the reason this method exists. {@link DirectIOVectorCache#releaseFile} keys on the
+     * file, not on this handle, and is not reference counted, so it is right when a reader is done with a
+     * file and wrong here: another reader of the same {@code .vec} may be routed and warm, and an open that
+     * read nothing must not cost it its entries. Nothing else {@code close()} does applies either, because
+     * this input never took a staging lease, never started a burst and never armed the ring.
+     *
+     * <p>Called only on the input {@link #open} returned and only before it is handed out, which is the one
+     * input that owns the handle; a clone or a slice must go through {@link #close()}.
+     */
+    void closeAbandoned() throws IOException {
+        if (closed) {
+            return;
+        }
+        closed = true;
+        try {
+            if (mmapFallback != null) {
+                mmapFallback.close();
+            }
+        } finally {
+            handle.channel.close();
         }
     }
 

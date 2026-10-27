@@ -24,7 +24,6 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
@@ -34,7 +33,7 @@ import java.util.function.LongSupplier;
  * vector data read is served, from the file's name alone.
  *
  * <h2>The dispatch rule, in one place</h2>
- * A read is served with {@code O_DIRECT} if and only if <b>all seven</b> of these hold:
+ * A read is served with {@code O_DIRECT} if and only if <b>all eight</b> of these hold:
  *
  * <ol>
  *   <li>the file is a <b>faiss or memory-optimized-search</b> flat vector file, of either precision
@@ -45,19 +44,21 @@ import java.util.function.LongSupplier;
  *   <li>the segment is <b>not compound</b> — a {@code CompoundDirectory} entry has no file of its own.
  *       Checked first among the structural conditions because it is the only one that is <em>expected</em>
  *       rather than diagnostic: see {@link #declinedCompound};
- *   <li>the delegate chain reaches an {@link FSDirectory} and <b>every layer above it is a known
- *       byte-passthrough</b> — see {@link #PASSTHROUGH_FILTER_DIRECTORIES}, and
- *       {@link #resolvePath(Directory, String, Set)} for why an unknown layer must decline rather than
- *       be walked past;
+ *   <li>the delegate chain bottoms out at an {@link FSDirectory} — see {@link #resolvePath};
  *   <li>the resolved path exists;
  *   <li>the file is at least {@code knn.direct_io.min_file_size} — the size floor, phase 13 audit FIX 1;
- *   <li>the {@code O_DIRECT} open itself succeeds.
+ *   <li><b>both</b> opens succeed: the delegate's own input, which the routed input keeps beside its
+ *       channel, and the {@code O_DIRECT} open itself;
+ *   <li>the file's bytes are the bytes the delegate chain serves — the length, the first 4 KiB and the
+ *       codec footer, compared through both routes before either is handed out. See
+ *       {@link DirectIOVectorIndexInput#contentMatches} for what the comparison covers and what it
+ *       cannot.
  * </ol>
  *
  * Everything else is the delegate's own {@link IndexInput}, returned <b>unwrapped</b>, and each of (3)
- * to (7) is counted under its own reason so an operator can tell them apart — see
+ * to (8) is counted under its own reason so an operator can tell them apart — see
  * {@link #declinedCompound}, {@link #declinedChain}, {@link #declinedMissing}, {@link #declinedTooSmall},
- * {@link #declinedOpenFailed}.
+ * {@link #declinedOpenFailed}, {@link #declinedContent}.
  *
  * <h2>Why the name is the whole signal</h2>
  * An earlier shape of this class also required the caller's {@link IOContext} to carry a plugin-defined
@@ -108,9 +109,11 @@ import java.util.function.LongSupplier;
  *
  * <h2>Failure is a fallback</h2>
  * Every way Direct I/O can be unavailable — no {@code ExtendedOpenOption.DIRECT} on this JDK, a
- * filesystem that answers {@code EINVAL}, a remote-store or in-memory directory with no path — ends in
- * the delegate's own input and a log line. There is no configuration in which a failure here changes a
- * result, because both routes read the same bytes of the same file.
+ * filesystem that answers {@code EINVAL}, a remote-store or in-memory directory with no path, a layer of
+ * the chain that transforms the bytes a reader sees — ends in the delegate's own input and a log line. A
+ * failure here cannot change a result, and that rests on condition 8 rather than on an assumption: the two
+ * routes are compared before either is handed out, so a file is routed only where they have been shown to
+ * read the same bytes.
  *
  * <h2>What this class deliberately does not have</h2>
  * The spike this design grew out of recorded every {@code openInput} in an unbounded list and set a
@@ -124,59 +127,7 @@ public final class KNNDirectIODirectory extends FilterDirectory {
     /** Lucene's flat vector data — the only extension this routes, at either precision. */
     static final String VECTOR_DATA_EXTENSION = ".vec";
 
-    /**
-     * The {@link FilterDirectory} layers condition 3 is willing to walk <b>past</b>, by fully qualified
-     * class name, because both are package private in OpenSearch and cannot be named as types here.
-     *
-     * <p><b>The allowlist is the guard, and it is deliberately short.</b> The chain the codec seam is
-     * handed for a non-compound segment on OpenSearch 3.9 is, MEASURED from a running node's own decline
-     * log rather than assumed:
-     *
-     * <pre>
-     * Store$StoreDirectory -> ByteSizeCachingDirectory -> BucketedCompositeDirectory -> FsDirectoryFactory$HybridDirectory
-     * </pre>
-     *
-     * Resolving a name against the bottom {@link FSDirectory}'s path is only correct if no layer above it
-     * changes which bytes a reader sees or which file a name means. None of these three does, and each
-     * claim was made by reading the class rather than by assuming:
-     *
-     * <ul>
-     *   <li>{@code Store$StoreDirectory} — overrides {@code close}, {@code deleteFile}, {@code toString},
-     *       {@code getPendingDeletions} and {@code copyFrom}, and <b>not {@code openInput}</b>
-     *       ({@code Store.java:1079-1135}).</li>
-     *   <li>{@code ByteSizeCachingDirectory} — caches an aggregate size; <b>no {@code openInput}</b>
-     *       ({@code index/store/ByteSizeCachingDirectory.java:55}).</li>
-     *   <li>{@code BucketedCompositeDirectory} — overrides <b>only {@code listAll()}</b>, to filter
-     *       {@code temp_}-prefixed child directories out of a context-aware index's listing
-     *       ({@code index/BucketedCompositeDirectory.java:35-41}). It is 42 lines and has no read path of
-     *       its own.</li>
-     * </ul>
-     *
-     * <p>The third layer is worth a note: it is not in the chain this guard was written against, and the
-     * guard found it by <em>declining</em> — the S5 re-proof's first run routed nothing and the decline log
-     * named it. That is the intended failure mode. A new layer costs engagement until someone reads it,
-     * never correctness.
-     *
-     * <p>An <b>unknown</b> {@link FilterDirectory} declines, and that is the whole point rather than
-     * caution for its own sake. Two shapes that exist and must never be bypassed:
-     * <ul>
-     *   <li>a <b>byte-transforming</b> layer — encryption at rest. Walking past it would open the raw
-     *       on-disk file and serve ciphertext as vectors, silently and only for the routed file;</li>
-     *   <li>a <b>path-relocating or composing</b> layer — {@code CompositeDirectory} (remote-backed
-     *       storage), {@code NRTCachingDirectory}. {@code name} may not be on local disk at all, or may be
-     *       live in a RAM buffer, so the path resolved from the bottom directory is wrong or absent.</li>
-     * </ul>
-     * Both read correctly through the delegate, so declining costs read-ahead and nothing else. Adding a
-     * name here is a claim that that class passes bytes and names through unchanged, and should be made
-     * the same way these two were: by reading its {@code openInput}.
-     */
-    static final Set<String> PASSTHROUGH_FILTER_DIRECTORIES = Set.of(
-        "org.opensearch.index.store.Store$StoreDirectory",
-        "org.opensearch.index.store.ByteSizeCachingDirectory",
-        "org.opensearch.index.BucketedCompositeDirectory"
-    );
-
-    /** How deep the chain walk will go. A guard must never be the thing that hangs a shard. */
+    /** How deep the chain description will go. A log line must never be the thing that hangs a shard. */
     private static final int MAX_CHAIN_DEPTH = 16;
 
     /** The segment this directory serves, so a log line can be attributed to one. */
@@ -188,7 +139,7 @@ public final class KNNDirectIODirectory extends FilterDirectory {
      */
     private final BooleanSupplier directIORescoreEnabled;
 
-    /** Condition 5, read at every dispatch for the same reason condition 2 is. */
+    /** Condition 6, read at every dispatch for the same reason condition 2 is. */
     private final LongSupplier minFileSizeBytes;
 
     private final AtomicLong routedOpens = new AtomicLong();
@@ -197,6 +148,7 @@ public final class KNNDirectIODirectory extends FilterDirectory {
     private final AtomicLong declinedMissing = new AtomicLong();
     private final AtomicLong declinedTooSmall = new AtomicLong();
     private final AtomicLong declinedOpenFailed = new AtomicLong();
+    private final AtomicLong declinedContent = new AtomicLong();
 
     public KNNDirectIODirectory(final Directory delegate, final String segmentName) {
         this(delegate, segmentName, KNNSettings::isDirectIORescoreEnabled, () -> KNNSettings.getDirectIOMinFileSize().getBytes());
@@ -240,20 +192,20 @@ public final class KNNDirectIODirectory extends FilterDirectory {
     }
 
     /**
-     * Conditions 3 to 6, or {@code null} when any of them declines — in which case exactly one reason
+     * Conditions 3 to 8, or {@code null} when any of them declines — in which case exactly one reason
      * counter has been incremented. The returned input owns its own file handle <b>and the delegate's input
      * beside it</b> (O1), and both are closed by whoever closes the input, which is the same ownership
      * {@link Directory#openInput} always has.
      */
     @Nullable
     private IndexInput directIOInput(final String name, final IOContext context) {
-        // (3a) the compound case, taken BEFORE the chain walk. A CompoundDirectory is not a FilterDirectory,
-        // so the walk below would decline it anyway and count declinedChain -- but that conflates the one
-        // decline reason that is EXPECTED with the one that means "a layer nobody has read yet is in the
-        // way". At the shipped defaults every flushed segment is compound (index.use_compound_file defaults
-        // to true, EngineConfig.java:262-266), so this counter moves on every reader open of every flushed
-        // segment: on the node a 27-segment reopen added +108 to declinedChain and a 28-segment one +234,
-        // and nothing distinguished that from an unsupported substrate.
+        // (3) the compound case, taken BEFORE the path resolution. A CompoundDirectory is not an FSDirectory,
+        // so condition 4 would decline it anyway and count declinedChain -- but that conflates the one
+        // decline reason that is EXPECTED with the one that means "this substrate has no file to route". At
+        // the shipped defaults every flushed segment is compound (index.use_compound_file defaults to true,
+        // EngineConfig.java:262-266), so this counter moves on every reader open of every flushed segment,
+        // and an operator who cannot tell it from a chain decline cannot tell a healthy node from a
+        // misconfigured one.
         if (in instanceof CompoundDirectory) {
             decline(declinedCompound, DirectIOVectorIndexInput.DeclineReason.COMPOUND);
             log.debug(
@@ -264,25 +216,24 @@ public final class KNNDirectIODirectory extends FilterDirectory {
             );
             return null;
         }
-        // (3b) the chain.
-        final Path path = resolvePath(in, name, PASSTHROUGH_FILTER_DIRECTORIES);
+        // (4) the chain.
+        final Path path = resolvePath(in, name);
         if (path == null) {
             decline(declinedChain, DirectIOVectorIndexInput.DeclineReason.CHAIN);
             // The whole chain, not just its top: a chain decline is the one reason an operator cannot
-            // diagnose from the counter alone, because the answer is always "some layer is not on the
-            // allowlist" and the only useful question is which. The last entry is the layer that stopped
-            // the walk.
+            // diagnose from the counter alone, because the answer is always "nothing below this chain has a
+            // filesystem path" and the only useful question is what the chain was. The last entry is the
+            // layer the description stopped at.
             log.debug(
-                "k-NN Direct I/O [{}]: [{}] has no resolvable filesystem path; the delegate chain is {}, "
-                    + "and the known byte-passthrough layers are {}",
+                "k-NN Direct I/O [{}]: [{}] has no resolvable filesystem path, because the delegate chain {} "
+                    + "does not bottom out at an FSDirectory",
                 segmentName,
                 name,
-                describeChain(in),
-                PASSTHROUGH_FILTER_DIRECTORIES
+                describeChain(in)
             );
             return null;
         }
-        // (4) and (5) in one syscall: Files.size throws NoSuchFileException for a missing file, which is a
+        // (5) and (6) in one syscall: Files.size throws NoSuchFileException for a missing file, which is a
         // different reason with a different cause and is counted apart from the floor.
         final long minBytes = minFileSizeBytes.getAsLong();
         try {
@@ -307,45 +258,84 @@ public final class KNNDirectIODirectory extends FilterDirectory {
             log.warn("k-NN Direct I/O [{}]: could not size [{}]", segmentName, path, e);
             return null;
         }
-        // (6) the open, which is the last thing that can decline and the only one that touches the device.
-        // Two inputs are opened rather than one, and that is O1 (D2): the delegate's own input is kept
-        // beside the O_DIRECT channel so that knn.direct_io.rescore.enabled can be turned off under a
+        // (7a) the delegate's own input. Two inputs are opened rather than one, and the second is not a
+        // spare: it is kept beside the O_DIRECT channel so that knn.direct_io.rescore.enabled can be turned off under a
         // reader that is already open and the read path changes at that reader's next prefetch burst, with
         // no reopen. Its cost is one file handle per routed .vec per reader, and it is paid only by a node
-        // that is routing. The delegate is opened first, because a failure there must leave nothing behind:
-        // the O_DIRECT channel would otherwise have to be closed by hand on a path that has no input to
-        // close it with.
-        IndexInput fallback = null;
+        // that is routing. It is opened first, because a failure there must leave nothing behind: the
+        // O_DIRECT channel would otherwise have to be closed by hand on a path that has no input to close
+        // it with.
+        final IndexInput fallback;
         try {
             fallback = in.openInput(name, context);
         } catch (IOException | RuntimeException e) {
-            // Routing without a fallback is still correct, only not switchable: an input with no fallback
-            // stays on O_DIRECT for its life. Declining here instead would give up read-ahead for a reason
-            // the operator never asked about.
+            // Fail closed: without the delegate's input there is nothing to compare the file's bytes with,
+            // and condition 8 is the only thing standing between a transforming layer and ciphertext served
+            // as vectors. An unverifiable open declines.
+            decline(declinedOpenFailed, DirectIOVectorIndexInput.DeclineReason.OPEN_FAILED);
             log.warn(
-                "k-NN Direct I/O [{}]: could not open a delegate input for [{}]; the switch will not reach this input",
+                "k-NN Direct I/O [{}]: could not open a delegate input for [{}], so its bytes cannot be "
+                    + "compared with the file's; the delegate serves it",
                 segmentName,
                 name,
                 e
             );
+            return null;
         }
+        // (7b) the O_DIRECT open, the only condition that touches the device.
+        final DirectIOVectorIndexInput direct;
         try {
-            final DirectIOVectorIndexInput direct = DirectIOVectorIndexInput.open(path, fallback, directIORescoreEnabled);
-            if (direct == null) {
-                decline(declinedOpenFailed, DirectIOVectorIndexInput.DeclineReason.OPEN_FAILED);
-                log.warn("k-NN Direct I/O [{}]: Direct I/O is not available for [{}]", segmentName, path);
-                closeQuietly(fallback);
-            }
-            return direct;
+            direct = DirectIOVectorIndexInput.open(path, fallback, directIORescoreEnabled);
         } catch (RuntimeException e) {
             decline(declinedOpenFailed, DirectIOVectorIndexInput.DeclineReason.OPEN_FAILED);
             log.warn("k-NN Direct I/O [{}]: could not open [{}] with Direct I/O", segmentName, path, e);
             closeQuietly(fallback);
             return null;
         }
+        if (direct == null) {
+            decline(declinedOpenFailed, DirectIOVectorIndexInput.DeclineReason.OPEN_FAILED);
+            log.warn("k-NN Direct I/O [{}]: Direct I/O is not available for [{}]", segmentName, path);
+            closeQuietly(fallback);
+            return null;
+        }
+        // (8) the bytes. Both routes are open, so the claim that every layer above the FSDirectory passes
+        // bytes through can be checked rather than assumed from a class name.
+        try {
+            if (direct.contentMatches(fallback)) {
+                return direct;
+            }
+            decline(declinedContent, DirectIOVectorIndexInput.DeclineReason.CONTENT);
+            // At warn, and with the whole chain: unlike a compound decline this one means a substrate the
+            // operator may not know is in the chain, and the chain is the only place the answer can be.
+            log.warn(
+                "k-NN Direct I/O [{}]: the bytes [{}] serves through the delegate chain {} are not the bytes "
+                    + "of [{}] on disk, so a layer in that chain transforms them; the delegate serves it",
+                segmentName,
+                name,
+                describeChain(in),
+                path
+            );
+        } catch (IOException | RuntimeException e) {
+            // Fail closed for the same reason (7a) does: a comparison that could not be made is not a
+            // comparison that passed.
+            decline(declinedContent, DirectIOVectorIndexInput.DeclineReason.CONTENT);
+            log.warn(
+                "k-NN Direct I/O [{}]: could not compare the bytes of [{}] through the delegate chain with "
+                    + "[{}] on disk; the delegate serves it",
+                segmentName,
+                name,
+                path,
+                e
+            );
+        }
+        // Both inputs go, because the routed input owns the delegate's; and through closeAbandoned rather
+        // than close, so that an open which read nothing does not free the cached vectors of a file another
+        // reader may be serving from the store.
+        abandonQuietly(direct);
+        return null;
     }
 
-    /** Closes a delegate input no routed input took ownership of, because the Direct I/O open declined. */
+    /** Closes a delegate input nothing took ownership of, because the {@code O_DIRECT} open declined. */
     private void closeQuietly(@Nullable final IndexInput input) {
         if (input == null) {
             return;
@@ -358,23 +348,22 @@ public final class KNNDirectIODirectory extends FilterDirectory {
     }
 
     /**
-     * The file behind {@code name} when every layer of {@code directory}'s chain down to an
-     * {@link FSDirectory} is a known byte-passthrough, and {@code null} otherwise.
-     *
-     * <p><b>Why this is not {@link FilterDirectory#unwrap}.</b> {@code unwrap} walks past every
-     * {@link FilterDirectory} whatever it does, and the previous shape of this method used it. A name
-     * resolved that way is the <em>bottom</em> directory's file, so any layer that was transforming bytes
-     * or relocating names got bypassed for the one file this routes and for no other — which is both a
-     * correctness bug and the hardest kind to see, because every other read in the system stays correct.
-     * So the walk is an allowlist: an unknown layer stops it and the read goes through the delegate, where
-     * that layer gets to do its job.
-     *
-     * <p>Package private and parameterised on the allowlist so a test can exercise the walk with its own
-     * stand-in layers; production always passes {@link #PASSTHROUGH_FILTER_DIRECTORIES}.
+     * Releases a routed input, and the delegate input it owns, that this open is abandoning: the content
+     * decline, which is the one decline taken after both opens succeeded. Not {@code close()}, because this
+     * input read nothing and the cache is keyed on the file rather than on the handle — see
+     * {@link DirectIOVectorIndexInput#closeAbandoned}.
      */
+    private void abandonQuietly(final DirectIOVectorIndexInput input) {
+        try {
+            input.closeAbandoned();
+        } catch (IOException | RuntimeException e) {
+            log.debug("k-NN Direct I/O [{}]: could not close an abandoned routed input", segmentName, e);
+        }
+    }
+
     /**
      * The delegate chain of {@code directory} as a list of class names, outermost first, stopping at the
-     * first layer that is not a {@link FilterDirectory}. For the decline log line only.
+     * first layer that is not a {@link FilterDirectory}. For the decline log lines only.
      */
     static List<String> describeChain(final Directory directory) {
         final List<String> chain = new ArrayList<>();
@@ -390,21 +379,31 @@ public final class KNNDirectIODirectory extends FilterDirectory {
         return chain;
     }
 
+    /**
+     * The file behind {@code name} when {@code directory}'s chain bottoms out at an {@link FSDirectory},
+     * and {@code null} otherwise: condition 4.
+     *
+     * <p><b>Why the layer's class name is not the guard.</b> Resolving a name against the bottom directory's
+     * path is correct only if no layer above it changes which bytes a reader sees, and a class name is not a
+     * property of the bytes: the shape this most matters for, an encryption-at-rest directory, <em>extends</em>
+     * {@link FSDirectory} rather than wrapping one, so it is the terminal case of any walk and is never asked
+     * whether it may be crossed. Deciding by name also declines every chain nobody has read yet, which costs
+     * the feature on a substrate that was passing bytes through all along.
+     *
+     * <p>So the resolution is {@link FilterDirectory#unwrap}, which walks past every layer whatever it does,
+     * and the claim is made where it can be checked: condition 8 compares the bytes the chain serves with
+     * the bytes in the file, after both inputs are open and before either is handed out. See
+     * {@link DirectIOVectorIndexInput#contentMatches}.
+     *
+     * <p>An {@link FSDirectory} is the terminal case and may be a subclass of one: OpenSearch's
+     * {@code HybridDirectory} extends {@code NIOFSDirectory} and chooses mmap or nio per file, but both
+     * reads are of {@code getDirectory().resolve(name)}, so the path is the same either way.
+     */
     @Nullable
-    static Path resolvePath(final Directory directory, final String name, final Set<String> passthrough) {
-        Directory current = directory;
-        for (int depth = 0; current != null && depth < MAX_CHAIN_DEPTH; depth++) {
-            // An FSDirectory is the terminal case and may be a subclass of one: OpenSearch's
-            // HybridDirectory extends NIOFSDirectory and chooses mmap or nio per file, but both reads are
-            // of getDirectory().resolve(name), so the path is the same either way.
-            if (current instanceof FSDirectory fsDirectory) {
-                return fsDirectory.getDirectory().resolve(name);
-            }
-            if (current instanceof FilterDirectory filterDirectory && passthrough.contains(current.getClass().getName())) {
-                current = filterDirectory.getDelegate();
-                continue;
-            }
-            return null;
+    static Path resolvePath(final Directory directory, final String name) {
+        // unwrap answers null for null, so a chain with nothing in it needs no case of its own.
+        if (FilterDirectory.unwrap(directory) instanceof FSDirectory fsDirectory) {
+            return fsDirectory.getDirectory().resolve(name);
         }
         return null;
     }
@@ -480,40 +479,54 @@ public final class KNNDirectIODirectory extends FilterDirectory {
     }
 
     /**
-     * Opens that satisfied conditions 1 and 2 but were declined by one of 3 to 6 — the sum of the five
+     * Opens that satisfied conditions 1 and 2 but were declined by one of 3 to 8 — the sum of the six
      * reason counters below. An operator watching only this number sees that routing is not happening; the
      * reasons say why, and they want different answers: a compound decline is every flushed segment and is
      * working as designed, a chain decline is a substrate the feature cannot serve, a size decline is
-     * working as designed, a missing file is a bug, and an open failure is a filesystem that does not
-     * support {@code O_DIRECT}.
+     * working as designed, a missing file is a bug, an open failure is a filesystem that does not
+     * support {@code O_DIRECT}, and a content decline is a layer in the chain that transforms bytes.
      */
     public long declinedOpens() {
-        return declinedCompound.get() + declinedChain.get() + declinedMissing.get() + declinedTooSmall.get() + declinedOpenFailed.get();
+        return declinedCompound.get() + declinedChain.get() + declinedMissing.get() + declinedTooSmall.get() + declinedOpenFailed.get()
+            + declinedContent.get();
     }
 
-    /** Condition 3a: the segment is compound, so the {@code .vec} is a {@code .cfs} entry and not a file. */
+    /** Condition 3: the segment is compound, so the {@code .vec} is a {@code .cfs} entry and not a file. */
     public long declinedCompound() {
         return declinedCompound.get();
     }
 
-    /** Condition 3b: no {@link FSDirectory} below, or an unknown {@link FilterDirectory} in the way. */
+    /** Condition 4: the delegate chain does not bottom out at an {@link FSDirectory}. */
     public long declinedChain() {
         return declinedChain.get();
     }
 
-    /** Condition 4: the resolved path does not exist, or could not be sized. */
+    /** Condition 5: the resolved path does not exist, or could not be sized. */
     public long declinedMissing() {
         return declinedMissing.get();
     }
 
-    /** Condition 5: the file is below {@code knn.direct_io.min_file_size}. */
+    /** Condition 6: the file is below {@code knn.direct_io.min_file_size}. */
     public long declinedTooSmall() {
         return declinedTooSmall.get();
     }
 
-    /** Condition 6: the {@code O_DIRECT} open itself failed, and the delegate served the read. */
+    /**
+     * Condition 7: one of the two opens failed — the {@code O_DIRECT} one, or the delegate's own input
+     * without which condition 8 cannot be checked. Either way the delegate served the read.
+     */
     public long declinedOpenFailed() {
         return declinedOpenFailed.get();
+    }
+
+    /**
+     * Condition 8: the bytes the delegate chain serves are not the bytes in the file, so some layer of the
+     * chain transforms them; or the comparison itself could not be made. The one decline reason that means
+     * <b>Direct I/O must not serve this file</b> rather than that it cannot: see
+     * {@link DirectIOVectorIndexInput#contentMatches}.
+     */
+    public long declinedContent() {
+        return declinedContent.get();
     }
 
     // -------------------------------------------------------------------------------------------------

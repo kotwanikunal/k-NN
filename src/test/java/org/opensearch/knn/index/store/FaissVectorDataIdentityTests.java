@@ -23,7 +23,12 @@ import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.VectorScorer;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FilterDirectory;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MMapDirectory;
+import org.opensearch.common.lucene.store.ByteArrayIndexInput;
 import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.index.SpaceType;
@@ -224,6 +229,119 @@ public class FaissVectorDataIdentityTests extends KNNTestCase {
                 assertEquals(DocIdSetIterator.NO_MORE_DOCS, actualDocs.nextDoc());
             }
         }
+    }
+
+    /**
+     * A byte-transforming layer over a <b>real</b> segment: W2's content decline, asserted where it
+     * matters, which is the answers rather than the counter.
+     *
+     * <p>The fixture is the shape of encryption at rest. The segment is written normally, its {@code .vec}
+     * is then rewritten on disk in transformed form, and the layer transforms it back on read — so a reader
+     * of the chain sees the right vectors while the file holds something else. The path resolution walks
+     * past the layer (W2 replaced the allowlist with {@link FilterDirectory#unwrap}), so without the byte
+     * check the {@code O_DIRECT} route would read the file and score transformed bytes.
+     *
+     * <p>Both halves are asserted: the open declines with {@code CONTENT}, and the vectors and the scores
+     * equal the ones the same chain returns with the feature off, which is the only comparison that says
+     * the decline cost correctness nothing.
+     */
+    @SneakyThrows
+    public void testAByteTransformingLayerDeclinesWithContentAndScoresTheSameAsWithTheFeatureOff() {
+        assumeDirectIOWorksHere();
+        final Path path = createTempDir();
+        try (MMapDirectory delegate = new MMapDirectory(path)) {
+            writeSegment(delegate);
+            final String vectorData = onlyVectorDataFileName(path);
+            // The on-disk form a transforming layer would have stored. From here the file's bytes are not
+            // the bytes any reader of the chain sees, which is the premise of the whole test.
+            final byte[] plain = Files.readAllBytes(path.resolve(vectorData));
+            Files.write(path.resolve(vectorData), xor(plain));
+
+            final float[] target = vector(new Random(7L));
+            try (XorOnReadDirectory transforming = new XorOnReadDirectory(delegate)) {
+                // The control: the same chain with the feature off, which is what a node runs today.
+                final List<float[]> expectedVectors;
+                final List<Float> expectedScores;
+                final KNNDirectIODirectory off = new KNNDirectIODirectory(transforming, "_0", () -> false, () -> 0L);
+                try (DirectoryReader reader = DirectoryReader.open(off)) {
+                    expectedVectors = readAll(onlyLeafValues(reader));
+                    expectedScores = scoreAll(onlyLeafValues(reader), target);
+                }
+                assertEquals(DOCS, expectedVectors.size());
+                assertEquals(0, off.routedOpens());
+
+                final KNNDirectIODirectory on = new KNNDirectIODirectory(transforming, "_0", () -> true, () -> 0L);
+                try (DirectoryReader reader = DirectoryReader.open(on)) {
+                    assertEquals("the transforming layer must not be served with O_DIRECT", 0, on.routedOpens());
+                    assertEquals("and the reason must be the bytes", 1, on.declinedContent());
+                    final List<float[]> actualVectors = readAll(onlyLeafValues(reader));
+                    final List<Float> actualScores = scoreAll(onlyLeafValues(reader), target);
+                    assertEquals(expectedVectors.size(), actualVectors.size());
+                    for (int ord = 0; ord < expectedVectors.size(); ord++) {
+                        assertArrayEquals("ordinal " + ord, expectedVectors.get(ord), actualVectors.get(ord), 0.0f);
+                    }
+                    assertEquals("0 differing score pairs, or the decline cost a correct answer", expectedScores, actualScores);
+                }
+            }
+        }
+    }
+
+    /** The one {@code .vec} the fixture's segment holds. */
+    @SneakyThrows
+    private static String onlyVectorDataFileName(final Path path) {
+        final List<String> names = new ArrayList<>();
+        try (var files = Files.list(path)) {
+            files.map(file -> file.getFileName().toString()).filter(name -> name.endsWith(".vec")).forEach(names::add);
+        }
+        assertEquals("the fixture must hold exactly one .vec, saw " + names, 1, names.size());
+        return names.get(0);
+    }
+
+    private static byte[] xor(final byte[] bytes) {
+        final byte[] out = new byte[bytes.length];
+        for (int i = 0; i < bytes.length; i++) {
+            out[i] = (byte) (bytes[i] ^ 0x5a);
+        }
+        return out;
+    }
+
+    /**
+     * A layer that undoes {@link #xor} on every {@code .vec} read, so that the file on disk is transformed
+     * and the chain serves the original bytes: the shape of an encryption-at-rest wrapper.
+     *
+     * <p>{@code openChecksumInput} is not transformed, because {@link FilterDirectory} delegates it to the
+     * layer below. This fixture's readers never reach it: the flat vectors reader uses it for the {@code .vemf}
+     * meta file and in {@code checkIntegrity()}, and this test does neither.
+     */
+    private static final class XorOnReadDirectory extends FilterDirectory {
+        XorOnReadDirectory(final Directory delegate) {
+            super(delegate);
+        }
+
+        @Override
+        public IndexInput openInput(final String name, final IOContext context) throws IOException {
+            if (name.endsWith(".vec") == false) {
+                return super.openInput(name, context);
+            }
+            final byte[] onDisk;
+            try (IndexInput delegate = super.openInput(name, context)) {
+                onDisk = new byte[Math.toIntExact(delegate.length())];
+                delegate.readBytes(onDisk, 0, onDisk.length);
+            }
+            return new ByteArrayIndexInput(name, xor(onDisk));
+        }
+    }
+
+    /** Every document's score under the mode the query path uses, in doc order. */
+    private static List<Float> scoreAll(final FloatVectorValues values, final float[] target) throws IOException {
+        final VectorScorer scorer = VectorScorerMode.RESCORE.createScorer(values, target);
+        assertNotNull(scorer);
+        final List<Float> scores = new ArrayList<>();
+        final DocIdSetIterator docs = scorer.iterator();
+        for (int doc = docs.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = docs.nextDoc()) {
+            scores.add(scorer.score());
+        }
+        return scores;
     }
 
     /**

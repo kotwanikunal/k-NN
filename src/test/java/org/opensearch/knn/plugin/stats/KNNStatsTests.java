@@ -79,11 +79,12 @@ public class KNNStatsTests extends KNNTestCase {
      * node bench reading {@code direct_io_stats.dispatch.routed_opens} breaks silently if one is renamed.
      *
      * <p>The counters this pins by name are the four S4 asked for — {@code staged_reads},
-     * {@code stage_declined}, {@code routed_opens}, {@code declined_opens} — plus the <b>five</b> decline
+     * {@code stage_declined}, {@code routed_opens}, {@code declined_opens} — plus the <b>six</b> decline
      * reasons, which are the ones that make a zero {@code routed_opens} diagnosable rather than mysterious.
      * Phase 15 D2 added {@code declined_compound}: at the shipped defaults every flushed segment is
      * compound, so that case is both the commonest decline and the one that means nothing is wrong, and it
-     * used to be indistinguishable from {@code declined_chain}.
+     * used to be indistinguishable from {@code declined_chain}. {@code declined_content} is the sixth: the
+     * reason a chain whose bytes are not the file's is refused.
      */
     @SuppressWarnings("unchecked")
     public void testDirectIOStatsAreReachableAndNamedStably() {
@@ -179,7 +180,8 @@ public class KNNStatsTests extends KNNTestCase {
                 "declined_chain",
                 "declined_missing",
                 "declined_too_small",
-                "declined_open_failed"
+                "declined_open_failed",
+                "declined_content"
             ),
             directIO.get("dispatch").keySet()
         );

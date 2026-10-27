@@ -99,12 +99,15 @@ public class KNNStats {
      *
      * <p>Two groups, because they answer two different questions.
      * <ul>
-     *   <li><b>dispatch</b> — is the seam engaging, and if not, why? {@code routed_opens} against the five
-     *       decline reasons, which want five different operator responses: a compound segment, i.e. every
+     *   <li><b>dispatch</b> — is the seam engaging, and if not, why? {@code routed_opens} against the six
+     *       decline reasons, which want six different operator responses: a compound segment, i.e. every
      *       flushed segment at the shipped defaults and nothing to act on
      *       ({@code declined_compound}); an unsupported substrate ({@code declined_chain}); a bug
-     *       ({@code declined_missing}); the size floor working as designed ({@code declined_too_small}); or
-     *       a filesystem with no {@code O_DIRECT} ({@code declined_open_failed}).</li>
+     *       ({@code declined_missing}); the size floor working as designed ({@code declined_too_small}); a
+     *       filesystem with no {@code O_DIRECT} ({@code declined_open_failed}); or a layer of the shard's
+     *       directory chain that transforms the bytes a reader sees, such as encryption at rest
+     *       ({@code declined_content}), which is the one reason that says Direct I/O <b>must not</b> serve
+     *       the file rather than that it cannot.</li>
      *   <li><b>reads</b> — once engaged, what is it doing? The staged/blocking/read-ahead channels and the
      *       byte counters behind the amplification ratio. {@code stage_declined} against
      *       {@code staged_reads} is the queue-capacity decline rate phase 13's audit row 7 measured as the
@@ -184,6 +187,7 @@ public class KNNStats {
         dispatch.put("declined_missing", stats.declinedMissing());
         dispatch.put("declined_too_small", stats.declinedTooSmall());
         dispatch.put("declined_open_failed", stats.declinedOpenFailed());
+        dispatch.put("declined_content", stats.declinedContent());
 
         final Map<String, Object> reads = new HashMap<>();
         reads.put("blocking_reads", stats.blockingReads());

@@ -109,7 +109,10 @@ public class DirectIORollbackIT extends KNNRestTestCase {
         // -- phase on --
         final List<Integer> idsOn = queryAll(queries);
         final Counters on = counters();
-        assumeTrue("this cluster routed nothing, so there is no switch to test: " + on, on.routedOpens > 0 && on.stagedReads > 0);
+        // Asserted, not assumed. A run that routed nothing proves nothing, and a skip here is how a chain
+        // that stopped routing -- a new layer, a content decline -- would have passed as green.
+        assertTrue("this cluster routed nothing, so there is no switch to test: " + on, on.routedOpens > 0);
+        assertTrue("and nothing was staged, so the route was not exercised: " + on, on.stagedReads > 0);
         assertTrue("the store must have filled, " + on, on.slabBytes > 0);
         assertEquals("nothing may have gone through the delegate yet, " + on, 0L, on.fallbackReads);
 

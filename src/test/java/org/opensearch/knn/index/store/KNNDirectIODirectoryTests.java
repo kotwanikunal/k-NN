@@ -13,10 +13,13 @@ import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FileDataHint;
 import org.apache.lucene.store.FileTypeHint;
 import org.apache.lucene.store.FilterDirectory;
+import org.apache.lucene.store.FlushInfo;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.MMapDirectory;
+import org.apache.lucene.store.NIOFSDirectory;
+import org.apache.lucene.store.NRTCachingDirectory;
 import org.opensearch.common.lucene.store.ByteArrayIndexInput;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
@@ -40,20 +43,22 @@ import java.nio.file.Files;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.UnaryOperator;
 
 /**
  * The dispatch rule of {@link KNNDirectIODirectory}, asserted one condition at a time, plus the two
  * properties that decide whether installing it is safe on an index that is not using the feature.
  *
- * <p>The rule has six conditions and the interesting failures are all failures of <em>one</em> of them:
+ * <p>The rule has eight conditions and the interesting failures are all failures of <em>one</em> of them:
  * routing every {@code .vec} would put the Lucene engine's unquantized traversal on Direct I/O and off
  * its memory-segment SIMD scorer, which is outside what this feature is for; ignoring the setting would
- * turn the feature on everywhere including the substrates where the measurements say it loses; walking
- * past an unknown layer of the delegate chain would serve a byte-transforming wrapper's ciphertext as
- * vectors; ignoring the absence of a path would turn a remote-store index into a failed query rather than
- * an ordinary one; and ignoring the size floor is measured at 8,016x on a flush-sized file. So each is
- * tested by holding the others and breaking that one, and each decline is asserted to be counted under
- * its own reason, because a node that cannot tell them apart cannot act on them.
+ * turn the feature on everywhere including the substrates where the measurements say it loses; serving a
+ * file whose bytes are not the bytes the delegate chain returns would serve a transforming layer's
+ * ciphertext as vectors; ignoring the absence of a path would turn a remote-store index into a failed query
+ * rather than an ordinary one; and ignoring the size floor is measured at 8,016x on a flush-sized file. So
+ * each is tested by holding the others and breaking that one, and each decline is asserted to be counted
+ * under its own reason, because a node that cannot tell them apart cannot act on them.
  *
  * <p>The other two properties are about what must <em>not</em> change. A file the rule does not name has
  * to come back as the delegate's own object, not a wrapper of it — a wrapper would displace Lucene's
@@ -118,10 +123,6 @@ public class KNNDirectIODirectoryTests extends KNNTestCase {
     /** No size floor, so the conditions under test are the only ones that can decline. */
     private KNNDirectIODirectory storageOver(final Directory delegate, final boolean enabled) {
         return new KNNDirectIODirectory(delegate, "_0", () -> enabled, () -> 0L);
-    }
-
-    private KNNDirectIODirectory storageOver(final Directory delegate, final boolean enabled, final long minFileBytes) {
-        return new KNNDirectIODirectory(delegate, "_0", () -> enabled, () -> minFileBytes);
     }
 
     // -------------------------------------------------------------------------------------------------
@@ -341,10 +342,9 @@ public class KNNDirectIODirectoryTests extends KNNTestCase {
      * This is a structural test because the failure it guards is a future edit, not current behaviour.
      *
      * <p>A static {@link java.util.Collection} is admitted only if the <em>instance</em> rejects mutation,
-     * which is checked rather than assumed: {@link KNNDirectIODirectory#PASSTHROUGH_FILTER_DIRECTORIES}
-     * is a {@code Set.of(...)} of class names and so carries nothing that varies with a node's history, but
-     * a later edit to a {@code HashSet} would be exactly the state joint 6 forbids and would pass a check
-     * on the declared type alone.
+     * which is checked rather than assumed, because a mutable collection would pass a check on the declared
+     * type alone and is exactly the state joint 6 forbids. The class holds no such field, so the branch guards an
+     * addition rather than the present.
      */
     @SneakyThrows
     public void testTheDirectoryKeepsNoNodeWideState() {
@@ -396,7 +396,7 @@ public class KNNDirectIODirectoryTests extends KNNTestCase {
     }
 
     // -------------------------------------------------------------------------------------------------
-    // Condition 3: the delegate chain, and what must never be walked past
+    // Conditions 4 and 8: the delegate chain, and the bytes it serves
     // -------------------------------------------------------------------------------------------------
 
     /**
@@ -404,6 +404,10 @@ public class KNNDirectIODirectoryTests extends KNNTestCase {
      * guard exists for — an encryption-at-rest wrapper — in the only way that matters to the test: the
      * file on disk is not what a reader of this directory sees. Nothing but {@code openInput} needs to be
      * faithful, because nothing but {@code openInput} is what the guard decides.
+     *
+     * <p>{@code openChecksumInput} is <b>not</b> transformed: {@link FilterDirectory} delegates it straight
+     * to the layer below, so a test that reaches {@code checkIntegrity()} through this fixture would read the
+     * file's own bytes and pass for the wrong reason. No test here reaches it.
      */
     private static final class XorDirectory extends FilterDirectory {
         private static final byte KEY = (byte) 0x5a;
@@ -415,14 +419,19 @@ public class KNNDirectIODirectoryTests extends KNNTestCase {
         /** Writes the on-disk form of {@code plain}, which is what a transforming wrapper stores. */
         @SneakyThrows
         static byte[] writeTransformed(final Directory bottom, final String name, final byte[] plain) {
-            final byte[] onDisk = new byte[plain.length];
-            for (int i = 0; i < plain.length; i++) {
-                onDisk[i] = (byte) (plain[i] ^ KEY);
-            }
+            final byte[] onDisk = xor(plain);
             try (IndexOutput output = bottom.createOutput(name, IOContext.DEFAULT)) {
                 output.writeBytes(onDisk, onDisk.length);
             }
             return onDisk;
+        }
+
+        static byte[] xor(final byte[] bytes) {
+            final byte[] out = new byte[bytes.length];
+            for (int i = 0; i < bytes.length; i++) {
+                out[i] = (byte) (bytes[i] ^ KEY);
+            }
+            return out;
         }
 
         @Override
@@ -432,26 +441,24 @@ public class KNNDirectIODirectoryTests extends KNNTestCase {
                 plain = new byte[Math.toIntExact(delegate.length())];
                 delegate.readBytes(plain, 0, plain.length);
             }
-            for (int i = 0; i < plain.length; i++) {
-                plain[i] ^= KEY;
-            }
-            return new ByteArrayIndexInput(name, plain);
+            return new ByteArrayIndexInput(name, xor(plain));
         }
     }
 
     /**
-     * The guard's reason for existing. A byte-transforming {@link FilterDirectory} between the codec and
-     * the {@link org.apache.lucene.store.FSDirectory} must <b>decline</b>, because the previous shape of
-     * this class used {@link FilterDirectory#unwrap} — which walks past every layer whatever it does — and
-     * would therefore have opened the raw on-disk file and served ciphertext as vectors. Silently, and
+     * The guard's reason for existing, and now the guard itself. A byte-transforming
+     * {@link FilterDirectory} between the codec and the {@link org.apache.lucene.store.FSDirectory} must
+     * <b>decline</b>: the path resolution walks past every layer with {@link FilterDirectory#unwrap}, so
+     * without condition 8 this open would serve the raw on-disk file's ciphertext as vectors. Silently, and
      * only for the one file this routes, while every other read in the system stayed correct.
      *
-     * <p>Two assertions, and the second is the one that makes the first worth having: the open declines
-     * <em>and</em> the bytes that come back through the delegate are the plaintext. Declining costs
-     * read-ahead; bypassing costs correctness.
+     * <p>Three assertions, and the last is the one that makes the first two worth having: the open declines,
+     * the reason is {@code CONTENT} rather than the chain, and the bytes that come back through the delegate
+     * are the plaintext. Declining costs read-ahead; bypassing costs correctness.
      */
     @SneakyThrows
-    public void testAByteTransformingFilterDirectoryDeclinesAndStillReadsTheRightBytes() {
+    public void testAByteTransformingFilterDirectoryDeclinesWithContent() {
+        assumeDirectIOWorksHere();
         final Path path = createTempDir();
         try (MMapDirectory bottom = new MMapDirectory(path)) {
             try (XorDirectory transforming = new XorDirectory(bottom)) {
@@ -465,82 +472,187 @@ public class KNNDirectIODirectoryTests extends KNNTestCase {
                 try (KNNDirectIODirectory storage = storageOver(transforming, true)) {
                     try (IndexInput input = storage.openInput(VECTOR_DATA, vectorDataContext())) {
                         assertFalse(
-                            "an unknown FilterDirectory must never be bypassed to reach the file under it",
+                            "a transforming layer must never be bypassed to reach the file under it",
                             input instanceof DirectIOVectorIndexInput
                         );
                         assertArrayEquals("declining must leave the transforming layer doing its job", expected, readAll(input));
                     }
                     assertEquals(0, storage.routedOpens());
-                    assertEquals("the reason must be the chain, not the size or the open", 1, storage.declinedChain());
+                    assertEquals("the reason must be the content, not the chain", 1, storage.declinedContent());
+                    assertEquals("the chain resolves: unwrap reaches the MMapDirectory under it", 0, storage.declinedChain());
                     assertEquals(0, storage.declinedTooSmall());
                     assertEquals(0, storage.declinedMissing());
                     assertEquals(0, storage.declinedOpenFailed());
+                    assertEquals(1, storage.declinedOpens());
                 }
             }
         }
     }
 
     /**
-     * The walk itself, with the allowlist as a parameter: a layer named in it is crossed, an unnamed one
-     * stops the walk. Parameterised rather than tested through the production constant because the two
-     * classes the constant names — {@code Store$StoreDirectory} and {@code ByteSizeCachingDirectory} — are
-     * package private in OpenSearch and cannot be constructed from here. The constant's contents are
-     * pinned separately, below.
+     * An {@link FSDirectory} <b>subclass</b> that transforms bytes on read: the shape of
+     * {@code CryptoNIOFSDirectory} in {@code AWSOpenSearchStorageEncryptionPlugin}, which extends
+     * {@code NIOFSDirectory} rather than wrapping a {@link Directory}.
+     *
+     * <p>This is the case an allowlist of {@link FilterDirectory} class names could not catch, and the
+     * reason W2 replaced it with a byte comparison: the layer <em>is</em> the terminal {@link FSDirectory}
+     * of the chain, so no walk ever asks whether it may be crossed, and {@code getDirectory().resolve(name)}
+     * is the raw ciphertext file.
      */
-    @SneakyThrows
-    public void testTheChainWalkCrossesAllowlistedLayersAndStopsAtUnknownOnes() {
-        final Path path = createTempDir();
-        try (MMapDirectory bottom = new MMapDirectory(path)) {
-            final Directory known = new XorDirectory(bottom);
-            final java.util.Set<String> allowlist = java.util.Set.of(XorDirectory.class.getName());
+    private static final class CryptoShapedDirectory extends NIOFSDirectory {
+        CryptoShapedDirectory(final Path path) throws IOException {
+            super(path);
+        }
 
+        @Override
+        public IndexInput openInput(final String name, final IOContext context) throws IOException {
+            final byte[] onDisk;
+            try (IndexInput delegate = super.openInput(name, context)) {
+                onDisk = new byte[Math.toIntExact(delegate.length())];
+                delegate.readBytes(onDisk, 0, onDisk.length);
+            }
+            return new ByteArrayIndexInput(name, XorDirectory.xor(onDisk));
+        }
+    }
+
+    /** The test the allowlist could not pass: a transforming {@link FSDirectory} subclass declines. */
+    @SneakyThrows
+    public void testACryptoShapedNioFsSubclassDeclinesWithContent() {
+        assumeDirectIOWorksHere();
+        final Path path = createTempDir();
+        final byte[] expected = contentOf(FILE_BYTES);
+        Files.write(path.resolve(VECTOR_DATA), XorDirectory.xor(expected));
+        try (CryptoShapedDirectory crypto = new CryptoShapedDirectory(path)) {
+            // The two premises: it is the terminal case of the chain, and it transforms.
+            assertTrue("the premise: this layer is itself an FSDirectory", crypto instanceof org.apache.lucene.store.FSDirectory);
             assertEquals(
-                "a layer in the allowlist is crossed",
+                "so the chain resolves to the raw file, with no layer to stop at",
                 path.resolve(VECTOR_DATA),
-                KNNDirectIODirectory.resolvePath(known, VECTOR_DATA, allowlist)
+                KNNDirectIODirectory.resolvePath(crypto, VECTOR_DATA)
             );
-            assertEquals(
-                "two of them are crossed too, so the walk is a walk and not a single step",
-                path.resolve(VECTOR_DATA),
-                KNNDirectIODirectory.resolvePath(new XorDirectory(known), VECTOR_DATA, allowlist)
-            );
-            assertNull(
-                "a layer absent from the allowlist stops the walk",
-                KNNDirectIODirectory.resolvePath(known, VECTOR_DATA, java.util.Set.of())
-            );
-            assertNull("and so does a null", KNNDirectIODirectory.resolvePath(null, VECTOR_DATA, allowlist));
+            try (IndexInput through = crypto.openInput(VECTOR_DATA, IOContext.DEFAULT)) {
+                assertArrayEquals("and a reader of it sees the plaintext", expected, readAll(through));
+            }
+            try (KNNDirectIODirectory storage = storageOver(crypto, true)) {
+                try (IndexInput input = storage.openInput(VECTOR_DATA, vectorDataContext())) {
+                    assertFalse("the bytes on disk are not the bytes this directory serves", input instanceof DirectIOVectorIndexInput);
+                    assertArrayEquals(expected, readAll(input));
+                }
+                assertEquals(1, storage.declinedContent());
+                assertEquals(0, storage.routedOpens());
+                assertEquals("and no counter but the content one moves", 1, storage.declinedOpens());
+            }
+        }
+    }
+
+    /** A {@link FilterDirectory} that adds nothing: the shape of every OpenSearch layer that only wraps. */
+    private static final class PassthroughDirectory extends FilterDirectory {
+        PassthroughDirectory(final Directory delegate) {
+            super(delegate);
         }
     }
 
     /**
-     * The production allowlist, pinned by name. Two of the three are package private in OpenSearch, so the
-     * only check available here is that the set says what it is documented to say; the claim behind each
-     * name — that the class has no read path of its own — was verified by reading {@code Store.java},
-     * {@code ByteSizeCachingDirectory.java} and {@code BucketedCompositeDirectory.java}, and is recorded
-     * per entry in the constant's javadoc. This test exists so that an addition to the list is a
-     * deliberate edit of a test rather than a one-line change nobody reviews — and the list has already
-     * grown once, when the S5 re-proof's decline log revealed a fourth layer in OpenSearch 3.9's real
-     * chain that nothing in the design notes had mentioned.
+     * The opposite answer to the one a class-name rule gives: a
+     * {@link FilterDirectory} nobody has ever named routes, because it passes the bytes through and
+     * condition 8 is what says so. Under the allowlist this open declined, and a new layer in a production
+     * chain cost the feature until someone read the class and added its name.
      */
-    public void testTheAllowlistNamesExactlyTheVerifiedPassthroughLayers() {
-        assertEquals(
-            java.util.Set.of(
-                "org.opensearch.index.store.Store$StoreDirectory",
-                "org.opensearch.index.store.ByteSizeCachingDirectory",
-                "org.opensearch.index.BucketedCompositeDirectory"
-            ),
-            KNNDirectIODirectory.PASSTHROUGH_FILTER_DIRECTORIES
+    @SneakyThrows
+    public void testAnUnknownPassthroughFilterDirectoryRoutes() {
+        assumeDirectIOWorksHere();
+        final Path path = createTempDir();
+        try (MMapDirectory bottom = new MMapDirectory(path)) {
+            final byte[] expected = writeFile(bottom, VECTOR_DATA, FILE_BYTES);
+            try (PassthroughDirectory unknown = new PassthroughDirectory(bottom)) {
+                try (KNNDirectIODirectory storage = storageOver(unknown, true)) {
+                    try (IndexInput input = storage.openInput(VECTOR_DATA, vectorDataContext())) {
+                        assertTrue(
+                            "a layer that passes bytes through must route, got " + input.getClass().getName(),
+                            input instanceof DirectIOVectorIndexInput
+                        );
+                        assertArrayEquals(expected, readAll(input));
+                    }
+                    assertEquals(1, storage.routedOpens());
+                    assertEquals(0, storage.declinedOpens());
+                }
+            }
+        }
+    }
+
+    /**
+     * OpenSearch 3.9's real chain, read from a node's own decline log:
+     * {@code Store$StoreDirectory -> ByteSizeCachingDirectory -> BucketedCompositeDirectory -> HybridDirectory}.
+     * Three of the four are package private in OpenSearch and cannot be constructed from here, so the test
+     * stands them in with passthrough layers of the same shape over the real {@code hybridfs} bottom. What
+     * it pins is that a three-deep chain over an {@link FSDirectory} subclass still routes, which is the
+     * production case the feature exists for.
+     */
+    @SneakyThrows
+    public void testTheMeasuredThreeNineChainShapeRoutes() {
+        assumeDirectIOWorksHere();
+        final IndexSettings indexSettings = IndexSettingsModule.newIndexSettings(
+            "dio",
+            Settings.builder().put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), "hybridfs").build()
         );
+        final Path shardDir = createTempDir().resolve(indexSettings.getUUID()).resolve("0");
+        Files.createDirectories(shardDir);
+        final ShardPath shardPath = new ShardPath(false, shardDir, shardDir, new ShardId(indexSettings.getIndex(), 0));
+        try (Directory hybrid = new FsDirectoryFactory().newDirectory(indexSettings, shardPath)) {
+            final byte[] expected = writeFile(hybrid, VECTOR_DATA, FILE_BYTES);
+            final Directory chain = new PassthroughDirectory(new PassthroughDirectory(new PassthroughDirectory(hybrid)));
+            try (KNNDirectIODirectory storage = storageOver(chain, true)) {
+                try (IndexInput input = storage.openInput(VECTOR_DATA, vectorDataContext())) {
+                    assertTrue(
+                        "the measured 3.9 chain shape must route, got " + input.getClass().getName(),
+                        input instanceof DirectIOVectorIndexInput
+                    );
+                    assertArrayEquals(expected, readAll(input));
+                }
+                assertEquals(1, storage.routedOpens());
+                assertEquals(0, storage.declinedOpens());
+            }
+        }
+    }
+
+    /**
+     * Condition 4 as a unit: {@link FilterDirectory#unwrap} down to an {@link FSDirectory}, whatever the
+     * layers are. There is no allowlist to parameterise any more, so what is left to pin is the terminal
+     * case, the layers crossed and the two answers that are {@code null}.
+     */
+    @SneakyThrows
+    public void testResolvePathUnwrapsToTheFsDirectory() {
+        final Path path = createTempDir();
+        try (MMapDirectory bottom = new MMapDirectory(path)) {
+            assertEquals(
+                "one layer is crossed",
+                path.resolve(VECTOR_DATA),
+                KNNDirectIODirectory.resolvePath(new PassthroughDirectory(bottom), VECTOR_DATA)
+            );
+            assertEquals(
+                "and so are three, whatever they do: the bytes are checked later, not the class names",
+                path.resolve(VECTOR_DATA),
+                KNNDirectIODirectory.resolvePath(new XorDirectory(new PassthroughDirectory(new XorDirectory(bottom))), VECTOR_DATA)
+            );
+            assertEquals("the bottom itself answers too", path.resolve(VECTOR_DATA), KNNDirectIODirectory.resolvePath(bottom, VECTOR_DATA));
+        }
+        try (ByteBuffersDirectory noPath = new ByteBuffersDirectory()) {
+            assertNull(
+                "a chain with no FSDirectory at the bottom has no path",
+                KNNDirectIODirectory.resolvePath(new PassthroughDirectory(noPath), VECTOR_DATA)
+            );
+        }
+        assertNull("and neither has nothing at all", KNNDirectIODirectory.resolvePath(null, VECTOR_DATA));
     }
 
     /**
      * The chain description that goes into the decline log, which is the only thing that makes a chain
-     * decline diagnosable: the counter can only ever say "some layer is not allowlisted", and the useful
+     * decline diagnosable: the counter can only ever say "nothing under this chain has a path", and the useful
      * question is which. Outermost first, stopping at the first non-{@link FilterDirectory}.
      *
      * <p>This is not cosmetic. The first S5 re-proof run routed nothing and declined 10 times on the chain;
-     * the log line as originally written named only the <em>top</em> of the chain, which was an allowlisted
-     * class, so it pointed away from the cause. With the full chain the answer was immediate.
+     * the log line as originally written named only the <em>top</em> of the chain, which was a layer that passes
+     * bytes through, so it pointed away from the cause. With the full chain the answer was immediate.
      */
     @SneakyThrows
     public void testTheDeclineLogDescribesTheWholeChainOutermostFirst() {
@@ -558,7 +670,7 @@ public class KNNDirectIODirectoryTests extends KNNTestCase {
      * OpenSearch's real {@code hybridfs} directory, built by the real {@code FsDirectoryFactory}: the
      * bottom of every production chain, and an {@code FSDirectory} <em>subclass</em> that overrides
      * {@code openInput} to pick mmap or nio per file. Both of its routes read
-     * {@code getDirectory().resolve(name)}, so the terminal case of the walk has to accept a subclass
+     * {@code getDirectory().resolve(name)}, so the terminal case of the resolution has to accept a subclass
      * rather than only the two concrete Lucene directories — which is what this pins.
      */
     @SneakyThrows
@@ -589,7 +701,7 @@ public class KNNDirectIODirectoryTests extends KNNTestCase {
     }
 
     // -------------------------------------------------------------------------------------------------
-    // Condition 5: the size floor (phase 13 audit FIX 1)
+    // Condition 6: the size floor (phase 13 audit FIX 1)
     // -------------------------------------------------------------------------------------------------
 
     /**
@@ -756,6 +868,575 @@ public class KNNDirectIODirectoryTests extends KNNTestCase {
         // Still only the .vec: the half-float formats' other files are no more routed than the fp32 ones'.
         assertFalse(KNNDirectIODirectory.isFaissVectorData("_7_" + KNNDirectIODirectory.HALF_FLOAT_FORMAT_NAME + "_0.vemf"));
         assertFalse(KNNDirectIODirectory.isFaissVectorData("_7_" + KNNDirectIODirectory.HALF_FLOAT_SQ_FORMAT_NAME + "_0.veq"));
+    }
+
+    // -------------------------------------------------------------------------------------------------
+    // Condition 8, one failure of it at a time: what the byte check catches, and what it cannot
+    // -------------------------------------------------------------------------------------------------
+
+    /**
+     * A {@link FilterDirectory} whose {@code .vec} input serves a transform of the file's bytes, so that one
+     * test can break one part of the comparison at a time. Every other file is the delegate's own, and so is
+     * {@code openChecksumInput} of this one: see {@link XorDirectory}.
+     */
+    private static final class TransformingDirectory extends FilterDirectory {
+        private final UnaryOperator<byte[]> transform;
+
+        TransformingDirectory(final Directory delegate, final UnaryOperator<byte[]> transform) {
+            super(delegate);
+            this.transform = transform;
+        }
+
+        @Override
+        public IndexInput openInput(final String name, final IOContext context) throws IOException {
+            if (name.endsWith(".vec") == false) {
+                return super.openInput(name, context);
+            }
+            final byte[] onDisk;
+            try (IndexInput delegate = super.openInput(name, context)) {
+                onDisk = new byte[Math.toIntExact(delegate.length())];
+                delegate.readBytes(onDisk, 0, onDisk.length);
+            }
+            return new ByteArrayIndexInput(name, transform.apply(onDisk));
+        }
+    }
+
+    /**
+     * Opens the {@code .vec} through {@code transform} and returns the directory, counters and all. Neither
+     * the transforming layer nor the directory is closed: closing either would close the caller's own
+     * {@code bottom} directory with it, which the caller is still holding.
+     */
+    @SneakyThrows
+    private KNNDirectIODirectory openThrough(final Directory bottom, final UnaryOperator<byte[]> transform) {
+        final TransformingDirectory transforming = new TransformingDirectory(bottom, transform);
+        final KNNDirectIODirectory storage = new KNNDirectIODirectory(transforming, "_0", () -> true, () -> 0L);
+        storage.openInput(VECTOR_DATA, vectorDataContext()).close();
+        return storage;
+    }
+
+    /**
+     * The length comparison, which is the cheapest of the three and the one a relocating layer fails: a
+     * chain that serves a different number of bytes than the file holds is not serving the file.
+     */
+    @SneakyThrows
+    public void testALengthMismatchDeclinesWithContent() {
+        assumeDirectIOWorksHere();
+        final Path path = createTempDir();
+        try (MMapDirectory bottom = new MMapDirectory(path)) {
+            writeFile(bottom, VECTOR_DATA, FILE_BYTES);
+            final KNNDirectIODirectory storage = openThrough(bottom, bytes -> java.util.Arrays.copyOf(bytes, bytes.length - 8));
+            assertEquals(1, storage.declinedContent());
+            assertEquals(0, storage.routedOpens());
+        }
+    }
+
+    /**
+     * The footer half of the comparison, on its own: a layer that passes the first 4 KiB through and
+     * transforms only the last 16 bytes. Lucene's codec footer is a checksum of everything before it, so a
+     * transform of the body shows here even when the header does not move — which is why the check reads the
+     * tail at all, and this is the test that pins it.
+     */
+    @SneakyThrows
+    public void testAFooterOnlyTransformDeclinesWithContent() {
+        assumeDirectIOWorksHere();
+        final Path path = createTempDir();
+        try (MMapDirectory bottom = new MMapDirectory(path)) {
+            writeFile(bottom, VECTOR_DATA, FILE_BYTES);
+            final KNNDirectIODirectory storage = openThrough(bottom, bytes -> {
+                final byte[] out = bytes.clone();
+                for (int i = out.length - DirectIOVectorIndexInput.CONTENT_CHECK_FOOTER_BYTES; i < out.length; i++) {
+                    out[i] ^= (byte) 0x5a;
+                }
+                return out;
+            });
+            assertEquals("the footer is compared, not only the head", 1, storage.declinedContent());
+            assertEquals(0, storage.routedOpens());
+        }
+    }
+
+    /**
+     * The documented limit, asserted so that the javadoc cannot drift away from the behaviour: a layer that
+     * transforms <b>only interior bytes</b> — neither the head nor the footer — is routed, and would serve
+     * transformed vectors. Sampling an interior block would narrow this without closing it, since a
+     * transform may be the identity on any block sampled, so the opt-in guide carries it as a limitation line
+     * instead.
+     */
+    @SneakyThrows
+    public void testAnInteriorOnlyTransformIsNotCaught() {
+        assumeDirectIOWorksHere();
+        final Path path = createTempDir();
+        try (MMapDirectory bottom = new MMapDirectory(path)) {
+            writeFile(bottom, VECTOR_DATA, FILE_BYTES);
+            final int interior = DirectIOVectorIndexInput.CONTENT_CHECK_HEAD_BYTES * 2;
+            assertTrue("the transformed bytes must be outside both compared regions", interior < FILE_BYTES - 1024);
+            final KNNDirectIODirectory storage = openThrough(bottom, bytes -> {
+                final byte[] out = bytes.clone();
+                out[interior] ^= (byte) 0x5a;
+                return out;
+            });
+            assertEquals("an interior-only transform is the limit, not a decline", 0, storage.declinedContent());
+            assertEquals(1, storage.routedOpens());
+        }
+    }
+
+    /** An input whose length is honest and whose reads are not: the chain cannot be compared at all. */
+    private static final class UnreadableIndexInput extends IndexInput {
+        private final long length;
+
+        UnreadableIndexInput(final String name, final long length) {
+            super(name);
+            this.length = length;
+        }
+
+        @Override
+        public void close() {}
+
+        @Override
+        public long getFilePointer() {
+            return 0L;
+        }
+
+        @Override
+        public void seek(final long pos) {}
+
+        @Override
+        public long length() {
+            return length;
+        }
+
+        @Override
+        public IndexInput slice(final String sliceDescription, final long offset, final long length) throws IOException {
+            throw new IOException("this input cannot be sliced either");
+        }
+
+        @Override
+        public byte readByte() throws IOException {
+            throw new IOException("this input cannot be read");
+        }
+
+        @Override
+        public void readBytes(final byte[] b, final int offset, final int len) throws IOException {
+            throw new IOException("this input cannot be read");
+        }
+    }
+
+    /**
+     * Fail closed on the comparison itself. A chain whose bytes cannot be read is a chain whose bytes have
+     * not been shown to be the file's, so the open declines rather than routing unverified — the same rule
+     * condition 7 applies to the delegate open that fails outright.
+     */
+    @SneakyThrows
+    public void testADelegateThatCannotBeReadDeclinesWithContent() {
+        assumeDirectIOWorksHere();
+        final Path path = createTempDir();
+        try (MMapDirectory bottom = new MMapDirectory(path)) {
+            writeFile(bottom, VECTOR_DATA, FILE_BYTES);
+            final Directory unreadable = new FilterDirectory(bottom) {
+                @Override
+                public IndexInput openInput(final String name, final IOContext context) throws IOException {
+                    if (name.endsWith(".vec")) {
+                        return new UnreadableIndexInput(name, FILE_BYTES);
+                    }
+                    return super.openInput(name, context);
+                }
+            };
+            try (KNNDirectIODirectory storage = new KNNDirectIODirectory(unreadable, "_0", () -> true, () -> 0L)) {
+                storage.openInput(VECTOR_DATA, vectorDataContext()).close();
+                assertEquals("a comparison that could not be made has not passed", 1, storage.declinedContent());
+                assertEquals(0, storage.routedOpens());
+            }
+        }
+    }
+
+    /**
+     * Condition 7's second half: a delegate input that cannot be opened at all declines, where an earlier shape
+     * of the rule routed on with no fallback. Without the delegate's input there is nothing to compare the file's
+     * bytes with, so routing would be routing unverified.
+     */
+    @SneakyThrows
+    public void testADelegateOpenFailureDeclinesWithOpenFailed() {
+        assumeDirectIOWorksHere();
+        final Path path = createTempDir();
+        try (MMapDirectory bottom = new MMapDirectory(path)) {
+            writeFile(bottom, VECTOR_DATA, FILE_BYTES);
+            final Directory failing = new FilterDirectory(bottom) {
+                @Override
+                public IndexInput openInput(final String name, final IOContext context) throws IOException {
+                    if (name.endsWith(".vec")) {
+                        throw new IOException("no input for " + name);
+                    }
+                    return super.openInput(name, context);
+                }
+            };
+            try (KNNDirectIODirectory storage = new KNNDirectIODirectory(failing, "_0", () -> true, () -> 0L)) {
+                // The decline is counted, and then the delegate's own failure is what the caller sees: the
+                // rule never turns a failing open into a routed one.
+                expectThrows(IOException.class, () -> storage.openInput(VECTOR_DATA, vectorDataContext()));
+                assertEquals(1, storage.declinedOpenFailed());
+                assertEquals(0, storage.routedOpens());
+                assertEquals(0, storage.declinedContent());
+            }
+        }
+    }
+
+    /**
+     * A file that lives only in an {@link NRTCachingDirectory}'s RAM buffer: the chain resolves to a path
+     * on disk, because {@code unwrap} walks past the caching layer, but nothing is there. It declines
+     * {@code MISSING}, reads correctly through the delegate, and is the shape every composing layer takes —
+     * a name whose bytes are not (yet) the file's.
+     */
+    @SneakyThrows
+    public void testAFileOnlyInAnNrtCachingRamBufferDeclinesWithMissing() {
+        final Path path = createTempDir();
+        try (MMapDirectory bottom = new MMapDirectory(path)) {
+            try (NRTCachingDirectory caching = new NRTCachingDirectory(bottom, 5.0, 60.0)) {
+                // A flush context, because that is the only write this directory caches: with no flush or
+                // merge info it writes straight through, and then there would be nothing in RAM to test.
+                final byte[] expected = contentOf(FILE_BYTES);
+                try (IndexOutput output = caching.createOutput(VECTOR_DATA, IOContext.flush(new FlushInfo(1, FILE_BYTES)))) {
+                    output.writeBytes(expected, expected.length);
+                }
+                // The premise: the name is in the listing but not on disk.
+                assertTrue(java.util.Arrays.asList(caching.listAll()).contains(VECTOR_DATA));
+                assertFalse("this fixture must keep the file in RAM, or the test proves nothing", Files.exists(path.resolve(VECTOR_DATA)));
+                try (KNNDirectIODirectory storage = storageOver(caching, true)) {
+                    try (IndexInput input = storage.openInput(VECTOR_DATA, vectorDataContext())) {
+                        assertFalse(input instanceof DirectIOVectorIndexInput);
+                        assertArrayEquals("the RAM buffer serves it", expected, readAll(input));
+                    }
+                    assertEquals("a name with no file is missing, not a content decline", 1, storage.declinedMissing());
+                    assertEquals(0, storage.declinedContent());
+                    assertEquals(0, storage.routedOpens());
+                }
+            }
+        }
+    }
+
+    /** An input over a byte array that counts what is read through it, and whose clones share the count. */
+    private static final class CountingIndexInput extends IndexInput {
+        private final byte[] content;
+        private final AtomicLong reads;
+        private final AtomicLong bytes;
+        private long position;
+
+        CountingIndexInput(final String name, final byte[] content, final AtomicLong reads, final AtomicLong bytes) {
+            super(name);
+            this.content = content;
+            this.reads = reads;
+            this.bytes = bytes;
+        }
+
+        @Override
+        public void close() {}
+
+        @Override
+        public long getFilePointer() {
+            return position;
+        }
+
+        @Override
+        public void seek(final long pos) {
+            position = pos;
+        }
+
+        @Override
+        public long length() {
+            return content.length;
+        }
+
+        @Override
+        public IndexInput slice(final String sliceDescription, final long offset, final long length) {
+            throw new UnsupportedOperationException("the byte check never slices");
+        }
+
+        @Override
+        public byte readByte() {
+            reads.incrementAndGet();
+            bytes.incrementAndGet();
+            return content[Math.toIntExact(position++)];
+        }
+
+        @Override
+        public void readBytes(final byte[] b, final int offset, final int len) {
+            reads.incrementAndGet();
+            bytes.addAndGet(len);
+            System.arraycopy(content, Math.toIntExact(position), b, offset, len);
+            position += len;
+        }
+
+        @Override
+        public IndexInput clone() {
+            final CountingIndexInput copy = new CountingIndexInput(toString(), content, reads, bytes);
+            copy.position = position;
+            return copy;
+        }
+    }
+
+    /**
+     * What condition 8 costs at open, which is the clause of W2 the performance guard reads: <b>two</b>
+     * block-aligned device reads and one {@value DirectIOVectorIndexInput#CONTENT_CHECK_HEAD_BYTES} plus
+     * {@value DirectIOVectorIndexInput#CONTENT_CHECK_FOOTER_BYTES} byte read through the delegate chain, per
+     * routed open and never per query.
+     *
+     * <p>The assertion that matters to every earlier measurement is the second one: the check reads through
+     * the file handle with a buffer of its own, <b>not</b> through this input's instrumented read path, so
+     * {@code blocking_reads}, {@code blocking_bytes}, {@code served_bytes} and {@code staged_reads} do not
+     * move and the re-proof's counters stay comparable across the change.
+     *
+     * <p>The delegate side is pinned exactly, and that is the substantive assertion. The device side is read
+     * from {@code /proc/self/io} where the runtime allows it, and its bound is deliberately loose rather than
+     * {@code 2 x blockSize}: that counter is JVM wide, so any other thread's page-in during the window lands
+     * in it. A loose bound still distinguishes two aligned regions from reading the file, which is the claim.
+     */
+    @SneakyThrows
+    public void testTheByteCheckCostsTwoReadsAndMovesNoReadCounter() {
+        assumeDirectIOWorksHere();
+        final Path path = createTempDir();
+        // Larger than the two compared regions by three orders of magnitude, so "it does not read the file"
+        // is a claim the device bytes can actually distinguish.
+        final int fileBytes = 4 * 1024 * 1024;
+        final byte[] content = contentOf(fileBytes);
+        Files.write(path.resolve(VECTOR_DATA), content);
+        final AtomicLong reads = new AtomicLong();
+        final AtomicLong bytes = new AtomicLong();
+        DirectIOVectorIndexInput.STATS.reset();
+        try (MMapDirectory bottom = new MMapDirectory(path)) {
+            final Directory counting = new FilterDirectory(bottom) {
+                @Override
+                public IndexInput openInput(final String name, final IOContext context) throws IOException {
+                    if (name.endsWith(".vec")) {
+                        return new CountingIndexInput(name, content, reads, bytes);
+                    }
+                    return super.openInput(name, context);
+                }
+            };
+            final long deviceBefore = deviceReadBytes();
+            try (KNNDirectIODirectory storage = new KNNDirectIODirectory(counting, "_0", () -> true, () -> 0L)) {
+                try (IndexInput input = storage.openInput(VECTOR_DATA, vectorDataContext())) {
+                    assertTrue(input instanceof DirectIOVectorIndexInput);
+                    assertEquals(1, storage.routedOpens());
+                }
+            }
+            final long deviceAfter = deviceReadBytes();
+
+            assertEquals("the head and the footer, one read each", 2L, reads.get());
+            assertEquals(
+                "and exactly their two lengths through the chain",
+                DirectIOVectorIndexInput.CONTENT_CHECK_HEAD_BYTES + DirectIOVectorIndexInput.CONTENT_CHECK_FOOTER_BYTES,
+                bytes.get()
+            );
+            assertEquals("no instrumented blocking read", 0L, DirectIOVectorIndexInput.STATS.blockingReads());
+            assertEquals(0L, DirectIOVectorIndexInput.STATS.blockingBytes());
+            assertEquals("and no staged read either", 0L, DirectIOVectorIndexInput.STATS.stagedReads());
+            assertEquals("so no byte is counted as served", 0L, DirectIOVectorIndexInput.STATS.servedBytes());
+            assertEquals(1L, DirectIOVectorIndexInput.STATS.routedOpens());
+            if (deviceBefore >= 0 && deviceAfter >= 0) {
+                final long delta = deviceAfter - deviceBefore;
+                logger.info("the byte check read {} device bytes at one routed open of a {} B file", delta, fileBytes);
+                assertTrue("the check must read two aligned regions, not the file: " + delta + " B of " + fileBytes, delta <= 64L * 1024);
+            }
+        } finally {
+            DirectIOVectorIndexInput.STATS.reset();
+        }
+    }
+
+    /** An input that counts how often it was closed, and whose clones share the count. */
+    private static final class CloseCountingIndexInput extends IndexInput {
+        private final IndexInput delegate;
+        private final AtomicLong closes;
+
+        CloseCountingIndexInput(final IndexInput delegate, final AtomicLong closes) {
+            super(delegate.toString());
+            this.delegate = delegate;
+            this.closes = closes;
+        }
+
+        @Override
+        public void close() throws IOException {
+            closes.incrementAndGet();
+            delegate.close();
+        }
+
+        @Override
+        public long getFilePointer() {
+            return delegate.getFilePointer();
+        }
+
+        @Override
+        public void seek(final long pos) throws IOException {
+            delegate.seek(pos);
+        }
+
+        @Override
+        public long length() {
+            return delegate.length();
+        }
+
+        @Override
+        public IndexInput slice(final String sliceDescription, final long offset, final long length) throws IOException {
+            return delegate.slice(sliceDescription, offset, length);
+        }
+
+        @Override
+        public byte readByte() throws IOException {
+            return delegate.readByte();
+        }
+
+        @Override
+        public void readBytes(final byte[] b, final int offset, final int len) throws IOException {
+            delegate.readBytes(b, offset, len);
+        }
+
+        @Override
+        public IndexInput clone() {
+            // The clone shares the counter but not the close: a clone of an IndexInput is never closed.
+            return new CloseCountingIndexInput(delegate.clone(), closes);
+        }
+    }
+
+    /**
+     * What the content decline releases, and what it must <b>not</b>. It is the only decline taken after both
+     * opens succeeded, so it is the only one that owns two resources, and it releases them indirectly through
+     * the routed input's ownership of the delegate's input. Nothing else in the suite would notice a leak of
+     * one file handle per routed {@code .vec}, on exactly the substrate where every open declines.
+     *
+     * <p>The second assertion is the one the design turns on: the release must not reach
+     * {@code DirectIOVectorCache.releaseFile}, which is keyed on the file rather than on the handle and is not
+     * reference counted, so an open that read nothing would otherwise evict the vectors another routed reader
+     * of the same file is being served from. {@code cache.closed_files} is how that release is visible.
+     */
+    @SneakyThrows
+    public void testTheContentDeclineReleasesBothInputsAndEvictsNothing() {
+        assumeDirectIOWorksHere();
+        final Path path = createTempDir();
+        try (MMapDirectory bottom = new MMapDirectory(path)) {
+            writeFile(bottom, VECTOR_DATA, FILE_BYTES);
+            final AtomicLong closes = new AtomicLong();
+            final Directory transforming = new FilterDirectory(bottom) {
+                @Override
+                public IndexInput openInput(final String name, final IOContext context) throws IOException {
+                    if (name.endsWith(".vec") == false) {
+                        return super.openInput(name, context);
+                    }
+                    final byte[] onDisk;
+                    try (IndexInput delegate = super.openInput(name, context)) {
+                        onDisk = new byte[Math.toIntExact(delegate.length())];
+                        delegate.readBytes(onDisk, 0, onDisk.length);
+                    }
+                    return new CloseCountingIndexInput(new ByteArrayIndexInput(name, XorDirectory.xor(onDisk)), closes);
+                }
+            };
+            final long closedFilesBefore = DirectIOVectorCache.closedFiles();
+            final KNNDirectIODirectory storage = new KNNDirectIODirectory(transforming, "_0", () -> true, () -> 0L);
+            // Not closed yet, so the count isolates the declined open's own input from the caller's.
+            final IndexInput served = storage.openInput(VECTOR_DATA, vectorDataContext());
+
+            assertEquals(1, storage.declinedContent());
+            assertEquals(0, storage.routedOpens());
+            assertEquals("the input the declined open took must be closed, exactly once", 1L, closes.get());
+            served.close();
+            assertEquals("and the one the caller got is its own, closed by the caller", 2L, closes.get());
+            assertEquals(
+                "and the file's cached vectors must not be released by an open that read nothing",
+                closedFilesBefore,
+                DirectIOVectorCache.closedFiles()
+            );
+        }
+    }
+
+    /**
+     * The byte check over the file sizes its arithmetic bends at, each one routed and read back whole. A
+     * {@code .vec} smaller than the compared head, one exactly a block, one a block plus a byte, and one whose
+     * footer straddles two blocks all take a different path through the offset and aligned-length arithmetic
+     * than the 16 KiB fixture the other tests use, and all of them are reachable the moment an operator lowers
+     * {@code knn.direct_io.min_file_size}.
+     */
+    @SneakyThrows
+    public void testTheByteCheckRoutesEveryFileGeometry() {
+        assumeDirectIOWorksHere();
+        for (final int fileBytes : new int[] {
+            64,
+            2048,
+            DirectIOVectorIndexInput.CONTENT_CHECK_HEAD_BYTES,
+            DirectIOVectorIndexInput.CONTENT_CHECK_HEAD_BYTES + 1,
+            FILE_BYTES - 1,
+            FILE_BYTES }) {
+            final Path path = createTempDir();
+            try (MMapDirectory delegate = new MMapDirectory(path)) {
+                final byte[] expected = writeFile(delegate, VECTOR_DATA, fileBytes);
+                try (KNNDirectIODirectory storage = storageOver(delegate, true)) {
+                    try (IndexInput input = storage.openInput(VECTOR_DATA, vectorDataContext())) {
+                        assertTrue(
+                            fileBytes + " B must route, got " + input.getClass().getName() + " declined=" + storage.declinedOpens(),
+                            input instanceof DirectIOVectorIndexInput
+                        );
+                        assertArrayEquals("and read the same bytes at " + fileBytes + " B", expected, readAll(input));
+                    }
+                    assertEquals(fileBytes + " B", 1, storage.routedOpens());
+                    assertEquals(fileBytes + " B", 0, storage.declinedContent());
+                }
+            }
+        }
+    }
+
+    /** A {@code .vec} of no bytes at all: nothing to compare, nothing a transform could hide in, so it routes. */
+    @SneakyThrows
+    public void testAnEmptyVectorDataFileRoutes() {
+        assumeDirectIOWorksHere();
+        final Path path = createTempDir();
+        Files.write(path.resolve(VECTOR_DATA), new byte[0]);
+        try (MMapDirectory delegate = new MMapDirectory(path)) {
+            try (KNNDirectIODirectory storage = storageOver(delegate, true)) {
+                try (IndexInput input = storage.openInput(VECTOR_DATA, vectorDataContext())) {
+                    assertTrue(input instanceof DirectIOVectorIndexInput);
+                    assertEquals(0L, input.length());
+                }
+                assertEquals(1, storage.routedOpens());
+                assertEquals(0, storage.declinedContent());
+            }
+        }
+    }
+
+    /**
+     * The fail-closed arm of the comparison that no transform can reach: the device could not deliver the
+     * region. The file is truncated under an already-open input, so the channel returns fewer bytes than the
+     * region needs while the delegate still reports the original length — and a region that could not be read
+     * has not been shown to match.
+     */
+    @SneakyThrows
+    public void testARegionThatCannotBeReadFromTheDeviceDoesNotMatch() {
+        assumeDirectIOWorksHere();
+        final Path path = createTempDir();
+        final byte[] content = contentOf(FILE_BYTES);
+        final Path file = path.resolve(VECTOR_DATA);
+        Files.write(file, content);
+        try (DirectIOVectorIndexInput routed = DirectIOVectorIndexInput.open(file)) {
+            assertNotNull(routed);
+            assertEquals(FILE_BYTES, routed.length());
+            // Both sides still agree while the file is whole.
+            assertTrue(routed.contentMatches(new ByteArrayIndexInput(VECTOR_DATA, content)));
+            try (FileChannel truncate = FileChannel.open(file, StandardOpenOption.WRITE)) {
+                truncate.truncate(1024);
+            }
+            assertFalse(
+                "a region the channel cannot deliver must not be reported as matching",
+                routed.contentMatches(new ByteArrayIndexInput(VECTOR_DATA, content))
+            );
+        }
+    }
+
+    /** This process's cumulative device read bytes, or -1 where the runtime will not let them be read. */
+    private static long deviceReadBytes() {
+        try {
+            for (final String line : Files.readAllLines(Path.of("/proc/self/io"))) {
+                if (line.startsWith("read_bytes:")) {
+                    return Long.parseLong(line.substring("read_bytes:".length()).trim());
+                }
+            }
+            return -1L;
+        } catch (IOException | RuntimeException e) {
+            return -1L;
+        }
     }
 
     /** O8, end to end through the dispatch point: the open is routed and the counter sees it. */
