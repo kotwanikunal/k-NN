@@ -42,13 +42,10 @@ import java.util.function.BooleanSupplier;
  * An {@link IndexInput} that fetches with {@code O_DIRECT} and implements {@link #prefetch} by putting
  * block-aligned reads in flight on {@link DirectIOReadPool}.
  *
- * <p><b>This class exists to answer one question</b> — Phase 9b gate 2. The rescore seam reaches its queue
- * depth through a seam of its own (a staging interface driven by a query-layer scorer wrapper, removed in
- * phase 12 H5), because Lucene's {@code DirectIOIndexInput} has no {@code prefetch} member at all and
- * {@link IndexInput#prefetch} defaults to a no-op. A {@code Directory}-based design has no query-layer
- * wrapper to lean on, so it can only match the seam's numbers if an {@code IndexInput} can carry read-ahead
- * by itself. That is what this class tests, and it is deliberately not wired into the codec: gate 2 is about
- * the mechanism, and a failure of wiring and a failure of the mechanism must not be indistinguishable.
+ * <p><b>Why read ahead lives in the input.</b> Lucene's {@code DirectIOIndexInput} has no {@code prefetch}
+ * member at all and {@link IndexInput#prefetch} defaults to a no-op, and a {@code Directory}-based design has
+ * no query-layer wrapper to carry read ahead on the input's behalf, so the input has to carry it itself.
+ * {@link KNNDirectIODirectory} is what opens it, for a {@code .vec} the dispatch rule routes.
  *
  * <h2>The batch of ordinals arrives here already, through shipped code</h2>
  * Read ahead needs to know what is coming. On the mmap path it does, and not by accident:
@@ -909,7 +906,6 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
     }
 
-    /** The one counter set, because the pool it counts is node wide too. */
     /** Why the dispatch rule declined a {@code .vec} it matched on name and setting. */
     public enum DeclineReason {
         /**
