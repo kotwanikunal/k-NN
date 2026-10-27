@@ -146,20 +146,6 @@ public class DirectIOReadPoolTests extends KNNTestCase {
      * {@code index_searcher = boundedBy(2p, 2, MAX)} ({@code ThreadPool.java:783-785}).
      */
     public void testTheDefaultQueueCapacityIsDerivedFromBurstDemand() {
-        assertEquals(
-            "0 is the shipped default and means derive",
-            0,
-            org.opensearch.knn.index.KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_DEFAULT_VALUE
-        );
-        assertEquals(
-            "knn.direct_io.rescore.prefetch.queue_capacity",
-            org.opensearch.knn.index.KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING.getKey()
-        );
-        assertTrue(
-            "the node has to sweep this without a rebuild",
-            org.opensearch.knn.index.KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING.isDynamic()
-        );
-
         // The 4-vCPU bench node: search 7, index_searcher 8, 15 x 64 = 960 -> 1024, which is the capacity
         // the sweep measured as best.
         assertEquals("search(4) + index_searcher(4)", 15, org.opensearch.knn.index.KNNSettings.burstThreadsFor(4));

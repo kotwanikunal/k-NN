@@ -186,11 +186,11 @@ final class DirectIOReadPool {
     }
 
     /**
-     * How many reads may wait behind the pool: {@code knn.direct_io.rescore.prefetch.queue_capacity} when an
-     * operator has set it to anything positive, and otherwise the derived default below. A setting that
-     * cannot be read falls back to the derived value, the same contract every other Direct I/O setting has.
+     * How many reads may wait behind the pool, derived from burst demand. A thread count that cannot be read
+     * falls back to the floor, the same contract every other Direct I/O value has: this must never be the
+     * reason a read fails.
      *
-     * <h4>The default is derived from burst demand, not from the pool size</h4>
+     * <h4>Derived from burst demand, not from the pool size</h4>
      * It used to be {@code max(64, 8 x pool_threads)}, which was <b>the wrong variable</b>. Pool threads set
      * the drain <em>rate</em>; the queue has to absorb the peak <em>burst</em>, and a burst is
      * {@code staged_ranges} ranges submitted by one scorer before it reads any of them. So the demand is
@@ -206,22 +206,14 @@ final class DirectIOReadPool {
      * queue that never fills costs only the task references it does not hold. The node measured 0 declines at
      * both 1,024 and 4,096, i.e. the queue filled at neither, and the p99 difference between those two arms
      * is therefore not a queue effect. Buffer bytes are bounded separately by
-     * {@code knn.direct_io.direct_memory_budget}.
+     * {@link DirectIOVectorIndexInput#DIRECT_MEMORY_BUDGET_BYTES}.
      *
      * <p>On the 4-vCPU node this is {@code (7 + 8) x 64 = 960 -> 1024}, which is the value the sweep measured
      * as best. On a 16-vCPU host it is {@code (25 + 32) x 64 = 3648 -> 4096}.
      */
     static int queueCapacity() {
         try {
-            final int configured = KNNSettings.getDirectIORescorePrefetchQueueCapacity();
-            if (configured > 0) {
-                return configured;
-            }
-        } catch (Exception e) {
-            log.debug("Could not read knn.direct_io.rescore.prefetch.queue_capacity; deriving the capacity", e);
-        }
-        try {
-            return derivedQueueCapacity(KNNSettings.getDirectIORescoreBurstThreads(), KNNSettings.getDirectIORescorePrefetchStagedRanges());
+            return derivedQueueCapacity(KNNSettings.getDirectIORescoreBurstThreads(), DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGES);
         } catch (Exception e) {
             log.debug("Could not derive the Direct I/O queue capacity from the thread pools; using the floor", e);
             return MIN_QUEUE_CAPACITY;

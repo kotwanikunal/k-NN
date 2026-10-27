@@ -484,10 +484,10 @@ public class DirectIOCacheConcurrencyStressTests extends KNNTestCase {
     private void nodeSettings(final long maxBytes, final boolean spanFill, final boolean readAround) {
         final Settings settings = Settings.builder()
             .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, maxBytes + "b")
-            .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL, spanFill)
-            .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES, readAround ? "64kb" : "0b")
             .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
             .build();
+        DirectIOVectorCache.setSpanFillForTesting(spanFill);
+        DirectIOVectorCache.setReadAroundBytesForTesting(readAround ? 64L * 1024 : 0L);
         final Set<Setting<?>> registered = new HashSet<>(ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
         registered.addAll(
             KNNSettings.state()

@@ -158,8 +158,7 @@ public class KNNStats {
      *       and {@code readmissions} how many vectors a second chance kept; {@code evictions} is vectors
      *       dropped, by a reclaim or with a released slab. {@code span_fills} is vectors admitted because
      *       they lay inside a span a burst had already staged rather than because a read asked for them,
-     *       which is {@code 0} while {@code knn.direct_io.rescore.cache.span_fill} is false and once the
-     *       store is at its slab target. {@code slab_alloc_failures} counts the times the backend refused a
+     *       which is {@code 0} while the store is off and once it is at its slab target. {@code slab_alloc_failures} counts the times the backend refused a
      *       slab the store was below its target for; it is one per time growth was given up on, because the
      *       store then stops asking until its target changes or it releases a slab, so non-zero means the
      *       node is holding a smaller cache than {@code max_bytes} asked for. {@code slab_memory} names the
@@ -232,7 +231,7 @@ public class KNNStats {
         memory.put("live_bytes", DirectIOVectorIndexInput.reclaim());
         memory.put("peak_bytes", stats.directMemoryPeak());
         memory.put("declined_budget", stats.declinedBudget());
-        memory.put("budget_bytes", KNNSettings.getDirectIODirectMemoryBudget().getBytes());
+        memory.put("budget_bytes", DirectIOVectorIndexInput.directMemoryBudgetBytes());
         memory.put("wall_bytes", KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES);
         memory.put("arenas_allocated", stats.arenasAllocated());
         memory.put("arenas_reused", stats.arenasReused());

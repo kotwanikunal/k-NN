@@ -88,6 +88,15 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
     public void setUp() throws Exception {
         super.setUp();
         DirectIOStagingLease.resetForTesting();
+        // The direct-memory budget is a constant on a node; the cases below publish their own, so each
+        // starts from the shipped one and leaves it there.
+        DirectIOVectorIndexInput.resetBudgetsForTesting();
+    }
+
+    @Override
+    public void tearDown() throws Exception {
+        DirectIOVectorIndexInput.resetBudgetsForTesting();
+        super.tearDown();
     }
 
     @SneakyThrows
@@ -636,22 +645,17 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
             // which task-15 measured as a paced p99 of 30 ms against 11 ms at identical byte volume.
             assertEquals(
                 "the table size must default to the burst size",
-                KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_DEFAULT_VALUE,
+                DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGES,
                 input.maxStagedRanges()
             );
             assertEquals("and that default must be Lucene's bulk batch size", 64, input.maxStagedRanges());
         }
 
-        withNodeSettings(
-            Settings.builder()
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN, "16kb")
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES, 12)
-                .build()
-        );
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+        // Both are constants on a node, so a measurement that wants another geometry asks for it at open.
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 12, 16 * 1024)) {
             assertNotNull(input);
-            assertEquals("the span bound must follow the setting", 16 * 1024, input.maxStagedRangeBytes());
-            assertEquals("the table size must follow the setting", 12, input.maxStagedRanges());
+            assertEquals("the span bound must follow the overload", 16 * 1024, input.maxStagedRangeBytes());
+            assertEquals("the table size must follow the overload", 12, input.maxStagedRanges());
         }
     }
 
@@ -951,11 +955,9 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
         }
     }
 
-    /** The shipped default, pinned: 64 KB, node scoped and dynamic so the node can sweep it. */
+    /** The shipped window size, pinned: 64 KB, the knee the phase 13 audit measured. */
     public void testTheShippedReadaheadWindowBytesIsSixtyFourKilobytes() {
-        assertEquals(64L * 1024, KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_DEFAULT_VALUE.getBytes());
-        assertEquals("knn.direct_io.readahead.window_bytes", KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_SETTING.getKey());
-        assertTrue(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_SETTING.isDynamic());
+        assertEquals(64L * 1024, DirectIOVectorIndexInput.DEFAULT_READAHEAD_WINDOW_BYTES);
     }
 
     /**
@@ -1150,16 +1152,16 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
             assertEquals("the trigger must default to the measured value", 2, input.readaheadTrigger());
         }
 
-        withNodeSettings(
-            Settings.builder()
-                .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 8)
-                .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_TRIGGER, 3)
-                .build()
-        );
+        // The window count is the one that stays a setting; the trigger is a constant, so a sweep of it
+        // goes through the sizing overload.
+        withNodeSettings(Settings.builder().put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 8).build());
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
             assertEquals("the window must follow the setting", 8, input.readaheadWindows());
-            assertEquals("the trigger must follow the setting", 3, input.readaheadTrigger());
+        }
+        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path, 0, 64, 128 * 1024 + 4096, 8, 3)) {
+            assertNotNull(input);
+            assertEquals("the trigger must follow the overload", 3, input.readaheadTrigger());
         }
     }
 
@@ -1600,12 +1602,8 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
         final float[] scratch = new float[DIMENSION];
 
         // A budget no allocation can fit. The ring is off so that this measures the burst table alone.
-        withNodeSettings(
-            Settings.builder()
-                .put(KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET, "1b")
-                .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
-                .build()
-        );
+        withNodeSettings(Settings.builder().put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0).build());
+        DirectIOVectorIndexInput.setDirectMemoryBudgetForTesting(1L);
         DirectIOVectorIndexInput.STATS.reset();
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
@@ -1634,13 +1632,8 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
             assertTrue("the blocking window is accounted for", DirectIOVectorIndexInput.STATS.directMemoryLive() > 0);
         }
 
-        // Raised live. The same input class, a fresh input, no restart: prefetch must resume.
-        withNodeSettings(
-            Settings.builder()
-                .put(KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET, "64mb")
-                .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
-                .build()
-        );
+        // Raised. The same input class, a fresh input, no restart: prefetch must resume.
+        DirectIOVectorIndexInput.setDirectMemoryBudgetForTesting(64L * 1024 * 1024);
         DirectIOVectorIndexInput.STATS.reset();
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
@@ -1721,29 +1714,32 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
         final Path dir = createTempDir();
         final Path path = writeVectorFile(dir, randomVectors(500));
 
-        withNodeSettings(Settings.builder().put(KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET, "0b").build());
+        DirectIOVectorIndexInput.setDirectMemoryBudgetForTesting(0L);
         DirectIOVectorIndexInput.STATS.reset();
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
             input.prefetch(HEADER_LENGTH, VECTOR_BYTES);
-            assertNotNull("0b must not bound anything", input.stagingArena());
+            assertNotNull("a budget of zero must not bound anything", input.stagingArena());
             assertEquals(0L, DirectIOVectorIndexInput.STATS.declinedBudget());
         }
     }
 
     /**
-     * The shipped default is half the JVM's direct-memory wall, and the wall is read rather than assumed.
+     * The shipped budget is half the JVM's direct-memory wall, and the wall is read rather than assumed.
      * Pinned because it is the one number in D3 that is a judgement rather than a measurement.
      */
     public void testTheBudgetDefaultIsHalfTheDirectMemoryWall() {
-        assertEquals("knn.direct_io.direct_memory_budget", KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING.getKey());
-        assertTrue("it has to be tunable on a live node", KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING.isDynamic());
         assertEquals(
-            "the default is exactly half of the resolved wall",
+            "the budget is exactly half of the resolved wall",
             KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES / 2,
-            KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_DEFAULT_VALUE.getBytes()
+            DirectIOVectorIndexInput.DIRECT_MEMORY_BUDGET_BYTES
         );
-        assertTrue("and it is a positive number on this JVM", KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_DEFAULT_VALUE.getBytes() > 0);
+        assertTrue("and it is a positive number on this JVM", DirectIOVectorIndexInput.DIRECT_MEMORY_BUDGET_BYTES > 0);
+        assertEquals(
+            "and it is what a node bounds itself by",
+            DirectIOVectorIndexInput.DIRECT_MEMORY_BUDGET_BYTES,
+            DirectIOVectorIndexInput.directMemoryBudgetBytes()
+        );
     }
 
     // -----------------------------------------------------------------------------------------------
@@ -1806,12 +1802,8 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
             final long perThread = (long) probe.maxStagedRanges() * probe.arenaSlotBytes() + probe.blockSize() - 1 + probe.bufferSize()
                 + probe.blockSize() - 1;
             final long budget = settledDirectMemory() + threads * perThread + (1L << 20);
-            withNodeSettings(
-                Settings.builder()
-                    .put(KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET, budget + "b")
-                    .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
-                    .build()
-            );
+            withNodeSettings(Settings.builder().put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0).build());
+            DirectIOVectorIndexInput.setDirectMemoryBudgetForTesting(budget);
             DirectIOVectorIndexInput.STATS.reset();
 
             final CountDownLatch start = new CountDownLatch(1);
@@ -2114,12 +2106,8 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
         final Path dir = createTempDir();
         final Path path = writeVectorFile(dir, randomVectors(500));
 
-        withNodeSettings(
-            Settings.builder()
-                .put(KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET, "0b")
-                .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
-                .build()
-        );
+        withNodeSettings(Settings.builder().put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0).build());
+        DirectIOVectorIndexInput.setDirectMemoryBudgetForTesting(0L);
         DirectIOStagingLease.resetForTesting();
         DirectIOVectorIndexInput.STATS.reset();
 

@@ -106,7 +106,7 @@ public class DirectIOHalfFloatVectorTests extends KNNTestCase {
     public void testAHalfFloatVectorIsStagedAdmittedAndThenServed() {
         assumeDirectIOWorksHere();
         writeFixture(40L, EVEN_DIMENSION);
-        configure(8, true, "0b");
+        configure(8, true, 0L);
 
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
@@ -140,7 +140,7 @@ public class DirectIOHalfFloatVectorTests extends KNNTestCase {
     public void testAHitIsByteIdenticalToTheDelegatesRead() {
         assumeDirectIOWorksHere();
         writeFixture(41L, EVEN_DIMENSION);
-        configure(8, true, "0b");
+        configure(8, true, 0L);
 
         final int[] ordinals = { 0, 1, 7, 63, 128, 301, VECTOR_COUNT - 1 };
         try (MMapDirectory delegate = new MMapDirectory(path.getParent())) {
@@ -174,7 +174,7 @@ public class DirectIOHalfFloatVectorTests extends KNNTestCase {
         assumeDirectIOWorksHere();
         writeFixture(42L, ODD_DIMENSION);
         assertEquals("the premise: not a whole number of floats", 2, vectorBytes % 4);
-        configure(8, true, "0b");
+        configure(8, true, 0L);
 
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
@@ -207,7 +207,7 @@ public class DirectIOHalfFloatVectorTests extends KNNTestCase {
     public void testSpanFillAdmitsTheWholeHalfFloatVectorsOfASpan() {
         assumeDirectIOWorksHere();
         writeFixture(43L, EVEN_DIMENSION);
-        configure(8, true, "0b");
+        configure(8, true, 0L);
 
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
@@ -225,7 +225,7 @@ public class DirectIOHalfFloatVectorTests extends KNNTestCase {
     public void testSpanFillOffAdmitsOnlyTheRequestedVector() {
         assumeDirectIOWorksHere();
         writeFixture(44L, EVEN_DIMENSION);
-        configure(8, false, "0b");
+        configure(8, false, 0L);
 
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
@@ -245,7 +245,7 @@ public class DirectIOHalfFloatVectorTests extends KNNTestCase {
         assumeDirectIOWorksHere();
         writeFixture(45L, EVEN_DIMENSION);
         // Eight 64 KiB slabs against a 131 KiB file, so the whole file fits in the room the target leaves.
-        configure(8, true, "64kb");
+        configure(8, true, 64L * 1024);
 
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
@@ -290,7 +290,7 @@ public class DirectIOHalfFloatVectorTests extends KNNTestCase {
     public void testAHeaderOrAnOffGridReadIsNeitherServedNorAdmitted() {
         assumeDirectIOWorksHere();
         writeFixture(46L, EVEN_DIMENSION);
-        configure(8, false, "0b");
+        configure(8, false, 0L);
 
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
@@ -332,7 +332,7 @@ public class DirectIOHalfFloatVectorTests extends KNNTestCase {
     public void testAnUndeclaredInputNeitherServesNorAdmits() {
         assumeDirectIOWorksHere();
         writeFixture(47L, EVEN_DIMENSION);
-        configure(8, true, "0b");
+        configure(8, true, 0L);
 
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
@@ -360,7 +360,7 @@ public class DirectIOHalfFloatVectorTests extends KNNTestCase {
     public void testTheGridSurvivesTheBurstBoundaryAndAClone() {
         assumeDirectIOWorksHere();
         writeFixture(48L, EVEN_DIMENSION);
-        configure(8, false, "0b");
+        configure(8, false, 0L);
 
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
@@ -401,7 +401,7 @@ public class DirectIOHalfFloatVectorTests extends KNNTestCase {
     public void testTheRouteSwitchReachesTheBytePath() {
         assumeDirectIOWorksHere();
         writeFixture(49L, EVEN_DIMENSION);
-        configure(8, false, "0b");
+        configure(8, false, 0L);
 
         final AtomicBoolean enabled = new AtomicBoolean(false);
         try (MMapDirectory delegate = new MMapDirectory(path.getParent())) {
@@ -438,7 +438,7 @@ public class DirectIOHalfFloatVectorTests extends KNNTestCase {
     public void testTheRacesSynchronousReadIsAdmittedOnTheBytePath() {
         assumeDirectIOWorksHere();
         writeFixture(50L, EVEN_DIMENSION);
-        configure(8, false, "0b");
+        configure(8, false, 0L);
 
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
@@ -535,17 +535,17 @@ public class DirectIOHalfFloatVectorTests extends KNNTestCase {
         KNNSettings.state().setClusterService(clusterService);
     }
 
-    private void configure(final int slabs, final boolean spanFill, final String readAround) {
+    private void configure(final int slabs, final boolean spanFill, final long readAroundBytes) {
         final long maxBytes = (long) slabs * TEST_SLAB_BYTES;
         withNodeSettings(
             Settings.builder()
                 .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, maxBytes + "b")
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL, spanFill)
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES, readAround)
                 .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
                 .build()
         );
         DirectIOVectorCache.resetForTesting();
+        DirectIOVectorCache.setSpanFillForTesting(spanFill);
+        DirectIOVectorCache.setReadAroundBytesForTesting(readAroundBytes);
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
         DirectIOVectorCache.configure(maxBytes);
         DirectIOVectorIndexInput.STATS.reset();

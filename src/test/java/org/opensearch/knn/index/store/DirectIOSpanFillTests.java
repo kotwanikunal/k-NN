@@ -285,9 +285,9 @@ public class DirectIOSpanFillTests extends KNNTestCase {
         }
     }
 
-    /** The setting off restores M3's admission: the requested vector and nothing else. */
+    /** Span fill off restores M3's admission: the requested vector and nothing else. */
     @SneakyThrows
-    public void testTheSettingOffRestoresRequestedOnlyAdmission() {
+    public void testSpanFillOffRestoresRequestedOnlyAdmission() {
         assumeDirectIOWorksHere();
         writeFixture(6L);
         spanFillOff(4);
@@ -304,9 +304,12 @@ public class DirectIOSpanFillTests extends KNNTestCase {
         }
     }
 
-    /** The setting is dynamic, so turning it on mid-life must take effect at the next burst. */
+    /**
+     * Span fill is answered per read and not captured at open, so turning it on under an open input takes
+     * effect on that input's next burst.
+     */
     @SneakyThrows
-    public void testTheSettingTakesEffectAtTheNextBurst() {
+    public void testSpanFillTakesEffectWithoutReopeningTheInput() {
         assumeDirectIOWorksHere();
         writeFixture(7L);
         spanFillOff(4);
@@ -316,15 +319,9 @@ public class DirectIOSpanFillTests extends KNNTestCase {
             readVector(input, offsetOf(10), new float[DIMENSION]);
             assertEquals(0L, DirectIOVectorCache.spanFills());
 
-            withNodeSettings(
-                Settings.builder()
-                    .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, (4L * TEST_SLAB_BYTES) + "b")
-                    .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL, true)
-                    .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
-                    .build()
-            );
+            DirectIOVectorCache.setSpanFillForTesting(true);
             readVector(input, offsetOf(300), new float[DIMENSION]);
-            assertTrue("the next burst picked the setting up", DirectIOVectorCache.spanFills() > 0);
+            assertTrue("the next burst picked span fill up", DirectIOVectorCache.spanFills() > 0);
         }
     }
 
@@ -530,11 +527,11 @@ public class DirectIOSpanFillTests extends KNNTestCase {
         withNodeSettings(
             Settings.builder()
                 .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, maxBytes + "b")
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL, spanFill)
                 .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
                 .build()
         );
         DirectIOVectorCache.resetForTesting();
+        DirectIOVectorCache.setSpanFillForTesting(spanFill);
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
         DirectIOVectorCache.configure(maxBytes);
         DirectIOVectorIndexInput.STATS.reset();

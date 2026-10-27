@@ -262,47 +262,38 @@ public class DirectIOSegmentedStatsTests extends KNNTestCase {
     // ---------------------------------------------------------------------------------------------------
 
     /**
-     * Every {@code knn.direct_io.*}, {@code knn.memory.*} and {@code knn.cache.*} key section Q inherited is
-     * still registered and still has the default it had, because the plan forbids removing a key or changing
-     * a default and {@code output/REMOVED-SETTINGS.md} says "none". Section Q adds none either: the segment
-     * count derives from the node, which is the plan's rule for a value that differs between tiers.
+     * The {@code knn.direct_io.*} surface is exactly the six keys an operator has, each still with the
+     * default it had: the nine F-03 removed are constants at the same values, which
+     * {@code KNNDirectIOConstantsTests} pins against the baseline dump, and nothing may change a default.
      */
-    public void testNoSettingKeyWasRemovedAndNoDefaultChanged() {
-        final Setting<?>[] inherited = {
+    public void testTheSettingSurfaceIsTheSixKeptKeysAtTheirDefaults() {
+        final Setting<?>[] kept = {
             KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED_SETTING,
             KNNSettings.KNN_DIRECT_IO_MIN_FILE_SIZE_SETTING,
             KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING,
-            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_SETTING,
-            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING,
-            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING,
-            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET_SETTING,
-            KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING,
             KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_SETTING,
-            KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_SETTING,
-            KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES_SETTING,
             KNNSettings.KNN_DIRECT_IO_RESCORE_READ_PROFILE_SETTING,
-            KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING,
-            KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_SETTING,
-            KNNSettings.KNN_DIRECT_IO_READAHEAD_TRIGGER_SETTING };
-        for (final Setting<?> setting : inherited) {
-            assertNotNull("a setting Q inherited must still exist", setting);
+            KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING };
+        for (final Setting<?> setting : kept) {
+            assertNotNull("a kept setting must still exist", setting);
             assertNotNull(
                 setting.getKey() + " must still have a default",
                 setting.getDefaultRaw(org.opensearch.common.settings.Settings.EMPTY)
             );
         }
+        assertEquals(
+            "and the surface is those six and nothing else",
+            6L,
+            KNNSettings.state().getSettings().stream().filter(s -> s.getKey().startsWith("knn.direct_io.")).count()
+        );
         // The three the cache itself owns, by value, because those are the ones Q touches the code of.
         assertEquals(
             "knn.direct_io.rescore.cache.max_bytes still defaults to 0b, so the cache is still off by default",
             new ByteSizeValue(0, ByteSizeUnit.BYTES),
             KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_DEFAULT_VALUE
         );
-        assertTrue("span_fill still defaults to true", KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_DEFAULT_VALUE);
-        assertEquals(
-            "read_around_bytes still defaults to 64kb",
-            new ByteSizeValue(64, ByteSizeUnit.KB),
-            KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES_DEFAULT_VALUE
-        );
+        assertTrue("span fill is still on", DirectIOVectorCache.SPAN_FILL);
+        assertEquals("read-around is still 64kb", 64L * 1024, DirectIOVectorCache.READ_AROUND_BYTES);
         // And the store is off at its default, which is what "off is off" rests on.
         DirectIOVectorCache.resetForTesting();
         assertFalse("the store is off before any configure", DirectIOVectorCache.isOn());

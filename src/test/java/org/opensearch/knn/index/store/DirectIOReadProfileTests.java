@@ -83,9 +83,11 @@ public class DirectIOReadProfileTests extends KNNTestCase {
 
     private static final int VECTOR_COUNT = 2_048;
     private static final int TEST_SLAB_BYTES = 1024 * 1024;
+    /** The span cap the current arm sweeps, applied by {@link #openAtCap(Path)}. */
+    private int capBytes = DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGE_BYTES;
     private static final long BYTES_128 = 128 * 1024;
     /** A cap low enough that it, and not the 128 KB group budget, is what closes a gapless run. */
-    private static final String LOW_CAP = "16kb";
+    private static final int LOW_CAP = 16 * 1024;
 
     private float[][] vectors;
     private Path path;
@@ -136,7 +138,7 @@ public class DirectIOReadProfileTests extends KNNTestCase {
         writeFixture(1L, NARROW_VECTOR_BYTES, 0);
         configure("bytes", LOW_CAP);
 
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+        try (DirectIOVectorIndexInput input = openAtCap(path)) {
             assertNotNull(input);
             assumeTrue("this filesystem's block is not 4 KiB", input.blockSize() == 4096);
             assertEquals("bytes", DirectIOVectorIndexInput.readProfile());
@@ -168,7 +170,7 @@ public class DirectIOReadProfileTests extends KNNTestCase {
         writeFixture(2L, FP32_VECTOR_BYTES, 0);
         configure("bytes", LOW_CAP);
 
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+        try (DirectIOVectorIndexInput input = openAtCap(path)) {
             assertNotNull(input);
             assumeTrue("this filesystem's block is not 4 KiB", input.blockSize() == 4096);
 
@@ -201,7 +203,7 @@ public class DirectIOReadProfileTests extends KNNTestCase {
         writeFixture(3L, NARROW_VECTOR_BYTES, 44);
         configure("bytes", LOW_CAP);
 
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+        try (DirectIOVectorIndexInput input = openAtCap(path)) {
             assertNotNull(input);
             assumeTrue("this filesystem's block is not 4 KiB", input.blockSize() == 4096);
 
@@ -236,7 +238,7 @@ public class DirectIOReadProfileTests extends KNNTestCase {
         writeFixture(4L, FP32_VECTOR_BYTES, 44);
         configure("ops", LOW_CAP);
 
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+        try (DirectIOVectorIndexInput input = openAtCap(path)) {
             assertNotNull(input);
             assertEquals("ops", DirectIOVectorIndexInput.readProfile());
             for (final int[] batch : List.of(
@@ -299,7 +301,7 @@ public class DirectIOReadProfileTests extends KNNTestCase {
 
         // Scattered far enough apart that every one of them is its own bytes group.
         final int[] batch = { 10, 100, 200, 300, 400, 500, 600, 700 };
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+        try (DirectIOVectorIndexInput input = openAtCap(path)) {
             assertNotNull(input);
             final int[] copy = batch.clone();
             PrefetchHelper.prefetch(input, 44, FP32_VECTOR_BYTES, copy, copy.length);
@@ -342,7 +344,7 @@ public class DirectIOReadProfileTests extends KNNTestCase {
         final int dimension = NARROW_VECTOR_BYTES / Float.BYTES;
 
         final int[] batch = { 10, 110, 210, 310, 410, 510, 610, 710 };
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+        try (DirectIOVectorIndexInput input = openAtCap(path)) {
             assertNotNull(input);
             assumeTrue("this filesystem's block is not 4 KiB", input.blockSize() == 4096);
             final int[] copy = batch.clone();
@@ -479,27 +481,35 @@ public class DirectIOReadProfileTests extends KNNTestCase {
     }
 
     /** The store off: the geometry under test is then the grouping's and nothing else. */
-    private void configure(final String profile, final String cap) {
+    private void configure(final String profile, final int cap) {
         configure(profile, cap, 0, false);
     }
 
-    private void configure(final String profile, final String cap, final int slabs, final boolean spanFill) {
+    private void configure(final String profile, final int cap, final int slabs, final boolean spanFill) {
         final long maxBytes = (long) slabs * TEST_SLAB_BYTES;
+        capBytes = cap;
         withNodeSettings(
             Settings.builder()
                 .put(KNNSettings.KNN_DIRECT_IO_RESCORE_READ_PROFILE, profile)
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN, cap)
                 .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, maxBytes + "b")
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL, spanFill)
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES, "0b")
                 .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
                 .build()
         );
         DirectIOVectorCache.resetForTesting();
+        DirectIOVectorCache.setSpanFillForTesting(spanFill);
+        DirectIOVectorCache.setReadAroundBytesForTesting(0L);
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
         DirectIOVectorCache.configure(maxBytes);
         DirectIOVectorIndexInput.STATS.reset();
         DirectIOVectorIndexInput.resetReadProfileForTesting();
+    }
+
+    /**
+     * An input opened at the span cap the arm is sweeping. The cap is a constant on a node, so a sweep of it
+     * goes through the sizing overload, which is what that overload exists for.
+     */
+    private DirectIOVectorIndexInput openAtCap(final Path file) {
+        return DirectIOVectorIndexInput.open(file, 0, DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGES, capBytes, 0, 0, 2);
     }
 
     @SneakyThrows

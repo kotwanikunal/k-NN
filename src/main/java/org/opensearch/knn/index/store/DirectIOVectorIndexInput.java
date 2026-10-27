@@ -8,7 +8,6 @@ package org.opensearch.knn.index.store;
 import lombok.extern.log4j.Log4j2;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.Nullable;
-import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.knn.index.KNNSettings;
 
 import java.io.EOFException;
@@ -439,10 +438,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
 
         /**
-         * Staged miss reads widened by {@code knn.direct_io.rescore.cache.read_around_bytes} (O5). Against
-         * {@code staged_reads} this says how much of the staging was widened; it is 0 at the setting's
-         * {@code 0b}, 0 once the store's target no longer leaves room for the whole file, and 0 with span
-         * fill off, which are the three gates.
+         * Staged miss reads widened by {@code DirectIOVectorCache#READ_AROUND_BYTES} (O5). Against
+         * {@code staged_reads} this says how much of the staging was widened; it is 0 once the store's target
+         * no longer leaves room for the whole file and 0 with the store off, which are its gates.
          */
         public long readAroundReads() {
             return readAroundReads.get();
@@ -606,7 +604,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
 
         /**
-         * Prefetches declined because {@code knn.direct_io.direct_memory_budget} was reached. Each one costs
+         * Prefetches declined because {@link DirectIOVectorIndexInput#DIRECT_MEMORY_BUDGET_BYTES} was reached. Each one costs
          * read-ahead for one burst and leaves the query correct, because the bytes are then served by
          * blocking reads — the same fallback a queue-capacity decline takes. Non-zero means the node is
          * holding as much direct memory for vector reads as it has been allowed to.
@@ -617,8 +615,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
         /**
          * The high-water mark of reads waiting behind the pool. Against
-         * {@code knn.direct_io.rescore.prefetch.queue_capacity} this says whether the queue ever came near
-         * filling, which is the question the node's 0-declines-at-both-1024-and-4096 result left open.
+         * {@code DirectIOReadPool#queueCapacity} this says whether the queue ever came near filling, which is
+         * the question the node's 0-declines-at-both-1024-and-4096 result left open.
          */
         public long queuePeak() {
             return queuePeak.get();
@@ -966,9 +964,14 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     private static final Set<Charge> CHARGES = ConcurrentHashMap.newKeySet();
 
     /**
-     * Default ranges a single prefetch burst may hold in flight: the size of Lucene's bulk batch, because
-     * a table smaller than the burst declines the burst's tail. Only the fallback since 9d-5 —
-     * {@link #open(Path)} reads {@code knn.direct_io.rescore.prefetch.staged_ranges}, whose default this is.
+     * Ranges a single prefetch burst may hold in flight: the size of Lucene's bulk batch, because a table
+     * smaller than the burst declines the burst's tail.
+     *
+     * <p>A constant rather than a setting, because the value is not a tuning choice but the batch size
+     * {@code PrefetchHelper} is driven by: a smaller table declines the tail of every burst and those
+     * ranges become blocking reads on the calling thread, and a larger one cannot help, because nothing
+     * asks for more than a batch in one burst. The sizing {@link #open(Path, int, int, int)} overloads
+     * carry another value for a measurement that wants one.
      */
     static final int DEFAULT_MAX_STAGED_RANGES = 64;
 
@@ -977,11 +980,53 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * 128 KB, so this is that plus a block for the alignment slack at each end; a larger range falls back to
      * blocking reads rather than to a buffer nobody budgeted for.
      *
-     * <p>Since 9d-5 this is only the <em>default</em>: {@link #open(Path)} reads
-     * {@code knn.direct_io.rescore.prefetch.max_span_bytes}, whose own default is this value, so that the
-     * bound can be lowered without a rebuild. Lowering it is the waste guard — see {@link #prefetch}.
+     * <p>A constant rather than a setting, for the same reason the table size is: it is the grouping budget
+     * of the caller plus the alignment slack, not a value with a better choice in it. Lowering it trades
+     * read-ahead for byte economy, which is a measurement the sizing overloads make.
      */
     static final int DEFAULT_MAX_STAGED_RANGE_BYTES = 128 * 1024 + 4096;
+
+    /**
+     * Bytes per read-ahead window — the sequential ring's request size, which phase 14 decoupled from
+     * {@code bufferSize} because the two access shapes want opposite sizes: sequential throughput goes
+     * 49.7 to 371.2 MiB/s from 8 KiB to 64 KiB, while the random path's amplification tracks the buffer
+     * size and must stay at 8 KiB.
+     *
+     * <p>A constant rather than a setting: 64 KiB is the knee, 256 KiB buys nothing sequentially, and the
+     * ring's own on/off switch is {@code knn.direct_io.readahead.window}. The seven-argument
+     * {@link #open(Path, int, int, int, int, int, int)} overload carries another value for a sweep.
+     */
+    static final int DEFAULT_READAHEAD_WINDOW_BYTES = 64 * 1024;
+
+    /**
+     * Consecutive gapless-forward blocking reads before the read-ahead ring arms — the no-waste guard, which
+     * a random (rescore) workload never crosses, so read-ahead issues zero speculative reads on that
+     * pattern.
+     *
+     * <p>A constant rather than a setting, because an operator who distrusts the no-waste claim turns the
+     * ring off with {@code knn.direct_io.readahead.window} rather than raising the trigger, and that is the
+     * arm the measurements are taken against.
+     */
+    static final int DEFAULT_READAHEAD_TRIGGER = 2;
+
+    /**
+     * The node-wide ceiling on direct buffers this read path holds at once, past which a prefetch declines
+     * and the bytes are served by blocking reads. Phase 13's audit FIX 3: Lucene's
+     * {@code OffHeapFloatVectorValues} is not {@code Closeable}, so {@link #close()} never runs on a
+     * per-query slice and a staging table lives until the cleaner reclaims it, which left 1.69 GB of live
+     * direct buffers against a 2 GB wall on the bench node.
+     *
+     * <p><b>Half the wall</b> ({@link KNNSettings#KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES}, the operator's
+     * explicit {@code -XX:MaxDirectMemorySize} or {@code heapSize / 2}), and not all of it, because the wall
+     * is shared: every other plugin's direct allocations are charged to the same limit, and a ceiling set at
+     * the wall would turn a contained decline here into an {@code OutOfMemoryError: Direct buffer memory}
+     * for whoever allocated next.
+     *
+     * <p>A constant rather than a setting: it is a bound, not a tuning knob, and it is derived from the one
+     * number that does vary between nodes. {@link #setDirectMemoryBudgetForTesting(long)} is the seam a test
+     * that must drive a decline, or run with the bound off, uses.
+     */
+    static final long DIRECT_MEMORY_BUDGET_BYTES = KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES / 2;
 
     /**
      * How long a read may wait for a staged read before giving up and issuing it itself.
@@ -997,10 +1042,32 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     static final long STAGED_READ_WAIT_MILLIS = 1000L;
 
     /**
-     * What fraction of {@code knn.direct_io.direct_memory_budget} the wide-group buffers may hold when their
-     * own setting is at its {@code 0b} default: one in {@value}. See {@link #allocateWideBuffer}.
+     * What fraction of {@link #DIRECT_MEMORY_BUDGET_BYTES} the wide-group buffers may hold: one in
+     * {@value}. See {@link #allocateWideBuffer}.
+     *
+     * <p>A quarter and not a half because the arenas are the mechanism's common case — phase 12 S3.1
+     * measured the mean aligned span at 7,310 B, so nearly every group fits an arena slot and needs no wide
+     * buffer at all — and the arenas must always have room. Wide buffers accumulating to the whole budget
+     * would leave none for an arena, and then every prefetch declines; a budget that wedges the feature is
+     * not a bound on it.
      */
     static final int WIDE_BUFFER_BUDGET_SHARE = 4;
+
+    /**
+     * The live direct-memory bound, {@link #DIRECT_MEMORY_BUDGET_BYTES} except where a test has moved it,
+     * and {@code 0} for off. Production writes it once, at class load.
+     *
+     * @see #setDirectMemoryBudgetForTesting(long)
+     */
+    private static volatile long directMemoryBudgetBytes = DIRECT_MEMORY_BUDGET_BYTES;
+
+    /**
+     * The live wide-group sub-budget, {@code 0} meaning derive it from {@link #directMemoryBudgetBytes}.
+     * Production never writes it.
+     *
+     * @see #setWideBufferBudgetForTesting(long)
+     */
+    private static volatile long wideBufferBudgetOverrideBytes;
 
     /** Hands out {@link #inputId}. Node wide, because a lease is per thread and meets inputs from anywhere. */
     private static final AtomicLong INPUT_IDS = new AtomicLong();
@@ -1276,45 +1343,12 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             mmapFallback,
             routeEnabled,
             0,
-            configuredMaxStagedRanges(),
-            configuredMaxStagedRangeBytes(),
+            DEFAULT_MAX_STAGED_RANGES,
+            DEFAULT_MAX_STAGED_RANGE_BYTES,
             configuredReadaheadWindow(),
-            configuredReadaheadWindowBytes(),
-            configuredReadaheadTrigger()
+            DEFAULT_READAHEAD_WINDOW_BYTES,
+            DEFAULT_READAHEAD_TRIGGER
         );
-    }
-
-    /**
-     * How many ranges one burst may hold in flight, from
-     * {@code knn.direct_io.rescore.prefetch.staged_ranges}.
-     *
-     * <p>Its own setting rather than the rescore seam's removed {@code prefetch_window}, which task-15
-     * first tried: that window was a rolling ring refilled as it drained, this is a table that must
-     * <b>hold a whole
-     * burst</b>, and the burst's size is not ours to choose. {@code PrefetchHelper} is driven by Lucene's
-     * 64-ordinal bulk batch, so a table smaller than 64 declines the tail of <em>every</em> burst and those
-     * ranges become blocking reads on the calling thread. Measured on {@code dio-1m}: at 48 the route made
-     * 5.4 blocking reads per query and the paced p99 was 30 ms; at 64 it makes 0.0 and the paced p99 is
-     * 11 ms, at <b>identical byte volume</b> (2,581 vs 2,591 KiB/query).
-     */
-    private static int configuredMaxStagedRanges() {
-        final int configured = KNNSettings.getDirectIORescorePrefetchStagedRanges();
-        return configured > 0 ? configured : DEFAULT_MAX_STAGED_RANGES;
-    }
-
-    /**
-     * The span bound from {@code knn.direct_io.rescore.prefetch.max_span_bytes}, clamped into int range.
-     * Read here, once per {@code .vec} open, rather than per prefetch: the bound sizes the staging buffers,
-     * and a bound that moved under a burst would mean a buffer allocated for one size holding another.
-     * A setting that cannot be read falls back to its default, the same contract every other Direct I/O
-     * setting has — this must never be the reason a shard fails to open.
-     */
-    private static int configuredMaxStagedRangeBytes() {
-        final ByteSizeValue configured = KNNSettings.getDirectIORescorePrefetchMaxSpan();
-        if (configured == null || configured.getBytes() <= 0) {
-            return DEFAULT_MAX_STAGED_RANGE_BYTES;
-        }
-        return Math.toIntExact(Math.min(configured.getBytes(), Integer.MAX_VALUE / 2));
     }
 
     /**
@@ -1334,37 +1368,6 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     }
 
     /**
-     * Bytes per read-ahead window, from {@code knn.direct_io.readahead.window_bytes}. Read once per
-     * {@code .vec} open for the same reason the window count is: the value sizes the ring's arena, and a
-     * value that moved under a running ring would mean a buffer allocated for one size holding another.
-     * Clamped into int range; a setting that cannot be read falls back to its default.
-     *
-     * @see #readaheadWindowBytes
-     */
-    private static int configuredReadaheadWindowBytes() {
-        try {
-            final ByteSizeValue configured = KNNSettings.getDirectIOReadaheadWindowBytes();
-            if (configured == null || configured.getBytes() <= 0) {
-                return Math.toIntExact(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_DEFAULT_VALUE.getBytes());
-            }
-            return Math.toIntExact(Math.min(configured.getBytes(), Integer.MAX_VALUE / 2));
-        } catch (RuntimeException e) {
-            log.debug("Could not read knn.direct_io.readahead.window_bytes; using the default", e);
-            return Math.toIntExact(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_DEFAULT_VALUE.getBytes());
-        }
-    }
-
-    /** The arm trigger, from {@code knn.direct_io.readahead.trigger}; same read-once, fall-back contract. */
-    private static int configuredReadaheadTrigger() {
-        try {
-            return Math.max(1, KNNSettings.getDirectIOReadaheadTrigger());
-        } catch (RuntimeException e) {
-            log.debug("Could not read knn.direct_io.readahead.trigger; using the default", e);
-            return KNNSettings.KNN_DIRECT_IO_READAHEAD_TRIGGER_DEFAULT_VALUE;
-        }
-    }
-
-    /**
      * As {@link #open(Path)}, with the sizes chosen by the caller so that a measurement can sweep them.
      *
      * @param bufferSize          bytes per blocking read, or 0 for twice the block size, which serves any
@@ -1379,15 +1382,16 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final int maxStagedRangeBytes
     ) {
         // The four-argument overload keeps its signature so the phase-9 queue-depth probe compiles against
-        // it unchanged; it picks up the read-ahead sizes from settings, exactly as open(Path) does.
+        // it unchanged; it takes the ring's window count from the setting and its sizes from the constants,
+        // exactly as open(Path) does.
         return open(
             path,
             bufferSize,
             maxStagedRanges,
             maxStagedRangeBytes,
             configuredReadaheadWindow(),
-            configuredReadaheadWindowBytes(),
-            configuredReadaheadTrigger()
+            DEFAULT_READAHEAD_WINDOW_BYTES,
+            DEFAULT_READAHEAD_TRIGGER
         );
     }
 
@@ -1576,7 +1580,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final long alignedStart = start - Math.floorMod(start, (long) blockSize);
         final int offset = Math.toIntExact(start - alignedStart);
         final int alignedLength = alignUp(offset + bytes, blockSize);
-        // Untracked by knn.direct_io.direct_memory_budget, deliberately: the budget's accounting holds a
+        // Untracked by the direct-memory budget, deliberately: the budget's accounting holds a
         // charge until the collector reclaims the buffer, so charging a buffer that lives for one open would
         // make live_bytes and peak_bytes a function of the open rate rather than of what is being read.
         // It is at most two blocks, and it is unreachable the moment this method returns.
@@ -1637,8 +1641,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      *
      * <p>Public since P1, because the grouping that produces the spans is one layer up in
      * {@code PrefetchHelper} and a group it closes before this bound is a group this input stages rather than
-     * declines. The bound is read from {@code knn.direct_io.rescore.prefetch.max_span_bytes} at open, so it
-     * is per input and not a constant the helper could carry.
+     * declines. The bound is chosen at open, so it is per input and not a constant the helper could carry.
      */
     public int maxStagedRangeBytes() {
         return maxStagedRangeBytes;
@@ -1932,7 +1935,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * vectors (a 128 KB span, none of it wasted) from a group of two vectors 120 KB apart (a 120 KB span,
      * 95% of it wasted). The gap structure exists one layer up and is not on this interface.
      *
-     * <p>What is left is a bound on the span, {@code knn.direct_io.rescore.prefetch.max_span_bytes}. Above
+     * <p>What is left is a bound on the span, {@link #DEFAULT_MAX_STAGED_RANGE_BYTES}. Above
      * it the range is declined, which costs read-ahead for exactly those groups and saves whatever their
      * gaps were: the bytes are then served by {@link #blockingSource}, one {@link #bufferSize} window per
      * vector touched and nothing for the gaps. That is a real trade and not a free win, which is why the
@@ -2109,7 +2112,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             // queue-capacity decline takes, already exercised on every arm.
             STATS.recordDeclinedBudget();
             log.debug(
-                "knn.direct_io.direct_memory_budget reached ({} B live); prefetch of {} declines and reads will block",
+                "The Direct I/O direct-memory budget was reached ({} B live); prefetch of {} declines and reads will block",
                 STATS.directMemoryLive(),
                 handle.path
             );
@@ -2185,7 +2188,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
     /**
      * One block-aligned direct buffer of at least {@code usableBytes}, charged to
-     * {@code knn.direct_io.direct_memory_budget}'s accounting.
+     * the direct-memory budget's accounting.
      *
      * <p>The charge is the <em>allocation</em>, not the aligned slice returned: the allocation is what the
      * JVM counts against {@code MaxDirectMemorySize}, and the {@code blockSize - 1} of alignment slack is
@@ -2224,7 +2227,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * A {@link DirectIOStagingLease} keeps one wide buffer per {@code staged_ranges} slot, grown on demand
      * to at most {@code max_span_bytes} and then <b>kept for the life of the arena</b>. At the defaults that
      * is 64 x 135,168 B = 8.25 MiB per thread, and a lease is per thread with no bound on the number of
-     * threads: 225 search threads on a 64-vCPU node reach 1.95 GB. {@code knn.direct_io.direct_memory_budget}
+     * threads: 225 search threads on a 64-vCPU node reach 1.95 GB. {@link #DIRECT_MEMORY_BUDGET_BYTES}
      * counts them, but it is one pot shared with the arenas, which are reused while these are held -- so wide
      * buffers accumulating to the overall budget would leave no room for an arena and then every prefetch
      * would decline. A budget that wedges the feature is not a bound on it.
@@ -2260,24 +2263,17 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     }
 
     /**
-     * The wide-group sub-budget in bytes, derived from the overall budget when the setting is {@code 0b},
-     * and {@code 0} when it is off. A setting that cannot be read is treated as off, for the same reason
-     * {@link #fitsBudget} treats one that way.
+     * The wide-group sub-budget in bytes: a quarter of the overall budget, and {@code 0} when that budget is
+     * off, so that the rule the budget has always had holds here too — a budget must never be the reason a
+     * shard cannot read its vectors.
      */
     public static long wideBufferBudgetBytes() {
-        try {
-            final ByteSizeValue configured = KNNSettings.getDirectIORescorePrefetchWideBufferBudget();
-            final long explicit = configured == null ? 0L : configured.getBytes();
-            if (explicit > 0) {
-                return explicit;
-            }
-            final ByteSizeValue overall = KNNSettings.getDirectIODirectMemoryBudget();
-            final long budget = overall == null ? 0L : overall.getBytes();
-            return budget <= 0 ? 0L : budget / WIDE_BUFFER_BUDGET_SHARE;
-        } catch (RuntimeException e) {
-            log.debug("Could not read the wide-group buffer budget; not bounding this allocation", e);
-            return 0L;
+        final long explicit = wideBufferBudgetOverrideBytes;
+        if (explicit > 0) {
+            return explicit;
         }
+        final long budget = directMemoryBudgetBytes;
+        return budget <= 0 ? 0L : budget / WIDE_BUFFER_BUDGET_SHARE;
     }
 
     /**
@@ -2318,9 +2314,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     }
 
     /**
-     * Whether {@code usableBytes} more of direct buffer fits under
-     * {@code knn.direct_io.direct_memory_budget}. A budget of {@code 0b} is off, and a setting that cannot
-     * be read is treated as off — a budget must never be the reason a shard cannot read its vectors.
+     * Whether {@code usableBytes} more of direct buffer fits under {@link #DIRECT_MEMORY_BUDGET_BYTES}. A
+     * budget of {@code 0} is off — a budget must never be the reason a shard cannot read its vectors.
      *
      * <p>Since D3c this is consulted only where a {@link DirectIOStagingLease} must carve: a new arena, a new
      * wide-group buffer, or a read-ahead ring. A burst that takes its thread's arena back allocates nothing
@@ -2329,18 +2324,48 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      */
     static boolean fitsBudget(final long usableBytes, final int blockSize) {
         final long live = reclaim();
-        final long budget;
-        try {
-            final ByteSizeValue configured = KNNSettings.getDirectIODirectMemoryBudget();
-            budget = configured == null ? 0L : configured.getBytes();
-        } catch (RuntimeException e) {
-            log.debug("Could not read knn.direct_io.direct_memory_budget; not bounding this allocation", e);
-            return true;
-        }
+        final long budget = directMemoryBudgetBytes;
         if (budget <= 0) {
             return true;
         }
         return live + allocationBytes(usableBytes, blockSize) <= budget;
+    }
+
+    /**
+     * The budget this read path is bounding itself by right now, which is
+     * {@link #DIRECT_MEMORY_BUDGET_BYTES} on a node and whatever a test has published otherwise.
+     *
+     * @return the live direct-memory budget in bytes, {@code 0} for off
+     */
+    public static long directMemoryBudgetBytes() {
+        return directMemoryBudgetBytes;
+    }
+
+    /**
+     * Test seam: publishes the direct-memory budget, {@code 0} turning the bound off. A node never calls
+     * this; the budget is {@link #DIRECT_MEMORY_BUDGET_BYTES}, and a test that must drive a decline, or
+     * measure the unbounded footprint the bound is read against, has no other way to move it.
+     *
+     * @see #resetBudgetsForTesting()
+     */
+    static void setDirectMemoryBudgetForTesting(final long bytes) {
+        directMemoryBudgetBytes = Math.max(0L, bytes);
+    }
+
+    /**
+     * Test seam: publishes an explicit wide-group sub-budget, {@code 0} restoring the derived one. A node
+     * never calls this.
+     *
+     * @see #resetBudgetsForTesting()
+     */
+    static void setWideBufferBudgetForTesting(final long bytes) {
+        wideBufferBudgetOverrideBytes = Math.max(0L, bytes);
+    }
+
+    /** Test seam: restores both budgets to what a node runs with. */
+    static void resetBudgetsForTesting() {
+        directMemoryBudgetBytes = DIRECT_MEMORY_BUDGET_BYTES;
+        wideBufferBudgetOverrideBytes = 0L;
     }
 
     /**
@@ -2879,7 +2904,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * so the lease remembers which input filled it ({@link DirectIOStagingLease#windowPosition}) and will not
      * answer a cached position to any other.
      *
-     * <p>It is charged to {@code knn.direct_io.direct_memory_budget}'s accounting (so {@code live_bytes} is
+     * <p>It is charged to the direct-memory budget's accounting (so {@code live_bytes} is
      * the truth about this class's direct memory) but is <b>never declined</b> by it, and that is forced
      * rather than chosen: this is the path every other decline falls back <em>to</em>. Declining it would
      * leave a read with nothing to read with, which is a failed query rather than a bounded one.
@@ -3047,7 +3072,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 STATS.recordDeclinedBudget();
                 STATS.readaheadDeclined.incrementAndGet();
                 log.debug(
-                    "knn.direct_io.direct_memory_budget reached ({} B live); the read-ahead ring of {} is not armed",
+                    "The Direct I/O direct-memory budget was reached ({} B live); the read-ahead ring of {} is not armed",
                     STATS.directMemoryLive(),
                     handle.path
                 );

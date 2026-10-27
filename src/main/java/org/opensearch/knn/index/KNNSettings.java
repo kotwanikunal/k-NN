@@ -196,93 +196,17 @@ public class KNNSettings {
         return Math.min(KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_MAX, Math.max(KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_MIN, 2 * cores));
     }
 
-    // The waste guard on the directory design's read-ahead channel: the largest single prefetch span
-    // DirectIOVectorIndexInput will put in flight. A span above it is declined, which is correct by the
-    // prefetch contract and leaves the bytes to blocking reads that touch only the blocks a vector is in.
-    //
-    // It exists because the read-ahead channel is Lucene's IndexInput#prefetch, whose only arguments are
-    // an offset and a length, and because the caller on this path -- PrefetchHelper#prefetchExactVectorSize
-    // -- asks for the SPAN of a coalesced group of ordinals, gaps included, extending a group while
-    // (vector end - group start) <= 128 KB. A group of two ordinals 120 KB apart is therefore one
-    // 120 KB request for 6 KB of vectors, and the input cannot see which bytes inside the span will be
-    // read: the gap structure is the caller's and is not in the arguments. So a guard here can only be a
-    // bound on the span, never a bound on the waste, and 9e-2's R60 -- that the paced p99 tracks byte
-    // volume (2.55x against a 2.50x p99 ratio) -- is what says whether bounding the span is worth its
-    // cost in queue depth.
-    //
-    // The default is 128 KB + one 4 KB block, i.e. PrefetchHelper's own grouping budget plus the
-    // alignment slack at each end, which is the value 9e-2 measured; at the default this setting changes
-    // nothing. Lower it to trade read-ahead for byte economy.
-    // How many prefetch ranges ONE Direct I/O vector input keeps in flight for one burst. This is a table
-    // that has to HOLD a whole burst, and the burst's size is not ours to choose -- PrefetchHelper is
-    // driven by Lucene's 64-ordinal bulk batch, so a table of 48 declines the tail of every burst and
-    // those ranges fall back to blocking reads on the calling thread. (The rescore seam's removed
-    // prefetch_window was a different quantity: a rolling ring refilled as it drained, swept to 48.)
-    //
-    // 64 on measurement (task-15, dio-1m, k=100, 200 queries x 3, cold, mincore-verified). At 48 the
-    // route made 5.4 blocking reads per query and the paced p99 was 30 ms; at 64 it makes 0.0 and the
-    // paced p99 is 11 ms, with byte volume UNCHANGED (2,581 vs 2,591 KiB/query) -- so the tail was
-    // serialization, not traffic. Saturated, the same change is p99 31 -> 28 and median 10 -> 9. The
-    // value is the batch size rather than a tuned number: raising it further cannot help, because
-    // nothing asks for more than 64 ranges in one burst.
-    public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES = "knn.direct_io.rescore.prefetch.staged_ranges";
-    public static final int KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_DEFAULT_VALUE = 64;
-
-    // How many reads may WAIT behind the shared pool. Phase 13 audit row 7 and phase 14 S3 both measured
-    // this as the binding constraint at concurrent-scorer load, and the Oct 4-5 node sweep settled it: at an
-    // effective capacity of 64 the node refused 46-52% of staged reads and made 783k device reads per 5,000
-    // queries at p50/p90/p99 777/1069/1322 ms; at 1,024 it refused 0% and made 707k at 650/877/954. The
-    // declined bursts were falling back to individual blocking reads. Phase 14's claim that declining is the
-    // cheaper fallback is WITHDRAWN on that evidence.
-    //
-    // 0 means "derive", and since phase 15 the derivation is BURST DEMAND rather than pool size:
-    // max(256, nextPowerOfTwo((search_max + index_searcher_max) * staged_ranges)) in DirectIOReadPool --
-    // 1,024 on a 4-vCPU node, 4,096 at 16. Any positive value is taken literally and still wins.
-    //
-    // DYNAMIC AND LIVE. ArrayBlockingQueue has no resize, so DirectIOReadPool SWAPS the executor when this
-    // changes: a new pool at the new capacity is published and the old one is shutdown() so its queued reads
-    // drain. Applied on the next pool acquisition, which is once per prefetch burst. Before phase 15 a change
-    // to this key silently did nothing until a node restart.
-    public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY = "knn.direct_io.rescore.prefetch.queue_capacity";
-    public static final int KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_DEFAULT_VALUE = 0;
-
-    // Node-wide ceiling on the direct (off-heap) buffers the Direct I/O read path holds at once. Phase 13's
-    // audit FIX 3, carried through phases 14 and 15: Lucene's OffHeapFloatVectorValues is not Closeable, so
-    // close() never runs on a per-query slice and a staging table lives until the GC's Cleaner reclaims it.
-    // There is no end-of-life signal to return a buffer at, so the footprint is proportional to live slices
-    // with nothing bounding it. MEASURED on the bench node: 1.69 GB of live direct buffers against a
-    // MaxDirectMemorySize of 2g.
-    //
-    // DEFAULT = HALF the JVM's actual direct-memory wall, where the wall is the operator's explicit
-    // -XX:MaxDirectMemorySize when they pinned one and heapSize / 2 otherwise -- see directMemoryWall().
-    // Half of the wall rather than all of it, because this plugin is not the only user of it: any other
-    // plugin's direct allocations come out of the same budget, and a ceiling AT the wall would turn a
-    // contained decline into a hard OutOfMemoryError: Direct buffer memory for whoever allocated next.
-    //
-    // D3b: this default was Runtime.maxMemory() / 4, which silently assumed the ergonomic wall. The bench
-    // node PINS the wall -- -XX:MaxDirectMemorySize=2g with -Xmx24g (MEASURED from the live JVM's cmdline) --
-    // so that default was 6 GB against a 2 GB wall, a ceiling 3x ABOVE the wall and therefore exactly the
-    // OutOfMemoryError this comment warns about rather than a bound against it. Operators pin this flag
-    // routinely. Reading the flag makes the default 1 GB there, and leaves it at maxMemory() / 4 when the
-    // flag is unset.
-    //
-    // Past the budget prefetch DECLINES and the bytes are served by blocking reads, which is a path the
-    // design already exercises on every queue-capacity decline. 0b disables the budget.
-    public static final String KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET = "knn.direct_io.direct_memory_budget";
-
     /**
-     * The JVM-wide direct-memory wall this node actually runs against, resolved once at class load.
+     * The JVM-wide direct-memory wall this node actually runs against, resolved once at class load. The
+     * Direct I/O read path's own ceiling is half of it, which
+     * {@code DirectIOVectorIndexInput#DIRECT_MEMORY_BUDGET_BYTES} derives, and {@code KNNStats} reports this
+     * value as {@code direct_io_stats.memory.wall_bytes}.
      *
      * @see #directMemoryWall(String, long)
      */
     public static final long KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES = directMemoryWall(
         readMaxDirectMemorySizeFlag(),
         Runtime.getRuntime().maxMemory()
-    );
-
-    public static final ByteSizeValue KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_DEFAULT_VALUE = new ByteSizeValue(
-        KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES / 2,
-        ByteSizeUnit.BYTES
     );
 
     // Node-wide cache of individual vectors on the Direct I/O random rescore path, in bytes of on-heap
@@ -295,7 +219,7 @@ public class KNNSettings {
     // ceiling of 45.6%. 16mb captures 84% of the achievable reuse, and replaying the same queries 3x does not
     // inflate it (128mb: 39.8% every pass), so it is inner-product HNSW hub reuse and not an artefact.
     //
-    // The value is ON HEAP, deliberately: it therefore stays out of knn.direct_io.direct_memory_budget and
+    // The value is ON HEAP, deliberately: it therefore stays out of the Direct I/O direct-memory budget and
     // out of MaxDirectMemorySize, and is bounded by Guava's maximumWeight rather than by a GC.
     //
     // Dynamic, applied on the next prefetch burst. A change REBUILDS the cache (Guava fixes maximumWeight at
@@ -303,43 +227,6 @@ public class KNNSettings {
     // is not free.
     public static final String KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES = "knn.direct_io.rescore.cache.max_bytes";
     public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_DEFAULT_VALUE = new ByteSizeValue(0, ByteSizeUnit.BYTES);
-
-    // Span fill (M4, ported from phase 16-I F5). While the vector cache is below its slab target, a staged
-    // span also admits every whole vector of the reading slice that lies inside it, keyed exactly like a
-    // requested fill.
-    //
-    // The measurement it exists for (MEASURED on the EBS node by phase 16-P, the pilot, whose cache was the
-    // on-heap one): on dio-1m with a cache large enough for every vector in the file, Direct I/O's p50 stayed
-    // 9.7x mmap's because 16% of candidates still missed after a 10,000-query warm-up. In that warm-up
-    // Direct I/O read 2.01 MB per query in ~40 KB staged spans (20 GB, 6.5x the file) and cached only the
-    // requested vectors, while mmap's page cache kept every page it read and ended up holding 95% of the
-    // file. The cache was paying for the reads and keeping a fraction of what they delivered.
-    //
-    // What span fill then did about it (MEASURED by 16-I on the EBS node, S1b, on the slab build): dio-1m's
-    // p50 went from 43.9 to 10.9 ms.
-    //
-    // A boolean rather than a size, because the policy has no magnitude: at or above the slab target
-    // admission is requested vectors only, exactly as before, so this cannot cause an eviction and cannot
-    // take a slab the target does not already allow. Default true, and a node can measure with and without
-    // it (the re-proof's C and C2 arms are exactly that pair).
-    public static final String KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL = "knn.direct_io.rescore.cache.span_fill";
-    public static final boolean KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_DEFAULT_VALUE = true;
-
-    // O5, CHALLENGES.md item 18. How wide a staged MISS read may be made while the store is below its target
-    // and the whole file would still fit in the room the target leaves, so that the whole vectors around the
-    // one being fetched are admitted with it. One read per miss stays one read; only its size changes.
-    //
-    // MEASURED on the EBS node (ref/RESULTS-N.md section 5): N1 made each miss one 12 KB read, which removed
-    // the first build's accidental read-around (it staged whole 65 KB coalesced groups), and on dio-1m
-    // coverage after 20,000 queries fell from 97.1% to 93.4% while the tail got worse (p99 30.5 against 25.8
-    // ms) even though the median and the throughput improved. This is that coverage bought back deliberately
-    // and with a bound, instead of as a side effect of grouping.
-    //
-    // 0b turns it off, which is exactly N1's read. The gate is the whole file fitting in the room left, not
-    // merely the store being below its target, because that is what makes it impossible for a read-around to
-    // evict a live vector: if the file fits, nothing has to be displaced to hold it.
-    public static final String KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES = "knn.direct_io.rescore.cache.read_around_bytes";
-    public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES_DEFAULT_VALUE = new ByteSizeValue(64, ByteSizeUnit.KB);
 
     // P2, P16-2. The shape of a staged read, which has to follow the device, and which device a node has is
     // the deployer's knowledge and not the plugin's.
@@ -377,45 +264,11 @@ public class KNNSettings {
     public static final String KNN_DIRECT_IO_RESCORE_READ_PROFILE_BYTES = "bytes";
     public static final String KNN_DIRECT_IO_RESCORE_READ_PROFILE_DEFAULT_VALUE = KNN_DIRECT_IO_RESCORE_READ_PROFILE_OPS;
 
-    public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN = "knn.direct_io.rescore.prefetch.max_span_bytes";
-    public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_DEFAULT_VALUE = new ByteSizeValue(
-        128 * 1024 + 4096,
-        ByteSizeUnit.BYTES
-    );
-
-    // D3d, phase 16-I I7, ported in O2. The wide-group buffers a DirectIOStagingLease keeps beside its
-    // arena: one per staged_ranges slot, each grown on demand to at most max_span_bytes, kept for the life
-    // of the arena and never shrunk. At the defaults that is 64 x 135,168 B = 8.25 MiB PER THREAD, and a
-    // lease is per thread with no bound on the number of leases, so 225 search threads reach 1.95 GB
-    // (MEASURED as arithmetic in phase 16-I FINDINGS I0.1; the buffers are grown lazily, so it is the worst
-    // case rather than the common one).
-    //
-    // knn.direct_io.direct_memory_budget already counts them, but that is one pot shared with the arenas and
-    // the read-ahead rings, and a wide buffer is held for the life of its lease while an arena is reused:
-    // wide buffers accumulating to the budget would leave no room for an arena, and then EVERY prefetch
-    // declines. A budget that wedges the feature is not a bound on it. So the wide buffers get a sub-budget
-    // of their own, checked with the overall one and never instead of it.
-    //
-    // 0b means DERIVE it: one quarter of knn.direct_io.direct_memory_budget, so an operator who has already
-    // sized that one does not have to size this. A quarter and not a half because the arenas are the
-    // mechanism's common case (phase 12 S3.1 measured the mean aligned span at 7,310 B, i.e. nearly every
-    // group fits an arena slot and needs no wide buffer at all) and they must always have room. With the
-    // direct-memory budget itself off the derived value is off too, which keeps the rule the budget has
-    // always had: a budget must never be the reason a shard cannot read its vectors.
-    //
-    // Past the cap bufferFor declines, the range is not staged, and the bytes are served by a blocking read
-    // -- the same fallback a queue-capacity or budget decline takes, already exercised on every arm.
-    public static final String KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET = "knn.direct_io.rescore.prefetch.wide_buffer_budget";
-    public static final ByteSizeValue KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET_DEFAULT_VALUE = new ByteSizeValue(
-        0,
-        ByteSizeUnit.BYTES
-    );
-
-    // Sequential read-ahead for DirectIOVectorIndexInput, a mechanism SEPARATE from the burst table above.
-    // The burst table (staged_ranges / max_span_bytes) serves the rescore seam, whose access is random and
-    // bursty and declared by prefetch() calls. A sequential bulk consumer -- a merge, the faiss-unquantized
+    // Sequential read-ahead for DirectIOVectorIndexInput, a mechanism SEPARATE from the burst table that
+    // serves the rescore seam, whose access is random and bursty and declared by prefetch() calls. A
+    // sequential bulk consumer -- a merge, the faiss-unquantized
     // exact first pass, unquantized traversal -- issues no prefetch() at all, so every one of its reads is a
-    // blocking QD1 pread one buffer at a time, slower than mmap's kernel read-ahead. These two settings add
+    // blocking QD1 pread one buffer at a time, slower than mmap's kernel read-ahead. This setting adds
     // an internal rolling ring that detects a gapless-forward run of blocking reads and puts the next
     // windows in flight, bringing sequential O_DIRECT toward mmap parity WITHOUT changing which bytes are
     // read. The ring stands down whenever a prefetch burst is active, so the rescore path is untouched.
@@ -433,36 +286,6 @@ public class KNNSettings {
     // lazily on the first arm, so an input that never runs sequentially never pays it.
     public static final String KNN_DIRECT_IO_READAHEAD_WINDOW = "knn.direct_io.readahead.window";
     public static final int KNN_DIRECT_IO_READAHEAD_WINDOW_DEFAULT_VALUE = 8;
-
-    // window_bytes: how LARGE each of those windows is. Phase 13 audit FIX 2, and the largest measured win
-    // in that audit. Until phase 14 the ring's request size WAS bufferSize, so one number served two access
-    // shapes with opposite needs. Measured (phase 13 e1b.out, 732 MiB ascending scan of a real 1M x 768
-    // fp32 .vec, and a 16-thread random rescore arm on the same file):
-    //
-    // bufferSize | sequential MiB/s at W=8 | random amplification, 16 threads
-    // 8 KiB | 49.7 | 2.667 <- shipped
-    // 64 KiB | 371.2 | ~21 (INFERRED, see below)
-    // 256 KiB | 370.6 | 85.3 <- measured
-    //
-    // Sequential wants >= 64 KiB: that is 7.5x, and it is the whole of the gap to mmap and past it (371.2
-    // against mmap's 239.1). Random wants <= 8 KiB: at 256 KiB amplification is 85.3x and qps collapses
-    // from 59.6 to 10.0. The 64 KiB random cell is INFERRED rather than measured -- amplification tracks
-    // bufferSize / vectorBytes almost exactly at the two measured points (8 KiB -> 2.667 at a 3,072 B
-    // vector; 256 KiB -> 85.3, a ratio of 32.0 against the size ratio of 32) -- and it is why the fix is
-    // NOT to raise bufferSize.
-    //
-    // So the ring gets its own size and bufferSize stays 8 KiB for the random path. 64 KiB is the knee:
-    // 256 KiB buys nothing sequentially (370.6 vs 371.2). Costs window * window_bytes of direct buffers per
-    // input, allocated lazily on the first ARM -- 512 KiB at the defaults for an input that runs
-    // sequentially, and zero for one that does not. The rescore path never arms, so it pays nothing.
-    public static final String KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES = "knn.direct_io.readahead.window_bytes";
-    public static final ByteSizeValue KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_DEFAULT_VALUE = new ByteSizeValue(64, ByteSizeUnit.KB);
-    // trigger: how many consecutive gapless-forward blocking reads must occur before the ring arms. This is
-    // the no-waste guard: a random (rescore) workload must never cross it, so read-ahead issues ZERO
-    // speculative reads on that pattern. A knob rather than a constant precisely because that no-waste claim
-    // is a claim about this value, and an operator who distrusts it must be able to raise it without a build.
-    public static final String KNN_DIRECT_IO_READAHEAD_TRIGGER = "knn.direct_io.readahead.trigger";
-    public static final int KNN_DIRECT_IO_READAHEAD_TRIGGER_DEFAULT_VALUE = 2;
 
     /**
      * For more details on supported engines, refer to {@link MemoryOptimizedSearchSupportSpec}
@@ -712,99 +535,6 @@ public class KNNSettings {
     );
 
     /**
-     * The waste guard on the read-ahead channel of the directory design: the largest single
-     * {@code IndexInput#prefetch} span {@code DirectIOVectorIndexInput} will stage. Read once per
-     * {@code .vec} open, so it takes effect on the next open of the index rather than on the next query.
-     * <p>
-     * Dynamic and node scoped for the same reason the cache budget is: it is the knob an A/B of the
-     * read-ahead economy turns, and turning it must not need a rebuild. At its default it is inert.
-     */
-    /**
-     * Ranges one Direct I/O vector input keeps in flight per prefetch burst. Node scoped and dynamic,
-     * read once per {@code .vec} open, so it takes effect on the next open of the index.
-     * <p>
-     * Lower bound 1 rather than 48-ish: a node that wants to measure the serial case should be able to
-     * ask for it, and every value is correct — declining a prefetch only costs read-ahead.
-     */
-    public static final Setting<Integer> KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_SETTING = Setting.intSetting(
-        KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES,
-        KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_DEFAULT_VALUE,
-        1,
-        NodeScope,
-        Dynamic
-    );
-
-    /**
-     * Reads that may wait behind the shared Direct I/O pool. Node scoped and dynamic; read once, when the
-     * pool is created, because {@link java.util.concurrent.ArrayBlockingQueue} cannot be resized.
-     * <p>
-     * {@code 0} means <b>derive</b>, which is the shipped behaviour and therefore the default: phase 14
-     * deliberately does not move it. This exists so the node can sweep the one constraint phase 13's audit
-     * row 7 measured as binding — 44% of declared reads refused at 16 concurrent scorers — without a
-     * rebuild. A refused submit is the cheaper fallback, not a failure, so every value here is correct.
-     */
-    public static final Setting<Integer> KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING = Setting.intSetting(
-        KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY,
-        KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_DEFAULT_VALUE,
-        0,
-        NodeScope,
-        Dynamic
-    );
-
-    public static final Setting<ByteSizeValue> KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING = Setting.byteSizeSetting(
-        KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN,
-        KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_DEFAULT_VALUE,
-        NodeScope,
-        Dynamic
-    );
-
-    /**
-     * The node-wide ceiling on the wide-group buffers a {@code DirectIOStagingLease} holds beside its arena,
-     * past which the range is not staged and its bytes are served by a blocking read. D3d, phase 16-I I7,
-     * ported in O2.
-     *
-     * <p><b>{@code 0b} derives it</b> as a quarter of {@code knn.direct_io.direct_memory_budget} rather than
-     * disabling it, which is the opposite of what {@code 0b} means for that setting. See the comment on the
-     * key for why these buffers need a sub-budget at all when the overall one already counts them.
-     */
-    public static final Setting<ByteSizeValue> KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET_SETTING = Setting.byteSizeSetting(
-        KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET,
-        KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET_DEFAULT_VALUE,
-        NodeScope,
-        Dynamic
-    );
-
-    /**
-     * The node-wide ceiling on direct buffers the Direct I/O read path holds at once, past which a prefetch
-     * declines and the bytes are served by blocking reads. Phase 13's audit FIX 3.
-     *
-     * <p><b>Why half the wall.</b> The default is
-     * {@link #KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES} / 2, where the wall is the operator's explicit
-     * {@code -XX:MaxDirectMemorySize} when they pinned one and {@code heapSize / 2} otherwise (see
-     * {@link #directMemoryWall(String, long)}). Half of the wall rather than all of it, because the wall is
-     * shared: every other plugin's direct allocations are charged to the same
-     * {@code MaxDirectMemorySize}, and a ceiling set at the wall would convert a contained decline here into
-     * an {@code OutOfMemoryError: Direct buffer memory} for whoever allocated next. MEASURED on the bench
-     * node before this existed: 1.69 GB live against a 2g wall.
-     *
-     * <p><b>Why the wall is read rather than assumed (D3b).</b> This default was
-     * {@code Runtime.maxMemory() / 4}, which is half the wall only on a node that let the launcher choose
-     * it. The bench node pins it: {@code -XX:MaxDirectMemorySize=2g} with {@code -Xmx24g} (MEASURED from
-     * the live JVM's command line), where {@code maxMemory() / 4} is 6 GB — a ceiling <em>three times
-     * above</em> the 2 GB wall, which is not a bound at all but precisely the {@code OutOfMemoryError} case
-     * the paragraph above names. Pinning this flag is routine. Reading it makes the default 1 GB there, and
-     * changes nothing on a node that did not pin it.
-     *
-     * <p>{@code 0b} disables the budget, which is the pre-phase-15 behaviour.
-     */
-    public static final Setting<ByteSizeValue> KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING = Setting.byteSizeSetting(
-        KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET,
-        KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_DEFAULT_VALUE,
-        NodeScope,
-        Dynamic
-    );
-
-    /**
      * The node-wide cache of individual vectors on the Direct I/O random rescore path. <b>Default
      * {@code 0b}, i.e. off.</b>
      *
@@ -818,7 +548,7 @@ public class KNNSettings {
      * mechanism and the correctness proof (the re-proof is 8/8 identical with the cache on and off).
      *
      * <p>The cached bytes are <b>on heap</b>, so they are outside
-     * {@code knn.direct_io.direct_memory_budget} and outside {@code MaxDirectMemorySize}, and are bounded by
+     * the Direct I/O direct-memory budget and outside {@code MaxDirectMemorySize}, and are bounded by
      * Guava's {@code maximumWeight} rather than by a collection. Applied on the next prefetch burst; a
      * change <b>rebuilds</b> the cache, because Guava fixes {@code maximumWeight} at build time, so the
      * entries are dropped and it warms again.
@@ -826,19 +556,6 @@ public class KNNSettings {
     public static final Setting<ByteSizeValue> KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_SETTING = Setting.byteSizeSetting(
         KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES,
         KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_DEFAULT_VALUE,
-        NodeScope,
-        Dynamic
-    );
-
-    /**
-     * Whether a staged span also admits the whole vectors of the reading slice that lie inside it, while the
-     * vector cache is below its slab target. Node scoped and dynamic, read once per prefetch burst alongside
-     * the cache's size, so it takes effect on the next burst with no reopen. See the key's declaration for
-     * the measurement it exists for.
-     */
-    public static final Setting<Boolean> KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_SETTING = Setting.boolSetting(
-        KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL,
-        KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_DEFAULT_VALUE,
         NodeScope,
         Dynamic
     );
@@ -881,21 +598,6 @@ public class KNNSettings {
     }
 
     /**
-     * How wide a staged miss read may be made so that the vectors around the one being fetched are admitted
-     * with it, while the store is below its target and the whole file would still fit in the room left. O5.
-     *
-     * <p>{@code 0b} turns it off, which is exactly N1's one read per miss. See the comment on the key for
-     * what the node measured N1's narrow reads costing in coverage, and for why the gate is the file fitting
-     * rather than merely the store being below its target.
-     */
-    public static final Setting<ByteSizeValue> KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES_SETTING = Setting.byteSizeSetting(
-        KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES,
-        KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES_DEFAULT_VALUE,
-        NodeScope,
-        Dynamic
-    );
-
-    /**
      * How many {@code bufferSize}-sized windows {@code DirectIOVectorIndexInput}'s sequential read-ahead
      * ring keeps in flight ahead of the file-order frontier. Node scoped and dynamic, read once per
      * {@code .vec} open. Lower bound 0, which disables the ring and makes the input exact passthrough.
@@ -905,36 +607,6 @@ public class KNNSettings {
         KNN_DIRECT_IO_READAHEAD_WINDOW,
         KNN_DIRECT_IO_READAHEAD_WINDOW_DEFAULT_VALUE,
         0,
-        NodeScope,
-        Dynamic
-    );
-
-    /**
-     * Bytes per read-ahead window — the ring's request size, decoupled from {@code bufferSize} in phase 14
-     * (audit FIX 2). Node scoped and dynamic, read once per {@code .vec} open. Rounded up to a filesystem
-     * block and never applied below {@code bufferSize}, so it can only widen the ring.
-     * <p>
-     * Defaults to 64 KB on the measurement recorded above: sequential throughput 49.7 -> 371.2 MiB/s, which
-     * is the whole of the gap to mmap and past it, at unchanged random amplification because the random path
-     * keeps {@code bufferSize}.
-     */
-    public static final Setting<ByteSizeValue> KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_SETTING = Setting.byteSizeSetting(
-        KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES,
-        KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_DEFAULT_VALUE,
-        NodeScope,
-        Dynamic
-    );
-
-    /**
-     * Consecutive gapless-forward blocking reads needed before the read-ahead ring arms. Node scoped and
-     * dynamic, read once per {@code .vec} open. Lower bound 1 so a node can force arm-on-first-read to test
-     * the ring in isolation; the no-waste property comes from the default of 2, which random access cannot
-     * reach.
-     */
-    public static final Setting<Integer> KNN_DIRECT_IO_READAHEAD_TRIGGER_SETTING = Setting.intSetting(
-        KNN_DIRECT_IO_READAHEAD_TRIGGER,
-        KNN_DIRECT_IO_READAHEAD_TRIGGER_DEFAULT_VALUE,
-        1,
         NodeScope,
         Dynamic
     );
@@ -1391,48 +1063,12 @@ public class KNNSettings {
             return KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING;
         }
 
-        if (KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY.equals(key)) {
-            return KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING;
-        }
-
-        if (KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET.equals(key)) {
-            return KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING;
-        }
-
         if (KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES.equals(key)) {
             return KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_SETTING;
         }
 
-        if (KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL.equals(key)) {
-            return KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_SETTING;
-        }
-
-        if (KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN.equals(key)) {
-            return KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING;
-        }
-
-        if (KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET.equals(key)) {
-            return KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET_SETTING;
-        }
-
-        if (KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES.equals(key)) {
-            return KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES_SETTING;
-        }
-
-        if (KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES.equals(key)) {
-            return KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_SETTING;
-        }
-
         if (KNN_DIRECT_IO_READAHEAD_WINDOW.equals(key)) {
             return KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING;
-        }
-
-        if (KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES.equals(key)) {
-            return KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_SETTING;
-        }
-
-        if (KNN_DIRECT_IO_READAHEAD_TRIGGER.equals(key)) {
-            return KNN_DIRECT_IO_READAHEAD_TRIGGER_SETTING;
         }
 
         throw new IllegalArgumentException("Cannot find setting by key [" + key + "]");
@@ -1481,20 +1117,11 @@ public class KNNSettings {
             KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS_SETTING,
             // Rescore-seam vector cache
             // The directory design's read-ahead channel: staging table size and the waste guard
-            KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_SETTING,
-            KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING,
-            KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET_SETTING,
-            KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES_SETTING,
-            KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING,
-            KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING,
             KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_SETTING,
-            KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_SETTING,
             // P2: the read shape, static because a cluster can hold more than one instance type
             KNN_DIRECT_IO_RESCORE_READ_PROFILE_SETTING,
             // Sequential read-ahead ring: window and arm trigger
-            KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING,
-            KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_SETTING,
-            KNN_DIRECT_IO_READAHEAD_TRIGGER_SETTING
+            KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING
         );
         return Stream.concat(settings.stream(), Stream.concat(getFeatureFlags().stream(), dynamicCacheSettings.values().stream()))
             .collect(Collectors.toList());
@@ -1555,22 +1182,6 @@ public class KNNSettings {
     }
 
     /**
-     * @return prefetch ranges one Direct I/O vector input keeps in flight per burst
-     */
-    public static int getDirectIORescorePrefetchStagedRanges() {
-        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES_SETTING);
-    }
-
-    /**
-     * Reads that may wait behind the shared Direct I/O pool, or 0 for the derived default.
-     *
-     * @return the configured queue capacity, or 0 meaning {@code DirectIOReadPool} should derive it
-     */
-    public static int getDirectIORescorePrefetchQueueCapacity() {
-        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_PREFETCH_QUEUE_CAPACITY_SETTING);
-    }
-
-    /**
      * How many threads can be inside a rescore at the same time, which is what the Direct I/O queue has to
      * absorb one {@code staged_ranges} burst from each of. The {@code search} pool answers the query and,
      * under concurrent segment search, {@code NativeEngineKnnVectorQuery} dispatches one task per leaf onto
@@ -1583,8 +1194,8 @@ public class KNNSettings {
      * {@code ThreadPool#info(String)} returns the holder's own {@code Info}
      * ({@code ThreadPool.java:448-454}). It reflects the size the pool was <em>built</em> at: the dynamic
      * {@code cluster.threadpool.*.size} path resizes the executor in place without replacing that
-     * {@code Info} ({@code ThreadPool.java:512+}), so a node that resizes its search pool at runtime should
-     * set {@code knn.direct_io.rescore.prefetch.queue_capacity} explicitly.
+     * {@code Info} ({@code ThreadPool.java:512+}), so a node that resizes its search pool at runtime keeps
+     * the queue capacity it was built with until the pool is rebuilt.
      *
      * <p>With no {@code ThreadPool} — a unit test, or any call before {@code createComponents} — the same two
      * formulas are applied to the configured allocated processors: {@code searchThreadPoolSize(p)} is
@@ -1691,31 +1302,12 @@ public class KNNSettings {
     }
 
     /**
-     * The node-wide ceiling on direct buffers the Direct I/O read path may hold at once; {@code 0b} off.
-     *
-     * @return the direct-memory budget
-     */
-    public static ByteSizeValue getDirectIODirectMemoryBudget() {
-        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING);
-    }
-
-    /**
      * The node-wide vector cache's budget on the Direct I/O rescore path; {@code 0b} off.
      *
      * @return the cache's maximum weight in bytes
      */
     public static ByteSizeValue getDirectIORescoreCacheMaxBytes() {
         return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES_SETTING);
-    }
-
-    /**
-     * Whether span fill is on: see {@link #KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL} for what it admits and the
-     * measurement it exists for. Read once per prefetch burst.
-     *
-     * @return true if a staged span may also admit the whole vectors inside it
-     */
-    public static boolean isDirectIORescoreCacheSpanFillEnabled() {
-        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_SETTING);
     }
 
     /**
@@ -1751,51 +1343,10 @@ public class KNNSettings {
     }
 
     /**
-     * @return the largest single prefetch span the Direct I/O vector input will stage, in bytes
-     */
-    public static ByteSizeValue getDirectIORescorePrefetchMaxSpan() {
-        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN_SETTING);
-    }
-
-    /**
-     * The node-wide ceiling on wide-group staging buffers; {@code 0b} means derive it from
-     * {@code knn.direct_io.direct_memory_budget}. D3d.
-     *
-     * @return the configured wide-buffer budget, {@code 0b} for the derived one
-     */
-    public static ByteSizeValue getDirectIORescorePrefetchWideBufferBudget() {
-        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET_SETTING);
-    }
-
-    /**
-     * How wide a staged miss read may be made to admit the vectors around the one being fetched; {@code 0b}
-     * is off. O5.
-     *
-     * @return the configured read-around width
-     */
-    public static ByteSizeValue getDirectIORescoreCacheReadAroundBytes() {
-        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES_SETTING);
-    }
-
-    /**
      * @return how many windows the Direct I/O sequential read-ahead ring keeps in flight; 0 disables it
      */
     public static int getDirectIOReadaheadWindow() {
         return getNodeSettingValueOrDefault(KNN_DIRECT_IO_READAHEAD_WINDOW_SETTING);
-    }
-
-    /**
-     * @return bytes per read-ahead window — the sequential ring's request size, independent of {@code bufferSize}
-     */
-    public static ByteSizeValue getDirectIOReadaheadWindowBytes() {
-        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_READAHEAD_WINDOW_BYTES_SETTING);
-    }
-
-    /**
-     * @return consecutive gapless-forward blocking reads needed before the read-ahead ring arms
-     */
-    public static int getDirectIOReadaheadTrigger() {
-        return getNodeSettingValueOrDefault(KNN_DIRECT_IO_READAHEAD_TRIGGER_SETTING);
     }
 
     public static boolean isCircuitBreakerTriggered() {

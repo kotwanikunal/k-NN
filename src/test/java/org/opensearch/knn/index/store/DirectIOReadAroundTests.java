@@ -64,7 +64,7 @@ public class DirectIOReadAroundTests extends KNNTestCase {
     /** 64 KiB, so a slab holds 128 of these vectors and a handful of slabs holds the whole file. */
     private static final int TEST_SLAB_BYTES = 64 * 1024;
     /** The shipped default, and wide enough to hold 128 vectors. */
-    private static final String READ_AROUND = "64kb";
+    private static final long READ_AROUND = 64L * 1024;
 
     private Path path;
     private float[][] vectors;
@@ -170,7 +170,7 @@ public class DirectIOReadAroundTests extends KNNTestCase {
     public void testZeroBytesIsExactlyTheNarrowRead() {
         assumeDirectIOWorksHere();
         writeFixture(22L);
-        configure(8, true, "0b");
+        configure(8, true, 0L);
 
         try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
             assertNotNull(input);
@@ -321,17 +321,17 @@ public class DirectIOReadAroundTests extends KNNTestCase {
         KNNSettings.state().setClusterService(clusterService);
     }
 
-    private void configure(final int slabs, final boolean spanFill, final String readAround) {
+    private void configure(final int slabs, final boolean spanFill, final long readAroundBytes) {
         final long maxBytes = (long) slabs * TEST_SLAB_BYTES;
         withNodeSettings(
             Settings.builder()
                 .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, maxBytes + "b")
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL, spanFill)
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES, readAround)
                 .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
                 .build()
         );
         DirectIOVectorCache.resetForTesting();
+        DirectIOVectorCache.setSpanFillForTesting(spanFill);
+        DirectIOVectorCache.setReadAroundBytesForTesting(readAroundBytes);
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
         DirectIOVectorCache.configure(maxBytes);
         DirectIOVectorIndexInput.STATS.reset();

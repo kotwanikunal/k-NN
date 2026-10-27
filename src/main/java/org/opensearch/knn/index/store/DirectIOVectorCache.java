@@ -189,10 +189,44 @@ public final class DirectIOVectorCache {
     private static volatile DirectIOCacheSegment[] segments = { new DirectIOCacheSegment(BROKER) };
 
     /**
-     * Whether span fill is on, refreshed once per prefetch burst by {@link #applyConfiguredSize(boolean)}. Starts at
-     * the setting's default so that a store filled before the first refresh behaves as the setting says.
+     * Whether a staged span also admits the whole vectors of the reading slice that lie inside it, while the
+     * store is below its slab target.
+     *
+     * <p>A constant rather than a setting, because the policy has no magnitude and no arm that wants it off:
+     * at or above the slab target admission is requested vectors only, exactly as before, so span fill
+     * cannot cause an eviction and cannot take a slab the target does not already allow. MEASURED on the EBS
+     * node (16-I S1b): dio-1m's p50 went from 43.9 to 10.9 ms with it. Turning the store off turns span fill
+     * off with it, which is the arm a node compares against.
      */
-    private static volatile boolean spanFill = KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_DEFAULT_VALUE;
+    static final boolean SPAN_FILL = true;
+
+    /**
+     * How wide a staged miss read may be made so that the whole vectors around the one being fetched are
+     * admitted with it, while the store is below its target and the whole file would still fit in the room
+     * the target leaves. One read per miss stays one read; only its size changes. O5.
+     *
+     * <p>A constant rather than a setting. MEASURED on the EBS node: with each miss made one 12 KB read,
+     * dio-1m's coverage after 20,000 queries fell from 97.1% to 93.4% and p99 rose from 25.8 to 30.5 ms, so
+     * the width is coverage bought deliberately and with a bound rather than a value with a better choice in
+     * it. The three gates in {@link #readAroundBytes(long)} are what keep it from evicting anything.
+     */
+    static final long READ_AROUND_BYTES = 64L * 1024;
+
+    /**
+     * Whether span fill is on, {@link #SPAN_FILL} except where a test has moved it. Production writes it
+     * once, at class load.
+     *
+     * @see #setSpanFillForTesting(boolean)
+     */
+    private static volatile boolean spanFill = SPAN_FILL;
+
+    /**
+     * The live read-around width, {@link #READ_AROUND_BYTES} except where a test has moved it. Production
+     * writes it once, at class load.
+     *
+     * @see #setReadAroundBytesForTesting(long)
+     */
+    private static volatile long readAroundBytes = READ_AROUND_BYTES;
 
     /** A segment count pinned by a test, or 0 to derive it from the node. See {@link #setSegmentsForTesting}. */
     private static volatile int segmentsForTesting;
@@ -329,7 +363,7 @@ public final class DirectIOVectorCache {
      * The 256 KiB stripe an offset lies in, which is the unit of segmentation (Q, section 2.1).
      *
      * <p>A stripe and not a vector, because a staged span is at most
-     * {@code knn.direct_io.rescore.prefetch.max_span_bytes} = 135,168 B and 135,168 &lt; 262,144, so a span
+     * {@link DirectIOVectorIndexInput#DEFAULT_MAX_STAGED_RANGE_BYTES} = 135,168 B and 135,168 &lt; 262,144, so a span
      * lies in at most <b>two</b> stripes wherever it starts and {@link #putRun} keeps essentially the one
      * write-lock acquisition it has. A per-vector key would scatter a 43-vector run across up to 43 segments
      * and turn one acquisition into 43. MEASURED (output/bench/q-baseline/q-seghitrate.out): the two keys give
@@ -774,7 +808,7 @@ public final class DirectIOVectorCache {
      *
      * <h4>The three gates, and why the second is the whole file rather than the target</h4>
      * <ul>
-     *   <li>{@code knn.direct_io.rescore.cache.read_around_bytes} is not {@code 0b};</li>
+     *   <li>{@link #READ_AROUND_BYTES} is not zero;</li>
      *   <li><b>the whole file would still fit in the room the target leaves</b>, which is what makes it
      *       impossible for a read-around to evict a live vector: if the file fits, nothing has to be
      *       displaced to hold it. Merely being below the target would not do, because a store one vector
@@ -802,14 +836,7 @@ public final class DirectIOVectorCache {
         if (isSpanFillOn() == false) {
             return 0;
         }
-        final long configured;
-        try {
-            final ByteSizeValue value = KNNSettings.getDirectIORescoreCacheReadAroundBytes();
-            configured = value == null ? 0L : value.getBytes();
-        } catch (RuntimeException e) {
-            log.debug("Could not read knn.direct_io.rescore.cache.read_around_bytes; not widening this read", e);
-            return 0;
-        }
+        final long configured = readAroundBytes;
         if (configured <= 0 || fileBytes <= 0) {
             return 0;
         }
@@ -1004,11 +1031,6 @@ public final class DirectIOVectorCache {
      *                    input (O1), and the store is released rather than resized.
      */
     static void applyConfiguredSize(final boolean routeActive) {
-        try {
-            spanFill = KNNSettings.isDirectIORescoreCacheSpanFillEnabled();
-        } catch (RuntimeException e) {
-            log.debug("Could not read knn.direct_io.rescore.cache.span_fill; leaving span fill as it is", e);
-        }
         if (routeActive == false) {
             // The caller is reading through its delegate input because knn.direct_io.rescore.enabled is off
             // (O1), so nothing will be admitted and nothing will be looked up: slabs held here serve
@@ -1035,13 +1057,10 @@ public final class DirectIOVectorCache {
     }
 
     /**
-     * Whether span fill is on, from {@code knn.direct_io.rescore.cache.span_fill} as of the last burst
-     * boundary (M4).
+     * Whether span fill is on: {@link #SPAN_FILL}, and the store not being off (M4).
      *
-     * <p>A volatile read of a field refreshed by {@link #applyConfiguredSize(boolean)}, not a settings read, because
-     * the caller asks once per staged range consumed and a settings read walks the cluster state. The burst
-     * boundary is the right cadence for the same reason it is for the size: a span fill can only follow a
-     * staged read, and a staged read can only follow a prefetch.
+     * <p>The store being off turns span fill off with it: the widened bytes are admitted by span fill, and a
+     * wider read nobody harvests is device traffic for nothing.
      *
      * @return whether a staged span may admit the whole vectors inside it
      */
@@ -1268,8 +1287,7 @@ public final class DirectIOVectorCache {
 
     /**
      * Vectors admitted because they lay inside a span a burst had already staged, rather than because a read
-     * asked for them (M4). Zero while {@code knn.direct_io.rescore.cache.span_fill} is false, and zero once
-     * the store reaches its slab target.
+     * asked for them (M4). Zero while the store is off, and zero once it reaches its slab target.
      */
     public static long spanFills() {
         return spanFills.sum();
@@ -1345,13 +1363,30 @@ public final class DirectIOVectorCache {
     // Test seams
     // ---------------------------------------------------------------------------------------------------
 
+    /**
+     * Test seam: publishes whether span fill is on. A node never calls this; span fill is
+     * {@link #SPAN_FILL}, and the arms that measure the store with it off have no other way to ask for it.
+     */
+    static void setSpanFillForTesting(final boolean on) {
+        spanFill = on;
+    }
+
+    /**
+     * Test seam: publishes the read-around width, {@code 0} turning read-around off. A node never calls
+     * this; the width is {@link #READ_AROUND_BYTES}.
+     */
+    static void setReadAroundBytesForTesting(final long bytes) {
+        readAroundBytes = Math.max(0L, bytes);
+    }
+
     /** Test seam: empties the store, releases every slab, and zeroes every counter. */
     static void resetForTesting() {
         BROKER.resetSlabMemory();
         configure(0);
         awaitReleasesForTesting();
         BROKER.setSlabBytes(DirectIOSlab.SLAB_BYTES);
-        spanFill = KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL_DEFAULT_VALUE;
+        spanFill = SPAN_FILL;
+        readAroundBytes = READ_AROUND_BYTES;
         segmentsForTesting = 0;
         segments = new DirectIOCacheSegment[] { new DirectIOCacheSegment(BROKER) };
         hits.reset();

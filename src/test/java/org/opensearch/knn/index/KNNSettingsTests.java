@@ -334,20 +334,40 @@ public class KNNSettingsTests extends KNNTestCase {
 
     /**
      * Every Direct I/O setting must be returned by getSettings(), or KNNPlugin never registers it
-     * and any attempt to set one is rejected as an unknown setting.
+     * and any attempt to set one is rejected as an unknown setting. The surface is six keys: F-03 turned the
+     * other nine into constants on the component that owns each, and a removed key must be neither
+     * registered nor resolvable, or an operator could still set one that nothing reads.
      */
     public void testDirectIOSettings_areRegistered() {
         final List<String> registeredKeys = KNNSettings.state().getSettings().stream().map(Setting::getKey).collect(Collectors.toList());
-        for (String key : List.of(
+        final List<String> kept = List.of(
             KNNSettings.KNN_DIRECT_IO_RESCORE_ENABLED,
+            KNNSettings.KNN_DIRECT_IO_MIN_FILE_SIZE,
             KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_THREADS,
-            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_STAGED_RANGES,
-            KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN,
+            KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES,
             KNNSettings.KNN_DIRECT_IO_RESCORE_READ_PROFILE,
-            KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW,
-            KNNSettings.KNN_DIRECT_IO_READAHEAD_TRIGGER
-        )) {
+            KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW
+        );
+        for (String key : kept) {
             assertTrue(key + " is not registered", registeredKeys.contains(key));
+        }
+        assertEquals(
+            "the Direct I/O surface is exactly the kept keys",
+            kept.size(),
+            registeredKeys.stream().filter(key -> key.startsWith("knn.direct_io.")).count()
+        );
+        for (String key : List.of(
+            "knn.direct_io.rescore.prefetch.staged_ranges",
+            "knn.direct_io.rescore.prefetch.queue_capacity",
+            "knn.direct_io.rescore.prefetch.max_span_bytes",
+            "knn.direct_io.rescore.prefetch.wide_buffer_budget",
+            "knn.direct_io.direct_memory_budget",
+            "knn.direct_io.rescore.cache.span_fill",
+            "knn.direct_io.rescore.cache.read_around_bytes",
+            "knn.direct_io.readahead.window_bytes",
+            "knn.direct_io.readahead.trigger"
+        )) {
+            assertFalse(key + " was removed and must not be registered", registeredKeys.contains(key));
         }
     }
 
@@ -531,15 +551,16 @@ public class KNNSettingsTests extends KNNTestCase {
         assertEquals("surrounding whitespace", 2147483648L, KNNSettings.directMemoryWall("  2147483648 ", heap));
     }
 
-    /** The wall resolved on this JVM is positive and the shipped budget default is exactly half of it. */
-    public void testTheResolvedWallIsUsableAndTheDefaultIsHalfOfIt() {
+    /**
+     * The wall resolved on this JVM is positive and agrees with the function applied to what the JVM
+     * reports. That the Direct I/O read path bounds itself by half of it is
+     * {@code DirectIOVectorIndexInputTests#testTheBudgetDefaultIsHalfTheDirectMemoryWall}, in the package
+     * that owns the budget.
+     */
+    public void testTheResolvedWallIsUsable() {
         assertTrue(
             "the wall must resolve to something positive on any JVM this runs on",
             KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES > 0
-        );
-        assertEquals(
-            KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES / 2,
-            KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET_SETTING.getDefault(Settings.EMPTY).getBytes()
         );
         // This JVM is a gradle test worker, so whichever branch it took, the answer must agree with the
         // function applied to what the JVM actually reports.

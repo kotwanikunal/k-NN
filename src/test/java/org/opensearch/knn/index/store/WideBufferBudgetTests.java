@@ -6,23 +6,15 @@
 package org.opensearch.knn.index.store;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
-import org.opensearch.common.settings.ClusterSettings;
-import org.opensearch.common.settings.Setting;
-import org.opensearch.common.settings.Settings;
 import org.opensearch.knn.KNNTestCase;
-import org.opensearch.knn.index.KNNSettings;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.stream.Collectors;
-
-import static org.mockito.Mockito.when;
 
 /**
  * O2 (16-I's I7, D3d): the per-thread wide-group staging buffers have a node-wide cap.
@@ -61,20 +53,15 @@ public class WideBufferBudgetTests extends KNNTestCase {
         // The wide-group gauge is node wide and its charges come back by reachability, so a test that holds
         // buffers leaves them charged for the next one; these tests assert an absolute figure against a cap.
         DirectIOVectorIndexInput.STATS.resetWideGaugeForTesting();
+        // Both budgets are constants on a node; these cases publish their own, so each starts from the
+        // shipped pair.
+        DirectIOVectorIndexInput.resetBudgetsForTesting();
     }
 
-    /** Rewrites the settings the test case's mock cluster service answers with. */
-    private void withNodeSettings(final Settings settings) {
-        final Set<Setting<?>> registered = new HashSet<>(ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
-        registered.addAll(
-            KNNSettings.state()
-                .getSettings()
-                .stream()
-                .filter(setting -> setting.getProperties().contains(Setting.Property.NodeScope))
-                .collect(Collectors.toList())
-        );
-        when(clusterService.getClusterSettings()).thenReturn(new ClusterSettings(settings, registered));
-        KNNSettings.state().setClusterService(clusterService);
+    @Override
+    public void tearDown() throws Exception {
+        DirectIOVectorIndexInput.resetBudgetsForTesting();
+        super.tearDown();
     }
 
     /**
@@ -151,12 +138,8 @@ public class WideBufferBudgetTests extends KNNTestCase {
         // measuring a counter the uncapped arm had already filled, and the arm would pass for the wrong
         // reason. This way each arm's claim is independent and neither needs a System.gc() to be true.
         final long cap = 16L * 1024 * 1024;
-        withNodeSettings(
-            Settings.builder()
-                .put(KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET, "0b")
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET, cap + "b")
-                .build()
-        );
+        DirectIOVectorIndexInput.setDirectMemoryBudgetForTesting(0L);
+        DirectIOVectorIndexInput.setWideBufferBudgetForTesting(cap);
         assertEquals(cap, DirectIOVectorIndexInput.wideBufferBudgetBytes());
         final long declinedBefore = DirectIOVectorIndexInput.STATS.declinedWideBudget();
         final long grantedCapped = fillWideBuffersOnEveryThread(SLOTS);
@@ -166,12 +149,8 @@ public class WideBufferBudgetTests extends KNNTestCase {
 
         // Then the same geometry with both budgets off, which is what D3d inherited: the number the cap has
         // to be read against.
-        withNodeSettings(
-            Settings.builder()
-                .put(KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET, "0b")
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET, "0b")
-                .build()
-        );
+        DirectIOVectorIndexInput.setDirectMemoryBudgetForTesting(0L);
+        DirectIOVectorIndexInput.setWideBufferBudgetForTesting(0L);
         assertEquals("with both budgets off there must be no cap", 0L, DirectIOVectorIndexInput.wideBufferBudgetBytes());
         final long grantedUncapped = fillWideBuffersOnEveryThread(SLOTS);
         final long uncapped = measured - capped;
@@ -208,15 +187,11 @@ public class WideBufferBudgetTests extends KNNTestCase {
      */
     public void testTheCapHoldsAtTheShippedGeometry() throws InterruptedException {
         final long cap = 16L * 1024 * 1024;
-        withNodeSettings(
-            Settings.builder()
-                .put(KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET, "0b")
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET, cap + "b")
-                .build()
-        );
-        final int shippedSlots = KNNSettings.getDirectIORescorePrefetchStagedRanges();
-        final int shippedSpan = Math.toIntExact(KNNSettings.getDirectIORescorePrefetchMaxSpan().getBytes());
-        assertEquals("this test is pinned to the shipped defaults", 64, shippedSlots);
+        DirectIOVectorIndexInput.setDirectMemoryBudgetForTesting(0L);
+        DirectIOVectorIndexInput.setWideBufferBudgetForTesting(cap);
+        final int shippedSlots = DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGES;
+        final int shippedSpan = DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGE_BYTES;
+        assertEquals("this test is pinned to the shipped geometry", 64, shippedSlots);
         assertEquals(128 * 1024 + 4096, shippedSpan);
 
         final long granted = fillWideBuffersOnEveryThread(shippedSlots);
@@ -241,34 +216,22 @@ public class WideBufferBudgetTests extends KNNTestCase {
     }
 
     /**
-     * With its own setting at {@code 0b} the cap is a quarter of the direct-memory budget, so an operator
-     * who has sized that one does not have to size this one, and with the direct-memory budget itself off
-     * there is no cap at all -- the rule that budget has always had.
+     * The cap is a quarter of the direct-memory budget, and with that budget off there is no cap at all --
+     * the rule that budget has always had.
      */
     public void testTheCapIsDerivedFromTheDirectMemoryBudget() {
-        withNodeSettings(
-            Settings.builder()
-                .put(KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET, "2gb")
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET, "0b")
-                .build()
-        );
+        DirectIOVectorIndexInput.setDirectMemoryBudgetForTesting(2L * 1024 * 1024 * 1024);
+        DirectIOVectorIndexInput.setWideBufferBudgetForTesting(0L);
         assertEquals(2L * 1024 * 1024 * 1024 / 4, DirectIOVectorIndexInput.wideBufferBudgetBytes());
 
-        // An explicit value wins over the derived one, in both directions.
-        withNodeSettings(
-            Settings.builder()
-                .put(KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET, "2gb")
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET, "16mb")
-                .build()
-        );
+        // And the seam's explicit value wins over the derived one, which is how the capped arms above are
+        // driven.
+        DirectIOVectorIndexInput.setDirectMemoryBudgetForTesting(2L * 1024 * 1024 * 1024);
+        DirectIOVectorIndexInput.setWideBufferBudgetForTesting(16L * 1024 * 1024);
         assertEquals(16L * 1024 * 1024, DirectIOVectorIndexInput.wideBufferBudgetBytes());
 
-        withNodeSettings(
-            Settings.builder()
-                .put(KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET, "0b")
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET, "0b")
-                .build()
-        );
+        DirectIOVectorIndexInput.setDirectMemoryBudgetForTesting(0L);
+        DirectIOVectorIndexInput.setWideBufferBudgetForTesting(0L);
         assertEquals("a budget must never be the reason a shard cannot read", 0L, DirectIOVectorIndexInput.wideBufferBudgetBytes());
     }
 
@@ -277,12 +240,8 @@ public class WideBufferBudgetTests extends KNNTestCase {
      * through one phantom reference, so one reclamation returns it to both and they cannot drift.
      */
     public void testAWideBufferIsChargedToBothBudgets() {
-        withNodeSettings(
-            Settings.builder()
-                .put(KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_BUDGET, "0b")
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_WIDE_BUFFER_BUDGET, "0b")
-                .build()
-        );
+        DirectIOVectorIndexInput.setDirectMemoryBudgetForTesting(0L);
+        DirectIOVectorIndexInput.setWideBufferBudgetForTesting(0L);
         final long directBefore = DirectIOVectorIndexInput.reclaim();
         final long wideBefore = DirectIOVectorIndexInput.STATS.wideBufferLive();
 

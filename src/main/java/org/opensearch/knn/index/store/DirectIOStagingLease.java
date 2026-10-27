@@ -17,7 +17,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * number of threads that can be inside a burst at once, not by when the garbage collector next runs.
  *
  * <h2>The measurement this exists for</h2>
- * Phase 15's budget ({@code knn.direct_io.direct_memory_budget}) bounded the wrong quantity, and the node
+ * Phase 15's budget ({@link DirectIOVectorIndexInput#DIRECT_MEMORY_BUDGET_BYTES}) bounded the wrong quantity, and the node
  * showed it twice in one night (MEASURED 2026-10-06, jar {@code 4a8cf9e9}, r7g.xlarge, {@code -Xmx24g}
  * {@code -XX:MaxDirectMemorySize=2g}, 16 clients):
  * <ul>

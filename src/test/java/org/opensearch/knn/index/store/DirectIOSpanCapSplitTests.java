@@ -76,6 +76,8 @@ public class DirectIOSpanCapSplitTests extends KNNTestCase {
     private static final int FOOTER_LENGTH = 16;
     private static final int VECTOR_COUNT = 1_024;
     private static final int TEST_SLAB_BYTES = 1024 * 1024;
+    /** The span cap the current arm sweeps, applied by {@link #openAtCap(Path)}. */
+    private int capBytes = DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGE_BYTES;
     private static final long BYTES_128 = 128 * 1024;
 
     private float[][] vectors;
@@ -102,9 +104,9 @@ public class DirectIOSpanCapSplitTests extends KNNTestCase {
     public void testNoGroupExceedsTheDefaultSpanCap() {
         assumeDirectIOWorksHere();
         writeFixture(1L);
-        configureStoreOff(DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGE_BYTES + "b");
+        configureStoreOff(DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGE_BYTES);
 
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+        try (DirectIOVectorIndexInput input = openAtCap(path)) {
             assertNotNull(input);
             assertEquals(DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGE_BYTES, input.maxStagedRangeBytes());
 
@@ -126,13 +128,13 @@ public class DirectIOSpanCapSplitTests extends KNNTestCase {
     public void testNoGroupExceedsASixteenKilobyteSpanCapWhereTheUnsplitGroupingDeclines() {
         assumeDirectIOWorksHere();
         writeFixture(2L);
-        configureStoreOff("16kb");
+        configureStoreOff(16 * 1024);
 
         final int[] batch = consecutive(0, 60);
 
         // Arm A: the grouping as it was before P1, driven straight at the input. 60 x 3,072 B is 184,320 B,
         // so the 128 KB budget makes two groups and each of them is far above a 16 KiB cap.
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+        try (DirectIOVectorIndexInput input = openAtCap(path)) {
             assertNotNull(input);
             assertEquals(16 * 1024, input.maxStagedRangeBytes());
             final int unsplitGroups = prefetchTheUnsplitWay(input, HEADER_LENGTH, VECTOR_BYTES, batch);
@@ -141,7 +143,7 @@ public class DirectIOSpanCapSplitTests extends KNNTestCase {
 
         // Arm B: the production path on the same batch.
         DirectIOVectorIndexInput.STATS.reset();
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+        try (DirectIOVectorIndexInput input = openAtCap(path)) {
             assertNotNull(input);
             final int[] copy = batch.clone();
             PrefetchHelper.prefetch(input, HEADER_LENGTH, VECTOR_BYTES, copy, copy.length);
@@ -161,9 +163,9 @@ public class DirectIOSpanCapSplitTests extends KNNTestCase {
     public void testEveryEmittedGroupIsWithinTheCapWhenAligned() {
         assumeDirectIOWorksHere();
         writeFixture(3L);
-        for (final String cap : List.of("16kb", "32kb", DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGE_BYTES + "b")) {
+        for (final int cap : List.of(16 * 1024, 32 * 1024, DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGE_BYTES)) {
             configureStoreOff(cap);
-            try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+            try (DirectIOVectorIndexInput input = openAtCap(path)) {
                 assertNotNull(input);
                 final int[] batch = clustered(400, 64, 11L);
                 final List<long[]> groups = recordGroups(input, HEADER_LENGTH, VECTOR_BYTES, batch);
@@ -207,8 +209,8 @@ public class DirectIOSpanCapSplitTests extends KNNTestCase {
 
         // Arm A: the unsplit grouping. One group of 110,628 B, declined at a 16 KiB cap, so every vector is a
         // blocking read and the store admits none of them.
-        configureStoreOn(8, false, "16kb");
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+        configureStoreOn(8, false, 16 * 1024);
+        try (DirectIOVectorIndexInput input = openAtCap(path)) {
             assertNotNull(input);
             prefetchTheUnsplitWay(input, HEADER_LENGTH, VECTOR_BYTES, batch);
             assertEquals("the single group is declined", 1L, DirectIOVectorIndexInput.STATS.stageDeclined());
@@ -222,8 +224,8 @@ public class DirectIOSpanCapSplitTests extends KNNTestCase {
         }
 
         // Arm B: the production path, which splits.
-        configureStoreOn(8, false, "16kb");
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+        configureStoreOn(8, false, 16 * 1024);
+        try (DirectIOVectorIndexInput input = openAtCap(path)) {
             assertNotNull(input);
             final int[] copy = batch.clone();
             PrefetchHelper.prefetch(input, HEADER_LENGTH, VECTOR_BYTES, copy, copy.length);
@@ -265,10 +267,10 @@ public class DirectIOSpanCapSplitTests extends KNNTestCase {
     public void testAVectorOnAGroupBoundaryIsReadCorrectlyAndTheRestAreAdmitted() {
         assumeDirectIOWorksHere();
         writeFixture(8L);
-        configureStoreOn(8, false, "16kb");
+        configureStoreOn(8, false, 16 * 1024);
 
         final int[] batch = consecutive(100, 40);
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+        try (DirectIOVectorIndexInput input = openAtCap(path)) {
             assertNotNull(input);
             final int[] copy = batch.clone();
             PrefetchHelper.prefetch(input, HEADER_LENGTH, VECTOR_BYTES, copy, copy.length);
@@ -331,9 +333,9 @@ public class DirectIOSpanCapSplitTests extends KNNTestCase {
     public void testTheCallersArrayIsOnlySorted() {
         assumeDirectIOWorksHere();
         writeFixture(5L);
-        configureStoreOn(8, false, "16kb");
+        configureStoreOn(8, false, 16 * 1024);
 
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+        try (DirectIOVectorIndexInput input = openAtCap(path)) {
             assertNotNull(input);
             final int[] batch = { 600, 0, 200, 50, 400 };
             PrefetchHelper.prefetch(input, HEADER_LENGTH, VECTOR_BYTES, batch, batch.length);
@@ -349,9 +351,9 @@ public class DirectIOSpanCapSplitTests extends KNNTestCase {
     public void testTheMissFilterStillRunsBeforeTheGrouping() {
         assumeDirectIOWorksHere();
         writeFixture(6L);
-        configureStoreOn(8, false, "16kb");
+        configureStoreOn(8, false, 16 * 1024);
 
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+        try (DirectIOVectorIndexInput input = openAtCap(path)) {
             assertNotNull(input);
             // Spaced, so that each warming read is its own group and every one of them is admitted; the
             // boundary rule of testAVectorOnAGroupBoundaryIsReadCorrectlyAndTheRestAreAdmitted would
@@ -390,9 +392,9 @@ public class DirectIOSpanCapSplitTests extends KNNTestCase {
     public void testAlignedSpanBytesIsTakenOverTheAbsoluteOffset() {
         assumeDirectIOWorksHere();
         writeFixture(7L);
-        configureStoreOff("16kb");
+        configureStoreOff(16 * 1024);
 
-        try (DirectIOVectorIndexInput input = DirectIOVectorIndexInput.open(path)) {
+        try (DirectIOVectorIndexInput input = openAtCap(path)) {
             assertNotNull(input);
             final int block = input.blockSize();
             assertEquals("a block-aligned request of one block stays one block", block, input.alignedSpanBytes(0, block));
@@ -570,11 +572,11 @@ public class DirectIOSpanCapSplitTests extends KNNTestCase {
     }
 
     /** The store off, so that the geometry under test is the grouping's and nothing else. */
-    private void configureStoreOff(final String cap) {
+    private void configureStoreOff(final int cap) {
+        capBytes = cap;
         withNodeSettings(
             Settings.builder()
                 .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, "0b")
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN, cap)
                 .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
                 .build()
         );
@@ -584,21 +586,29 @@ public class DirectIOSpanCapSplitTests extends KNNTestCase {
         DirectIOVectorIndexInput.STATS.reset();
     }
 
-    private void configureStoreOn(final int slabs, final boolean spanFill, final String cap) {
+    private void configureStoreOn(final int slabs, final boolean spanFill, final int cap) {
         final long maxBytes = (long) slabs * TEST_SLAB_BYTES;
+        capBytes = cap;
         withNodeSettings(
             Settings.builder()
                 .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, maxBytes + "b")
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL, spanFill)
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_READ_AROUND_BYTES, "0b")
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_PREFETCH_MAX_SPAN, cap)
                 .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
                 .build()
         );
         DirectIOVectorCache.resetForTesting();
+        DirectIOVectorCache.setSpanFillForTesting(spanFill);
+        DirectIOVectorCache.setReadAroundBytesForTesting(0L);
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
         DirectIOVectorCache.configure(maxBytes);
         DirectIOVectorIndexInput.STATS.reset();
+    }
+
+    /**
+     * An input opened at the span cap the arm is sweeping. The cap is a constant on a node, so a sweep of it
+     * goes through the sizing overload, which is what that overload exists for.
+     */
+    private DirectIOVectorIndexInput openAtCap(final Path file) {
+        return DirectIOVectorIndexInput.open(file, 0, DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGES, capBytes, 0, 0, 2);
     }
 
     @SneakyThrows

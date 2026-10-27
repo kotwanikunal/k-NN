@@ -103,15 +103,15 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
         withNodeSettings(
             Settings.builder()
                 .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, maxBytes + "b")
-                // Span fill off, so the counts here are the requested fills' and one read admits one vector.
-                // It is on by default and has a suite of its own, DirectIOSpanFillTests, where the admitted
-                // set is computed from the span's geometry; what these tests pin is the accounting, the key
-                // and the resize, and a span admitting fifteen neighbours would hide all three.
-                .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL, false)
                 .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
                 .build()
         );
         DirectIOVectorCache.resetForTesting();
+        // Span fill off, so the counts here are the requested fills' and one read admits one vector. It is
+        // on by default and has a suite of its own, DirectIOSpanFillTests, where the admitted set is
+        // computed from the span's geometry; what these tests pin is the accounting, the key and the resize,
+        // and a span admitting fifteen neighbours would hide all three.
+        DirectIOVectorCache.setSpanFillForTesting(false);
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
         DirectIOVectorCache.configure(maxBytes);
     }
@@ -426,7 +426,6 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
             withNodeSettings(
                 Settings.builder()
                     .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, (4 * TEST_SLAB_BYTES) + "b")
-                    .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL, false)
                     .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
                     .build()
             );
@@ -451,7 +450,6 @@ public class DirectIOVectorCacheTests extends KNNTestCase {
             withNodeSettings(
                 Settings.builder()
                     .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, "0b")
-                    .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_SPAN_FILL, false)
                     .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
                     .build()
             );
