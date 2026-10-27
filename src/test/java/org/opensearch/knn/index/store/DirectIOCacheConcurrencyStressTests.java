@@ -211,8 +211,13 @@ public class DirectIOCacheConcurrencyStressTests extends KNNTestCase {
         // 64 slabs is the derived count's own ratio at eight slabs a segment, and the settings are what
         // applyConfiguredSize reads when the control thread turns the route off and back on.
         final long target = 64L * TEST_SLAB_BYTES;
-        nodeSettings(target, spanFill, readAround);
+        nodeSettings(target);
         DirectIOVectorCache.resetForTesting();
+        // After the reset, never before it: span fill and the read-around width are constants in production and
+        // the reset returns both fields to those constants, so a corner that wants either one off has to say so
+        // once the store is back at its own defaults.
+        DirectIOVectorCache.setSpanFillForTesting(spanFill);
+        DirectIOVectorCache.setReadAroundBytesForTesting(readAround ? 64L * 1_024 : 0L);
         DirectIOVectorCache.setSlabBytesForTesting(TEST_SLAB_BYTES);
         DirectIOVectorCache.publishMaxBytes(target);
         DirectIOVectorCache.applyConfiguredSize(true);
@@ -481,13 +486,11 @@ public class DirectIOCacheConcurrencyStressTests extends KNNTestCase {
     }
 
     /** The node settings {@code applyConfiguredSize} reads, set once per phase and never under load. */
-    private void nodeSettings(final long maxBytes, final boolean spanFill, final boolean readAround) {
+    private void nodeSettings(final long maxBytes) {
         final Settings settings = Settings.builder()
             .put(KNNSettings.KNN_DIRECT_IO_RESCORE_CACHE_MAX_BYTES, maxBytes + "b")
             .put(KNNSettings.KNN_DIRECT_IO_READAHEAD_WINDOW, 0)
             .build();
-        DirectIOVectorCache.setSpanFillForTesting(spanFill);
-        DirectIOVectorCache.setReadAroundBytesForTesting(readAround ? 64L * 1024 : 0L);
         final Set<Setting<?>> registered = new HashSet<>(ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
         registered.addAll(
             KNNSettings.state()
