@@ -74,8 +74,8 @@ final class DirectIOSlabBroker {
      *
      * <p>A failed reservation is <b>expensive</b>, not merely fruitless: {@code java.nio.Bits#reserveMemory}
      * calls {@code System.gc()} and then sleeps nine times with backoff, so the caller is blocked for a
-     * measured half second and the node takes a full pause. That holds for {@code allocateDirect} on any JDK
-     * and for FFM on 21, where the arena charges the same limit. Retrying on every fill below the target
+     * measured fraction of a second and the node takes a full pause. That holds for {@code allocateDirect}
+     * on the JDKs this runs on, and for FFM on 21, where the arena charges the same limit. Retrying on every fill below the target
      * costs that once per fill, and the answer is the same every time.
      *
      * <p>An {@link AtomicBoolean} rather than a field under a lock, because the one thing that must happen

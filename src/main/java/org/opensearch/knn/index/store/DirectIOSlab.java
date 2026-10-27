@@ -80,8 +80,9 @@ final class DirectIOSlab {
      * The slab size, 32 MiB, fixed rather than a setting because nothing an operator can measure would tell
      * them what to set it to. The figure that matters is the cache's total, which
      * {@code knn.direct_io.rescore.cache.max_bytes} bounds, and the slab is only the granularity at which
-     * that total is reclaimed. It leaves a large enough slab population for slab-granular FIFO eviction at
-     * any useful cache size, and it is three orders of magnitude above the largest vector it holds.
+     * that total is reclaimed. At the cache sizes this feature is deployed at it leaves tens of slabs or
+     * more, which is a large enough population for slab-granular FIFO eviction, and it is three orders of
+     * magnitude above the largest vector a {@code knn_vector} field can hold.
      */
     static final int SLAB_BYTES = 32 * 1024 * 1024;
 

@@ -213,7 +213,7 @@ final class DirectIOCacheSegment {
         boolean wanted;
         /**
          * Whether the slab is to be <b>borrowed</b> from another segment rather than allocated, which is what
-         * a segment holding no slab at all asks for when the store is already at its target (Q, section 2.2
+         * a segment holding no slab at all asks for when the store is already at its target
          * step 3). Set by {@link DirectIOCacheSegment#obtainSlab}.
          */
         boolean wantsTransfer;
@@ -564,7 +564,7 @@ final class DirectIOCacheSegment {
                         placement.slab.memory.bytes().put(placement.slot * length, source, position, length);
                         attach(placement.slab, placement.slot, placement.map, offset);
                         DirectIOVectorCache.insertions.increment();
-                        // Both counters: BACKLOG asks for this under the existing readmissions key, and
+                        // Both counters: this belongs under the existing readmissions key, and
                         // race_readmissions keeps the two sources separable, because readmissions otherwise
                         // means second chances alone and the re-proof reads it arm against arm.
                         DirectIOVectorCache.readmissions.increment();
@@ -655,7 +655,7 @@ final class DirectIOCacheSegment {
      * <h4>Why the second clause is not simply "the open slab has a free slot"</h4>
      * At the target the open slab's free slots are what a reclaim has just produced, and the requested fills
      * are entitled to them: letting span fill take them would be span fill running at the target, which is
-     * the scan-resistance question (agenda item 4) this phase is not deciding. Slots a closed file vacated
+     * the scan-resistance question this store does not answer. Slots a closed file vacated
      * are a different thing. Nothing is pushed out to use them, because what held them is gone, so admitting
      * into them cannot displace a working set. That is the whole of the closed-file release: after a merge the store would
      * otherwise sit at its target holding dead vectors, span fill would not re-arm, and the merged segment
@@ -738,7 +738,7 @@ final class DirectIOCacheSegment {
         }
         Slab slab = openSlabs.get(length);
         if (slab == null || slab.freeSlots() == 0) {
-            // slots a closed file gave back come first, before any growth and before any eviction. The
+            // Slots a closed file gave back come first, before any growth and before any eviction. The
             // store has room it has already been given, and using it is what lets span fill re-arm for a
             // merged segment without displacing a live vector.
             slab = recycledSlab(length);
@@ -889,8 +889,8 @@ final class DirectIOCacheSegment {
         if (oldest == null) {
             // This segment holds no slab at all and the store is at its target, so there is nothing here to
             // reclaim and growing is refused. Ask the broker to lend one from the segment holding the most
-            // slabs. INFERRED: with 128 segments and over a thousand slabs every segment reaches several
-            // during the ramp, so this is a cold-start transient and not a steady-state path.
+            // slabs. On a store with many segments every one of them reaches several slabs during the
+            // ramp, so this is a cold-start transient and not a steady-state path.
             if (request != null && pendingSlabs == 0 && retired == false && broker.maxSlabs() > 0) {
                 pendingSlabs++;
                 request.reservedIn = this;
@@ -926,7 +926,8 @@ final class DirectIOCacheSegment {
      * half of {@link #obtainSlab} that displaces nothing, which is the only half span fill is allowed. Called
      * under the write lock.
      *
-     * <p>Nothing here allocates: that is the rule. The target check is the broker's, and it counts the slabs other
+     * <p>Nothing here allocates: an allocation happens outside every lock. The target check is the
+     * broker's, and it counts the slabs other
      * fills are allocating right now as well as the live ones, so concurrent growth cannot overshoot.
      *
      * <p>One allocation attempt per latch, not one per fill: see {@link DirectIOSlabBroker} for what a failed
@@ -1227,7 +1228,7 @@ final class DirectIOCacheSegment {
         return liveSlabs;
     }
 
-    /** Heap held by this segment's index, for the bytes-per-entry figure M2's bench reports. */
+    /** Heap held by this segment's index, which is what the index's bytes-per-entry figure is taken from. */
     long indexBytes() {
         lock.readLock().lock();
         try {
@@ -1265,7 +1266,7 @@ final class DirectIOCacheSegment {
         }
     }
 
-    /** Whether the calling thread holds this segment's lock in either mode. a test seam. */
+    /** Test seam: whether the calling thread holds this segment's lock in either mode. */
     boolean lockHeldByCurrentThread() {
         return lock.isWriteLockedByCurrentThread() || lock.getReadHoldCount() > 0;
     }

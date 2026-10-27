@@ -461,7 +461,7 @@ public final class KNNDirectIODirectory extends FilterDirectory {
      */
     @Nullable
     static Path resolvePath(final Directory directory, final String name) {
-        // unwrap answers null for null, so a chain with nothing in it needs no case of its own.
+        // Unwrap answers null for null, so a chain with nothing in it needs no case of its own.
         if (FilterDirectory.unwrap(directory) instanceof FSDirectory fsDirectory) {
             return fsDirectory.getDirectory().resolve(name);
         }
@@ -470,9 +470,9 @@ public final class KNNDirectIODirectory extends FilterDirectory {
 
     /**
      * The two FP16 per-field formats' names. Spelled out here rather than read from the formats because
-     * both declare their {@code FORMAT_NAME} private and one of them lives outside the files this phase may
-     * change; {@code KNNDirectIODirectoryTests#halfFloatFormatNamesMatchTheFormats} asks the formats
-     * themselves and fails if either is ever renamed, so these strings cannot drift in silence.
+     * both declare their {@code FORMAT_NAME} private and one of them lives outside this package.
+     * {@code KNNDirectIODirectoryTests#halfFloatFormatNamesMatchTheFormats} asks the formats themselves and
+     * fails if either is ever renamed, so these strings cannot drift in silence.
      */
     static final String HALF_FLOAT_FORMAT_NAME = "NativeEngines990HalfFloatKnnVectorsFormat";
     static final String HALF_FLOAT_SQ_FORMAT_NAME = "Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat";
@@ -501,8 +501,9 @@ public final class KNNDirectIODirectory extends FilterDirectory {
      * {@code Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat}. Both extend the fp32 formats above and both
      * nest {@code KNN1040HalfFloatFlatVectorsFormat}, whose data extension is also {@code vec}, so the open
      * always reaches this rule — but the inserted {@code HalfFloat} breaks the fp32 substrings, which is why
-     * the two names are listed. Nothing else about the rule changes: a half-float {@code .vec} is a flat file of {@code 2 x dimension} bytes per vector
-     * that the rescore path reads at random, which is what this feature is for. The store keys on offset and
+     * the two names are listed. Nothing else about the rule changes: a half-float {@code .vec} is a flat
+     * file of {@code 2 x dimension} bytes per vector that the rescore path reads at random, which is what
+     * this feature is for. The store keys on offset and
      * byte length, so the halved vector length needs nothing of it, and the FP16 read path's
      * {@code readBytes} is served by {@code DirectIOVectorIndexInput#isVectorRead}.
      */
@@ -529,9 +530,12 @@ public final class KNNDirectIODirectory extends FilterDirectory {
      */
     private void decline(final AtomicLong counter, final DirectIOVectorIndexInput.DeclineReason reason) {
         counter.incrementAndGet();
-        // The delegate's own class, not this one's: an operator reading the node-wide map wants the substrate
-        // that declined, and every entry in it would otherwise read KNNDirectIODirectory.
-        DirectIOVectorIndexInput.STATS.recordDecline(reason, in.getClass().getSimpleName());
+        // The top of the chain below this directory, not this directory's own class, which every entry
+        // would otherwise read. getSimpleName is empty for an anonymous Directory, and an empty name says
+        // less than a long one, so the fully qualified name stands in for it -- the same choice
+        // describeChain makes.
+        final String top = in.getClass().getSimpleName();
+        DirectIOVectorIndexInput.STATS.recordDecline(reason, top.isEmpty() ? in.getClass().getName() : top);
     }
 
     /** Flat vector data opens this directory served with {@code O_DIRECT}, at either precision. */

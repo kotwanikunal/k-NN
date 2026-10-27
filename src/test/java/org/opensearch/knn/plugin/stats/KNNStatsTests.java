@@ -173,10 +173,10 @@ public class KNNStatsTests extends KNNTestCase {
 
         assertEquals(Set.of("routed_opens", "declined_opens", "declined"), directIO.get("dispatch").keySet());
         // F-08: the six reasons are one map keyed by the reason, each entry carrying its count and the
-        // outermost wrapper of the last chain to decline under it. The reason names are the API now, so they
-        // are asserted literally for the same reason the key names are.
+        // top of the chain the last decline under it came through. The reason names are the API now, so they
+        // are asserted literally for the same reason the key names are, and in the same lower-case shape.
         final Map<String, Object> declined = (Map<String, Object>) directIO.get("dispatch").get("declined");
-        assertEquals(Set.of("COMPOUND", "CHAIN", "MISSING", "TOO_SMALL", "OPEN_FAILED", "CONTENT"), declined.keySet());
+        assertEquals(Set.of("compound", "chain", "missing", "too_small", "open_failed", "content"), declined.keySet());
         declined.forEach((reason, entry) -> {
             final Map<String, Object> fields = (Map<String, Object>) entry;
             assertEquals("declined." + reason + " must carry a count and a wrapper", Set.of("count", "outermost"), fields.keySet());

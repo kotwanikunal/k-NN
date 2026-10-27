@@ -47,10 +47,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <ul>
  *   <li>{@code DirectIOVectorIndexInput}'s sequential read-ahead ring also submits, and a ring window can
  *       be <em>retired without ever being awaited</em>, so not every task has a waiting submitter.</li>
- *   <li>{@code concurrent scorers x window} is not small. Measured: a 16-thread probe driving the real
- *       stack on 4 pinned cores with the shipped {@code staged_ranges=64} held <b>654-857 tasks
- *       queued</b> with all 64 threads active, sustained. Every staged read in that state waits behind
- *       about thirteen others, on a search thread, with no bound.</li>
+ *   <li>{@code concurrent scorers x window} is not small. A probe driving the real stack on a few cores at
+ *       the shipped {@code staged_ranges} held hundreds of tasks queued with every thread active,
+ *       sustained. Every staged read in that state waits behind a dozen others, on a search thread, with no
+ *       bound.</li>
  * </ul>
  *
  * So the queue is an {@link ArrayBlockingQueue} of {@link #queueCapacity()}, and a submit past it is

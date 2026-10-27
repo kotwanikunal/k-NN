@@ -573,6 +573,49 @@ public class KNNDirectIODirectoryTests extends KNNTestCase {
      * condition 8 is what says so. Under the allowlist this open declined, and a new layer in a production
      * chain cost the feature until someone read the class and added its name.
      */
+    /**
+     * The {@code outermost} the decline map records is the <b>top</b> of the chain below this directory and
+     * not the substrate at its bottom, which a one-layer chain cannot tell apart because they are the same
+     * object. Two layers can: the file sits in a {@link ByteBuffersDirectory} with no filesystem path, the
+     * chain declines {@code CHAIN}, and what the map must name is the {@code PassthroughDirectory} on top.
+     *
+     * <p>Also the anonymous-wrapper case: {@code Class#getSimpleName} is empty for one, and an entry that
+     * named nothing would be indistinguishable from a reason that never declined, so the fully qualified
+     * name stands in.
+     */
+    @SneakyThrows
+    public void testTheDeclineMapNamesTheTopOfTheChainAndNeverNothing() {
+        DirectIOVectorIndexInput.STATS.reset();
+        try {
+            // One bottom per phase, because closing the storage closes the whole chain under it.
+            final ByteBuffersDirectory firstBottom = new ByteBuffersDirectory();
+            writeFile(firstBottom, VECTOR_DATA, FILE_BYTES);
+            try (KNNDirectIODirectory storage = storageOver(new PassthroughDirectory(firstBottom), true)) {
+                storage.openInput(VECTOR_DATA, vectorDataContext()).close();
+                assertEquals(1, storage.declinedChain());
+            }
+            assertEquals(
+                "the top of the chain, not the ByteBuffersDirectory at its bottom",
+                "PassthroughDirectory",
+                entryOf(DirectIOVectorIndexInput.STATS.declines(), "chain").get("outermost")
+            );
+
+            // An anonymous FilterDirectory: getSimpleName is "", which must not be what the map reports.
+            final ByteBuffersDirectory secondBottom = new ByteBuffersDirectory();
+            writeFile(secondBottom, VECTOR_DATA, FILE_BYTES);
+            try (KNNDirectIODirectory storage = storageOver(new FilterDirectory(secondBottom) {
+            }, true)) {
+                storage.openInput(VECTOR_DATA, vectorDataContext()).close();
+                assertEquals(1, storage.declinedChain());
+            }
+            final String named = (String) entryOf(DirectIOVectorIndexInput.STATS.declines(), "chain").get("outermost");
+            assertFalse("an anonymous wrapper must still name something, got an empty string", named.isEmpty());
+            assertTrue("and it must name this test's own anonymous class, got " + named, named.contains("KNNDirectIODirectoryTests"));
+        } finally {
+            DirectIOVectorIndexInput.STATS.reset();
+        }
+    }
+
     @SneakyThrows
     public void testAnUnknownPassthroughFilterDirectoryRoutes() {
         assumeDirectIOWorksHere();
@@ -841,16 +884,16 @@ public class KNNDirectIODirectoryTests extends KNNTestCase {
             assertEquals(1L, DirectIOVectorIndexInput.STATS.declinedChain());
             assertEquals(1L, DirectIOVectorIndexInput.STATS.declinedTooSmall());
 
-            // F-08's map reports the same counts and, per reason, the substrate that declined under it. The
-            // two declines above came through two different delegates, so the two entries must differ: that
-            // is the whole point of recording the wrapper rather than this directory's own class.
+            // F-08's map reports the same counts and, per reason, the top of the chain the decline came
+            // through. The two declines above came through two different delegates, so the two entries must
+            // differ: that is the whole point of recording the delegate rather than this directory's class.
             final Map<String, Object> declined = DirectIOVectorIndexInput.STATS.declines();
-            assertEquals(1L, entryOf(declined, "CHAIN").get("count"));
-            assertEquals("ByteBuffersDirectory", entryOf(declined, "CHAIN").get("outermost"));
-            assertEquals(1L, entryOf(declined, "TOO_SMALL").get("count"));
-            assertEquals("MMapDirectory", entryOf(declined, "TOO_SMALL").get("outermost"));
-            assertEquals("a reason nothing declined under names no wrapper", "", entryOf(declined, "MISSING").get("outermost"));
-            assertEquals(0L, entryOf(declined, "MISSING").get("count"));
+            assertEquals(1L, entryOf(declined, "chain").get("count"));
+            assertEquals("ByteBuffersDirectory", entryOf(declined, "chain").get("outermost"));
+            assertEquals(1L, entryOf(declined, "too_small").get("count"));
+            assertEquals("MMapDirectory", entryOf(declined, "too_small").get("outermost"));
+            assertEquals("a reason nothing declined under names no wrapper", "", entryOf(declined, "missing").get("outermost"));
+            assertEquals(0L, entryOf(declined, "missing").get("count"));
         } finally {
             DirectIOVectorIndexInput.STATS.reset();
         }

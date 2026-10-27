@@ -642,9 +642,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
         /**
          * Counts one decline, under one of the six reasons the dispatch rule distinguishes, and remembers
-         * which directory declined it: {@code outermost} is the simple class name of the top of the delegate
-         * chain the declining directory wraps. Only the last one per reason is kept, because the counter
-         * answers "how often" and this answers "what substrate", and a node serves one substrate.
+         * which directory declined it: {@code outermost} names the top of the delegate chain the declining
+         * directory wraps. Only the last one per reason is kept, because the counter answers "how often"
+         * and this answers "whose chain", and a node's shards stack their directories the same way.
          */
         void recordDecline(final DeclineReason reason, final String outermost) {
             switch (reason) {
@@ -659,11 +659,12 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
 
         /**
-         * One entry per decline reason, each with the opens declined under it and the outermost wrapper of
-         * the last chain to decline under it ({@code ""} until one does). This is the shape
-         * {@code direct_io_stats.dispatch.declined} takes, and it is one map rather than six counters
-         * because an operator reads the reasons together: a zero {@code routed_opens} is diagnosed by
-         * finding which reason moved, and the wrapper names the substrate to look at next.
+         * One entry per decline reason, keyed by the reason's lower-case name, each with the opens declined
+         * under it and the top of the delegate chain the last decline under it came from ({@code ""} until
+         * one does). This is the shape {@code direct_io_stats.dispatch.declined} takes, and it is one map
+         * rather than six counters because an operator reads the reasons together: a zero
+         * {@code routed_opens} is diagnosed by finding which reason moved, and the chain's top says which
+         * shard's directory stack to look at.
          */
         public Map<String, Object> declines() {
             final Map<String, Object> byReason = new LinkedHashMap<>();
@@ -671,7 +672,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 final Map<String, Object> entry = new LinkedHashMap<>();
                 entry.put("count", declinedUnder(reason));
                 entry.put("outermost", declinedBy.getOrDefault(reason, ""));
-                byReason.put(reason.name(), entry);
+                byReason.put(reason.name().toLowerCase(Locale.ROOT), entry);
             }
             return byReason;
         }
@@ -835,7 +836,11 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             return stagedWaitTimeouts.get();
         }
 
+        /** Test seam: zeroes every counter and forgets every recorded wrapper. */
         public void reset() {
+            // The wrappers before the counts: a declines() racing a reset() must not see a reason with no
+            // count and a wrapper, which is the one pairing this class says cannot happen.
+            declinedBy.clear();
             routedOpens.set(0);
             declinedCompound.set(0);
             declinedChain.set(0);
@@ -843,7 +848,6 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             declinedTooSmall.set(0);
             declinedOpenFailed.set(0);
             declinedContent.set(0);
-            declinedBy.clear();
             blockingReads.set(0);
             stagedReads.set(0);
             stagedHits.set(0);
@@ -875,10 +879,72 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             wideBufferPeak.set(0);
             declinedWideBudget.set(0);
             readAroundReads.set(0);
-            // wideBufferLive is NOT reset here, for the reason directMemoryLive is not: it is a live gauge.
+            // WideBufferLive is NOT reset here, for the reason directMemoryLive is not: it is a live gauge.
             // resetWideGaugeForTesting is the seam a test that measures an absolute against the cap uses.
             // directMemoryLive is NOT reset: it is a live gauge, not a counter, and zeroing it while buffers
             // are still held would make the budget let through exactly as much again.
+        }
+
+        @Override
+        public String toString() {
+            // Read-ahead bytes join the numerator because they are traffic this object caused, the same as
+            // the staged and blocking channels; a window fetched and never served is amplification.
+            final long read = stagedBytes.get() + blockingBytes.get() + readaheadBytes.get();
+            final long served = servedBytes.get();
+            return String.format(
+                Locale.ROOT,
+                "routedOpens=%d declinedCompound=%d declinedChain=%d declinedMissing=%d declinedTooSmall=%d declinedOpenFailed=%d "
+                    + "declinedContent=%d "
+                    + "blockingReads=%d stagedReads=%d stagedHits=%d stageDeclined=%d prefetchCalls=%d inFlightPeak=%d "
+                    + "stagedBytes=%d blockingBytes=%d servedBytes=%d declinedSpanBytes=%d "
+                    + "readaheadReads=%d readaheadBytes=%d readaheadHits=%d readaheadDeclined=%d readaheadArmed=%d "
+                    + "stagedWaitTimeouts=%d queuePeak=%d poolRebuilds=%d "
+                    + "directMemoryLive=%d directMemoryPeak=%d declinedBudget=%d "
+                    + "arenasAllocated=%d arenasReused=%d arenasRetired=%d foreignThreadReads=%d "
+                    + "fallbackReads=%d fallbackBytes=%d switchedToMmap=%d switchedToDirect=%d "
+                    + "wideBufferLive=%d wideBufferPeak=%d declinedWideBudget=%d readAroundReads=%d amplification=%.3f",
+                routedOpens.get(),
+                declinedCompound.get(),
+                declinedChain.get(),
+                declinedMissing.get(),
+                declinedTooSmall.get(),
+                declinedOpenFailed.get(),
+                declinedContent.get(),
+                blockingReads.get(),
+                stagedReads.get(),
+                stagedHits.get(),
+                stageDeclined.get(),
+                prefetchCalls.get(),
+                inFlightPeak.get(),
+                stagedBytes.get(),
+                blockingBytes.get(),
+                served,
+                declinedSpanBytes.get(),
+                readaheadReads.get(),
+                readaheadBytes.get(),
+                readaheadHits.get(),
+                readaheadDeclined.get(),
+                readaheadArmed.get(),
+                stagedWaitTimeouts.get(),
+                queuePeak.get(),
+                poolRebuilds.get(),
+                directMemoryLive(),
+                directMemoryPeak(),
+                declinedBudget.get(),
+                arenasAllocated.get(),
+                arenasReused.get(),
+                arenasRetired.get(),
+                foreignThreadReads.get(),
+                fallbackReads.get(),
+                fallbackBytes.get(),
+                switchedToMmap.get(),
+                switchedToDirect.get(),
+                wideBufferLive.get(),
+                wideBufferPeak.get(),
+                declinedWideBudget.get(),
+                readAroundReads.get(),
+                served == 0 ? 0.0 : (double) read / served
+            );
         }
     }
 
@@ -1825,7 +1891,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final long base = this.offset + sliceOffset;
         final boolean geometryUsable = sliceOffset >= 0 && base >= 0 && vectorBytes > 0 && vectorBytes <= Integer.MAX_VALUE;
         if (geometryUsable) {
-            // the grid the FP16 path's readBytes is gated on. Declared here, before anything below can
+            // The grid the FP16 path's readBytes is gated on. Declared here, before anything below can
             // decline, because it describes this input's field and not this batch or the store's state. If it
             // were declared after the checks below, the burst at which an operator's change to
             // max_bytes or to knn.direct_io.rescore.enabled is picked up -- the one burst that arrives with
@@ -1839,7 +1905,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
         beginBurst();
         if (directIOActive == false) {
-            // with the switch off this input admits nothing and the store has been released, so there
+            // With the switch off this input admits nothing and the store has been released, so there
             // is nothing to filter and the caller takes its unfiltered path, which prefetches through the
             // delegate. Checked after beginBurst, which is where the switch was just re-read.
             return -1;
@@ -1949,7 +2015,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
         beginBurst();
         if (directIOActive == false) {
-            // this burst is a delegate burst, so the lookahead is the one the page-cache path has.
+            // This burst is a delegate burst, so the lookahead is the one the page-cache path has.
             // Lucene's mmap prefetch is madvise(WILLNEED) over the mapped range, and the delegate's input
             // carries this input's coordinates, so the arguments pass through unchanged.
             mmapFallback.prefetch(offset, length);
@@ -1975,7 +2041,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             STATS.declinedSpanBytes.addAndGet(length);
             return;
         }
-        // past here this range is a MISS -- the store does not hold it whole -- so while the whole file
+        // Past here this range is a MISS -- the store does not hold it whole -- so while the whole file
         // would still fit in the room the target leaves, widen it and let span fill harvest the neighbours.
         // One read per miss stays one read; only its size changes. The widened window is still one aligned
         // range, so nothing downstream changes: the span-fill walk clips to the reading slice and ends at
@@ -2454,7 +2520,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         leaseThreadId = -1;
         readSincePrefetch = false;
         burstConfigured = false;
-        // the filter's answers belong to the burst that asked. A blocking read in the next burst for an
+        // The filter's answers belong to the burst that asked. A blocking read in the next burst for an
         // offset this one dropped is not this race.
         filteredCount = 0;
         // The burst boundary is also where the pool reference is dropped, so the next burst picks up a pool
@@ -2498,7 +2564,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final long runStart = offset + filePointer;
         final IndexInput fallback = fallbackFor(count);
         if (fallback != null) {
-            // the delegate's own read of the same bytes, and no lookup and no admission on this route.
+            // The delegate's own read of the same bytes, and no lookup and no admission on this route.
             fallback.readBytes(destination, destinationOffset, count);
             filePointer += count;
             STATS.servedBytes.addAndGet(count);
@@ -2580,7 +2646,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final long runStart = offset + filePointer;
         final IndexInput fallback = fallbackFor(requested);
         if (fallback != null) {
-            // the same bytes of the same file, decoded by Lucene's own reader. This is the mmap read
+            // The same bytes of the same file, decoded by Lucene's own reader. This is the mmap read
             // the dispatch rule would have produced had the switch been off when the file was opened, and
             // no lookup and no admission happen on this route: nothing is served from the store and nothing
             // is put into it while the switch is off.
@@ -2634,7 +2700,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 // where the bytes are known to be valid, the vector length is known, and the range is known.
                 spanFill(source.range, runStart, requested);
             } else if (written == 0 && usableFloats == count && wasFilteredAsCached(runStart)) {
-                // the filter-then-read race. This vector was cached when the prefetch filter checked it, so it
+                // The filter-then-read race. This vector was cached when the prefetch filter checked it, so it
                 // was not staged, and it is not cached now -- the store lost it in between and this read went
                 // to the device synchronously. Keeping its bytes is what stops it staying a miss. It is
                 // admitted without evicting anything; see DirectIOVectorCache#readmitAfterRace for why this
@@ -2695,7 +2761,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      */
     private void spanFill(final StagedRange range, final long runStart, final int vectorBytes) {
         if (range == null || range.spanFilled || vectorBytes <= 0 || DirectIOVectorCache.isSpanFillOn() == false
-        // or a closed file has given slots back, which is room nothing was pushed out to get.
+        // Or a closed file has given slots back, which is room nothing was pushed out to get.
         // Approximate on purpose, because this runs before the write lock; putRun re-asks precisely.
             || DirectIOVectorCache.mayAdmitSpanFillApproximately() == false) {
             return;
@@ -2822,13 +2888,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * never completed — because the pool was saturated, because the queue in front of it was unbounded, or
      * because the device stopped answering — held the calling search thread with no bound and no
      * cancellation check. {@code SearchBackpressure} cancellation is cooperative, so such a thread is not
-     * recoverable; the Oct-2 incident's search tasks logged elapsed times of 2.1 hours.
+     * recoverable, and such threads have been observed logging elapsed times in hours.
      *
      * <p>On timeout the range is {@link StagedRange#abandoned}, which makes it {@link StagedRange#covers}
      * nothing, and the caller falls through to {@link #blockingSource} — the same fall-through the
      * short-read-at-EOF case already uses. The read may still be running and may still write into the
-     * range's buffer, so that buffer is retired rather than reused; {@link #releaseAbandoned} is where
-     * that happens.
+     * range's buffer, so the whole arena it was carved from is retired rather than handed to the next
+     * burst; {@link DirectIOStagingLease#take} is where that happens.
      *
      * @return true if the bytes are in the range's buffer, false if the caller must read them itself
      */
@@ -2868,8 +2934,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      *
      * <h4>This path's own buffer is bounded, and the budget deliberately does not decline it</h4>
      * It is <b>exactly one</b> buffer of {@link #bufferSize} per <b>thread</b> rather than one per input,
-     * allocated on that thread's first blocking read and then reused: the window check below serves every later read that falls inside the window it
-     * already holds, and a read outside it re-reads into the <em>same</em> buffer rather than allocating. It
+     * allocated on that thread's first blocking read and then reused: the window check below serves every
+     * later read that falls inside the window it already holds, and a read outside it re-reads into the
+     * <em>same</em> buffer rather than allocating. It
      * is never grown and never allocated per read. So the blocking channel's whole direct footprint is
      * {@code bufferSize x live threads}, where one per input would be {@code bufferSize x live inputs} and
      * inputs outlive their queries.
@@ -3223,7 +3290,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         // The route this clone starts on is the one its parent is on, so a clone taken mid burst does not
         // change path on its first read; it re-reads the switch at its own next burst like any other input.
         copy.directIOActive = directIOActive;
-        // and the same field's vector grid, which is sound because a clone covers the same offset and
+        // And the same field's vector grid, which is sound because a clone covers the same offset and
         // length as its parent. Without this a clone taken for a values copy could read a vector before its
         // own first prefetch filter call and so neither hit nor admit it.
         copy.vectorGridBase = vectorGridBase;
@@ -3251,7 +3318,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 mmapFallback.close();
             }
             handle.channel.close();
-            // the file is closed for good, so its cached vectors are cold for ever and the slots they
+            // The file is closed for good, so its cached vectors are cold for ever and the slots they
             // hold are room the store can have back without evicting anything. Only here, in the
             // ownsHandle branch: a clone or a slice closing would otherwise free bytes its parent is still
             // reading. After the channel close rather than before it, because nothing may read the file

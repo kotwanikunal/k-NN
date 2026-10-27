@@ -442,8 +442,8 @@ public final class DirectIOVectorCache {
 
     /**
      * {@link #segmentFor}'s arithmetic, separately so a test can assert it without a store. Byte for byte
-     * the form {@code bench/q-baseline/SegmentedHitRateBench#segmentOf} measured the hit-rate cost of, so
-     * the implementation and the design run's emulation select the same segment for the same key.
+     * the form the hit-rate cost of segmenting was measured against, so the implementation and that
+     * emulation select the same segment for the same key.
      *
      * @param fileIdHash the file identity's {@code hashCode}
      * @param offset     the vector's byte offset
@@ -551,7 +551,7 @@ public final class DirectIOVectorCache {
             // One read acquisition for the batch, which is the batching this method exists to keep.
             return all[0].selectMissing(fileId, baseOffset, vectorBytes, ords, 0, numOrds, missing, 0);
         }
-        // bucket the batch by segment, walk each touched segment under ONE read acquisition, and write
+        // Bucket the batch by segment, walk each touched segment under ONE read acquisition, and write
         // the misses out in the caller's ordinal order. A counting sort, so the bucketing is
         // O(batch + segments) with no comparison, and the scratch is one set of arrays per thread.
         //
@@ -580,7 +580,7 @@ public final class DirectIOVectorCache {
         for (int i = 0; i < numOrds; i++) {
             order[bounds[segmentOf[i]]++] = i;
         }
-        // bounds[s] is now one past segment s's group, so its group is [the previous bound, bounds[s]).
+        // Bounds[s] is now one past segment s's group, so its group is [the previous bound, bounds[s]).
         boolean anyIndexed = false;
         int from = 0;
         for (int segment = 0; segment < all.length; segment++) {
@@ -800,7 +800,7 @@ public final class DirectIOVectorCache {
      *       impossible for a read-around to evict a live vector: if the file fits, nothing has to be
      *       displaced to hold it. Merely being below the target would not do, because a store one vector
      *       below its target would widen a read whose neighbours then evict the working set, and scan
-     *       resistance (agenda item 4) is undecided;</li>
+     *       resistance is not something this store provides;</li>
      *   <li>span fill is on, because the widened bytes are admitted by span fill and a wider read nobody
      *       harvests is device traffic for nothing.</li>
      * </ul>
@@ -811,7 +811,7 @@ public final class DirectIOVectorCache {
      * fields of different dimensions, so there is no one vector length to multiply by. Costing a nearly-full
      * store some coverage is the right direction for a gate whose job is to never evict.
      *
-     * <p>The fit test is a lock-free sum of the segments' volatile byte counts since Q, where it took the
+     * <p>The fit test is a lock-free sum of the segments' volatile byte counts rather than the
      * store's one read lock: it is a global question and it is asked once per prefetch burst, not once per
      * read (see {@code DirectIOVectorIndexInput#beginBurst}), so it has no business competing with the query
      * path for a lock.
@@ -862,7 +862,7 @@ public final class DirectIOVectorCache {
      *   <li><b>It never evicts, and never takes a slab the target does not allow.</b> It places with eviction
      *       refused, so the moment the store is at its slab target this admits nothing and the admission
      *       policy is back to the requested vectors alone. That is what keeps a span fill from being a scan
-     *       that pushes out the working set, which is the open agenda item (item 4) this phase is not
+     *       that pushes out the working set, which is the scan resistance this store does not
      *       deciding.</li>
      *   <li><b>It skips an offset that is already cached.</b> The requested fill has just put this read's
      *       vector in, and the span it was staged for contains it; admitting it again would spend a slot on a
@@ -1267,7 +1267,7 @@ public final class DirectIOVectorCache {
      * Slot bytes held by live vectors right now. Payload, not the slab total: see {@link #slabBytes()} for
      * what the node is actually holding, which is the figure a memory budget cares about.
      *
-     * <p>A lock-free sum of the segments' volatile counters since Q, where it took the store's one read lock.
+     * <p>A lock-free sum of the segments' volatile counters, so a stats read takes no lock at all.
      */
     public static long bytes() {
         long total = 0;
@@ -1351,7 +1351,7 @@ public final class DirectIOVectorCache {
 
     /**
      * Vectors a blocking read put back after the filter-then-read race lost them. These are also
-     * counted in {@link #readmissions()}, which BACKLOG asks for; this key is what keeps the two sources of
+     * counted in {@link #readmissions()}; this key is what keeps the two sources of
      * a readmission separable, because the other one is the second chance.
      *
      * <p>What it says: the race happened this often and cost a synchronous device read each time, and the
@@ -1376,7 +1376,7 @@ public final class DirectIOVectorCache {
         return DirectIOSlab.backend();
     }
 
-    /** Heap held by the index itself, for the bytes-per-entry figure M2's bench reports. */
+    /** Heap held by the index itself, which is what the index's bytes-per-entry figure is taken from. */
     static long indexBytes() {
         long total = 0;
         for (final DirectIOCacheSegment segment : segments) {
@@ -1463,8 +1463,9 @@ public final class DirectIOVectorCache {
     }
 
     /**
-     * Test seam: whether the calling thread is inside this store's locks at all, which since Q means the
-     * broker's lock or any segment's lock in either mode. the property is that neither a slab allocation
+     * Test seam: whether the calling thread is inside this store's locks at all, which means the
+     * broker's lock or any segment's lock in either mode. The property to assert is that neither a slab
+     * allocation
      * nor a slab release ever runs while it is.
      *
      * @return whether this thread holds any of the store's locks
@@ -1532,7 +1533,7 @@ public final class DirectIOVectorCache {
      * The most and the fewest vectors any one segment holds right now, which is the entry skew the hit-rate
      * cost of segmenting the eviction is priced against. At the chosen operating point of eight slabs per
      * segment an emulation of this policy measured the spread within a few per cent of the mean, and the
-     * hit-rate loss that skew carries inside the bar it was designed to.
+     * hit-rate loss that skew carries stays inside the bar the segment count was chosen against.
      *
      * <p>A lock-free sum of volatile counters, like {@link #entries()}, so a wide spread between the two is
      * readable on a node without the stats endpoint competing with the query path.

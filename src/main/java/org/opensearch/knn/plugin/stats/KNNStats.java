@@ -109,8 +109,9 @@ public class KNNStats {
      *       {@code OPEN_FAILED} is a filesystem with no {@code O_DIRECT}; and {@code CONTENT} is a layer of
      *       the shard's directory chain that transforms the bytes a reader sees, such as encryption at rest,
      *       which is the one reason that says Direct I/O <b>must not</b> serve the file rather than that it
-     *       cannot. {@code outermost} is what makes {@code CHAIN} and {@code CONTENT} diagnosable without a
-     *       debug log, because for both the useful question is which substrate it was.</li>
+     *       cannot. {@code outermost} is the top of the declining shard's directory chain, which is what
+     *       says <em>which</em> chain a {@code CHAIN} or {@code CONTENT} decline came from; the chain below
+     *       it is in the decline's own debug log.</li>
      *   <li><b>reads</b> — once engaged, what is it doing? The staged/blocking/read-ahead channels and the
      *       byte counters behind the amplification ratio. {@code stage_declined} against
      *       {@code staged_reads} is the queue-capacity decline rate phase 13's audit row 7 measured as the
@@ -144,9 +145,11 @@ public class KNNStats {
      *       {@code live_bytes} nor {@code peak_bytes} is ever reported above {@code wall_bytes}: the node
      *       read a {@code peak_bytes} of 7.46 GB against a 2 GB wall before D3c, which was arithmetic rather
      *       than memory.
-     *       <p>{@code arenas_allocated} is the lease model's own number: a healthy node allocates one arena
-     *       per reader thread and never another, so this counter settling at the reader-thread count is what
-     *       says the leases are being reused rather than rebuilt per burst.</li>
+     *       <p>{@code arenas_allocated} is the lease model's own number: a healthy node carves one arena
+     *       per reader thread, so this counter settling near the reader-thread count is what says the leases
+     *       are being reused rather than rebuilt per burst. It also rises once per arena retired, so a
+     *       counter that keeps climbing on a settled node means arenas are being dropped rather than taken
+     *       back.</li>
      *   <li><b>cache</b> — the node-wide slab store of individual vectors, every counter {@code 0} while
      *       {@code knn.direct_io.rescore.cache.max_bytes} is at its default of {@code 0b}.
      *       {@code hits / (hits + misses)} is the hit rate and is directly comparable with the 40.3%

@@ -154,7 +154,7 @@ final class DirectIOStagingLease {
         if (arena != null && (quiesced == false || this.slots != slots || this.slotBytes != slotBytes || this.blockSize != blockSize)) {
             // Two reasons, one counter: a read that would not quiesce may still write into these buffers, and
             // a burst of a different shape cannot use them. Both are "an arena was dropped rather than
-            // reused", which is what an operator reads arenas_retired for.
+            // reused", which is what the retired-arena counter exists for.
             retire();
         }
         if (arena == null) {

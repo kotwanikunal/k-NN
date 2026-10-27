@@ -287,7 +287,7 @@ final class DirectIOSlotMap {
         return invalidated;
     }
 
-    /** The table's capacity in cells, for the index-bytes-per-entry figure M2 reports. */
+    /** The table's capacity in cells, which is what the index's bytes-per-entry figure is taken from. */
     int capacity() {
         return offsets.length;
     }
