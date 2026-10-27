@@ -69,11 +69,11 @@ public class DirectIOHalfFloatReadProfileTests extends KNNTestCase {
     private static final int FOOTER_LENGTH = 16;
     private static final int VECTOR_COUNT = 1_024;
     private static final int TEST_SLAB_BYTES = 1024 * 1024;
-    /** The span cap the current arm sweeps, applied by {@link #openAtCap(Path)}. */
-    private int capBytes = DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGE_BYTES;
     private static final long BYTES_128 = 128 * 1024;
     private static final int LOW_CAP = 16 * 1024;
 
+    /** The span cap the current arm sweeps, applied by {@link #openAtCap(Path)}. */
+    private int capBytes = DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGE_BYTES;
     private Path path;
     private int vectorBytes;
     /** Each vector's raw FP16 bytes, which is what the FP16 read path reads and what a hit must equal. */

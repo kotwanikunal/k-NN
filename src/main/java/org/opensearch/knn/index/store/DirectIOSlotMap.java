@@ -14,15 +14,14 @@ import java.util.Arrays;
  * <h2>Why not a {@code HashMap}</h2>
  * The index competes with vectors for the same byte budget, so its per-entry cost comes off the cache's
  * capacity. A {@code HashMap<Long, Integer>} entry is a 32 B {@code Node}, a 24 B boxed {@code Long}, a 16 B
- * boxed {@code Integer} and a 4 B table slot: about 76 B per cached vector. Open addressing over two
- * primitive arrays is 12 B per cell, so about 36 B per entry at this map's load factor, and a lookup
- * allocates nothing at all.
+ * boxed {@code Integer} and a 4 B table slot, several times what open addressing over two primitive arrays
+ * costs per entry at this map's load factor, and a lookup here allocates nothing at all.
  *
- * <p>This is 16-I's {@code OrdinalSlotMap} with a wider key. 16-I keyed by Lucene vector ordinal, an
- * {@code int}; below the {@code IndexInput} there is no ordinal, only the byte offset the reader asked for,
- * which is a {@code long}. That costs 4 B per cell and 8 B per slot back pointer against 16-I's, and it buys
- * the key the input already has: nothing has to be translated, grouped or inferred (see
- * {@code DirectIOVectorCache}'s "vector granularity comes for free").
+ * <p>The key is the <b>byte offset</b> and not a Lucene vector ordinal, because below the
+ * {@code IndexInput} there is no ordinal: only the offset the reader asked for, which is a {@code long}.
+ * That costs a few bytes per cell against an {@code int} key and it buys the key the input already has, so
+ * nothing has to be translated, grouped or inferred (see {@code DirectIOVectorCache}'s "vector granularity
+ * comes for free").
  *
  * <h2>Not thread safe, and does not need to be</h2>
  * Every mutation happens under {@link DirectIOVectorCache}'s write lock and every read under its read lock,
@@ -53,7 +52,7 @@ final class DirectIOSlotMap {
     }
 
     /**
-     * Told every occupied cell of a table, so that the closed-file release (O3) can free this file's slots
+     * Told every occupied cell of a table, so that the closed-file release can free this file's slots
      * without walking every slot of every slab. Implemented by the cache, which is the only thing that can
      * see a slot; it must still check each slot's back pointer, because an occupied cell is not proof that
      * the vector is still there -- see the class javadoc.
@@ -65,13 +64,13 @@ final class DirectIOSlotMap {
     /** Free cell. An offset is a position in a file and so is never negative. */
     private static final long EMPTY = -1L;
 
-    /** Smallest table. A file with one cached vector costs 192 B of index and no more. */
+    /** Smallest table. A file with one cached vector costs this many cells of index and no more. */
     private static final int MIN_CAPACITY = 16;
 
     /**
      * How a slot is packed into one int: {@code (slabId << SLOT_BITS) | slot}. 11 bits of slab id and 20 of
-     * slot index fit in a positive int, which bounds the cache at {@link #MAX_SLABS} slabs (64 GiB at the
-     * 32 MiB slab size) and a slab at {@link #MAX_SLOTS} slots. Both bounds are checked where slabs are
+     * slot index fit in a positive int, which bounds the cache at {@link #MAX_SLABS} slabs and a slab at
+     * {@link #MAX_SLOTS} slots. Both bounds are checked where slabs are
      * registered and opened, so nothing here defends against an overflowing shift.
      */
     private static final int SLOT_BITS = 20;
@@ -264,9 +263,9 @@ final class DirectIOSlotMap {
     }
 
     /**
-     * Tells {@code visitor} every occupied cell, invalidated ones included. O3's release walks the file's own
-     * table rather than every slab's back pointers, so a close costs this file's cells and not the store's
-     * slots: at 128 slabs of 768-dimension vectors that is 500,000 cells against 1,396,736 slots.
+     * Tells {@code visitor} every occupied cell, invalidated ones included. The closed-file release walks
+     * the file's own table rather than every slab's back pointers, so a close costs this file's cells and not
+     * the store's slots, which is a large multiple of them on a store holding many files.
      */
     void forEachCell(final CellVisitor visitor) {
         final long[] keys = offsets;

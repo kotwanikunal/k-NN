@@ -16,29 +16,19 @@ import java.util.concurrent.atomic.AtomicLong;
  * prefetch burst on that thread. The direct memory the random rescore path holds is then bounded by the
  * number of threads that can be inside a burst at once, not by when the garbage collector next runs.
  *
- * <h2>The measurement this exists for</h2>
- * Phase 15's budget ({@link DirectIOVectorIndexInput#DIRECT_MEMORY_BUDGET_BYTES}) bounded the wrong quantity, and the node
- * showed it twice in one night (MEASURED 2026-10-06, jar {@code 4a8cf9e9}, r7g.xlarge, {@code -Xmx24g}
- * {@code -XX:MaxDirectMemorySize=2g}, 16 clients):
- * <ul>
- *   <li>At the default budget of 1 GB, {@code live_bytes} reached <b>1,068-1,087 MB</b> within two minutes
- *       of load, {@code staged_reads} froze at 159,137, {@code stage_declined} and {@code blocking_reads}
- *       rose ~700/s and {@code declined_budget} ran to 373k-614k. Twenty seconds later {@code live_bytes}
- *       fell to <b>0 in one step</b> on a young collection. The budget did not bound the feature, it
- *       <em>wedged</em> it between garbage collections.</li>
- *   <li>At {@code 0b} the gauge ratcheted to <b>7.46 GB, 9.0 GB and 28 GB</b> against a 2 GB wall, because
- *       {@code fitsBudget} short-circuits when the budget is off and that was the only place the phantom
- *       queue was drained outside a stats read. Meanwhile the JDK's own {@code Bits.reserveMemory} forced
- *       <b>23 full collections (2.1 s)</b> in 65 minutes on a 0.6 GB-occupied 24 GB heap.</li>
- * </ul>
+ * <h2>Why a per-input arena cannot be bounded</h2>
+ * A byte budget alone ({@link DirectIOVectorIndexInput#DIRECT_MEMORY_BUDGET_BYTES}) bounds the wrong
+ * quantity, and a node under load shows it two ways: at a budget the gauge saturates and then falls to zero
+ * in one step on a young collection, so the budget wedges the feature between collections rather than
+ * bounding it; with the budget off the gauge ratchets past the JVM's own direct-memory wall and the JDK's
+ * {@code Bits.reserveMemory} forces full collections to keep up.
  *
- * <p>Neither number was a measurement of memory in use. Every {@code slice()} and {@code clone()} is a new
+ * <p>Neither reading is a measurement of memory in use. Every {@code slice()} and {@code clone()} is a new
  * input with its own buffers, so a per-query {@code OffHeapFloatVectorValues} slice carved a fresh
- * {@code staged_ranges x arenaSlotBytes} arena (~516 KiB at the shipped defaults) on its first prefetch and
- * held it for the input's life — which, since that class is not {@code Closeable}, ends only when a
- * collection finds it. Arenas therefore churned at roughly {@code QPS x segments x 516 KiB/s} (9-13 MiB/s on
- * the node) while the memory actually being read through was about {@code 16 concurrent bursts x 516 KiB},
- * i.e. <b>8 MiB</b>. The accounting measured the churn awaiting collection and called it "live".
+ * {@code staged_ranges x arenaSlotBytes} arena on its first prefetch and held it for the input's life —
+ * which, since that class is not {@code Closeable}, ends only when a collection finds it. Arenas therefore
+ * churned at {@code QPS x segments} arenas a second while the memory actually being read through was one
+ * arena per concurrent burst. The accounting measured the churn awaiting collection and called it "live".
  *
  * <h2>Why the lease is per thread and not per input</h2>
  * The obvious fix — return the arena at the next prefetch on the same input — cannot work, because a
@@ -49,7 +39,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * {@code PrefetchableVectorValuesHelper#doPrefetch} and then {@code delegate.bulkScore} as two statements of
  * one synchronous method, and under concurrent segment search each leaf is a
  * {@code TaskExecutor$Task extends FutureTask} whose {@code run()} is a one-shot, so a leaf's whole
- * prefetch-then-read sequence happens on exactly one thread. See FINDINGS.md D3c(a) for the citations.
+ * prefetch-then-read sequence happens on exactly one thread.
  *
  * <h2>{@link ThreadLocal} rather than a map keyed by thread</h2>
  * A {@code ThreadLocal}'s values live in a map that is a <em>field of the {@link Thread}</em>, so when a
@@ -278,7 +268,7 @@ final class DirectIOStagingLease {
             if (DirectIOVectorIndexInput.fitsBudget(alignedLength, blockSize) == false) {
                 return null;
             }
-            // D3d (O2): and the wide buffers' own sub-budget, because these are the allocations a lease
+            // The wide buffers have a sub-budget of their own, because these are the allocations a lease
             // keeps for the life of its arena while the arena itself is reused. Declining costs this range
             // its staging and nothing else -- the bytes are then served by a blocking read, the same
             // fallback the overall budget's decline takes.
@@ -310,8 +300,8 @@ final class DirectIOStagingLease {
      *
      * <p><b>Never declined by the budget.</b> This is the path every other decline falls back <em>to</em>;
      * refusing it would leave a read with nothing to read with, which is a failed query rather than a
-     * bounded one. It is one buffer per thread — 8 KiB at the shipped default — where before D3c it was one
-     * per input, so the blocking channel's footprint stopped scaling with lingering per-query slices too.
+     * bounded one. It is one buffer per <b>thread</b> rather than one per input, so the blocking channel's
+     * footprint does not scale with lingering per-query slices either.
      */
     ByteBuffer window(final int bufferSize, final int blockSize) {
         if (window == null || windowBytes != bufferSize || windowBlockSize != blockSize) {

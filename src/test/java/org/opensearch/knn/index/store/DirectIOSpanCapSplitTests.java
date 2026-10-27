@@ -76,10 +76,10 @@ public class DirectIOSpanCapSplitTests extends KNNTestCase {
     private static final int FOOTER_LENGTH = 16;
     private static final int VECTOR_COUNT = 1_024;
     private static final int TEST_SLAB_BYTES = 1024 * 1024;
-    /** The span cap the current arm sweeps, applied by {@link #openAtCap(Path)}. */
-    private int capBytes = DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGE_BYTES;
     private static final long BYTES_128 = 128 * 1024;
 
+    /** The span cap the current arm sweeps, applied by {@link #openAtCap(Path)}. */
+    private int capBytes = DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGE_BYTES;
     private float[][] vectors;
     private Path path;
 

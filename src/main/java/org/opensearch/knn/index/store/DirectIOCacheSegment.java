@@ -16,18 +16,15 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * One segment of {@link DirectIOVectorCache}: its own lock, its own file index, its own slabs, its own FIFO
- * queue with its own second chance, its own open slab per vector length and its own recycled queue (Q, C1a).
+ * queue with its own second chance, its own open slab per vector length and its own recycled queue.
  *
  * <h2>Why the store is segmented, in one measurement</h2>
- * Before Q the whole store was one {@link ReentrantReadWriteLock}. MEASURED on the dev desktop
- * ({@code output/bench/q-baseline}), driven in the sequence {@link DirectIOVectorIndexInput} actually makes,
- * that store <b>peaked at one thread</b>, 1,529,026 serving lookups/s, and settled at 320 to 375K from four
- * threads up. From four threads up <b>every</b> read acquisition found a writer already queued, and at eight
- * threads and above more than 90% of all thread time was lock wait. The mechanism is named: the lock is
- * nonfair, and {@code NonfairSync#readerShouldBlock} makes a reader block when a <em>waiting</em> writer is
- * at the head of the queue, which at 250K fills/s is nearly always. INFERRED against
- * {@code ref/trillion-readiness.md} section 3.1, that capped a hot node at about 12,800 QPS against a 16,000
- * target.
+ * One {@link ReentrantReadWriteLock} for the whole store <b>peaks at one thread</b> and falls to a fraction
+ * of that from four threads up, with every read acquisition finding a writer already queued and most of all
+ * thread time spent in lock wait. The mechanism is named: the lock is nonfair, and
+ * {@code NonfairSync#readerShouldBlock} makes a reader block when a <em>waiting</em> writer is at the head of
+ * the queue, which at a fill rate of hundreds of thousands a second is nearly always. That capped a hot node
+ * well below its target query rate, which is what this split is for.
  *
  * <h2>What a segment owns, and what it therefore never waits for</h2>
  * Everything a fill does under this lock touches only this object. A slab holds the vectors of exactly one
@@ -72,12 +69,12 @@ final class DirectIOCacheSegment {
 
     /**
      * Slabs that hold free slots a closed file gave back, per vector byte length, waiting to be reopened for
-     * appending. O3.
+     * appending.
      *
      * <p>Without this the slots {@link #releaseFile} frees would be unreachable until their slab came to the
      * head of {@link #fifo}, because {@link #place} only appends to {@link #openSlabs}. A fill arriving
      * straight after a close would then grow or evict while the store had room it had just been given, which
-     * is the opposite of what O3 is for.
+     * is the opposite of what the closed-file release is for.
      *
      * <p>Entries are validated on the way out rather than removed on every event that could stale one (a
      * reclaim reopening the slab for another length, a {@code configure} releasing it): see
@@ -87,7 +84,7 @@ final class DirectIOCacheSegment {
 
     /**
      * How many slabs sit in {@link #recycled}. Written under the write lock and read without it by
-     * {@link DirectIOVectorCache#mayAdmitSpanFillApproximately}, which is the input's pre-check. O3.
+     * {@link DirectIOVectorCache#mayAdmitSpanFillApproximately}, which is the input's pre-check.
      */
     private volatile int recycledSlabs;
 
@@ -97,18 +94,17 @@ final class DirectIOCacheSegment {
     /**
      * Live entries, their slot bytes, and the slabs holding them. Written under the write lock and read
      * without it, because the stats endpoint sums them across segments and has no business competing with
-     * the query path for a lock (Q, section 2.6).
+     * the query path for a lock.
      */
     private volatile long liveEntries;
     private volatile long liveEntryBytes;
     private volatile int liveSlabs;
 
     /**
-     * Reservations this segment has in flight. <b>One at a time</b>, which is N3's rule made per segment:
-     * one slab holds thousands of vectors and the fills waiting for it all fit in it, so that is a
-     * per-segment reason. MEASURED on the re-proof's arm E without the rule: the first burst's threads each
-     * reserved a slab, a 64mb store reached its 2 slab target before a single vector had been cached, span
-     * fill stopped because it only runs below the target, and the arm's hit count fell from 2,921 to 832.
+     * Reservations this segment has in flight. <b>One at a time</b>, and the reason is per segment: one slab
+     * holds thousands of vectors and the fills waiting for it all fit in it. Without the rule a small store's
+     * first burst reserves its whole target before a single vector has been cached, span fill then stops
+     * because it only runs below the target, and the hit rate collapses — which the re-proof measured.
      *
      * <p>Only read and written under the write lock.
      */
@@ -154,7 +150,7 @@ final class DirectIOCacheSegment {
         /**
          * Whether this slab is sitting in {@link #recycled} waiting to be reopened for appending. A flag
          * rather than a containment test, so a closed file that freed slots in the same slab twice cannot
-         * queue it twice. O3.
+         * queue it twice.
          */
         private boolean recycled;
 
@@ -196,9 +192,9 @@ final class DirectIOCacheSegment {
     /**
      * One fill's slab request, carried across a release of a segment's write lock.
      *
-     * <p><b>Why the lock has to be released at all.</b> A 32 MiB slab takes about 7 to 10 ms to allocate
-     * (MEASURED, M1 and output/bench/n2: FFM zero-fills it; 16-I's JNI took 7.6 us), and before N3
-     * {@code growSlabs} did that with the write lock held, so every lookup on the node waited behind it.
+     * <p><b>Why the lock has to be released at all.</b> A slab takes milliseconds to allocate, because the
+     * backend zero-fills it, and allocating under the write lock makes every lookup on the node wait behind
+     * it.
      * A fill that needs a slab therefore reserves its headroom ({@link DirectIOSlabBroker#reserve()}), leaves
      * the lock, allocates, and comes back with the slab in hand.
      *
@@ -262,7 +258,7 @@ final class DirectIOCacheSegment {
     }
 
     // ---------------------------------------------------------------------------------------------------
-    // The lock, and what it costs (C2; published by KNNStats, see DirectIOVectorCache)
+    // The lock, and what it costs. Published by KNNStats; see DirectIOVectorCache.
     // ---------------------------------------------------------------------------------------------------
 
     /**
@@ -270,16 +266,12 @@ final class DirectIOCacheSegment {
      * if it did.
      *
      * <h4>Why the wait is timed on a contended acquisition and not sampled over all of them</h4>
-     * The design run proposed sampling one acquisition in 1,024, because the instrumented baseline build
-     * timed <b>every</b> acquisition with two {@code System.nanoTime} calls (31 ns each on this host) and
-     * cost 26% of the plain build's one-thread throughput. Timing only the contended ones is both exact and
-     * cheaper than sampling, and the measurement is why: a contended acquisition waits 20.3 us at the core
-     * count and 168.3 us at 128 threads on the unsegmented store (MEASURED, output/bench/q-c1b), against
-     * <b>0.045 us</b> uncontended. All of the wait is in the contended acquisitions, so an uncontended one
-     * has nothing worth timing, and 62 ns against a 0.7 us wait is 9% of a figure that is 1.9% of
-     * acquisitions at the core count. The uncontended path therefore costs one
-     * {@code hasQueuedThreads()} volatile read and a branch, which is what the design wanted the counts to
-     * cost and now also what the timing costs.
+     * Timing <b>every</b> acquisition costs two {@code System.nanoTime} calls on the hottest path in the
+     * store and was measured to take a quarter of its one-thread throughput. Sampling would hide that cost
+     * but also the answer. Timing only the contended ones is exact and cheaper than either, and the reason is
+     * that all of the wait is in them: an uncontended acquisition's wait is three orders of magnitude below a
+     * contended one's, so it has nothing worth timing. The uncontended path therefore costs one
+     * {@code hasQueuedThreads()} volatile read and a branch.
      */
     private void lockRead() {
         if (lock.hasQueuedThreads()) {
@@ -422,8 +414,8 @@ final class DirectIOCacheSegment {
      * {@code fileId} at all and the caller's whole batch is therefore missing from it.
      *
      * <p>One read-lock acquisition for the range, which is the batching {@link DirectIOVectorCache} exists to
-     * preserve: MEASURED, a contended read acquisition on the unsegmented lock waited 8.9 us at 8 threads and
-     * 168.8 us at 128, against 0.045 us uncontended.
+     * preserve: a contended acquisition's wait rises with the thread count, so the number of acquisitions is
+     * the quantity to hold down.
      */
     int selectMissing(
         final String fileId,
@@ -456,7 +448,7 @@ final class DirectIOCacheSegment {
     /**
      * Records in {@code miss} whether this segment holds each of the ordinals {@code ords[order[k]]} for
      * {@code k} in {@code [from, to)}, under <b>one</b> read-lock acquisition, and says whether it holds an
-     * index for the file at all. C2's batched probe: {@code order} is the batch grouped by segment, so this
+     * index for the file at all. {@code order} is the batch grouped by segment, so this
      * segment's members of the batch are a contiguous run of it and the caller's ordinal order is recovered
      * from {@code miss} afterwards.
      *
@@ -645,7 +637,7 @@ final class DirectIOCacheSegment {
                 }
                 // One acquisition per span is the rule, and this is the one thing that can need a second:
                 // a span that fills the open slab. The staged bytes are still the caller's and still valid
-                // across the gap, and the alternative is an 8 ms allocation inside the hold (N3).
+                // across the gap, and the alternative is a millisecond-scale allocation inside the hold.
                 if (next >= lastIndex || request.wanted == false || broker.allocateOutsideLock(request) == false) {
                     break;
                 }
@@ -658,14 +650,14 @@ final class DirectIOCacheSegment {
 
     /**
      * Whether span fill may admit a vector of {@code length} bytes: the store is below its slab target, or a
-     * closed file has given back slots of that length in this segment (O3). Called under the write lock.
+     * closed file has given back slots of that length in this segment. Called under the write lock.
      *
      * <h4>Why the second clause is not simply "the open slab has a free slot"</h4>
      * At the target the open slab's free slots are what a reclaim has just produced, and the requested fills
      * are entitled to them: letting span fill take them would be span fill running at the target, which is
      * the scan-resistance question (agenda item 4) this phase is not deciding. Slots a closed file vacated
      * are a different thing. Nothing is pushed out to use them, because what held them is gone, so admitting
-     * into them cannot displace a working set. That is the whole of O3: after a merge the store would
+     * into them cannot displace a working set. That is the whole of the closed-file release: after a merge the store would
      * otherwise sit at its target holding dead vectors, span fill would not re-arm, and the merged segment
      * would refill at one vector per miss.
      *
@@ -673,11 +665,11 @@ final class DirectIOCacheSegment {
      * still turns itself off exactly when the store as a whole reaches its target, which is the policy every
      * measurement was taken under.
      *
-     * <h4>What this does widen, MEASURED in {@code DirectIOClosedFileReleaseTests}</h4>
+     * <h4>What this does widen</h4>
      * While a close's room is still there this says yes, and {@link #place} then uses whatever free slot it
-     * finds first -- which may be a leftover in the open slab rather than one of the freed ones. In the test
-     * fixture a close freeing 66 slots let span fill admit 190 vectors. That is wider than "the slots the
-     * close freed" and it is deliberate: {@link #place} is called with eviction refused either way, so
+     * finds first -- which may be a leftover in the open slab rather than one of the freed ones, so span fill
+     * can admit more vectors than the close freed slots. That is wider than "the slots the close freed" and
+     * it is deliberate: {@link #place} is called with eviction refused either way, so
      * nothing can be displaced, and refusing a free slot because of which event produced it would leave the
      * store holding room it could have warmed with. Once the free slots are gone this says no again, which
      * is what the test pins.
@@ -708,7 +700,7 @@ final class DirectIOCacheSegment {
         return false;
     }
 
-    /** How many slabs sit in this segment's recycled queue. A volatile read and no lock. O3. */
+    /** How many slabs sit in this segment's recycled queue. A volatile read and no lock. */
     int recycledSlabs() {
         return recycledSlabs;
     }
@@ -746,7 +738,7 @@ final class DirectIOCacheSegment {
         }
         Slab slab = openSlabs.get(length);
         if (slab == null || slab.freeSlots() == 0) {
-            // O3: slots a closed file gave back come first, before any growth and before any eviction. The
+            // slots a closed file gave back come first, before any growth and before any eviction. The
             // store has room it has already been given, and using it is what lets span fill re-arm for a
             // merged segment without displacing a live vector.
             slab = recycledSlab(length);
@@ -766,7 +758,7 @@ final class DirectIOCacheSegment {
 
     /**
      * A slab with free slots of {@code length} bytes that a closed file gave back, reopened for appending, or
-     * {@code null} when there is none. Called under the write lock. O3.
+     * {@code null} when there is none. Called under the write lock.
      *
      * <p>Queue entries are validated here rather than removed wherever a slab's state could change: a slab
      * that has since been reclaimed for another vector length, released by a {@code configure}, or refilled
@@ -798,7 +790,7 @@ final class DirectIOCacheSegment {
         }
     }
 
-    /** Queues {@code slab} as holding free slots, once. Called under the write lock. O3. */
+    /** Queues {@code slab} as holding free slots, once. Called under the write lock. */
     private void offerRecycled(final Slab slab) {
         if (slab.recycled || slab.freeSlots() <= 0 || openSlabs.get(slab.slotBytes) == slab) {
             return;
@@ -811,7 +803,7 @@ final class DirectIOCacheSegment {
     /**
      * Frees this segment's entries of {@code fileId} and drops its index table, accumulating the entries and
      * the bytes into {@code freed}. One write-lock acquisition, this segment's cells only, which is what
-     * bounds the hold to one {@code N}th of the unsegmented one (Q, section 2.4).
+     * bounds the hold to one {@code N}th of the unsegmented one.
      *
      * @param fileId the file's identity
      * @param freed  {@code {entries, bytes}}, added to
@@ -862,8 +854,8 @@ final class DirectIOCacheSegment {
             unlockWrite();
             // The hold and not the wait for the lock: what a lookup in this segment waits behind is the
             // time this thread owns the lock, and a close that itself waited for a reader has not made that
-            // reader wait. One segment at a time is the whole point of C4 and this is the figure that makes
-            // the claim readable on a node.
+            // reader wait. One segment at a time is the whole point of the bound, and this is the figure
+            // that makes it readable on a node.
             DirectIOVectorCache.noteCloseHold(held, walked);
         }
     }
@@ -897,8 +889,8 @@ final class DirectIOCacheSegment {
         if (oldest == null) {
             // This segment holds no slab at all and the store is at its target, so there is nothing here to
             // reclaim and growing is refused. Ask the broker to lend one from the segment holding the most
-            // (Q, section 2.2 step 3). INFERRED: with 128 segments and 1,120 slabs every segment reaches
-            // about eight during the ramp, so this is a cold-start transient and not a steady-state path.
+            // slabs. INFERRED: with 128 segments and over a thousand slabs every segment reaches several
+            // during the ramp, so this is a cold-start transient and not a steady-state path.
             if (request != null && pendingSlabs == 0 && retired == false && broker.maxSlabs() > 0) {
                 pendingSlabs++;
                 request.reservedIn = this;
@@ -934,7 +926,7 @@ final class DirectIOCacheSegment {
      * half of {@link #obtainSlab} that displaces nothing, which is the only half span fill is allowed. Called
      * under the write lock.
      *
-     * <p>Nothing here allocates: that is N3. The target check is the broker's, and it counts the slabs other
+     * <p>Nothing here allocates: that is the rule. The target check is the broker's, and it counts the slabs other
      * fills are allocating right now as well as the live ones, so concurrent growth cannot overshoot.
      *
      * <p>One allocation attempt per latch, not one per fill: see {@link DirectIOSlabBroker} for what a failed
@@ -952,7 +944,7 @@ final class DirectIOCacheSegment {
             }
             if (broker.growthLatched() || broker.reserve() == false) {
                 // The latch is checked here and not on the path below, because what it says is "an
-                // allocation failed" (N2) and a fill arriving with a slab in hand has had one succeed. A
+                // allocation failed" and a fill arriving with a slab in hand has had one succeed. A
                 // borrowed slab is likewise unaffected: it needs no allocation at all.
                 return null;
             }
@@ -1134,7 +1126,7 @@ final class DirectIOCacheSegment {
 
     /**
      * Takes this segment's oldest slab out of service, dropping its entries, and adds its memory to
-     * {@code detached} for the caller to release outside every lock (N3). One write-lock acquisition.
+     * {@code detached} for the caller to release outside every lock. One write-lock acquisition.
      *
      * <p>Clearing {@code slabsById} is what makes the release safe outside the lock: every lookup resolves a
      * slab through {@link #slabAt} under the read lock, so a reader arriving after this cannot reach the slab
@@ -1273,7 +1265,7 @@ final class DirectIOCacheSegment {
         }
     }
 
-    /** Whether the calling thread holds this segment's lock in either mode. N3's test seam. */
+    /** Whether the calling thread holds this segment's lock in either mode. a test seam. */
     boolean lockHeldByCurrentThread() {
         return lock.isWriteLockedByCurrentThread() || lock.getReadHoldCount() > 0;
     }

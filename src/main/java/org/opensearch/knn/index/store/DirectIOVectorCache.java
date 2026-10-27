@@ -19,40 +19,20 @@ import java.util.concurrent.atomic.LongAdder;
  * The one cache of individual vectors on the Direct I/O random rescore path, for the whole node: a slab store
  * below the {@link DirectIOVectorIndexInput}, keyed by the file and the byte offset the reader asks for.
  *
- * <h2>Why it exists, in one measurement</h2>
- * Every phase 12-14 arm, and the store-factory arm it was compared against, ran with <b>no vector cache at
- * all</b>. An LRU one existed in phase 7 and was deleted in phase 12 as unreachable code after phase 10
- * removed the channel that reached it — on reachability, never on performance evidence. So the question
- * "would a cache help" had never been asked of the design that ships.
- *
- * <p>It was asked, at scale, before a line of this was written. MEASURED 2026-10-05 on {@code dio-10m}:
- * an exact LRU stack-distance replay at vector granularity of 5,000 real OSB query vectors against the
- * exact rescore candidate set (k=200 {@code rescore:false}, which is what a k=100 rescore asks for at 32x
- * compression and 768 dims), 1,000,000 references over 544,060 unique vectors — a 1.70 GB working set:
- *
- * <table>
- *   <caption>steady-state hit rate by budget; ceiling 45.6%</caption>
- *   <tr><th>budget</th><th>entries</th><th>hit rate</th></tr>
- *   <tr><td><b>16 MB</b></td><td>5,127</td><td><b>40.3%</b></td></tr>
- *   <tr><td>64 MB</td><td>20,510</td><td>40.9%</td></tr>
- *   <tr><td>128 MB</td><td>41,020</td><td>41.4%</td></tr>
- *   <tr><td>256 MB</td><td>82,040</td><td>42.3%</td></tr>
- *   <tr><td>1024 MB</td><td>328,160</td><td>48.1%</td></tr>
- * </table>
- *
- * 16 MB captures 84% of the achievable reuse, and replaying the same 5,000 queries three times does not
- * inflate the figure (128 MB: 39.8% on every pass), so it is inner-product HNSW hub reuse rather than an
- * artefact of the query set. On the EBS node a slab store of this shape then MEASURED 6-9 more hit points
- * than the phase 15 Guava cache at equal bytes (16-S: 61.3 against 54.9% at 4 GB), with device reads per
- * query falling in step with the misses, which is what moved latency on an IOPS-capped volume.
+ * <h2>Why it exists</h2>
+ * The rescore candidate sets of successive queries overlap, so the vectors a rescore reads are reused: an
+ * exact LRU stack-distance replay of a real query set against the exact candidate set reaches most of its
+ * achievable hit rate at a budget of tens of megabytes, and replaying the same queries again does not
+ * inflate it, so the reuse is inner-product HNSW hub reuse rather than an artefact of the query set. On an
+ * IOPS-capped volume the device reads per query fall in step with the misses, which is what moves latency.
  *
  * <h2>Vector granularity comes for free</h2>
  * {@code Lucene99FlatVectorsReader}'s values object asks this input for exactly one vector's range — a
  * {@code prefetch(offset, vectorBytes)} and then a {@code readFloats} of the same run — so a key of
  * {@code (file, offset)} <em>is</em> one vector. Nothing has to be grouped, aligned or split, and the value
- * is the vector's bytes rather than the 8 KiB block they sit in: caching the block would cache 2.7 vectors'
- * worth of neighbours that the measured access pattern does not ask for, and would charge the budget 2.7x
- * for the 40% it buys.
+ * is the vector's bytes rather than the filesystem block they sit in: caching the block would also cache
+ * the neighbours the measured access pattern does not ask for, and would charge the budget several times
+ * over for the same hit rate.
  *
  * <h2>File identity: path and length, not the handle</h2>
  * The key's file part is {@code <absolute path>#<file length>} ({@link #fileId}), built once per
@@ -68,13 +48,13 @@ import java.util.concurrent.atomic.LongAdder;
  * is a second discriminator on top of that. A Lucene segment file is also immutable once written, so the
  * bytes at a given offset of a given file never change.
  *
- * <h2>Slabs, slots and the index (M1, M2)</h2>
+ * <h2>Slabs, slots and the index</h2>
  * <ul>
  *   <li>A <b>slab</b> is {@link DirectIOSlab#SLAB_BYTES} of off-heap memory, allocated through
  *       {@code java.lang.foreign} by reflection where that works and {@code ByteBuffer.allocateDirect}
  *       otherwise ({@link DirectIOSlab}). It is opened for <b>one vector byte length</b> and cut into slots
- *       of exactly that length, so placing a vector is a bump pointer and finding it is a multiply: 10,922
- *       slots at 768 dimensions, 128 slabs at a 4 GB cache, at most {@link DirectIOSlotMap#MAX_SLABS}.</li>
+ *       of exactly that length, so placing a vector is a bump pointer and finding it is a multiply. The
+ *       store holds at most {@link DirectIOSlotMap#MAX_SLABS} of them.</li>
  *   <li>Per slot, in plain arrays per slab: the owning file index, the byte offset (a back pointer) and a
  *       one-byte hit flag, plus a free list per slab.</li>
  *   <li>The <b>index</b> is {@code HashMap<fileId, DirectIOSlotMap>}, where {@link DirectIOSlotMap} is a
@@ -88,29 +68,28 @@ import java.util.concurrent.atomic.LongAdder;
  * re-admitted rather than dropped: the survivors <b>stay exactly where they are</b>, the slots of the vectors
  * that were never read become free slots in that same slab, and the slab is reopened for the same vector
  * length and appended to through its free list. No byte moves and no index entry changes, which is what keeps
- * the write-lock hold off the millisecond scale (16-I MEASURED 26.5 us p50 per reclaim this way, against
- * 1.7-4.8 ms when survivors were compacted to the front).
+ * the write-lock hold off the millisecond scale: compacting the survivors to the front of the slab instead
+ * was measured two orders of magnitude dearer per reclaim.
  *
  * <p>Re-admission is capped at half a slab's slots, which is what makes an eviction always yield room and the
  * algorithm terminate in one step: a fully hot slab cannot re-admit itself whole and so cannot deadlock the
  * cache against its own hit flags. The cap is the same device S3-FIFO and Segcache use for the same reason.
- * There is no admission filter: scan resistance is undecided (agenda item 4).
+ * There is no admission filter, so the store is not scan resistant.
  *
  * <p>A slab reopened for a <em>different</em> vector length is the one case with no second chance: its slot
  * layout changes, so there is nowhere for a survivor to stay, and those entries are dropped. The case needs
  * two vector lengths competing for the same slabs, which is rare, and costs a refill rather than an answer.
  *
- * <h2>Segments, one lock each, and no view of slab memory leaves the store (Q)</h2>
+ * <h2>Segments, one lock each, and no view of slab memory leaves the store</h2>
  * A reader must not be shown a slot while another thread is overwriting it, and the index must not be read
  * half-rebuilt. One {@code ReentrantReadWriteLock} solves both: a lookup takes the read lock, and insert,
  * eviction, resize and release take the write lock. Lookups therefore run concurrently with each other and
  * never with a mutation, which is what lets the index be a plain {@code HashMap} of {@link DirectIOSlotMap}s
  * with no per-entry synchronisation.
  *
- * <p>Until Q that lock was <b>one lock for the whole store</b>, and MEASURED on the dev desktop
- * ({@code output/bench/q-baseline}) that store peaked at one thread: 1,529,026 serving lookups/s on one
- * thread against 320 to 375K from four threads up, with every read acquisition finding a writer already
- * queued and more than 90% of all thread time spent waiting. So the store is split into
+ * <p>One lock for the <b>whole store</b> peaks at one thread and falls to a fraction of that from four
+ * threads up, with every read acquisition finding a writer already queued and most of all thread time spent
+ * waiting (see {@link DirectIOCacheSegment}'s javadoc for the mechanism). So the store is split into
  * {@link DirectIOCacheSegment}s, each owning its lock, its index, its slabs and its eviction, with one
  * {@link DirectIOSlabBroker} owning the node's total slab target. A key's segment is a pure function of
  * {@code (fileId, offset)} ({@link #segmentFor}), so nothing about it is stored and a vector can only ever be
@@ -137,8 +116,8 @@ import java.util.concurrent.atomic.LongAdder;
  *       lending it performs. That is why the slab <em>reservation</em> is lock free: a fill has to reserve
  *       while it holds its own segment's write lock, which this rule would otherwise forbid. See
  *       {@link DirectIOSlabBroker}.</li>
- *   <li><b>Nothing that can block runs under either lock.</b> A slab allocation (7 to 10 ms, MEASURED) and a
- *       slab release (2.2 ms per arena) both run with no lock held, which is N3 and is asserted by a probe
+ *   <li><b>Nothing that can block runs under either lock.</b> A slab allocation and a slab release both
+ *       take milliseconds and both run with no lock held, which is asserted by a probe
  *       {@link SlabMemory} in the suite; so is "at most one segment lock", through
  *       {@link #segmentLocksHeldByCurrentThreadForTesting()}.</li>
  * </ol>
@@ -151,21 +130,21 @@ import java.util.concurrent.atomic.LongAdder;
  * ({@link #publishMaxBytes(long)}); the prefetch burst only re-asserts the target already published
  * ({@link #applyConfiguredSize(boolean)}), which is how a store released under a route that was off grows
  * back. Growing lets the next miss allocate a slab and keeps every cached vector;
- * shrinking releases the oldest slabs and keeps every vector that still fits; {@code 0b} releases every slab.
- * Phase 15's Guava cache could not do that — {@code maximumWeight} is fixed at {@code CacheBuilder#build()},
- * so a change dropped the whole cache and warmed it again.
+ * shrinking releases the oldest slabs and keeps every vector that still fits; {@code 0b} releases every
+ * slab. A {@code Guava} cache cannot do that — {@code maximumWeight} is fixed at
+ * {@code CacheBuilder#build()}, so a change drops the whole cache and warms it again.
  *
- * <h2>Entries of a file that has been closed are freed at the close (O3)</h2>
+ * <h2>Entries of a file that has been closed are freed at the close</h2>
  * A merged-away segment's entries are <b>never wrong</b> — the key says which file's bytes they are and that
- * file's bytes are immutable — only <em>cold</em>. M2 therefore left them to age out: the FIFO reaches them
+ * file's bytes are immutable — only <em>cold</em>. They would age out on their own: the FIFO reaches them
  * without a second chance (nothing reads them, so no hit flag is ever set) and they become free slots, and
  * when the last slot belonging to a file goes, that file's whole {@link DirectIOSlotMap} is dropped from the
  * index.
  *
- * <p>That is bounded but it is not free, and O3 is what the merge analysis (ref/MERGE-NOTE.md section 4)
- * found it costing: until the FIFO cycles past them the store <b>sits at its target</b>, and span fill only
- * runs below the target, so it does not re-arm for the merged segment and that segment refills at one vector
- * per miss. So {@link #releaseFile} now frees a file's slots when the routed input that owned its
+ * <p>That is bounded but it is not free, and what it costs is this: until the FIFO cycles past them the
+ * store <b>sits at its target</b>, and span fill only runs below the target, so it does not re-arm for the
+ * merged segment and that segment refills at one vector per miss. So {@link #releaseFile} frees a file's
+ * slots when the routed input that owned its
  * {@code O_DIRECT} handle closes — its index tables go, its slots go back to their slabs' free lists, and a
  * fill hands those slots out before it grows or evicts. The ageing-out path above stays, because it is what
  * covers an entry whose cell was already invalidated and a file nobody closes.
@@ -173,8 +152,7 @@ import java.util.concurrent.atomic.LongAdder;
  * <h2>Off is off</h2>
  * {@code knn.direct_io.rescore.cache.max_bytes} defaults to {@code 0b}. When it is zero there are no slabs
  * and every lookup is one volatile read and a compare — no key built, no segment selected, no lock taken, no
- * counter touched. The shipped default is the node arm's to decide; this phase ships the mechanism and the
- * correctness proof.
+ * counter touched.
  */
 @Log4j2
 public final class DirectIOVectorCache {
@@ -202,21 +180,22 @@ public final class DirectIOVectorCache {
      *
      * <p>A constant rather than a setting, because the policy has no magnitude and no arm that wants it off:
      * at or above the slab target admission is requested vectors only, exactly as before, so span fill
-     * cannot cause an eviction and cannot take a slab the target does not already allow. MEASURED on the EBS
-     * node (16-I S1b): dio-1m's p50 went from 43.9 to 10.9 ms with it. Turning the store off turns span fill
-     * off with it, which is the arm a node compares against.
+     * cannot cause an eviction and cannot take a slab the target does not already allow. It was measured on
+     * an EBS node to take the rescore p50 down by a factor of four, because without it the store warms one
+     * requested vector at a time. Turning the store off turns span fill off with it, which is the arm a node
+     * compares against.
      */
     static final boolean SPAN_FILL = true;
 
     /**
      * How wide a staged miss read may be made so that the whole vectors around the one being fetched are
      * admitted with it, while the store is below its target and the whole file would still fit in the room
-     * the target leaves. One read per miss stays one read; only its size changes. O5.
+     * the target leaves. One read per miss stays one read; only its size changes.
      *
-     * <p>A constant rather than a setting. MEASURED on the EBS node: with each miss made one 12 KB read,
-     * dio-1m's coverage after 20,000 queries fell from 97.1% to 93.4% and p99 rose from 25.8 to 30.5 ms, so
-     * the width is coverage bought deliberately and with a bound rather than a value with a better choice in
-     * it. The three gates in {@link #readAroundBytes(long)} are what keep it from evicting anything.
+     * <p>A constant rather than a setting. A narrower read-around was measured to cost coverage and p99
+     * together, so the width is coverage bought deliberately and with a bound rather than a value with a
+     * better choice in it. The three gates in {@link #readAroundBytes(long)} are what keep it from evicting
+     * anything.
      */
     static final long READ_AROUND_BYTES = 64L * 1024;
 
@@ -249,8 +228,9 @@ public final class DirectIOVectorCache {
     private static volatile int segmentsForTesting;
 
     /**
-     * Where a slab's memory comes from and goes back to. A seam, and the only reason it is one is that N3's
-     * property is about <b>where</b> these two calls run: neither may run while the caller holds a segment's
+     * Where a slab's memory comes from and goes back to. A seam, and the only reason it is one is that the
+     * property to assert is about <b>where</b> these two calls run: neither may run while the caller holds a
+     * segment's
      * lock or the broker's, and a test can only see that if it can observe the calling thread at the moment
      * of the call. Production has exactly one implementation.
      */
@@ -290,24 +270,23 @@ public final class DirectIOVectorCache {
     static final LongAdder slabAllocFailures = new LongAdder();
     /** Write-lock time spent reclaiming slabs, which is the figure a node has to be able to read. */
     static final LongAdder reclaimNanos = new LongAdder();
-    /** Files whose entries were freed at close, and the entries that went with them. O3. */
+    /** Files whose entries were freed at close, and the entries that went with them. */
     private static final LongAdder closedFiles = new LongAdder();
     private static final LongAdder closedFileEntries = new LongAdder();
-    /** Vectors put back after the filter-then-read race lost them. Also counted in readmissions. O4. */
+    /** Vectors put back after the filter-then-read race lost them. Also counted in readmissions. */
     static final LongAdder raceReadmissions = new LongAdder();
-    /** Slabs the broker lent from one segment to another because the borrower held none (Q, C1b). */
+    /** Slabs the broker lent from one segment to another because the borrower held none. */
     static final LongAdder slabTransfers = new LongAdder();
-    /** Resizes that crossed a segment-count boundary and so cost a re-warm (Q, C1b). */
+    /** Resizes that crossed a segment-count boundary and so cost a re-warm. */
     static final LongAdder segmentCountChanges = new LongAdder();
 
     /**
-     * The longest one segment's write lock has been held by a close, which is C4's bound made readable on a
-     * node (Q, section 2.4). An {@link AtomicLong} kept at its maximum rather than a {@link LongAdder},
-     * because what an operator needs is the worst one a lookup could have waited behind, not the total.
+     * The longest one segment's write lock has been held by a close, which is the close-hold bound made
+     * readable on a node. An {@link AtomicLong} kept at its maximum rather than a {@link LongAdder}, because
+     * what an operator needs is the worst one a lookup could have waited behind, not the total.
      *
-     * <p>Unsegmented, the readiness doc prices a close of 500K entries at 37 ms, about 16 ms per shard when a
-     * tenant leaves hot. Segmented, a close takes one segment's lock at a time and each holds about a
-     * {@code 1/N} share of the cells.
+     * <p>A close of a large file's entries takes tens of milliseconds unsegmented. Segmented, it takes one
+     * segment's lock at a time and each holds about a {@code 1/N} share of the cells.
      */
     static final AtomicLong longestCloseHoldNanos = new AtomicLong();
 
@@ -334,7 +313,7 @@ public final class DirectIOVectorCache {
 
     /**
      * Acquisitions that found a thread already queued on the segment's lock, and the nanoseconds they then
-     * waited (C2). Only a contended acquisition is counted and only a contended one is timed, which is why
+     * waited. Only a contended acquisition is counted and only a contended one is timed, which is why
      * both are free on the path that matters; see {@link DirectIOCacheSegment}'s {@code lockRead}.
      */
     static final LongAdder contendedReadAcquisitions = new LongAdder();
@@ -355,7 +334,7 @@ public final class DirectIOVectorCache {
     static volatile boolean acquisitionCounting;
 
     /**
-     * Whether a contended acquisition is timed. Always true in production; a test and the C6 overhead
+     * Whether a contended acquisition is timed. Always true in production; a test and the overhead
      * measurement turn it off to price the timing against a build that does none.
      */
     static volatile boolean lockTimingEnabled = true;
@@ -377,15 +356,14 @@ public final class DirectIOVectorCache {
     // ---------------------------------------------------------------------------------------------------
 
     /**
-     * The 256 KiB stripe an offset lies in, which is the unit of segmentation (Q, section 2.1).
+     * The 256 KiB stripe an offset lies in, which is the unit of segmentation.
      *
      * <p>A stripe and not a vector, because a staged span is at most
-     * {@link DirectIOVectorIndexInput#DEFAULT_MAX_STAGED_RANGE_BYTES} = 135,168 B and 135,168 &lt; 262,144, so a span
+     * {@link DirectIOVectorIndexInput#DEFAULT_MAX_STAGED_RANGE_BYTES}, which is below the stripe, so a span
      * lies in at most <b>two</b> stripes wherever it starts and {@link #putRun} keeps essentially the one
-     * write-lock acquisition it has. A per-vector key would scatter a 43-vector run across up to 43 segments
-     * and turn one acquisition into 43. MEASURED (output/bench/q-baseline/q-seghitrate.out): the two keys give
-     * the same hit rate to within 0.01 points at every segment count from 1 to 256, so the read side does not
-     * pay for the choice.
+     * write-lock acquisition it has. A per-vector key would scatter a run across one segment per vector and
+     * turn one acquisition into dozens. The two keys were measured to give the same hit rate at every segment
+     * count, so the read side does not pay for the choice.
      */
     private static final int STRIPE_SHIFT = 18;
 
@@ -415,8 +393,7 @@ public final class DirectIOVectorCache {
     }
 
     /**
-     * How many segments a store of {@code maxSlabs} slabs gets on a node of {@code cores} cores
-     * (Q, section 2.1):
+     * How many segments a store of {@code maxSlabs} slabs gets on a node of {@code cores} cores:
      *
      * <pre>
      * coreSegments = clamp(nextPowerOfTwo(8 * cores), 8, 256)
@@ -424,18 +401,15 @@ public final class DirectIOVectorCache {
      * </pre>
      *
      * <p><b>Both terms, because the slab floor binds before the core count does.</b> The {@code 8 * cores}
-     * term aims at about one thread per segment, which is where the measurement says contention disappears:
-     * at one thread the unsegmented store was 13.1% lock wait with <b>zero</b> contended acquisitions, and at
-     * two it was already 53% contended (MEASURED, output/bench/q-baseline). The {@code maxSlabs / 8} term is
-     * what the hit rate requires: MEASURED by an exact emulation of this policy over M2's trace, the loss
-     * against an unsegmented store is governed by <b>slabs per segment</b> and not by the segment count, and
-     * it is -0.08 points at eight slabs per segment against C3's 0.2-point bar (-0.16 at four, -0.36 at two,
-     * -0.87 at one, where a segment evicts its whole contents at once).
+     * term aims at about one thread per segment, which is where contention was measured to disappear: one
+     * thread contends for nothing and two already contend for most acquisitions. The {@code maxSlabs / 8}
+     * term is what the hit rate requires: an exact emulation of this policy over a real trace showed the loss
+     * against an unsegmented store governed by <b>slabs per segment</b> and not by the segment count, and
+     * acceptable at eight slabs per segment but not below it, because a segment with one slab evicts its
+     * whole contents at once.
      *
-     * <p>Worked: 64 cores and 35 GB (1,120 slabs) gives 128; 32 cores and 18 GB (576 slabs) gives 64; this
-     * desktop's 16 cores at a 32 GB target (1,024 slabs) gives 128, which is the hot node's count and is what
-     * makes a desktop stress a real proof; 16 cores at 4 GB (128 slabs) gives 16; 256 MB (8 slabs) gives 1,
-     * which is the unsegmented store exactly, so no configuration gets worse than it was.
+     * <p>A small store therefore gets one segment, which is the unsegmented store exactly, so no
+     * configuration gets worse than it was.
      *
      * @param cores    the node's available processors
      * @param maxSlabs the store's slab target
@@ -491,30 +465,26 @@ public final class DirectIOVectorCache {
      *
      * <p>This is the input's first lookup, in {@code prefetch}, where the answer decides whether the range
      * joins the burst — so a yes here is what saves the device read, but it is not what serves the vectors.
-     * Counting it would double every count against the vectors actually served, which is what phase 15 did
-     * and had to document ({@link #lookupsPerVector()}); one count per vector at the lookup that serves it
-     * makes {@code hits / (hits + misses)} a hit rate directly comparable with the 16-S node figures.
+     * Counting it would double every count against the vectors actually served, which an earlier shape of
+     * this store did and had to document ({@link #lookupsPerVector()}); one count per vector at the lookup
+     * that serves it makes {@code hits / (hits + misses)} a hit rate comparable with a node's own figures.
      *
-     * <h4>Why it is a run and not one vector (MEASURED)</h4>
+     * <h4>Why it is a run and not one vector</h4>
      * The range {@code prefetch} is given is not a vector, it is a <em>coalesced group</em>:
      * {@code PrefetchHelper#prefetchExactVectorSize} sorts the batch's ordinals and asks for the span of each
-     * group it can fit in 128 KB (CODE: {@code PrefetchHelper.java:97-108}), so both ends are vector
-     * boundaries on one grid but the span can hold dozens of them. A one-vector lookup therefore answers
-     * "no" for every multi-vector group, however much of it is cached, and the group is staged in full.
+     * group it can fit in its span budget, so both ends are vector boundaries on one grid but the span can
+     * hold dozens of them. A one-vector lookup therefore answers "no" for every multi-vector group, however
+     * much of it is cached, and the group is staged in full. The one-vector form was measured reading the
+     * whole file many times over at a hit rate near its ceiling, because the groups were staged even once the store
+     * held every vector in them; walking the run takes the same arm to about the file's own size. The cost is
+     * up to {@code max_span_bytes / vectorBytes} index probes under one read-lock acquisition, against the
+     * device read it avoids.
      *
-     * <p>MEASURED on M4's fixture (output/bench/m4), 4,000 batches of 64 random candidates over a 64 MB
-     * {@code .vec}, span fill on, with the one-vector form: a 97.1% hit rate and <b>1.87 GB of device reads,
-     * 27.9x the whole file</b>, because 10.7 groups per batch averaging 45 KB were staged even once the store
-     * held every vector in the file. Walking the run takes the same arm to <b>81 MB, 1.21x the file</b>, and
-     * 16-I's scorer-level cache measured 1.53x. The cost is up to {@code max_span_bytes / vectorBytes} index
-     * probes (43 at the defaults) under one read-lock acquisition, against the 45 KB device read it avoids.
+     * <p>A run of one vector is a single lookup, so a caller asking about one vector asks exactly as before.
      *
-     * <p>A run of one vector is the single lookup this method used to be, so the key's meaning is unchanged
-     * and a caller asking about one vector asks exactly as before.
-     *
-     * <p>Since Q the run is walked segment by segment: a 135,168 B span lies in at most two 256 KiB stripes,
-     * so this takes at most <b>two</b> read acquisitions and releases each before taking the next, which is
-     * the no-two-segment-locks rule.
+     * <p>The run is walked segment by segment: a span lies in at most two stripes, so this takes at most
+     * <b>two</b> read acquisitions and releases each before taking the next, which is the
+     * no-two-segment-locks rule.
      *
      * @param fileId the file's identity, from {@link #fileId}
      * @param offset the first vector's byte offset in that file
@@ -545,7 +515,7 @@ public final class DirectIOVectorCache {
      * hold whole and returns how many, or returns {@code -1} when it holds nothing of {@code fileId} at all.
      *
      * <p>Like {@link #contains} it <b>counts nothing</b>: the caller
-     * ({@code DirectIOVectorIndexInput#selectUncachedOrdinals}, N1) is deciding what to prefetch, not serving
+     * ({@code DirectIOVectorIndexInput#selectUncachedOrdinals}) is deciding what to prefetch, not serving
      * bytes. {@code -1} rather than a copy of every ordinal is what lets a cold file take the caller's
      * unfiltered path with no array to walk.
      *
@@ -581,14 +551,14 @@ public final class DirectIOVectorCache {
             // One read acquisition for the batch, which is the batching this method exists to keep.
             return all[0].selectMissing(fileId, baseOffset, vectorBytes, ords, 0, numOrds, missing, 0);
         }
-        // C2: bucket the batch by segment, walk each touched segment under ONE read acquisition, and write
+        // bucket the batch by segment, walk each touched segment under ONE read acquisition, and write
         // the misses out in the caller's ordinal order. A counting sort, so the bucketing is
         // O(batch + segments) with no comparison, and the scratch is one set of arrays per thread.
         //
-        // MEASURED (output/bench/q-baseline): a contended read acquisition on the unsegmented lock waited
-        // 8.9 us at 8 threads and 168.8 us at 128, against 0.045 us uncontended. A 190-candidate batch over
-        // 128 segments touches about 103 of them, so this trades one contended acquisition for about 103
-        // uncontended ones.
+        // A contended read acquisition's wait rises with the thread count and an uncontended one's is three
+        // orders of magnitude below it, so bucketing trades one contended acquisition per batch for one
+        // uncontended acquisition per touched segment, which is the cheaper side at every thread count
+        // measured.
         final SelectScratch scratch = SELECT_SCRATCH.get().sized(numOrds, all.length);
         final int[] segmentOf = scratch.segmentOf;
         final int[] bounds = scratch.bounds;
@@ -684,8 +654,8 @@ public final class DirectIOVectorCache {
         final float[] destination,
         final int destinationOffset
     ) {
-        // Not a whole number of floats is a miss and not a lookup. Since O8 a slab's slot length may be any
-        // even number of bytes (an FP16 vector of an odd dimension is 2 x dim bytes), and the
+        // Not a whole number of floats is a miss and not a lookup. A slab's slot length may be any
+        // even number of bytes (an FP16 vector of an odd dimension is two bytes a dimension), and the
         // {@link DirectIOSlab#floats} view below indexes in floats, so a slot that is not float-aligned must
         // never be reachable through this method. The FP16 path reads through {@link #getBytes} instead.
         if (BROKER.maxSlabs() == 0 || (length & 3) != 0) {
@@ -703,7 +673,7 @@ public final class DirectIOVectorCache {
     /**
      * {@link #getFloats} for a caller that wants the vector's bytes rather than its floats: copies
      * {@code length} bytes into {@code destination} and returns true, or returns false and leaves
-     * {@code destination} alone. O8.
+     * {@code destination} alone.
      *
      * <h4>Why this exists, and why the store needed nothing else for FP16</h4>
      * The FP16 flat format's values read a vector with
@@ -757,7 +727,7 @@ public final class DirectIOVectorCache {
      * <p>Silently does nothing when the cache is off, when the length is odd or is larger than a slab, or
      * when no slab can be had. A fill that does not happen costs a future hit and nothing else.
      *
-     * <p>The length rule is "an even number of bytes", not "a whole number of floats", since O8: an FP16
+     * <p>The length rule is "an even number of bytes", not "a whole number of floats", because an FP16
      * vector is {@code 2 x dimension} bytes and an odd dimension makes that a multiple of 2 and not of 4. A
      * slot that is not float-aligned is unreachable through {@link #getFloats}, which refuses such a length
      * outright, and is served by {@link #getBytes}, which is what the FP16 read path uses.
@@ -776,16 +746,16 @@ public final class DirectIOVectorCache {
     }
 
     /**
-     * Admits the vector a blocking read had to fetch because the store lost it between N1's prefetch filter
-     * and {@code readFloats}, <b>without evicting anything</b>. O4, {@code CHALLENGES.md} item 13.
+     * Admits the vector a blocking read had to fetch because the store lost it between the prefetch filter
+     * and {@code readFloats}, <b>without evicting anything</b>.
      *
      * <h4>The race, and why it leaves a vector uncached without this</h4>
-     * Since N1 the prefetch filter asks {@link #contains} and drops the ordinals the store holds, so those
-     * vectors are not staged. A vector evicted in the window between that check and the read is then a
-     * <em>blocking</em> read, and M3's admission rule is "only from a staged read covering the vector whole",
+     * The prefetch filter asks {@link #contains} and drops the ordinals the store holds, so those vectors are
+     * not staged. A vector evicted in the window between that check and the read is then a
+     * <em>blocking</em> read, and the admission rule is "only from a staged read covering the vector whole",
      * so its bytes were thrown away. The next batch asking for it would stage and admit it, so this
-     * self-heals; what it costs until then is one synchronous device read, which is the 12 to 22 per 5,000
-     * queries the node measured in S2 and S3 (ref/RESULTS-N.md).
+     * self-heals; what it costs until then is one synchronous device read, and a node measured a dozen or
+     * two of them per five thousand queries.
      *
      * <h4>Why this does not reopen the "a blocking read is not admitted" rule</h4>
      * That rule is about the sequential channels: the read-ahead ring buys a cache nothing and would evict
@@ -821,7 +791,7 @@ public final class DirectIOVectorCache {
 
     /**
      * How wide a staged miss read of a file of {@code fileBytes} bytes may be made, or {@code 0} for "do not
-     * widen it". O5.
+     * widen it".
      *
      * <h4>The three gates, and why the second is the whole file rather than the target</h4>
      * <ul>
@@ -885,7 +855,7 @@ public final class DirectIOVectorCache {
     /**
      * Admits the {@code count} consecutive vectors starting at {@code (fileId, firstOffset)} from
      * {@code source}, under <b>one</b> write-lock acquisition per segment the run touches, and only while the
-     * store is below its slab target. M4's span fill, ported from 16-I F5.
+     * store is below its slab target. This is span fill.
      *
      * <p><b>Three rules, and each is a thing this must not do rather than a thing it does.</b>
      * <ul>
@@ -903,10 +873,9 @@ public final class DirectIOVectorCache {
      * </ul>
      *
      * <p>One acquisition per run rather than per vector is what bounds the hold to one span's worth of
-     * copying: a run is the whole vectors of one staged span, about two at the measured mean aligned span of
-     * 7,310 B for a 3,072 B vector and at most {@code max_span_bytes / length} (43 at the defaults). Since Q
-     * the run is split at 256 KiB stripe boundaries into at most <b>two</b> per-segment sub-runs, taken
-     * sequentially, because 135,168 &lt; 262,144; see {@link #segmentFor}.
+     * copying: a run is the whole vectors of one staged span, which is a handful at the measured mean span
+     * and at most {@code max_span_bytes / length}. The run is split at stripe boundaries into at most
+     * <b>two</b> per-segment sub-runs, taken sequentially; see {@link #segmentFor}.
      *
      * @param fileId the file's identity, from {@link #fileId}
      * @param firstOffset the byte offset of the first vector in the run
@@ -975,13 +944,12 @@ public final class DirectIOVectorCache {
 
     /**
      * Frees every entry of {@code fileId} and drops its index tables, because the input that owned the file's
-     * {@code O_DIRECT} handle has closed and nothing will read those vectors again. O3, the merge note's
-     * fix 1.
+     * {@code O_DIRECT} handle has closed and nothing will read those vectors again.
      *
-     * <h4>What it is for (CODE, ref/MERGE-NOTE.md section 4)</h4>
-     * Before this, a merged-away segment's entries stayed in their slots until the FIFO cycled past them,
-     * and they were never <em>wrong</em> -- the key says which file's bytes they are and that file's bytes
-     * are immutable -- only cold. But the store therefore sat at its target after a merge, and span fill runs
+     * <h4>What it is for</h4>
+     * Without it, a merged-away segment's entries stay in their slots until the FIFO cycles past them, and
+     * they are never <em>wrong</em> -- the key says which file's bytes they are and that file's bytes are
+     * immutable -- only cold. But the store then sits at its target after a merge, and span fill runs
      * only below the target, so it did not re-arm for the merged segment and that segment refilled at one
      * vector per miss. Freeing them at close puts the store below its target again, which is what lets span
      * fill warm the new segment. A reopened file simply refills.
@@ -995,8 +963,8 @@ public final class DirectIOVectorCache {
      *
      * <h4>Why one segment at a time</h4>
      * Nothing waits behind a close that is not in the segment being drained, and the segment being drained
-     * waits for one {@code N}th of the work. MEASURED unsegmented in the readiness doc at 37 ms per 500K
-     * entries, which is about 16 ms per shard when a tenant leaves hot.
+     * waits for one {@code N}th of the work; a close of a large file's entries was measured at tens of
+     * milliseconds unsegmented.
      *
      * <h4>Why the slots are freed and not evicted</h4>
      * {@code evictions} counts vectors the store had to displace to make room, which is the figure an
@@ -1115,7 +1083,7 @@ public final class DirectIOVectorCache {
     }
 
     /**
-     * Whether span fill is on: {@link #SPAN_FILL}, and the store not being off (M4).
+     * Whether span fill is on: {@link #SPAN_FILL}, and the store not being off.
      *
      * <p>The store being off turns span fill off with it: the widened bytes are admitted by span fill, and a
      * wider read nobody harvests is device traffic for nothing.
@@ -1136,7 +1104,7 @@ public final class DirectIOVectorCache {
      *
      * <p><b>This resizes; it does not rebuild.</b> Growing keeps every cached vector and lets the next miss
      * allocate; shrinking drops the oldest slabs and keeps every vector that still fits. That is the
-     * difference from phase 15, whose Guava cache had to be rebuilt because {@code maximumWeight} is fixed at
+     * difference from a {@code Guava} cache, which has to be rebuilt because {@code maximumWeight} is fixed at
      * {@code build()}, so every change cost the whole cache and a re-warm.
      *
      * <p>Shrinking drops the oldest slabs <b>of the fullest segments</b> rather than the oldest globally,
@@ -1170,7 +1138,7 @@ public final class DirectIOVectorCache {
                     resegment(wantedSegments, detached);
                 }
                 BROKER.setMaxSlabs(wanted);
-                // A new target is a new question, so an earlier allocation failure stops standing (N2).
+                // A new target is a new question, so an earlier allocation failure stops standing.
                 BROKER.unlatchGrowth();
                 while (BROKER.liveSlabs() > wanted) {
                     final DirectIOCacheSegment fullest = fullestSegment();
@@ -1274,7 +1242,7 @@ public final class DirectIOVectorCache {
      * <b>One.</b> A vector is counted once, at the lookup that serves or misses it, which is the one in
      * {@code readFloats}. The lookup in {@code prefetch} decides whether the range joins the burst and
      * deliberately counts nothing, so {@code hits / (hits + misses)} is the hit rate <em>and</em> the counts
-     * are the vectors served. Phase 15 counted both sites, so its totals were twice the vectors.
+     * are the vectors served. An earlier shape counted both sites, so its totals were twice the vectors.
      *
      * @return 1
      */
@@ -1345,14 +1313,14 @@ public final class DirectIOVectorCache {
 
     /**
      * Vectors admitted because they lay inside a span a burst had already staged, rather than because a read
-     * asked for them (M4). Zero while the store is off, and zero once it reaches its slab target.
+     * asked for them. Zero while the store is off, and zero once it reaches its slab target.
      */
     public static long spanFills() {
         return spanFills.sum();
     }
 
     /**
-     * Slab allocations the backend refused (N2). One per latch: after a failure the store stops growing until
+     * Slab allocations the backend refused. One per latch: after a failure the store stops growing until
      * its target changes or it releases a slab, so this is also how many times growth was given up on.
      * Non-zero means the node's {@code knn.direct_io.rescore.cache.max_bytes} is above what the JVM would
      * hand out, and the store is smaller than the operator asked for.
@@ -1367,8 +1335,8 @@ public final class DirectIOVectorCache {
     }
 
     /**
-     * Files whose cached vectors were freed because the input owning their {@code O_DIRECT} handle closed
-     * (O3). Counts a close that freed at least one entry, so a {@code .vec} the store never held does not
+     * Files whose cached vectors were freed because the input owning their {@code O_DIRECT} handle closed.
+     * Counts a close that freed at least one entry, so a {@code .vec} the store never held does not
      * move it. On a merging node this rises with the merges, and {@code evictions} standing still while it
      * does is what says the merged-away segments cost the live ones nothing.
      */
@@ -1376,13 +1344,13 @@ public final class DirectIOVectorCache {
         return closedFiles.sum();
     }
 
-    /** Cached vectors freed at a close, which is room the store got back without evicting anything. O3. */
+    /** Cached vectors freed at a close, which is room the store got back without evicting anything. */
     public static long closedFileEntries() {
         return closedFileEntries.sum();
     }
 
     /**
-     * Vectors a blocking read put back after the filter-then-read race lost them (O4). These are also
+     * Vectors a blocking read put back after the filter-then-read race lost them. These are also
      * counted in {@link #readmissions()}, which BACKLOG asks for; this key is what keeps the two sources of
      * a readmission separable, because the other one is the second chance.
      *
@@ -1477,7 +1445,7 @@ public final class DirectIOVectorCache {
 
     /**
      * Test seam: where slab memory comes from and goes back to, so a suite can exercise a backend that will
-     * not allocate (N2) and can see which thread, holding which lock, each call runs on (N3). Takes effect on
+     * not allocate and can see which thread, holding which lock, each call runs on. Takes effect on
      * the next growth attempt or release and is restored by {@link #resetForTesting()}.
      *
      * @param memory the allocate and release pair to use until the next reset
@@ -1496,7 +1464,7 @@ public final class DirectIOVectorCache {
 
     /**
      * Test seam: whether the calling thread is inside this store's locks at all, which since Q means the
-     * broker's lock or any segment's lock in either mode. N3's property is that neither a slab allocation
+     * broker's lock or any segment's lock in either mode. the property is that neither a slab allocation
      * nor a slab release ever runs while it is.
      *
      * @return whether this thread holds any of the store's locks
@@ -1562,9 +1530,9 @@ public final class DirectIOVectorCache {
 
     /**
      * The most and the fewest vectors any one segment holds right now, which is the entry skew the hit-rate
-     * cost of segmenting the eviction is priced against (C3). MEASURED by the design run's emulation at the
-     * chosen operating point of eight slabs per segment: 597 to 680 entries per segment against a mean of
-     * 638, which is +-7%, and the hit-rate loss that skew carries is -0.08 points.
+     * cost of segmenting the eviction is priced against. At the chosen operating point of eight slabs per
+     * segment an emulation of this policy measured the spread within a few per cent of the mean, and the
+     * hit-rate loss that skew carries inside the bar it was designed to.
      *
      * <p>A lock-free sum of volatile counters, like {@link #entries()}, so a wide spread between the two is
      * readable on a node without the stats endpoint competing with the query path.
@@ -1598,8 +1566,8 @@ public final class DirectIOVectorCache {
 
     /**
      * Nanoseconds spent waiting for a segment's read lock, over the <b>contended</b> acquisitions only: an
-     * uncontended one waited 0.045 us (MEASURED) and is not timed, because timing it would cost 62 ns of
-     * {@code System.nanoTime} to measure 45.
+     * uncontended one's wait was measured below the cost of the two {@code System.nanoTime} calls it would
+     * take to measure it, so it is not timed.
      */
     public static long readLockWaitNanos() {
         return readLockWaitNanos.sum();
@@ -1611,8 +1579,8 @@ public final class DirectIOVectorCache {
     }
 
     /**
-     * Test seam: counts every acquisition, not only the contended ones, so a test can assert the BACKLOG's
-     * C2 criterion -- write acquisitions per burst no more than the segments the burst touched.
+     * Test seam: counts every acquisition, not only the contended ones, so a test can assert the criterion
+     * the batching exists for -- write acquisitions per burst no more than the segments the burst touched.
      *
      * @param on whether to count
      */

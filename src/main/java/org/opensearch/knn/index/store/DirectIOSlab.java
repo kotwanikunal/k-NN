@@ -32,45 +32,29 @@ import java.util.concurrent.atomic.AtomicLong;
  *       reference and the memory comes back at a later collection.</li>
  * </ol>
  *
- * <h2>Why FFM is first (MEASURED 2026-10-12, dev desktop, output/bench/m1)</h2>
+ * <h2>Why FFM is first</h2>
  * {@code java.lang.foreign} is a preview API in JDK 21 (JEP 442), but the preview gate is enforced by
  * {@code javac} and by a class file's preview minor version, and a reflective call passes through neither.
- * So the four methods resolve and work on Corretto 21.0.11 and on Temurin 25.0.4 alike, with no warning,
- * no exception and no {@code --enable-preview}.
+ * So the four methods resolve and work on Corretto 21 and on Temurin 25 alike, with no warning, no exception
+ * and no {@code --enable-preview}.
  *
- * <table>
- *   <caption>32 MiB slab, median of 100 after 10 warm-ups; VmRSS for 16 slabs allocated and touched</caption>
- *   <tr><th></th><th>ffm, JDK 21</th><th>ffm, JDK 25</th><th>direct_buffer, JDK 21</th>
- *       <th>direct_buffer, JDK 25</th></tr>
- *   <tr><td>allocate p50</td><td>7,111 us</td><td>6,730 us</td><td>7,366 us</td><td>7,557 us</td></tr>
- *   <tr><td>release p50</td><td>2,230 us</td><td>2,060 us</td><td>0.1 us</td><td>0.1 us</td></tr>
- *   <tr><td>VmRSS, 16 touched</td><td>+529,152 kB</td><td>+536,948 kB</td><td>+529,440 kB</td>
- *       <td>+535,708 kB</td></tr>
- *   <tr><td>VmRSS after release</td><td><b>+4,964 kB</b></td><td><b>+13,024 kB</b></td>
- *       <td>+529,440 kB, unchanged</td><td>+535,708 kB, unchanged</td></tr>
- * </table>
+ * <p><b>The release is the whole of the choice.</b> Neither backend is fast to allocate, because both
+ * zero-fill, and neither has to be: a slab is allocated on a miss that has no room, against a device read
+ * per miss of the same order. What differs is what happens when the cache shrinks or an operator sets
+ * {@code knn.direct_io.rescore.cache.max_bytes} back to {@code 0b}: FFM gives the pages back inside
+ * {@link #close()}, and {@code allocateDirect} holds them until a collection finds the buffer, which is the
+ * GC-timed release the staging buffers were taken off for the same reason.
  *
- * The last row is the decision. Neither backend is fast to allocate, because both zero-fill, and neither has
- * to be: a 4 GB cache is 128 slabs, so filling it from empty costs about 0.9 s spread over the first 128
- * misses that need a slab, against a device read of 0.3-3 ms per miss. What differs is what happens when the
- * cache shrinks or an operator sets {@code knn.direct_io.rescore.cache.max_bytes} back to {@code 0b}: FFM
- * gives the pages back inside {@link #close()}, and {@code allocateDirect} holds them until a collection
- * finds the buffer, which is exactly the GC-timed release D3c removed from the staging buffers.
- *
- * <h2>{@code MaxDirectMemorySize}: outside it on the node's JDK, inside it on 21 (MEASURED)</h2>
- * With {@code -XX:MaxDirectMemorySize=64m}, 16 FFM slabs (512 MiB) allocate fine on JDK 25, which does not
- * count them in {@code BufferPoolMXBean("direct")} either. On JDK 21 the <b>allocation</b> charges the limit:
- * the third {@code allocate(32 MiB, 64)} throws
- * {@code OutOfMemoryError: Cannot reserve 33554495 bytes of direct buffer memory} from
- * {@code java.nio.Bits.reserveMemory}, and {@code Arena#close} gives that reservation straight back with no
- * GC. Corretto 21's {@code jdk.internal.foreign.NativeMemorySegmentImpl#makeNativeSegment:127} is where it
- * happens, and its cleanup unreserves at {@code :140}; {@code makeByteBuffer:91-94} reserves nothing, so the
- * view is free. The 63 bytes over 32 MiB in that message are the alignment pad the same method adds
- * ({@code byteSize + (byteAlignment - 1)} for an alignment past {@code MAX_MALLOC_ALIGN}), which is another
- * way of seeing that it is the allocation and not the view. {@code allocateDirect} is inside the limit on
- * both JDKs. So on a JDK 21 runtime this cache shares {@code MaxDirectMemorySize} with Direct I/O staging
- * and netty, and on a JDK 22+ runtime it does not; its own ceiling,
- * {@code knn.direct_io.rescore.cache.max_bytes}, is the bound either way.
+ * <h2>{@code MaxDirectMemorySize}: outside it on a JDK 22+ runtime, inside it on 21</h2>
+ * On a JDK 22+ runtime an FFM slab is outside {@code MaxDirectMemorySize} and does not appear in
+ * {@code BufferPoolMXBean("direct")}. On 21 the <b>allocation</b> charges the limit and throws
+ * {@code OutOfMemoryError: Cannot reserve ... bytes of direct buffer memory} from
+ * {@code java.nio.Bits.reserveMemory} when it is exhausted, while {@code Arena#close} gives the reservation
+ * straight back with no GC; the segment's view ({@code makeByteBuffer}) reserves nothing, so it is the
+ * allocation and not the view that is charged. {@code allocateDirect} is inside the limit on both. So on a
+ * JDK 21 runtime this cache shares {@code MaxDirectMemorySize} with Direct I/O staging and netty, and on a
+ * JDK 22+ runtime it does not; its own ceiling, {@code knn.direct_io.rescore.cache.max_bytes}, is the bound
+ * either way.
  *
  * <h2>An allocation that fails is not an error</h2>
  * {@link #allocate(int)} returns {@code null} rather than throwing when the backend will not give up the
@@ -85,7 +69,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * no reader can be inside the slab when it goes away. That is why there is no per-slab lock here.
  *
  * <p>Reading through a buffer a caller kept from <em>before</em> the close is still a broken contract, and
- * what it does differs by backend: FFM throws {@code IllegalStateException: Already closed} (MEASURED),
+ * what it does differs by backend: FFM throws {@code IllegalStateException: Already closed},
  * {@code allocateDirect} returns the old bytes until the collector unmaps them. Neither crashes the JVM,
  * which is the one thing a JNI slab could not promise.
  */
@@ -93,12 +77,11 @@ import java.util.concurrent.atomic.AtomicLong;
 final class DirectIOSlab {
 
     /**
-     * The slab size, 32 MiB, fixed rather than a setting for the reason 16-I's {@code VectorCacheSlab}
-     * recorded: nothing an operator can measure would tell them what to set it to. The figure that matters
-     * is the cache's total, which {@code knn.direct_io.rescore.cache.max_bytes} bounds, and the slab is only
-     * the granularity at which that total is reclaimed. At a 4 GB cache it is 128 slabs, which is a fine
-     * enough population for slab-granular FIFO eviction, and it is three orders of magnitude above the
-     * largest vector it holds (a 4,096-dim fp32 vector is 16 KiB).
+     * The slab size, 32 MiB, fixed rather than a setting because nothing an operator can measure would tell
+     * them what to set it to. The figure that matters is the cache's total, which
+     * {@code knn.direct_io.rescore.cache.max_bytes} bounds, and the slab is only the granularity at which
+     * that total is reclaimed. It leaves a large enough slab population for slab-granular FIFO eviction at
+     * any useful cache size, and it is three orders of magnitude above the largest vector it holds.
      */
     static final int SLAB_BYTES = 32 * 1024 * 1024;
 
@@ -292,7 +275,7 @@ final class DirectIOSlab {
      * memory to the next collection that finds it.
      *
      * <p>Idempotent, because a shared arena's second {@code close()} throws
-     * {@code IllegalStateException: Already closed} (MEASURED) and a double release has to be a no-op: it is
+     * {@code IllegalStateException: Already closed} and a double release has to be a no-op: it is
      * reachable from a resize that races a shutdown.
      */
     void close() {

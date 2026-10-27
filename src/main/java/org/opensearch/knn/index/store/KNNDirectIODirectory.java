@@ -37,7 +37,7 @@ import java.util.function.LongSupplier;
  *
  * <ol>
  *   <li>the file is a <b>faiss or memory-optimized-search</b> flat vector file, of either precision
- *       (O8 added the two FP16 formats) — see {@link #isFaissVectorData};
+ *       fp32 or FP16 — see {@link #isFaissVectorData};
  *   <li>{@code knn.direct_io.rescore.enabled} is on — the per-substrate enablement rule, which
  *       stays a setting because Direct I/O is a win only where the {@code .vec} working set cannot stay
  *       in the page cache;
@@ -46,7 +46,7 @@ import java.util.function.LongSupplier;
  *       rather than diagnostic: see {@link #declinedCompound};
  *   <li>the delegate chain bottoms out at an {@link FSDirectory} — see {@link #resolvePath};
  *   <li>the resolved path exists;
- *   <li>the file is at least {@code knn.direct_io.min_file_size} — the size floor, phase 13 audit FIX 1;
+ *   <li>the file is at least {@code knn.direct_io.min_file_size} — the size floor;
  *   <li><b>both</b> opens succeed: the delegate's own input, which the routed input keeps beside its
  *       channel, and the {@code O_DIRECT} open itself;
  *   <li>the file's bytes are the bytes the delegate chain serves — the length, the first 4 KiB and the
@@ -72,21 +72,19 @@ import java.util.function.LongSupplier;
  *
  * <h2>One engagement point, and it is the codec</h2>
  * This directory is installed by {@link #routeVectorData(SegmentReadState)} alone — the codec seam, which
- * needs no index setting. Phase 14 deleted the alternative, an
- * {@code IndexStorePlugin.StoreFactory} selected per index with {@code index.store.factory}, because that
- * slot is single valued and {@code @ExperimentalApi}: one factory per index, already claimed by
- * {@code store-subdirectory}, and in the way of any encryption-at-rest wrapper. The codec seam is the
- * only engagement a plugin can take that composes with everything else.
+ * needs no index setting. The alternative, an {@code IndexStorePlugin.StoreFactory} selected per index with
+ * {@code index.store.factory}, does not compose: that slot is single valued and {@code @ExperimentalApi},
+ * so it is one factory per index, already claimed by {@code store-subdirectory} and in the way of any
+ * encryption-at-rest wrapper. The codec seam is the only engagement a plugin can take that composes with
+ * everything else.
  *
  * <h2>Compound segments delegate, and that is most segments</h2>
  * The {@code Directory} a codec is handed for a <b>compound</b> segment is the {@link CompoundDirectory}
  * ({@code Lucene90CompoundReader}), which has no filesystem path, so condition 3 declines and the entry is
  * served by the compound reader's own mmap slice. That is the right answer rather than a gap: a compound
- * segment is a freshly flushed one, and phase 13's E4 measured a flush-sized {@code .vec} as
- * <b>8,016x</b> better served from the page cache than from {@code O_DIRECT}. Phase 14 therefore also
- * deleted {@code KNNVectorCompoundSliceInput}, the 423-line {@code .cfs}-slice interceptor the
- * store-factory design needed to reach that same entry: the code existed to route reads that measurement
- * says must not be routed.
+ * segment is a freshly flushed one, and a flush-sized {@code .vec} was measured orders of magnitude better
+ * served from the page cache than from {@code O_DIRECT}. So there is deliberately no {@code .cfs}-slice
+ * interceptor to reach that entry: it would exist to route reads the measurement says must not be routed.
  *
  * <p><b>How often that happens is not a corner case.</b> At the shipped defaults <em>every</em> flushed
  * segment is compound, because {@code index.use_compound_file} defaults to {@code true}
@@ -256,7 +254,7 @@ public final class KNNDirectIODirectory extends FilterDirectory {
     /**
      * Conditions 3 to 8, or {@code null} when any of them declines — in which case exactly one reason
      * counter has been incremented. The returned input owns its own file handle <b>and the delegate's input
-     * beside it</b> (O1), and both are closed by whoever closes the input, which is the same ownership
+     * beside it</b>, and both are closed by whoever closes the input, which is the same ownership
      * {@link Directory#openInput} always has.
      */
     @Nullable
@@ -471,7 +469,7 @@ public final class KNNDirectIODirectory extends FilterDirectory {
     }
 
     /**
-     * The two FP16 per-field formats' names (O8). Spelled out here rather than read from the formats because
+     * The two FP16 per-field formats' names. Spelled out here rather than read from the formats because
      * both declare their {@code FORMAT_NAME} private and one of them lives outside the files this phase may
      * change; {@code KNNDirectIODirectoryTests#halfFloatFormatNamesMatchTheFormats} asks the formats
      * themselves and fails if either is ever renamed, so these strings cannot drift in silence.
@@ -497,14 +495,13 @@ public final class KNNDirectIODirectory extends FilterDirectory {
      * {@code _0_Faiss1040ScalarQuantizedKnnVectorsFormat_0.vec}, while a Lucene-engine one carries
      * Lucene's own format name.
      *
-     * <h4>The two FP16 names (O8)</h4>
+     * <h4>The two FP16 names</h4>
      * A {@code half_float} faiss or MOS field writes its vectors through
      * {@code NativeEngines990HalfFloatKnnVectorsFormat} or, with {@code sq, bits:1}, through
      * {@code Faiss1040HalfFloatScalarQuantizedKnnVectorsFormat}. Both extend the fp32 formats above and both
      * nest {@code KNN1040HalfFloatFlatVectorsFormat}, whose data extension is also {@code vec}, so the open
-     * always reached this rule — but the inserted {@code HalfFloat} breaks the substring, so before O8 the
-     * file was declined at condition 1, before any counter. The two names are listed and nothing else about
-     * the rule changes: a half-float {@code .vec} is a flat file of {@code 2 x dimension} bytes per vector
+     * always reaches this rule — but the inserted {@code HalfFloat} breaks the fp32 substrings, which is why
+     * the two names are listed. Nothing else about the rule changes: a half-float {@code .vec} is a flat file of {@code 2 x dimension} bytes per vector
      * that the rescore path reads at random, which is what this feature is for. The store keys on offset and
      * byte length, so the halved vector length needs nothing of it, and the FP16 read path's
      * {@code readBytes} is served by {@code DirectIOVectorIndexInput#isVectorRead}.

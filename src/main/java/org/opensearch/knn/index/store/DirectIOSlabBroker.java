@@ -17,7 +17,7 @@ import java.util.concurrent.locks.ReentrantLock;
 /**
  * The global slab target and the slab supply for {@link DirectIOVectorCache}, which is everything about the
  * store that cannot be a per-segment decision: how many slabs the node may hold in total, where their memory
- * comes from and goes back to, and whether an allocation that failed should be retried (Q, section C1a).
+ * comes from and goes back to, and whether an allocation that failed should be retried.
  *
  * <h2>Why this is a separate object from a segment</h2>
  * A {@link DirectIOCacheSegment} owns its slabs, its index, its FIFO queue and its lock, and everything it
@@ -47,8 +47,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * </ul>
  *
  * <p>No lock is taken for any of them, which is what lets a segment reserve while it holds its own write
- * lock without ever violating the order above. Before Q the same arithmetic ran under the store's one write
- * lock, which is where the reservation was invented (N3).
+ * lock without ever violating the order above.
  */
 @Log4j2
 final class DirectIOSlabBroker {
@@ -70,15 +69,14 @@ final class DirectIOSlabBroker {
     private final AtomicLong supply = new AtomicLong();
 
     /**
-     * Set when an allocation failed, so the store stops asking for a slab it cannot have (N2). Cleared when
+     * Set when an allocation failed, so the store stops asking for a slab it cannot have. Cleared when
      * the target changes or a slab is released, which are the two events that can make the answer different.
      *
-     * <p>MEASURED by the orchestrator (2026-10-12, desktop, {@code -Xmx256m} with
-     * {@code -XX:MaxDirectMemorySize=96m}): a failed reservation blocks the caller for 515 to 525 ms and runs
-     * one {@code Pause Full (System.gc())}, for {@code allocateDirect} on JDK 21 and 25 and for FFM on JDK 21,
-     * because {@code java.nio.Bits#reserveMemory} calls {@code System.gc()} and then sleeps nine times with
-     * backoff. Retrying it on every fill below the target costs that once per fill, and the answer is the same
-     * every time.
+     * <p>A failed reservation is <b>expensive</b>, not merely fruitless: {@code java.nio.Bits#reserveMemory}
+     * calls {@code System.gc()} and then sleeps nine times with backoff, so the caller is blocked for a
+     * measured half second and the node takes a full pause. That holds for {@code allocateDirect} on any JDK
+     * and for FFM on 21, where the arena charges the same limit. Retrying on every fill below the target
+     * costs that once per fill, and the answer is the same every time.
      *
      * <p>An {@link AtomicBoolean} rather than a field under a lock, because the one thing that must happen
      * exactly once per latch is the warning, and {@link #latchGrowth()} is the compare and set that decides
@@ -159,8 +157,8 @@ final class DirectIOSlabBroker {
     /**
      * The resize lock. Taken by {@link DirectIOVectorCache#configure(long)} and by {@link #lend}, and by
      * nothing else; see the class javadoc for the order it comes in. Counted while a test has asked for
-     * acquisition counting, because C5's criterion is that a {@code configure} with an unchanged target
-     * takes <b>no lock at all</b>, and that is the once-per-prefetch-burst path.
+     * acquisition counting, because a {@code configure} with an unchanged target must take <b>no lock at
+     * all</b> and that is the once-per-prefetch-burst path.
      */
     ReentrantLock lock() {
         if (DirectIOVectorCache.acquisitionCounting) {
@@ -257,7 +255,7 @@ final class DirectIOSlabBroker {
                 throw new IllegalStateException("released a slab the broker was not counting");
             }
             if (supply.compareAndSet(current, packed(live - 1, pendingOf(current)))) {
-                // Memory is coming back, so an earlier allocation failure may not stand any more (N2).
+                // Memory is coming back, so an earlier allocation failure may not stand any more.
                 growthLatched.set(false);
                 return;
             }
@@ -281,14 +279,14 @@ final class DirectIOSlabBroker {
         return growthLatched.compareAndSet(false, true);
     }
 
-    /** A new target, or memory coming back, is a new question, so an earlier failure stops standing (N2). */
+    /** A new target, or memory coming back, is a new question, so an earlier failure stops standing. */
     void unlatchGrowth() {
         growthLatched.set(false);
     }
 
     /**
      * Allocates one slab, with no lock held, and says whether to ask the store again. A refusal latches
-     * growth (N2) so that no later fill pays for the same answer.
+     * growth so that no later fill pays for the same answer.
      *
      * @param request the fill's request, which carries the slab back to it
      * @return whether a slab was allocated
@@ -321,7 +319,7 @@ final class DirectIOSlabBroker {
 
     /**
      * Lends {@code request}'s segment a slab from the segment holding the most, because the requesting
-     * segment holds none and the store is already at its target (Q, section 2.2 step 3).
+     * segment holds none and the store is already at its target.
      *
      * <p><b>The donor keeps at least one slab</b>, which is what bounds this: a segment that has just been
      * lent one holds exactly one and so can never be the next donor, and with the segment count capped at
@@ -368,9 +366,9 @@ final class DirectIOSlabBroker {
     /**
      * Gives back the memory of slabs a release has detached, with no lock held and not on the calling thread.
      *
-     * <p><b>Why not under the lock.</b> An FFM arena takes about 2.2 ms to close (MEASURED, M1), so before N3
-     * a {@code configure(0)} at a 4 GB target held the store's write lock for about 0.26 s and a 12 GB one for
-     * about 0.8 s, and every lookup on the node waited behind it. Detaching is what makes the close safe to do
+     * <p><b>Why not under the lock.</b> An FFM arena takes milliseconds to close, so closing a large store's
+     * slabs under the store's write lock held it for a fraction of a second per few gigabytes of target and
+     * every lookup on the node waited behind it. Detaching is what makes the close safe to do
      * outside the lock: it clears the slab's entry in its segment's {@code slabsById} under that segment's
      * write lock, so its index cells go stale and no reader that arrives afterwards can reach it, while a
      * reader already inside holds the read lock the detaching thread had to wait for.

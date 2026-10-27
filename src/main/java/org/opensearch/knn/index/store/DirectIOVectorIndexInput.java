@@ -78,11 +78,11 @@ import java.util.function.BooleanSupplier;
  *       {@code DefaultFlatVectorScorer}. That fallback is what makes {@code vectorValue(ord)} — and so
  *       {@link #seek} plus {@link #readFloats} on this input — actually run. A SIMD scorer bound straight to
  *       a mapping would never call us.</li>
- *   <li><b>Not a {@code FilterIndexInput}.</b> Not for the reason first recorded here: the same
- *       {@code create} does call {@code FilterIndexInput.unwrapOnlyTest} first, but that method only
- *       unwraps classes registered through {@code TestSecrets}, whose setter Lucene restricts to its own
- *       test framework, so a <em>production</em> {@code FilterIndexInput} subclass is <b>not</b> seen
- *       through and would displace the SIMD scorer just as well (gate 3). The reason to extend
+ *   <li><b>Not a {@code FilterIndexInput}.</b> Not because {@code create} unwraps one: it calls
+ *       {@code FilterIndexInput.unwrapOnlyTest} first, but that method only unwraps classes registered
+ *       through {@code TestSecrets}, whose setter Lucene restricts to its own test framework, so a
+ *       <em>production</em> {@code FilterIndexInput} subclass is <b>not</b> seen through and would displace
+ *       the SIMD scorer just as well. The reason to extend
  *       {@link IndexInput} directly is the other one: {@code FilterIndexInput} delegates only
  *       {@code readByte} and {@code readBytes}, so it inherits {@code IndexInput}'s no-op
  *       {@link #prefetch} and {@code DataInput}'s per-{@code float} {@code readFloats} loop — a wrapper
@@ -161,7 +161,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
          */
         private volatile boolean abandoned;
         /**
-         * Whether this range has already been offered to span fill (M4). Set the first time a read consumes
+         * Whether this range has already been offered to span fill. Set the first time a read consumes
          * the range, whatever the geometry then decides to admit, so the walk happens once per range rather
          * than once per vector read out of it. Written and read by the one thread that owns the burst.
          */
@@ -221,8 +221,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
         /**
          * Quiesces this range within {@link #STAGED_READ_WAIT_MILLIS} and reports whether its buffer is safe
-         * to reuse. False means a read may still be writing into it, so the buffer — and, since D3c, the
-         * whole arena it was carved from — must be retired rather than handed to the next burst.
+         * to reuse. False means a read may still be writing into it, so the buffer — and the whole arena it
+         * was carved from — must be retired rather than handed to the next burst.
          *
          * <p>Lives here rather than on the input because the thread taking a lease back is quiescing ranges
          * the <em>previous holder</em> staged, and that holder may be a different input that nothing holds a
@@ -262,16 +262,15 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     }
 
     /**
-     * Node-wide counters, for the gate-2 measurement and for any later wiring.
+     * Node-wide counters, cumulative since node start.
      *
-     * <p>{@link #inFlightPeak} is the number gate 2 turns on: it is the measured queue depth this input
-     * offers the device, so a prefetch that stages nothing shows up here as 1 and not as a latency riddle.
+     * <p>{@link #inFlightPeak} is the queue depth this input offers the device, so a prefetch that stages
+     * nothing shows up here as 1 and not as a latency riddle.
      *
      * <h2>The byte counters, and why they are not a duplicate of {@code /proc/diskstats}</h2>
-     * 9e-2 priced the design's read amplification from the device side: {@code sectors_read} over the
-     * queries of a block, divided by the vectors those queries rescored. That number is a sum of every
-     * read the node made, so attributing it to this class was an inference (R60) rather than a
-     * measurement — the graph, the quantized codes and the doc values are on the same device.
+     * Pricing read amplification from the device side — {@code sectors_read} over the vectors a block of
+     * queries rescored — sums every read the node made, so attributing it to this class is an inference
+     * rather than a measurement: the graph, the quantized codes and the doc values are on the same device.
      * {@link #stagedBytes} + {@link #blockingBytes} over {@link #servedBytes} is the same ratio taken
      * inside the one object that issues the reads, so it can neither include another reader's traffic nor
      * miss any of this one's. Both byte figures are what the device <em>returned</em>, which equals the
@@ -281,7 +280,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * {@link #routedOpens} and the four decline reasons are {@link KNNDirectIODirectory}'s, not this
      * class's. They are aggregated here because the directory is created <b>per segment per reader</b> by
      * the codec seam and is discarded with that reader, so its own instance counters are unreachable from
-     * a REST API by construction — which phase 13's re-proof notes recorded as a gap. This object is the
+     * a REST API by construction. This object is the
      * one node-wide, cumulative place Direct I/O statistics already live, so one read of it answers both
      * "is the seam engaging at all" and "what is it doing once engaged". The directory still keeps its own
      * instance counters: they are what a test asserts on, and they are per segment, which the node-wide
@@ -371,7 +370,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             directMemoryLive.addAndGet(-bytes);
         }
 
-        /** Charges {@code bytes} of wide-group buffer to its sub-budget and raises that peak. D3d, O2. */
+        /** Charges {@code bytes} of wide-group buffer to its sub-budget and raises that peak. */
         void recordWideAllocation(final long bytes) {
             raiseWidePeak(wideBufferLive.addAndGet(bytes));
         }
@@ -380,10 +379,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
          * Charges {@code bytes} of wide-group buffer only if the total stays at or under {@code cap}.
          *
          * <p>A compare-and-set loop rather than a read followed by an add, because a read-then-add is a
-         * check-then-act that every thread passes at once: MEASURED by 16-I at 64 threads against a 16 MiB
-         * cap, the advisory form reached 18,788,213 B, a 12% overshoot. It is the same protocol
+         * check-then-act that every thread passes at once, and the advisory form was measured overshooting
+         * its cap by double digits of a per cent under concurrent load. It is the same protocol
          * {@link DirectIOVectorCache}'s pending-allocation count uses to stop concurrent fills overshooting
-         * the slab target (N3), and for the same reason.
+         * the slab target, and for the same reason.
          *
          * @return true when the charge was taken, false when it would have exceeded {@code cap}
          */
@@ -433,13 +432,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             declinedWideBudget.incrementAndGet();
         }
 
-        /** Counts one staged miss read widened by O5's read-around. */
+        /** Counts one staged miss read widened by the read-around. */
         void recordReadAround() {
             readAroundReads.incrementAndGet();
         }
 
         /**
-         * Staged miss reads widened by {@code DirectIOVectorCache#READ_AROUND_BYTES} (O5). Against
+         * Staged miss reads widened by {@code DirectIOVectorCache#READ_AROUND_BYTES}. Against
          * {@code staged_reads} this says how much of the staging was widened; it is 0 once the store's target
          * no longer leaves room for the whole file and 0 with the store off, which are its gates.
          */
@@ -487,13 +486,13 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             foreignThreadReads.incrementAndGet();
         }
 
-        /** Counts one read an already-open routed input served through its delegate, with the switch off. O1, D2. */
+        /** Counts one read an already-open routed input served through its delegate, with the switch off. */
         void recordFallbackRead(final long bytes) {
             fallbackReads.incrementAndGet();
             fallbackBytes.addAndGet(bytes);
         }
 
-        /** Counts one already-open input changing read path at a prefetch burst boundary. O1, D2. */
+        /** Counts one already-open input changing read path at a prefetch burst boundary. */
         void recordSwitch(final boolean toDirectIO) {
             (toDirectIO ? switchedToDirect : switchedToMmap).incrementAndGet();
         }
@@ -518,14 +517,12 @@ public final class DirectIOVectorIndexInput extends IndexInput {
          * Caps a reported figure at the JVM's direct-memory wall, because a number above it is not a fact
          * about this node.
          *
-         * <p>MEASURED on the node 2026-10-06 with the budget off: {@code peak_bytes} read <b>7,457,394,721</b>
-         * — and later 9.0 GB and 28 GB — against {@code -XX:MaxDirectMemorySize=2g}. The raw counter is
-         * "charged minus proven reclaimed", and with the budget off nothing drained the phantom queue outside
-         * a stats read, so it ratcheted past the physical limit while the JDK's own
-         * {@code java.nio.Bits.reserveMemory} kept freeing buffers behind it. D3c fixes the drain (it now runs
-         * on every {@link DirectIOVectorIndexInput#trackedAllocate}) and clamps the report, which are two
-         * different fixes for the same defect: the drain makes the number smaller, the clamp makes it
-         * impossible for it to be absurd.
+         * <p>The raw counter is "charged minus proven reclaimed", and a node with the budget off was measured
+         * reporting several times the JVM's wall, because nothing drained the phantom queue outside a stats
+         * read while the JDK's own {@code java.nio.Bits.reserveMemory} kept freeing buffers behind it. The
+         * drain now runs on every {@link DirectIOVectorIndexInput#trackedAllocate} and the report is clamped
+         * here, which are two fixes for the same defect: the drain makes the number smaller, the clamp makes
+         * it impossible for it to be absurd.
          */
         private static long clampToWall(final long bytes) {
             final long wall = KNNSettings.KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES;
@@ -534,10 +531,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
         /**
          * Staging arenas carved since node start, one per thread that has run a prefetch burst — plus one per
-         * {@link #arenasRetired()}. <b>This is the number D3c exists to flatten.</b> Before it, every
-         * per-query {@code OffHeapFloatVectorValues} slice carved its own, so arenas were allocated at
-         * roughly {@code QPS x segments} per second (9-13 MiB/s of direct buffer on the node) and the gauge
-         * measured churn awaiting a collection rather than memory in use.
+         * {@link #arenasRetired()}. <b>This is the number the per-thread lease exists to flatten.</b> With
+         * an arena per input, every per-query {@code OffHeapFloatVectorValues} slice carved its own, so
+         * arenas were allocated at {@code QPS x segments} a second and the live gauge measured churn awaiting
+         * a collection rather than memory in use.
          */
         public long arenasAllocated() {
             return arenasAllocated.get();
@@ -568,7 +565,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         /**
          * Reads that skipped the staged table because they arrived on a thread other than the one that holds
          * the lease, and were served by a blocking read instead. <b>~0 on a healthy node</b>, because the
-         * rescore path prefetches and reads a burst on one thread (FINDINGS.md D3c(a)). Non-zero means some
+         * rescore path prefetches and reads a burst on one thread. Non-zero means some
          * caller hands a prefetched input to another thread, which costs that read its read-ahead and
          * nothing else — the bytes are identical either way, because the owner-confinement rule is what
          * makes the lease's generation check race free rather than an optimisation.
@@ -579,7 +576,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
         /**
          * Reads an already-open routed input served through its delegate because
-         * {@code knn.direct_io.rescore.enabled} was off at the last prefetch burst boundary (O1, D2).
+         * {@code knn.direct_io.rescore.enabled} was off at the last prefetch burst boundary.
          *
          * <p>The counter an operator watches to see a rollback take effect <b>with no reopen</b>: it rises
          * while the switch is off and stops rising when it goes back on, and it rises while
@@ -590,17 +587,17 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             return fallbackReads.get();
         }
 
-        /** Bytes served through the delegate input by an already-open routed input. O1. */
+        /** Bytes served through the delegate input by an already-open routed input. */
         public long fallbackBytes() {
             return fallbackBytes.get();
         }
 
-        /** Times an already-open input changed over to its delegate at a burst boundary. O1. */
+        /** Times an already-open input changed over to its delegate at a burst boundary. */
         public long switchedToMmap() {
             return switchedToMmap.get();
         }
 
-        /** Times an already-open input changed back to {@code O_DIRECT} at a burst boundary. O1. */
+        /** Times an already-open input changed back to {@code O_DIRECT} at a burst boundary. */
         public long switchedToDirect() {
             return switchedToDirect.get();
         }
@@ -699,7 +696,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
          * Declines because the segment is <b>compound</b>, so the codec was handed a
          * {@code CompoundDirectory} and the {@code .vec} is an entry in a {@code .cfs} rather than a file.
          *
-         * <p>Counted apart from {@link #declinedChain()} since phase 15, and the distinction is the whole
+         * <p>Counted apart from {@link #declinedChain()} , and the distinction is the whole
          * point: at the shipped defaults <b>every flushed segment is compound</b>
          * ({@code index.use_compound_file} defaults to {@code true},
          * {@code EngineConfig.java:262-266}), so a healthy node accumulates this counter steadily and only
@@ -927,7 +924,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      */
     private static final class Charge extends PhantomReference<ByteBuffer> {
         private final int bytes;
-        /** Whether this buffer is also charged to the wide-group sub-budget. D3d, O2. */
+        /** Whether this buffer is also charged to the wide-group sub-budget. */
         private final boolean wide;
 
         private Charge(final ByteBuffer buffer, final int bytes, final boolean wide) {
@@ -964,13 +961,14 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     static final int DEFAULT_MAX_STAGED_RANGE_BYTES = 128 * 1024 + 4096;
 
     /**
-     * Bytes per read-ahead window — the sequential ring's request size, which phase 14 decoupled from
-     * {@code bufferSize} because the two access shapes want opposite sizes: sequential throughput goes
-     * 49.7 to 371.2 MiB/s from 8 KiB to 64 KiB, while the random path's amplification tracks the buffer
-     * size and must stay at 8 KiB.
+     * Bytes per read-ahead window — the sequential ring's request size, which is deliberately decoupled
+     * from {@code bufferSize} because the two access shapes want opposite sizes: sequential throughput rises
+     * steeply with the request size, while the random path's amplification tracks it and wants the smallest
+     * request that holds a vector.
      *
-     * <p>A constant rather than a setting: 64 KiB is the knee, 256 KiB buys nothing sequentially, and the
-     * ring's own on/off switch is {@code knn.direct_io.readahead.window}. The seven-argument
+     * <p>A constant rather than a setting: this size is the measured knee, a larger one buys nothing
+     * sequentially, and the ring's own on/off switch is {@code knn.direct_io.readahead.window}. The
+     * seven-argument
      * {@link #open(Path, int, int, int, int, int, int)} overload carries another value for a sweep.
      */
     static final int DEFAULT_READAHEAD_WINDOW_BYTES = 64 * 1024;
@@ -988,10 +986,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
     /**
      * The node-wide ceiling on direct buffers this read path holds at once, past which a prefetch declines
-     * and the bytes are served by blocking reads. Phase 13's audit FIX 3: Lucene's
+     * and the bytes are served by blocking reads. It exists because Lucene's
      * {@code OffHeapFloatVectorValues} is not {@code Closeable}, so {@link #close()} never runs on a
-     * per-query slice and a staging table lives until the cleaner reclaims it, which left 1.69 GB of live
-     * direct buffers against a 2 GB wall on the bench node.
+     * per-query slice and a staging table lives until the cleaner reclaims it, which a bench node measured
+     * holding most of the JVM's direct-memory wall in live buffers.
      *
      * <p><b>Half the wall</b> ({@link KNNSettings#KNN_DIRECT_IO_DIRECT_MEMORY_WALL_BYTES}, the operator's
      * explicit {@code -XX:MaxDirectMemorySize} or {@code heapSize / 2}), and not all of it, because the wall
@@ -1011,10 +1009,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * <p>A constant rather than a setting, because there is no value an operator should want to tune: this
      * is not a latency target, it is the point past which waiting is certainly worse than reading. The
      * derivation — a staged read on this stack costs a device read at the pool's queue depth, which is
-     * tens of milliseconds at the deepest queue the bounded pool allows ({@code QUEUED_READS_PER_THREAD}
-     * reads of ~30 ms), so the worst healthy wait is a few hundred milliseconds. One second is above that
-     * and two orders of magnitude above the measured per-query p99 of 11 ms, so it fires only on pathology;
-     * and when it does fire, the fallback is one {@code pread} of a few kilobytes.
+     * tens of milliseconds at the deepest queue the bounded pool allows, so the worst healthy wait is a few
+     * hundred milliseconds. One second is above that and orders of magnitude above the measured per-query
+     * p99, so it fires only on pathology; and when it does fire, the fallback is one {@code pread} of a few
+     * kilobytes.
      */
     static final long STAGED_READ_WAIT_MILLIS = 1000L;
 
@@ -1022,9 +1020,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * What fraction of {@link #DIRECT_MEMORY_BUDGET_BYTES} the wide-group buffers may hold: one in
      * {@value}. See {@link #allocateWideBuffer}.
      *
-     * <p>A quarter and not a half because the arenas are the mechanism's common case — phase 12 S3.1
-     * measured the mean aligned span at 7,310 B, so nearly every group fits an arena slot and needs no wide
-     * buffer at all — and the arenas must always have room. Wide buffers accumulating to the whole budget
+     * <p>A quarter and not a half because the arenas are the mechanism's common case — the mean aligned
+     * span was measured below one arena slot, so nearly every group fits one and needs no wide buffer at
+     * all — and the arenas must always have room. Wide buffers accumulating to the whole budget
      * would leave none for an arena, and then every prefetch declines; a budget that wedges the feature is
      * not a bound on it.
      */
@@ -1050,7 +1048,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     private static final AtomicLong INPUT_IDS = new AtomicLong();
 
     /**
-     * The resolved {@code knn.direct_io.rescore.read_profile}, or null until it has been read once. P2. See
+     * The resolved {@code knn.direct_io.rescore.read_profile}, or null until it has been read once. See
      * {@link #readProfile()} for why it is cached and why an unresolvable read is not.
      */
     private static volatile String readProfile;
@@ -1071,7 +1069,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * measurements use. An input the directory returns always has one: an open with no delegate input is an
      * open whose bytes could not be compared with the chain's, and the directory declines it.
      *
-     * <p><b>This is O1, D2's rollback half.</b> {@code knn.direct_io.rescore.enabled} has to reach segments
+     * <p><b>This is the rollback half of the feature switch.</b> {@code knn.direct_io.rescore.enabled} has to reach segments
      * that are already open, because an operator who turns Direct I/O off wants the device traffic to stop
      * now, not after the next reader opens. The decision cannot be re-taken at the {@code openInput}
      * {@link KNNDirectIODirectory} describes, because that open has already happened; so the input carries
@@ -1081,8 +1079,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      *
      * <p>It is <b>only</b> opened when the switch was on at {@code openInput} time, so the cost of carrying
      * it is one extra file handle per routed {@code .vec} per reader and nothing on a node with the feature
-     * off, which routes no file and so opens no second input. The asymmetry that leaves is deliberate and is
-     * 16-I's: turning the switch off reaches open segments, turning it on from a cold start reaches only
+     * off, which routes no file and so opens no second input. The asymmetry that leaves is deliberate:
+     * turning the switch off reaches open segments, turning it on from a cold start reaches only
      * segments opened after it, because the alternative is opening an {@code O_DIRECT} channel for every
      * {@code .vec} on a node that will never use one.
      */
@@ -1109,27 +1107,20 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     /**
      * Bytes per read-ahead window — the ring's request size, <b>decoupled from {@link #bufferSize}</b>.
      *
-     * <p>Phase 13 audit FIX 2, and the largest measured win in that audit. {@code bufferSize} was one
-     * number serving two access shapes with opposite needs ({@code bench/e1b.out}): the sequential scan
-     * wants a big request and the random rescore path wants a small one.
+     * <p>One number cannot serve two access shapes with opposite needs: the sequential scan wants a big
+     * request and the random rescore path wants the smallest one that holds a vector. A sweep over a large
+     * ascending scan measured sequential throughput rising almost an order of magnitude from the small
+     * request to the ring's size and flattening above it, while the random path's amplification and its
+     * query rate both went the other way by more than an order of magnitude.
      *
-     * <table>
-     *   <caption>measured on a 732 MiB ascending scan of a real 1M x 768 fp32 {@code .vec}</caption>
-     *   <tr><th>{@code bufferSize}</th><th>sequential MiB/s at W=8</th><th>random amplification, 16 threads</th></tr>
-     *   <tr><td>8 KiB</td><td>49.7</td><td><b>2.667</b></td></tr>
-     *   <tr><td>64 KiB</td><td><b>371.2</b></td><td>~21 (inferred)</td></tr>
-     *   <tr><td>256 KiB</td><td>370.6</td><td><b>85.3</b></td></tr>
-     * </table>
-     *
-     * <p>So the fix is not to raise {@code bufferSize} — at 256 KiB the rescore path's device traffic goes
-     * up 32x and its qps collapses from 59.6 to 10.0. It is to give the ring its own size while
-     * {@link #blockingSource} and the burst table keep {@code bufferSize} at 8 KiB. The ring already
+     * <p>So the fix is not to raise {@code bufferSize}. It is to give the ring its own size while
+     * {@link #blockingSource} and the burst table keep the small one. The ring already
      * allocated separately and already submitted with an explicit length, so this is one field reaching
      * three places in {@link #refillReadahead}.
      *
      * <p>Costs {@code readaheadWindows * this} of direct buffers per input, allocated lazily on the
-     * <em>first arm</em> — so the default is 512 KiB rather than 64 KiB for an input that runs
-     * sequentially, and still zero for one that does not. The rescore path never arms (the ring stands
+     * <em>first arm</em> — so an input that runs sequentially pays for the whole ring and one that does not
+     * pays nothing. The rescore path never arms (the ring stands
      * down while a burst is live, and random access never reaches the trigger), so it pays nothing.
      */
     private final int readaheadWindowBytes;
@@ -1179,7 +1170,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * Whether this burst has already picked up a settings change, cleared by {@link #endBurst}.
      *
      * <p>The marker used to be {@code pool == null}, which is set by {@link #ensureStagingTable} part way
-     * through {@link #prefetch}. It is a field of its own since N1 because the burst boundary is now also
+     * through {@link #prefetch}. It is a field of its own because the burst boundary is also
      * reached by {@link #selectUncachedOrdinals}, which runs <em>before</em> the first {@link #prefetch} of a
      * batch and has to do the refresh itself: a batch whose every candidate is cached issues no
      * {@link #prefetch} at all, and without this an operator's {@code max_bytes} change (0b included) would
@@ -1188,12 +1179,12 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     private boolean burstConfigured;
 
     /**
-     * The absolute file offsets N1's prefetch filter dropped as cached in this burst, sorted ascending, and
-     * how many of them are valid. Cleared by {@link #endBurst}. O4.
+     * The absolute file offsets the prefetch filter dropped as cached in this burst, sorted ascending, and
+     * how many of them are valid. Cleared by {@link #endBurst}.
      *
      * <p>This is what makes the filter-then-read race recoverable. A vector the filter dropped is not staged,
-     * so if the store loses it before {@link #readFloats} the read is a blocking one and M3's rule throws its
-     * bytes away. Knowing that <em>this</em> blocking read is for a vector the filter believed cached is what
+     * so if the store loses it before {@link #readFloats} the read is a blocking one and the admission rule
+     * throws its bytes away. Knowing that <em>this</em> blocking read is for a vector the filter believed cached is what
      * distinguishes it from a sequential scan's blocking read, which must still not be admitted. Bounded by
      * the batch the caller hands in, so one long per candidate and nothing per burst that has no filter call.
      */
@@ -1202,7 +1193,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
     /**
      * How wide this burst may make a staged miss read so that the vectors around the one being fetched are
-     * admitted with it, or 0 for "do not widen it". O5. Read once per burst by {@link #beginBurst}, because
+     * admitted with it, or 0 for "do not widen it". Read once per burst by {@link #beginBurst}, because
      * the gates are a settings read and a store-wide byte comparison and the answer cannot change inside a
      * burst without the staged geometry changing under a read.
      */
@@ -1210,7 +1201,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
     /**
      * The field's vector grid on this input: the absolute offset of ordinal zero and one vector's length in
-     * bytes, or {@code 0} length for "this input has not been told". O8.
+     * bytes, or {@code 0} length for "this input has not been told".
      *
      * <h4>What it is for</h4>
      * The FP32 path's vector read is a {@code readFloats} of one whole vector, which is the only read shape
@@ -1218,7 +1209,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * unconditionally. The FP16 path's vector read is a {@code readBytes}
      * ({@code KNN1040HalfFloatFlatVectorsValues#readRawVectorBytes}), and {@link #readBytes} also serves the
      * file's header and footer and the whole sequential merge path. Hooking it unconditionally would admit a
-     * 44-byte header as a "vector" and break M4's whole-vectors-only geometry. This grid is the gate that
+     * file header as a "vector" and break the whole-vectors-only geometry. This grid is the gate that
      * makes it precise: a {@code readBytes} is treated as a vector read only when its length is the declared
      * vector length and its offset sits on the declared grid.
      *
@@ -1276,8 +1267,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         this.mmapFallback = mmapFallback;
         this.routeEnabled = routeEnabled;
         // The route a new input starts on is the one the switch names now, not the one it named when the
-        // file was opened. MEASURED by 16-I: without this, arm D of its re-proof still read the device once
-        // per values object with the switch off, because Lucene builds a fresh slice per query and the first
+        // file was opened. Without this a re-proof arm still read the device once per values object with
+        // the switch off, because Lucene builds a fresh slice per query and the first
         // read of a slice arrives before its first prefetch, which is the boundary a route change is taken
         // at. One supplier call per input object, and none at all for an input with no fallback.
         this.directIOActive = mmapFallback == null || routeEnabled.getAsBoolean();
@@ -1306,7 +1297,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     /**
      * As {@link #open(Path)}, with the delegate's own input over the same file kept beside the
      * {@code O_DIRECT} channel so that {@code knn.direct_io.rescore.enabled} can be turned off under an
-     * already-open input (O1). The returned input owns {@code mmapFallback} and closes it; a {@code null}
+     * already-open input. The returned input owns {@code mmapFallback} and closes it; a {@code null}
      * fallback means the input stays on {@code O_DIRECT} whatever the setting says, which is what every
      * caller that has no second input to give gets. See {@link #mmapFallback}.
      */
@@ -1387,8 +1378,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
     /**
      * As the four-argument overload with the ring's <b>window count</b> chosen by the caller, each window
-     * being one {@code bufferSize} — which is what the ring was before phase 14 decoupled the two. Kept at
-     * that meaning rather than reading the new setting, so that every phase 11 read-ahead measurement and
+     * being one {@code bufferSize} rather than {@link #DEFAULT_READAHEAD_WINDOW_BYTES}. Kept at that meaning
+     * rather than reading the published setting, so that the read-ahead measurements taken through it and
      * the tests that pin them keep measuring the thing they were taken against.
      *
      * @param readaheadWindows windows the sequential ring keeps in flight; 0 disables it (exact passthrough)
@@ -1606,7 +1597,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         return handle.blockSize;
     }
 
-    /** Whether this input is reading through {@code O_DIRECT} right now rather than its delegate. O1. */
+    /** Whether this input is reading through {@code O_DIRECT} right now rather than its delegate. */
     public boolean isDirectIOActive() {
         return directIOActive;
     }
@@ -1629,7 +1620,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     /**
      * The waste guard's bound: the largest single prefetch span this input will stage, in bytes.
      *
-     * <p>Public since P1, because the grouping that produces the spans is one layer up in
+     * <p>Public because the grouping that produces the spans is one layer up in
      * {@code PrefetchHelper} and a group it closes before this bound is a group this input stages rather than
      * declines. The bound is chosen at open, so it is per input and not a constant the helper could carry.
      */
@@ -1641,12 +1632,12 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * How many bytes {@link #prefetch} would stage for {@code [sliceOffset, sliceOffset + length)}: the
      * length of the block-aligned range covering it.
      *
-     * <p><b>P1's accessor, and it exists because the answer is not computable one layer up.</b> The aligned
-     * range is taken over the <em>absolute</em> file offset, which is {@link #offset} plus the argument, and
-     * {@link #offset} is the slice's own base: the slice Lucene hands the scorer starts at the field's data
-     * offset, which is not block aligned. A caller holding only slice-relative offsets would be off by
-     * whatever that base's remainder is, and at a 16 KiB cap being off by one block is the difference between
-     * a group that stages and a group that declines. Exposing the block size alone would not fix that;
+     * <p><b>It exists because the answer is not computable one layer up.</b> The aligned range is taken over
+     * the <em>absolute</em> file offset, which is {@link #offset} plus the argument, and {@link #offset} is
+     * the slice's own base: the slice Lucene hands the scorer starts at the field's data offset, which is not
+     * block aligned. A caller holding only slice-relative offsets would be off by whatever that base's
+     * remainder is, and at a tight span cap one block is the difference between a group that stages and a
+     * group that declines. Exposing the block size alone would not fix that;
      * exposing {@link #offset} would hand out an absolute file coordinate for no other purpose.
      *
      * <p>Returns a {@code long} and performs no narrowing, so a caller may ask about a range larger than the
@@ -1671,7 +1662,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     /**
      * Which block of the file the byte at {@code sliceOffset} lies in, counted from the start of the file.
      *
-     * <p><b>P2's accessor.</b> The {@code bytes} profile groups by blocks rather than by span: a missing
+     * <p><b>The {@code bytes} read profile's accessor.</b> That profile groups by blocks rather than by
+     * span: a missing
      * vector joins the current group only when its first block overlaps or touches the group's last, so that
      * no read carries a block holding no byte of a missing vector. Like {@link #alignedSpanBytes} it is taken
      * over the absolute offset, for the same reason, and it reads nothing.
@@ -1794,17 +1786,17 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * <b>not</b> hold whole, and returns how many, or returns {@code -1} to mean "ask about nothing, prefetch
      * the batch as it is".
      *
-     * <p>This is N1. The caller is {@code PrefetchHelper#prefetch}, which without it hands every candidate of
-     * a batch to its 128 KB coalescing and so asks this input for groups whose spans are mostly already
-     * cached. The input can only accept or decline a whole group, so a group with one missing vector in it is
-     * staged in full: MEASURED on the node (ref/NODE-16M.md), 73.4 staged reads per query for 77.1 missing
-     * vectors at 22.9 KB a read in S2, against 16-I's 62.7 for 76.9 at 12.6 KB, because 16-I grouped only its
-     * misses. Dropping the hits here before the grouping is what makes the groups the same ones 16-I built.
+     * <p>The caller is {@code PrefetchHelper#prefetch}, which without this hands every candidate of a batch
+     * to its coalescing and so asks this input for groups whose spans are mostly already cached. The input
+     * can only accept or decline a whole group, so a group with one missing vector in it is staged in full,
+     * and a node measured that costing both more staged reads per query and more bytes a read than grouping
+     * the misses alone. Dropping the hits here, before the grouping, is what makes the groups the misses'
+     * own.
      *
      * <h4>What it does not do</h4>
      * It counts no hit and no miss, like {@link DirectIOVectorCache#contains}: a hit is counted once, by the
      * {@code readFloats} that serves it, so {@code hits / (hits + misses)} stays a per-vector hit rate
-     * comparable with the 16-S node figures. It serves no bytes either: a vector dropped here is still read
+     * comparable with a node's own figures. It serves no bytes either: a vector dropped here is still read
      * through {@link #readFloats}, which looks it up again, and a vector evicted in between is a blocking read
      * of the same bytes. So no score can change.
      *
@@ -1833,7 +1825,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final long base = this.offset + sliceOffset;
         final boolean geometryUsable = sliceOffset >= 0 && base >= 0 && vectorBytes > 0 && vectorBytes <= Integer.MAX_VALUE;
         if (geometryUsable) {
-            // O8: the grid the FP16 path's readBytes is gated on. Declared here, before anything below can
+            // the grid the FP16 path's readBytes is gated on. Declared here, before anything below can
             // decline, because it describes this input's field and not this batch or the store's state. If it
             // were declared after the checks below, the burst at which an operator's change to
             // max_bytes or to knn.direct_io.rescore.enabled is picked up -- the one burst that arrives with
@@ -1847,7 +1839,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
         beginBurst();
         if (directIOActive == false) {
-            // O1: with the switch off this input admits nothing and the store has been released, so there
+            // with the switch off this input admits nothing and the store has been released, so there
             // is nothing to filter and the caller takes its unfiltered path, which prefetches through the
             // delegate. Checked after beginBurst, which is where the switch was just re-read.
             return -1;
@@ -1864,7 +1856,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
     /**
      * Remembers the offsets this filter call dropped, which is {@code ords \ uncached}, so that a blocking
-     * read for one of them can be admitted rather than thrown away (O4). Sorted, so the read path's check is
+     * read for one of them can be admitted rather than thrown away. Sorted, so the read path's check is
      * a binary search.
      *
      * <p>{@code uncached[0..missing)} is a subsequence of {@code ords[0..numOrds)} in order -- the store
@@ -1899,8 +1891,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     }
 
     /**
-     * Whether N1's prefetch filter dropped the vector at {@code absoluteOffset} as cached in this burst. The
-     * gate on O4's re-admission: a blocking read for one of these is the filter-then-read race and its bytes
+     * Whether the prefetch filter dropped the vector at {@code absoluteOffset} as cached in this burst. The
+     * gate on the re-admission: a blocking read for one of these is the filter-then-read race and its bytes
      * are worth keeping, where any other blocking read is a sequential channel's and is not.
      */
     private boolean wasFilteredAsCached(final long absoluteOffset) {
@@ -1919,11 +1911,11 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * on the waste</h4>
      * The caller on the rescore path is {@code PrefetchHelper#prefetchExactVectorSize}, which sorts the
      * batch's ordinals and then asks for the <em>span</em> of each coalesced group — extending a group
-     * while {@code (vector end) - (group start) <= 128 KB} and then calling
+     * while the span stays inside its own budget and then calling
      * {@code prefetch(groupStart, lastEnd - groupStart)}. The gaps between the group's vectors are inside
-     * that span and are not in these two arguments, so this method cannot tell a group of 42 back-to-back
-     * vectors (a 128 KB span, none of it wasted) from a group of two vectors 120 KB apart (a 120 KB span,
-     * 95% of it wasted). The gap structure exists one layer up and is not on this interface.
+     * that span and are not in these two arguments, so this method cannot tell a group of back-to-back
+     * vectors, none of the span wasted, from a group of two vectors at either end of the same span, nearly
+     * all of it wasted. The gap structure exists one layer up and is not on this interface.
      *
      * <p>What is left is a bound on the span, {@link #DEFAULT_MAX_STAGED_RANGE_BYTES}. Above
      * it the range is declined, which costs read-ahead for exactly those groups and saves whatever their
@@ -1931,11 +1923,11 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * vector touched and nothing for the gaps. That is a real trade and not a free win, which is why the
      * bound is a setting with the measured value as its default rather than a new constant.
      *
-     * <p><b>P1: a decline costs more than read-ahead, so the rescore path no longer reaches one.</b> The
+     * <p><b>A decline costs more than read-ahead, so the rescore path no longer reaches one.</b> The
      * bytes a declined group's vectors are then read with are blocking reads, and the store admits only
-     * vectors a staged read covered (M3), so a declined group costs its <em>hits</em> as well, for as long as
-     * those vectors stay uncached. MEASURED on the NVMe node at a {@code 16kb} cap: 98.3% hits to 85.6% in
-     * the f regime and 51.6% to 43% in r1 (ref/RESULTS-NVME.md section 3). {@code PrefetchHelper} therefore
+     * vectors a staged read covered, so a declined group costs its <em>hits</em> as well, for as long as
+     * those vectors stay uncached — which a node measured as a double-digit loss of hit rate at a tight
+     * cap. {@code PrefetchHelper} therefore
      * closes a group before {@link #alignedSpanBytes} of it would pass the bound, which turns every decline
      * it could have caused into one more staged read of the same bytes. The bound still guards the ranges
      * that do not come from the grouping -- a caller asking for a range of its own -- and a single vector
@@ -1957,7 +1949,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
         beginBurst();
         if (directIOActive == false) {
-            // O1, D2: this burst is a delegate burst, so the lookahead is the one the page-cache path has.
+            // this burst is a delegate burst, so the lookahead is the one the page-cache path has.
             // Lucene's mmap prefetch is madvise(WILLNEED) over the mapped range, and the delegate's input
             // carries this input's coordinates, so the arguments pass through unchanged.
             mmapFallback.prefetch(offset, length);
@@ -1967,12 +1959,12 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final int blockSize = handle.blockSize;
         // The cache lookup comes BEFORE the submit, so a hit costs the device nothing: the range is simply
         // not added to the burst, and readFloats will find the same entries when it consumes the vectors.
-        // This is where the 707k -> ~420k device reads per 5,000 queries would come from.
+        // This is where the store's whole saving in device reads comes from.
         //
         // The range here is a coalesced GROUP and not one vector (PrefetchHelper sorts the batch's ordinals
         // and asks for each group's span), so the store walks the whole run and answers only if every vector
-        // in it is cached. M4 MEASURED what the one-vector form costs instead: 27.9x the file in device
-        // reads against 1.21x, because a group of a dozen cached vectors was staged in full.
+        // in it is cached. A one-vector lookup was measured reading the file many times over instead,
+        // because a group holding a dozen cached vectors was staged in full.
         if (DirectIOVectorCache.isOn() && DirectIOVectorCache.contains(handle.fileId, absolute, Math.toIntExact(length))) {
             return;
         }
@@ -1983,7 +1975,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             STATS.declinedSpanBytes.addAndGet(length);
             return;
         }
-        // O5: past here this range is a MISS -- the store does not hold it whole -- so while the whole file
+        // past here this range is a MISS -- the store does not hold it whole -- so while the whole file
         // would still fit in the room the target leaves, widen it and let span fill harvest the neighbours.
         // One read per miss stays one read; only its size changes. The widened window is still one aligned
         // range, so nothing downstream changes: the span-fill walk clips to the reading slice and ends at
@@ -2018,7 +2010,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final ByteBuffer buffer = lease.bufferFor(alignedLength);
         if (buffer == null) {
             // Only reachable for a coalesced group wider than an arena slot, which needs a buffer of its own
-            // (up to max_span_bytes, 132 KiB) and is therefore the one per-range allocation a burst can still
+            // (up to max_span_bytes) and is therefore the one per-range allocation a burst can still
             // make. See arenaSlotBytes() for why that is the uncommon case.
             STATS.recordDeclinedBudget();
             STATS.stageDeclined.incrementAndGet();
@@ -2057,23 +2049,22 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     /**
      * Acquires the pool for this burst and allocates the burst table once.
      *
-     * <p><b>Acquired per burst, which is what makes a live capacity change reach this input.</b> Before
-     * phase 15 this method returned early on {@code staged != null} and so read {@link #pool} once per input
-     * and then held that reference for the input's whole life — and an input lives as long as the values
+     * <p><b>Acquired per burst, which is what makes a live capacity change reach this input.</b> Reading
+     * {@link #pool} once per input instead would hold that reference for the input's whole life — and an
+     * input lives as long as the values
      * object Lucene built it for, which on the merge path is the whole merge. A capacity change swaps the
      * pool, so a stale reference would keep submitting to the retired one until it was shut down and then
      * decline every prefetch. Re-acquiring at the burst boundary ({@link #endBurst} clears the field)
      * bounds staleness to one burst, and costs one settings read per burst rather than one per
      * {@link #prefetch} call — there are up to {@code staged_ranges} of those in a burst.
      *
-     * <p><b>And it is where this input takes its thread's staging arena (D3c).</b> The first
+     * <p><b>And it is where this input takes its thread's staging arena.</b> The first
      * {@link #prefetch} of a burst calls {@link DirectIOStagingLease#take}, which quiesces whatever the
      * previous holder left staged and then reuses that thread's arena or, if a read may still be writing into
-     * it, retires it and carves one. Before D3c every input carved its own and held it until a collection
-     * found the input, which on the per-query slices Lucene's flat reader creates meant arenas churned at
-     * {@code QPS x segments x 516 KiB/s} — 9-13 MiB/s on the node — while the memory actually in use was
-     * about {@code 16 concurrent bursts x 516 KiB}. That churn is what the direct-memory budget was
-     * measuring, and why at its 1 GB default it wedged the feature between collections.
+     * it, retires it and carves one. An arena per input instead is an arena carved per per-query slice and
+     * held until a collection finds the slice, so arenas churn at {@code QPS x segments} a second while the
+     * memory actually in use is one arena per concurrent burst. That churn is what a byte budget over the
+     * per-input arenas measured, and why it wedged the feature between collections.
      *
      * @return this thread's lease, or null when there is no pool or the budget refused an arena, in which
      *         case reads must block
@@ -2086,7 +2077,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         // Past here this is a NEW burst, whether or not endBurst ran -- an input that prefetched, never read,
         // and was then revoked by another burst arrives here with a stale pool reference still set. Dropping
         // it is what bounds pool staleness to one burst in that case too, which is the whole point of
-        // acquiring per burst (D1).
+        // acquiring per burst.
         pool = null;
         final ExecutorService acquired = DirectIOReadPool.executor();
         if (acquired == null) {
@@ -2096,7 +2087,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final DirectIOStagingLease taken = DirectIOStagingLease.current();
         final long generation = taken.take(maxStagedRanges, arenaSlotBytes(), handle.blockSize);
         if (generation < 0) {
-            // D3's decline, now reached only when a lease has to carve: a burst that reuses its thread's
+            // The budget's decline, reached only when a lease has to carve: a burst that reuses its thread's
             // arena cannot raise the node's footprint, so there is nothing to decline it for. Past here
             // prefetch counts stageDeclined and the bytes are served by blockingSource -- the same fallback a
             // queue-capacity decline takes, already exercised on every arm.
@@ -2118,12 +2109,11 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * span of any single vector however it straddles a block boundary.
      *
      * <p>This is the size the <em>common</em> staged range needs, not the largest one allowed. A prefetch
-     * group is {@code PrefetchHelper}'s coalescing of a sorted ordinal batch, and phase 12 S3.1 measured the
-     * mean aligned span at <b>7,310 B</b> for a 3,072 B vector against an arithmetic expectation of 7,168 B
-     * — i.e. nearly every group is one vector straddling one boundary and fits in two blocks. Groups that
-     * hold several adjacent candidates are wider and keep their own allocation (see {@link #prefetch}), so
-     * sizing the arena for the worst case ({@link #maxStagedRangeBytes}, 132 KiB × {@code staged_ranges} =
-     * 8.4 MiB per input) would reserve two orders of magnitude more than the measured need.
+     * group is {@code PrefetchHelper}'s coalescing of a sorted ordinal batch, and the mean aligned span was
+     * measured at just over two filesystem blocks — i.e. nearly every group is one vector straddling one
+     * boundary. Groups that hold several adjacent candidates are wider and keep their own allocation (see
+     * {@link #prefetch}), so sizing the arena for the worst case, {@link #maxStagedRangeBytes} times
+     * {@code staged_ranges}, would reserve orders of magnitude more than the measured need.
      */
     int arenaSlotBytes() {
         return Math.max(bufferSize, 2 * handle.blockSize);
@@ -2133,8 +2123,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * Allocates one block-aligned direct buffer holding {@code slots} slots and fills {@code buffers} /
      * {@code floats} with a view of each.
      *
-     * <p><b>Why one allocation rather than one per slot.</b> Phase 12 S1.3 measured direct-buffer capacity
-     * cycling to <b>4,365 MB</b> under 16-way load, because a fresh {@link DirectIOVectorIndexInput} is
+     * <p><b>Why one allocation rather than one per slot.</b> Direct-buffer capacity was measured cycling
+     * through gigabytes under concurrent load, because a fresh {@link DirectIOVectorIndexInput} is
      * created per query per segment ({@code ExactSearcher#createVectorScorer} → Lucene's flat reader →
      * {@link #slice}), each one allocated its own sync window plus up to {@code staged_ranges} staged slots
      * plus a read-ahead ring, and nothing frees them — Lucene's {@code OffHeapFloatVectorValues} is not
@@ -2143,8 +2133,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * the footprint cannot be fixed by pooling across inputs; what it can be fixed by is allocating less and
      * less often. One arena makes a per-input {@code staged_ranges}-slot table <b>one</b>
      * {@code allocateDirect} instead of up to {@code staged_ranges} of them, and drops the per-slot
-     * {@code blockSize - 1} alignment slack (12,287 B → 8,192 B per slot at a 4 KiB block), which is the
-     * same arena move the rescore seam's reader made for its own buffers before phase 12 H5 removed it.
+     * {@code blockSize - 1} alignment slack, which is the saving one arena buys over a buffer a slot.
      *
      * <p><b>What this does not claim.</b> It does not bound total direct memory and it does not promise the
      * pages go back to the OS: glibc raises its {@code mmap} threshold to the size of the first {@code mmap}ed
@@ -2190,15 +2179,15 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
     /**
      * As {@link #trackedAllocate(int, int)}, tagging the charge as a wide-group buffer when {@code wide} so
-     * that one reclamation returns the bytes to both the overall budget and the sub-budget. D3d, O2.
+     * that one reclamation returns the bytes to both the overall budget and the sub-budget.
      *
      * <p>The sub-budget is <b>not</b> charged here: {@link #allocateWideBuffer} has already reserved it, so
      * that the cap is a bound rather than a hint.
      */
     static ByteBuffer trackedAllocate(final int usableBytes, final int blockSize, final boolean wide) {
-        // D3c: drain here, on every allocation, and not only from fitsBudget. With the budget off fitsBudget
-        // short-circuits, which left the phantom queue draining on stats reads alone -- and the node then
-        // reported peak_bytes of 7.46 GB, 9.0 GB and 28 GB against a 2 GB wall. The drain is a non-blocking
+        // Drain here, on every allocation, and not only from fitsBudget. With the budget off fitsBudget
+        // short-circuits, which leaves the phantom queue draining on stats reads alone -- and a node then
+        // reports a live total several times the JVM's wall. The drain is a non-blocking
         // poll loop against an allocateDirect that is orders of magnitude dearer.
         reclaim();
         final int bytes = Math.toIntExact(allocationBytes(usableBytes, blockSize));
@@ -2211,21 +2200,20 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     /**
      * One block-aligned direct buffer for a coalesced group too wide for an arena slot, charged to the
      * wide-group sub-budget as well as the overall one, or {@code null} when the sub-budget refuses it.
-     * D3d, phase 16-I's I7, ported in O2.
      *
      * <h4>Why these buffers need a cap of their own</h4>
      * A {@link DirectIOStagingLease} keeps one wide buffer per {@code staged_ranges} slot, grown on demand
-     * to at most {@code max_span_bytes} and then <b>kept for the life of the arena</b>. At the defaults that
-     * is 64 x 135,168 B = 8.25 MiB per thread, and a lease is per thread with no bound on the number of
-     * threads: 225 search threads on a 64-vCPU node reach 1.95 GB. {@link #DIRECT_MEMORY_BUDGET_BYTES}
+     * to at most {@code max_span_bytes} and then <b>kept for the life of the arena</b>. That is megabytes
+     * per thread at the defaults, and a lease is per thread with no bound on the number of threads, so a
+     * large node's search pool reaches gigabytes of them. {@link #DIRECT_MEMORY_BUDGET_BYTES}
      * counts them, but it is one pot shared with the arenas, which are reused while these are held -- so wide
      * buffers accumulating to the overall budget would leave no room for an arena and then every prefetch
      * would decline. A budget that wedges the feature is not a bound on it.
      *
      * <p>{@code 0b} <b>derives</b> the cap as a quarter of the overall budget rather than disabling it, and
-     * a quarter because the arenas are the common case and must always have room: phase 12 S3.1 measured the
-     * mean aligned span at 7,310 B against an arena slot of 8,192, i.e. nearly every group needs no wide
-     * buffer at all. With the overall budget off the derived cap is off too, which keeps the rule the budget
+     * a quarter because the arenas are the common case and must always have room: the mean aligned span was
+     * measured below one arena slot, i.e. nearly every group needs no wide buffer at all. With the overall
+     * budget off the derived cap is off too, which keeps the rule the budget
      * has always had: it must never be the reason a shard cannot read its vectors.
      */
     @Nullable
@@ -2271,8 +2259,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      *
      * <h4>Why the accounting hangs on reachability and not on {@link #close()}</h4>
      * Lucene's {@code OffHeapFloatVectorValues} is not {@code Closeable}, so {@link #close()} never runs on
-     * the per-query slice that owns a staging table — which is exactly the condition phase 13's audit FIX 3
-     * recorded and the node then measured as 1.69 GB of live direct buffers. A counter decremented only in
+     * the per-query slice that owns a staging table, which a node measured as most of the JVM's direct-memory
+     * wall held in live buffers. A counter decremented only in
      * {@link #close()} would therefore rise monotonically and, after enough queries, decline every prefetch
      * forever: the budget would <em>wedge</em> the feature rather than bound it. The buffers are in fact
      * reclaimed — by the JDK's own cleaner, once the {@link ByteBuffer} is unreachable — so the accounting
@@ -2295,7 +2283,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 STATS.recordDirectFree(charge.bytes);
                 if (charge.wide) {
                     // One reclamation, two counters: both charges hang off the one ByteBuffer, so the
-                    // sub-budget is returned exactly when the overall budget is. D3d, O2.
+                    // sub-budget is returned exactly when the overall budget is.
                     STATS.recordWideFree(charge.bytes);
                 }
             }
@@ -2307,10 +2295,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * Whether {@code usableBytes} more of direct buffer fits under {@link #DIRECT_MEMORY_BUDGET_BYTES}. A
      * budget of {@code 0} is off — a budget must never be the reason a shard cannot read its vectors.
      *
-     * <p>Since D3c this is consulted only where a {@link DirectIOStagingLease} must carve: a new arena, a new
+     * <p>It is consulted only where a {@link DirectIOStagingLease} must carve: a new arena, a new
      * wide-group buffer, or a read-ahead ring. A burst that takes its thread's arena back allocates nothing
-     * and so cannot be declined, which is why {@code declined_budget} should now read 0 on a loaded node
-     * where before it read 373k-614k at the same 1 GB default.
+     * and so cannot be declined, which is why {@code declined_budget} reads 0 on a loaded node where an
+     * arena per input had it in the hundreds of thousands.
      */
     static boolean fitsBudget(final long usableBytes, final int blockSize) {
         final long live = reclaim();
@@ -2380,23 +2368,23 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             // that.
             refreshRoute();
             DirectIOVectorCache.applyConfiguredSize(directIOActive);
-            // O5, after the size refresh so the fit test is against the target the operator has just set.
+            // After the size refresh, so the fit test is against the target the operator has just set.
             burstReadAroundBytes = directIOActive ? DirectIOVectorCache.readAroundBytes(handle.fileLength) : 0;
         }
     }
 
     /**
-     * Re-reads {@code knn.direct_io.rescore.enabled} and changes this input's route if it has to. O1, D2.
+     * Re-reads {@code knn.direct_io.rescore.enabled} and changes this input's route if it has to.
      *
      * <p>Called once per prefetch burst from {@link #beginBurst()}, which is the only boundary at which a
      * route may change: within a burst the staged ranges and the read that consumes them have to be on the
      * same channel, and between bursts nothing is in flight. An input with no fallback stays on
      * {@code O_DIRECT} whatever the setting says, because the alternative would be a read with nowhere to go.
      *
-     * <p>Both of this input's burst entry points reach it: {@link #selectUncachedOrdinals}, which N1's
-     * prefetch filter calls once per batch, and {@link #prefetch}. That matters for the rollback, and it is
-     * where this port differs from 16-I's: 16-I refreshed the route in {@code prefetch} alone, and with a
-     * warm cache a batch can make no {@code prefetch} call at all.
+     * <p>Both of this input's burst entry points reach it: {@link #selectUncachedOrdinals}, which the
+     * prefetch filter calls once per batch, and {@link #prefetch}. Both, and not {@code prefetch} alone,
+     * because with a warm cache a batch can make no {@code prefetch} call at all and the rollback would then
+     * never reach that input.
      *
      * <p>Never throws. A setting that cannot be read leaves the route alone, for the reason every other
      * settings read on this path has: a cluster-state read must not fail a query.
@@ -2455,7 +2443,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     /**
      * Ends this input's burst: it stops consulting the staged table and stops holding the pool.
      *
-     * <p><b>It does not quiesce anything, and that is the D3c change.</b> The ranges stay staged in the
+     * <p><b>It deliberately quiesces nothing.</b> The ranges stay staged in the
      * thread's lease until the next burst on that thread takes the arena back and quiesces them there — which
      * is the only boundary that can be relied on, because a per-query input usually never prefetches twice.
      * Letting go of the generation is enough to make the table unreadable: {@link #heldLease} will not match
@@ -2466,7 +2454,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         leaseThreadId = -1;
         readSincePrefetch = false;
         burstConfigured = false;
-        // O4: the filter's answers belong to the burst that asked. A blocking read in the next burst for an
+        // the filter's answers belong to the burst that asked. A blocking read in the next burst for an
         // offset this one dropped is not this race.
         filteredCount = 0;
         // The burst boundary is also where the pool reference is dropped, so the next burst picks up a pool
@@ -2496,21 +2484,21 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
     /**
      * Reads {@code count} raw bytes, which on the FP16 {@code .vec} path is one whole vector and is that
-     * path's only read shape that matters for latency (O8), and on every other path is a header, a footer, a
+     * path's only read shape that matters for latency, and on every other path is a header, a footer, a
      * {@code DirectMonotonicReader}'s metadata or a merge's sequential scan.
      *
      * <p>The store's two sites are here as well as in {@link #readFloats}, for exactly the reads
      * {@link #isVectorRead} recognises: a lookup first, so a hit costs no device read, and admission from a
      * staged read that covered the whole vector in one buffer. Everything else is byte for byte the read it
-     * was before O8, with no lookup and no admission, which is what keeps a 44-byte header and the merge
-     * path out of the store.
+     * was without the FP16 path, with no lookup and no admission, which is what keeps a file header and the
+     * merge path out of the store.
      */
     @Override
     public void readBytes(final byte[] destination, final int destinationOffset, final int count) throws IOException {
         final long runStart = offset + filePointer;
         final IndexInput fallback = fallbackFor(count);
         if (fallback != null) {
-            // O1: the delegate's own read of the same bytes, and no lookup and no admission on this route.
+            // the delegate's own read of the same bytes, and no lookup and no admission on this route.
             fallback.readBytes(destination, destinationOffset, count);
             filePointer += count;
             STATS.servedBytes.addAndGet(count);
@@ -2548,7 +2536,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                     DirectIOVectorCache.put(handle.fileId, runStart, source.buffer, source.position, count);
                     spanFill(source.range, runStart, count);
                 } else if (wasFilteredAsCached(runStart)) {
-                    // O4's filter-then-read race, on the FP16 path: the filter believed this vector cached,
+                    // The filter-then-read race, on the FP16 path: the filter believed this vector cached,
                     // so it was not staged, and the store has lost it since. Keeping the bytes this
                     // synchronous read had to fetch is what stops it staying a miss.
                     DirectIOVectorCache.readmitAfterRace(handle.fileId, runStart, source.buffer, source.position, count);
@@ -2562,7 +2550,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
     /**
      * Whether a {@code readBytes} of {@code count} bytes at {@code runStart} is one whole vector of the field
-     * {@link #selectUncachedOrdinals} declared on this input. O8's gate; see {@link #vectorGridBytes}.
+     * {@link #selectUncachedOrdinals} declared on this input. See {@link #vectorGridBytes}.
      *
      * <p>Three conditions and each excludes a real read of this file: the length must be the field's vector
      * length (a header, a footer and a checksum are other lengths), the offset must not precede ordinal zero
@@ -2592,7 +2580,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         final long runStart = offset + filePointer;
         final IndexInput fallback = fallbackFor(requested);
         if (fallback != null) {
-            // O1: the same bytes of the same file, decoded by Lucene's own reader. This is the mmap read
+            // the same bytes of the same file, decoded by Lucene's own reader. This is the mmap read
             // the dispatch rule would have produced had the switch been off when the file was opened, and
             // no lookup and no admission happen on this route: nothing is served from the store and nothing
             // is put into it while the switch is off.
@@ -2642,11 +2630,11 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             if (written == 0 && usableFloats == count && source.staged()) {
                 DirectIOVectorCache.put(handle.fileId, runStart, source.buffer, source.position, requested);
                 // And, while the store is below its slab target, the rest of the whole vectors this span
-                // already holds (M4). Done here rather than anywhere else because this is the one point
+                // already holds. Done here rather than anywhere else because this is the one point
                 // where the bytes are known to be valid, the vector length is known, and the range is known.
                 spanFill(source.range, runStart, requested);
             } else if (written == 0 && usableFloats == count && wasFilteredAsCached(runStart)) {
-                // O4: the filter-then-read race. This vector was cached when N1's filter checked it, so it
+                // the filter-then-read race. This vector was cached when the prefetch filter checked it, so it
                 // was not staged, and it is not cached now -- the store lost it in between and this read went
                 // to the device synchronously. Keeping its bytes is what stops it staying a miss. It is
                 // admitted without evicting anything; see DirectIOVectorCache#readmitAfterRace for why this
@@ -2661,23 +2649,22 @@ public final class DirectIOVectorIndexInput extends IndexInput {
 
     /**
      * Admits the whole vectors of this slice that {@code range} holds besides the one just read, while the
-     * store is below its slab target. M4, ported from phase 16-I's F5.
+     * store is below its slab target. This is span fill.
      *
-     * <h4>Why it exists (MEASURED by 16-I on the EBS node, S1b)</h4>
-     * On dio-1m, with a cache large enough for every vector in the file, Direct I/O's p50 stayed 9.7x mmap's
-     * because 16% of candidates still missed after a 10,000-query warm-up. In that warm-up Direct I/O read
-     * 2.01 MB per query in about 40 KB staged spans, 6.5x the whole file, and cached only the vectors a
-     * candidate had asked for; mmap's page cache kept every page it read and ended up holding 95% of the
-     * file. The cache was paying for the reads and keeping a fraction of what they delivered. With span fill
-     * on, dio-1m's p50 went from 43.9 to 10.9 ms.
+     * <h4>Why it exists</h4>
+     * Without it, a cache large enough for every vector in the file still leaves a sixth of candidates
+     * missing after a long warm-up, and the rescore p50 stays several times mmap's: the reads deliver whole
+     * staged spans and the store keeps only the one vector each read asked for, while mmap's page cache keeps
+     * every page it reads. The cache pays for the reads and keeps a fraction of what they deliver. Admitting
+     * the rest of the span was measured taking the p50 down by a factor of four.
      *
      * <h4>Four rules, each of them a thing this must not do</h4>
      * <ul>
      *   <li><b>Below the target only.</b> {@link DirectIOVectorCache#putRun} places with eviction refused and
      *       re-checks the target under the write lock, so span fill can neither evict a requested vector nor
      *       take a slab the target does not already allow. At the target, admission is requested vectors
-     *       only, which is exactly M3's policy. That is what keeps this from being a scan that pushes out
-     *       the working set (agenda item 4, which this phase does not decide).</li>
+     *       only, which is the policy with no span fill at all. That is what keeps this from being a scan
+     *       that pushes out the working set.</li>
      *   <li><b>Whole vectors of the reading slice only.</b> A staged range is block aligned in the whole
      *       file, so its ends routinely reach outside this slice, into another field's vectors or into the
      *       file's header or footer. The span is clipped to {@code [offset, offset + length)} <em>before</em>
@@ -2694,9 +2681,9 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * </ul>
      *
      * <h4>The boundary grid is anchored on the vector just read, not on the slice start</h4>
-     * 16-I's F5 computed ordinals from the slice start, which is the same grid whenever the slice begins at
-     * vector zero -- which is what {@code OffHeapFloatVectorValues} gives it. Anchoring on {@code runStart}
-     * instead makes the grid right for <em>any</em> caller: the keys admitted are then exactly the offsets
+     * Computing ordinals from the slice start gives the same grid whenever the slice begins at vector zero,
+     * which is what {@code OffHeapFloatVectorValues} gives it. Anchoring on {@code runStart} instead makes
+     * the grid right for <em>any</em> caller: the keys admitted are then exactly the offsets
      * some later {@code readFloats} of this field will ask for, including the case where a slice starts part
      * way into a field. The requested vector is at {@code k = 0} and is always inside the clipped span,
      * because it was just read out of it, so the run is never empty and always contains it (the store skips
@@ -2708,7 +2695,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      */
     private void spanFill(final StagedRange range, final long runStart, final int vectorBytes) {
         if (range == null || range.spanFilled || vectorBytes <= 0 || DirectIOVectorCache.isSpanFillOn() == false
-        // O3: or a closed file has given slots back, which is room nothing was pushed out to get.
+        // or a closed file has given slots back, which is room nothing was pushed out to get.
         // Approximate on purpose, because this runs before the write lock; putRun re-asks precisely.
             || DirectIOVectorCache.mayAdmitSpanFillApproximately() == false) {
             return;
@@ -2752,7 +2739,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
          * would evict the random path's working set, and a blocking read is the fallback the cache exists to
          * avoid rather than a thing to remember.
          *
-         * <p>It is the range and not a flag because span fill (M4) needs the range's geometry -- its aligned
+         * <p>It is the range and not a flag because span fill needs the range's geometry -- its aligned
          * start and the bytes the read actually returned -- and needs to mark it walked.
          */
         private final StagedRange range;
@@ -2788,7 +2775,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * {@code pread}. The two staging mechanisms are independent — neither resets the other, and the burst
      * table is scanned first because a {@link #prefetch} is a stronger signal than a detected run.
      *
-     * <p>Since D3c the burst table belongs to the <em>thread</em>, so it is consulted only when this input
+     * <p>The burst table belongs to the <em>thread</em>, so it is consulted only when this input
      * still holds its thread's lease. Two ways it may not, both of which fall through to a blocking read with
      * identical bytes: another burst on this thread took the arena back (the generation moved on), or this
      * read arrived on a different thread from the one that prefetched, which is counted as
@@ -2880,13 +2867,12 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * One blocking {@code pread} of the block-aligned window holding {@code absolute}, when not already held.
      *
      * <h4>This path's own buffer is bounded, and the budget deliberately does not decline it</h4>
-     * It is <b>exactly one</b> buffer of {@link #bufferSize} (8 KiB at the shipped default, two filesystem
-     * blocks) per <b>thread</b> since D3c — it was one per input — allocated on that thread's first blocking
-     * read and then reused: the window check below serves every later read that falls inside the window it
+     * It is <b>exactly one</b> buffer of {@link #bufferSize} per <b>thread</b> rather than one per input,
+     * allocated on that thread's first blocking read and then reused: the window check below serves every later read that falls inside the window it
      * already holds, and a read outside it re-reads into the <em>same</em> buffer rather than allocating. It
      * is never grown and never allocated per read. So the blocking channel's whole direct footprint is
-     * {@code bufferSize x live threads}, where before it was {@code bufferSize x live inputs} and inputs
-     * outlive their queries.
+     * {@code bufferSize x live threads}, where one per input would be {@code bufferSize x live inputs} and
+     * inputs outlive their queries.
      *
      * <p>Sharing it is safe because the bytes are consumed before the next read on that thread: the caller
      * copies out of the returned {@link Source} inside the same {@code readFloats} or {@code readBytes}
@@ -3043,7 +3029,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
      * path owns and clears at each burst boundary. The ring has no burst boundary to re-acquire at — it
      * lives for the length of a scan — so re-reading it on every refill is what makes a live capacity change
      * reach the ring too. A refill happens once per window served, i.e. once per
-     * {@link #readaheadWindowBytes} (64 KiB by default), so the settings read is not on a per-vector path.
+     * {@link #readaheadWindowBytes}, so the settings read is not on a per-vector path.
      */
     private void refillReadahead() {
         final DirectIOStagingLease held = heldLease();
@@ -3237,7 +3223,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         // The route this clone starts on is the one its parent is on, so a clone taken mid burst does not
         // change path on its first read; it re-reads the switch at its own next burst like any other input.
         copy.directIOActive = directIOActive;
-        // O8: and the same field's vector grid, which is sound because a clone covers the same offset and
+        // and the same field's vector grid, which is sound because a clone covers the same offset and
         // length as its parent. Without this a clone taken for a values copy could read a vector before its
         // own first prefetch filter call and so neither hit nor admit it.
         copy.vectorGridBase = vectorGridBase;
@@ -3265,7 +3251,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 mmapFallback.close();
             }
             handle.channel.close();
-            // O3: the file is closed for good, so its cached vectors are cold for ever and the slots they
+            // the file is closed for good, so its cached vectors are cold for ever and the slots they
             // hold are room the store can have back without evicting anything. Only here, in the
             // ownsHandle branch: a clone or a slice closing would otherwise free bytes its parent is still
             // reading. After the channel close rather than before it, because nothing may read the file

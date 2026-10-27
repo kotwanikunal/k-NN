@@ -83,12 +83,12 @@ public class DirectIOReadProfileTests extends KNNTestCase {
 
     private static final int VECTOR_COUNT = 2_048;
     private static final int TEST_SLAB_BYTES = 1024 * 1024;
-    /** The span cap the current arm sweeps, applied by {@link #openAtCap(Path)}. */
-    private int capBytes = DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGE_BYTES;
     private static final long BYTES_128 = 128 * 1024;
     /** A cap low enough that it, and not the 128 KB group budget, is what closes a gapless run. */
     private static final int LOW_CAP = 16 * 1024;
 
+    /** The span cap the current arm sweeps, applied by {@link #openAtCap(Path)}. */
+    private int capBytes = DirectIOVectorIndexInput.DEFAULT_MAX_STAGED_RANGE_BYTES;
     private float[][] vectors;
     private Path path;
     private int headerLength;

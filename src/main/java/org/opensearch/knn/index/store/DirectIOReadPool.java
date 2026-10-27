@@ -22,9 +22,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  * A rescore query dispatches one scoring task per leaf and runs them concurrently
  * ({@code NativeEngineKnnVectorQuery} uses {@code getTaskExecutor().invokeAll}), so total in-flight
  * reads are {@code segments x window}, not {@code window}. On the host this was tuned for the device
- * queue holds 63 requests ({@code nr_requests}), and eight segments at a window of 16 would offer 128 —
- * past the point where more in-flight I/O helps, and into the region where it measurably hurts: a
- * 200-wide fan-out measured p90 2.2x and p99 2.0x worse than a 64-wide one. A per-segment pool cannot
+ * queue holds a few dozen requests ({@code nr_requests}), and eight segments at a window of 16 would offer
+ * far more — past the point where more in-flight I/O helps, and into the region where a measured sweep
+ * showed it hurting p90 and p99 outright. A per-segment pool cannot
  * express that bound, because no segment knows how many others are being scored beside it. This one can,
  * and the bound is the published {@code knn.direct_io.rescore.prefetch_threads}.
  *
@@ -60,13 +60,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * {@code readaheadDeclined} and leaves the scan at queue depth one. Bounding the queue makes those
  * already-written paths reachable rather than adding anything.
  *
- * <p><b>Declining is not the cheaper fallback, and the node measured it.</b> Phase 14 recorded the opposite
- * here as a design claim. On the Oct 4-5 sweep (r7g.xlarge, 4 vCPU, gp3 3000 IOPS, 16 clients, k=100, 5,000
- * queries) the same jar at an effective capacity of 64 declined 46-52% of staged reads and ran
- * 769-777 / 1060-1069 / 1322-1428 ms at 16.7-17.4 qps against <b>783k</b> device reads; at a capacity of
- * 1,024 it declined <b>0%</b> and ran 634-650 / 877-896 / 954-970 at 17.4-19.5 qps against <b>707k</b>. The
- * 76k extra device reads are the declined bursts falling back to individual blocking reads. The claim is
- * withdrawn and the default is derived from burst demand — see {@link #queueCapacity()}.
+ * <p><b>Declining is not the cheaper fallback, and a node sweep showed it.</b> A capacity that declines
+ * about half of all staged reads is worse on p50, p90, p99 and throughput than one that declines none, and
+ * it makes more device reads rather than fewer, because each declined burst falls back to individual
+ * blocking reads. So the capacity is derived from burst demand — see {@link #queueCapacity()}.
  *
  * <h2>The thread count is live, and the queue is swapped rather than resized</h2>
  * A changed {@code knn.direct_io.rescore.prefetch_threads} resizes the pool in place
@@ -87,11 +84,9 @@ public final class DirectIOReadPool {
 
     /**
      * Floor on the queue. Four whole prefetch bursts, where a burst is {@code PrefetchHelper}'s 64-ordinal
-     * Lucene bulk batch: task-15 measured that a table which declines the tail of every burst makes 5.4
-     * blocking reads per query and a paced p99 of 30 ms where one that holds the burst makes 0.0 and 11 ms,
-     * so one burst is the hard minimum and the floor is above it because a single-processor host still
-     * answers several leaves at once. Raised from 64 in phase 15: at 64 the node declined 46-52% of staged
-     * reads (see the class javadoc).
+     * Lucene bulk batch. A table that declines the tail of every burst was measured to make several blocking
+     * reads per query against none, and to pace p99 several times worse, so one whole burst is the hard
+     * minimum; the floor is above it because a single-processor host still answers several leaves at once.
      */
     static final int MIN_QUEUE_CAPACITY = 256;
 
@@ -223,25 +218,20 @@ public final class DirectIOReadPool {
      * reason a read fails.
      *
      * <h4>Derived from burst demand, not from the pool size</h4>
-     * It used to be {@code max(64, 8 x pool_threads)}, which was <b>the wrong variable</b>. Pool threads set
-     * the drain <em>rate</em>; the queue has to absorb the peak <em>burst</em>, and a burst is
+     * The pool size is <b>the wrong variable</b> to derive it from. Pool threads set the drain
+     * <em>rate</em>; the queue has to absorb the peak <em>burst</em>, and a burst is
      * {@code staged_ranges} ranges submitted by one scorer before it reads any of them. So the demand is
      * {@code (threads that can be inside a rescore at once) x staged_ranges}, and those threads are the
      * {@code search} pool plus — under concurrent segment search, where
      * {@code NativeEngineKnnVectorQuery} dispatches one task per leaf through
-     * {@code getTaskExecutor().invokeAll} — the {@code index_searcher} pool. This method's own earlier
-     * Javadoc already stated the demand correctly ("16 scorers x 64 staged ranges want 1,024 slots") while
-     * the code computed {@code 8 x 16 = 128}.
+     * {@code getTaskExecutor().invokeAll} — the {@code index_searcher} pool.
      *
      * <p>Rounded up to a power of two and floored at {@link #MIN_QUEUE_CAPACITY}, because excess capacity is
      * free: a submit past capacity is refused immediately (default abort policy) rather than waited on, so a
-     * queue that never fills costs only the task references it does not hold. The node measured 0 declines at
-     * both 1,024 and 4,096, i.e. the queue filled at neither, and the p99 difference between those two arms
-     * is therefore not a queue effect. Buffer bytes are bounded separately by
+     * queue that never fills costs only the task references it does not hold. A node sweep found no declines
+     * at the derived capacity or at four times it, so the queue filled at neither and the capacity is not
+     * what separates them. Buffer bytes are bounded separately by
      * {@link DirectIOVectorIndexInput#DIRECT_MEMORY_BUDGET_BYTES}.
-     *
-     * <p>On the 4-vCPU node this is {@code (7 + 8) x 64 = 960 -> 1024}, which is the value the sweep measured
-     * as best. On a 16-vCPU host it is {@code (25 + 32) x 64 = 3648 -> 4096}.
      */
     static int queueCapacity() {
         try {
@@ -274,7 +264,8 @@ public final class DirectIOReadPool {
      * capacity above can be validated against what a real burst actually offers rather than against a
      * formula. Called by both submit sites immediately after a successful submit, which is the only moment
      * occupancy is known to be at least one. Costs one {@link ArrayBlockingQueue} lock acquisition — the same
-     * lock the submit just released — against a device read of ~100 us.
+     * lock the submit just released — against the device read it is sampling, which is orders of magnitude
+     * dearer.
      */
     static void sampleQueueDepth(final ExecutorService executor) {
         if (executor instanceof ThreadPoolExecutor threadPool) {
