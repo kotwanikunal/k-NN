@@ -285,6 +285,34 @@ public class TestVectorValues {
         }
     }
 
+    /**
+     * {@link PreDefinedFloatVectorValues} over a doc id space it does not fill, for layouts where only some doc
+     * ids carry a vector. {@code ordToDoc[ordinal]} is the doc id of that ordinal and must ascend.
+     */
+    public static class PreDefinedSparseFloatVectorValues extends PreDefinedFloatVectorValues {
+        private final int[] ordToDoc;
+
+        public PreDefinedSparseFloatVectorValues(final List<float[]> vectors, final int[] ordToDoc) {
+            super(vectors);
+            this.ordToDoc = ordToDoc;
+        }
+
+        @Override
+        public int ordToDoc(final int ordinal) {
+            return ordToDoc[ordinal];
+        }
+
+        @Override
+        public DocIndexIterator iterator() {
+            return createSparseIterator();
+        }
+
+        @Override
+        public FloatVectorValues copy() {
+            return new PreDefinedSparseFloatVectorValues(vectors, ordToDoc);
+        }
+    }
+
     public static class PreDefinedByteVectorValues extends ByteVectorValues {
         private final int count;
         private final int dimension;

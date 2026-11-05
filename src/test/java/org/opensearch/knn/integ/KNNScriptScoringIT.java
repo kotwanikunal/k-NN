@@ -35,6 +35,8 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.engine.KNNEngine;
 import org.opensearch.knn.index.mapper.KNNVectorFieldType;
+import org.opensearch.knn.KNNJsonIndexMappingsBuilder;
+import org.opensearch.knn.NestedKnnDocBuilder;
 import org.opensearch.knn.plugin.script.KNNScoringScriptEngine;
 import org.opensearch.knn.plugin.script.KNNScoringSpace;
 import org.opensearch.knn.plugin.script.KNNScoringSpaceFactory;
@@ -80,6 +82,68 @@ public class KNNScriptScoringIT extends KNNCompressionRestTestCase {
 
     public void testKNNL2ScriptScore() throws Exception {
         testKNNScriptScore(SpaceType.L2);
+    }
+
+    /**
+     * A {@code script_score} with {@code knn_score} over a nested field answers, and it does not go through k-NN's
+     * exact searcher at all: nothing under {@code index/query/} builds an exact searcher context for the script
+     * path, so no parent bit set reaches the nested scorer. A regression check, not coverage of that scorer.
+     */
+    @SneakyThrows
+    public void testKNNScoreOverNestedField_whenScriptScore_thenItAnswersWithoutTheNestedScorer() {
+        final String nestedField = "test_nested";
+        final String vectorPath = nestedField + "." + FIELD_NAME;
+        final String mapping = KNNJsonIndexMappingsBuilder.builder()
+            .nestedFieldName(nestedField)
+            .fieldName(FIELD_NAME)
+            .dimension(2)
+            .build()
+            .getIndexMapping();
+        createKnnIndex(INDEX_NAME, mapping);
+        try {
+            for (int parent = 1; parent <= 3; parent++) {
+                addKnnDoc(
+                    INDEX_NAME,
+                    String.valueOf(parent),
+                    NestedKnnDocBuilder.create(nestedField)
+                        .addVectors(FIELD_NAME, new Float[] { (float) parent, (float) parent }, new Float[] { parent + 1f, parent + 1f })
+                        .build()
+                );
+            }
+            refreshIndex(INDEX_NAME);
+
+            final String body = XContentFactory.jsonBuilder()
+                .startObject()
+                .startObject("query")
+                .startObject("nested")
+                .field("path", nestedField)
+                .startObject("query")
+                .startObject("script_score")
+                .startObject("query")
+                .startObject("exists")
+                .field("field", vectorPath)
+                .endObject()
+                .endObject()
+                .startObject("script")
+                .field("source", "knn_score")
+                .field("lang", KNNScoringScriptEngine.NAME)
+                .startObject("params")
+                .field("field", vectorPath)
+                .field("query_value", new Float[] { 1f, 1f })
+                .field("space_type", SpaceType.L2.getValue())
+                .endObject()
+                .endObject()
+                .endObject()
+                .endObject()
+                .endObject()
+                .endObject()
+                .endObject()
+                .toString();
+            final Response response = searchKNNIndex(INDEX_NAME, body, 3);
+            assertFalse("the script query found nothing", parseIds(EntityUtils.toString(response.getEntity())).isEmpty());
+        } finally {
+            deleteKNNIndex(INDEX_NAME);
+        }
     }
 
     public void testKNNL2ByteScriptScore() throws Exception {

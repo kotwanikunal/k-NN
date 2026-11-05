@@ -16,12 +16,16 @@ import org.opensearch.knn.KNNJsonQueryBuilder;
 import org.opensearch.knn.KNNRestTestCase;
 import org.opensearch.knn.NestedKnnDocBuilder;
 import org.opensearch.knn.index.KNNSettings;
+import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.engine.KNNEngine;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
+import java.util.Locale;
 
 import static org.opensearch.knn.common.KNNConstants.METHOD_HNSW;
 
@@ -135,6 +139,108 @@ public class NestedSearchBinaryIT extends KNNRestTestCase {
         assertEquals(2, parseTotalSearchHits(entity));
     }
 
+    /**
+     * A nested binary field answered by exact search, because the segment is written without a graph: every parent
+     * comes back with its own best child's Hamming score, checked against the vectors this test indexed.
+     */
+    @SneakyThrows
+    public void testNestedSearchBinary_whenExactSearch_thenHammingScoresMatchReference() {
+        final String indexName = "nested-exact-binary-" + engine.getName().toLowerCase(Locale.ROOT);
+        final String nestedFieldName = "nested";
+        createKnnBinaryIndexWithNestedField(
+            indexName,
+            nestedFieldName,
+            FIELD_NAME,
+            DIMENSION_EXACT,
+            engine,
+            SpaceType.HAMMING,
+            Settings.builder()
+                .put(getKNNDefaultIndexSettings())
+                .put(KNNSettings.INDEX_KNN_ADVANCED_APPROXIMATE_THRESHOLD, NO_GRAPH_THRESHOLD)
+                .build()
+        );
+
+        for (int group = 0; group < GROUPS.length; group++) {
+            final NestedKnnDocBuilder builder = NestedKnnDocBuilder.create(nestedFieldName);
+            for (int offset = 0; offset < GROUPS[group][0]; offset++) {
+                if (offset == GROUPS[group][2]) {
+                    builder.addMetadata(Map.of(TAG_FIELD, "t" + offset));
+                    continue;
+                }
+                builder.addVectors(FIELD_NAME, box(childVector(group, offset)));
+            }
+            addKnnDoc(indexName, "p" + group, builder.build());
+        }
+        refreshIndex(indexName);
+
+        final int size = GROUPS.length + 5;
+        final String query = KNNJsonQueryBuilder.builder()
+            .nestedFieldName(nestedFieldName)
+            .fieldName(FIELD_NAME)
+            .vector(box(queryVector()))
+            .k(size)
+            .build()
+            .getQueryString();
+        final String entity = EntityUtils.toString(searchKNNIndex(indexName, query, size).getEntity());
+
+        final List<String> expectedIds = new ArrayList<>();
+        for (int group = 0; group < GROUPS.length; group++) {
+            if (GROUPS[group][0] > 0) {
+                expectedIds.add("p" + group);
+            }
+        }
+        assertEquals("binary hamming: the parents and their order", expectedIds, parseIds(entity));
+        final List<Double> scores = parseScores(entity);
+        for (int i = 0; i < expectedIds.size(); i++) {
+            final int group = Integer.parseInt(expectedIds.get(i).substring(1));
+            final float expected = SpaceType.HAMMING.getKnnVectorSimilarityFunction()
+                .compare(queryVector(), childVector(group, GROUPS[group][1]));
+            assertEquals("binary hamming: score of p" + group, expected, scores.get(i), 1.0e-5 * Math.max(1.0, expected));
+        }
+
+        deleteKNNIndex(indexName);
+    }
+
+    // ---- the parent groups the exact search method indexes: child count, the offset that must win, and
+    // the offset that carries no vector ----
+    private static final int[][] GROUPS = { { 1, 0, -1 }, { 3, 0, -1 }, { 4, 3, -1 }, { 5, 2, 0 }, { 0, -1, -1 }, { 6, 1, 5 } };
+    /** In bits, which is how a binary field's dimension is given. */
+    private static final int DIMENSION_EXACT = 32;
+    private static final int NO_GRAPH_THRESHOLD = 100000;
+    /** What a child with no vector carries instead, which is how a sparse nested field looks. */
+    private static final String TAG_FIELD = "tag";
+
+    private byte[] queryVector() {
+        return new byte[DIMENSION_EXACT / Byte.SIZE];
+    }
+
+    /**
+     * The group's named best child differs from the all-zero query in as many bits as its group index plus one, so
+     * the winners' Hamming scores fall with the group index. Every other child has half its bits set, which is far
+     * from the query and from every named winner.
+     */
+    private byte[] childVector(final int group, final int offset) {
+        final byte[] vector = queryVector();
+        if (offset == GROUPS[group][1]) {
+            for (int bit = 0; bit <= group; bit++) {
+                vector[bit / Byte.SIZE] |= (byte) (1 << (bit % Byte.SIZE));
+            }
+            return vector;
+        }
+        for (int i = 0; i < vector.length; i++) {
+            vector[i] = (byte) (0b10101010 ^ ((group + offset + i) % 2));
+        }
+        return vector;
+    }
+
+    private static Object[] box(final byte[] vector) {
+        final Integer[] boxed = new Integer[vector.length];
+        for (int i = 0; i < vector.length; i++) {
+            boxed[i] = (int) vector[i];
+        }
+        return boxed;
+    }
+
     private void createKnnBinaryIndexWithNestedField(
         final String indexName,
         final String nestedFieldName,
@@ -142,9 +248,22 @@ public class NestedSearchBinaryIT extends KNNRestTestCase {
         final int dimension,
         final KNNEngine knnEngine
     ) throws Exception {
+        createKnnBinaryIndexWithNestedField(indexName, nestedFieldName, fieldName, dimension, knnEngine, null, null);
+    }
+
+    private void createKnnBinaryIndexWithNestedField(
+        final String indexName,
+        final String nestedFieldName,
+        final String fieldName,
+        final int dimension,
+        final KNNEngine knnEngine,
+        final SpaceType spaceType,
+        final Settings settings
+    ) throws Exception {
         KNNJsonIndexMappingsBuilder.Method method = KNNJsonIndexMappingsBuilder.Method.builder()
             .methodName(METHOD_HNSW)
             .engine(knnEngine.getName())
+            .spaceType(spaceType == null ? null : spaceType.getValue())
             .build();
 
         String knnIndexMapping = KNNJsonIndexMappingsBuilder.builder()
@@ -156,6 +275,10 @@ public class NestedSearchBinaryIT extends KNNRestTestCase {
             .build()
             .getIndexMapping();
 
-        createKnnIndex(indexName, knnIndexMapping);
+        if (settings == null) {
+            createKnnIndex(indexName, knnIndexMapping);
+        } else {
+            createKnnIndex(indexName, settings, knnIndexMapping);
+        }
     }
 }

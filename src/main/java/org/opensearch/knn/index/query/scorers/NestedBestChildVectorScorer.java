@@ -5,95 +5,61 @@
 
 package org.opensearch.knn.index.query.scorers;
 
-import org.apache.lucene.search.ConjunctionUtils;
+import org.apache.lucene.search.DocAndFloatFeatureBuffer;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.util.BitSet;
 import org.opensearch.common.Nullable;
 
-import java.util.Arrays;
-
 import java.io.IOException;
 
 /**
- * A {@link VectorScorer} decorator for nested (parent-child) document structures that groups
- * child documents by their parent and yields only the highest-scoring child per parent.
+ * A {@link VectorScorer} for nested documents that groups children by their parent and yields the best scoring
+ * child of each parent. It follows Lucene's {@code DiversifyingChildrenVectorScorer}, as a standalone scorer for
+ * OpenSearch's exact search path that scores a group through the child scorer's {@link VectorScorer.Bulk} view, so
+ * that the child scorer declares the group's vectors to the storage layer before it reads them. Unlike Lucene's,
+ * it keeps a group's first child whatever it scores, so every group yields a child of its own.
  *
- * <p>This is adapted from Lucene's {@code DiversifyingChildrenVectorScorer} inner class in
- * {@code DiversifyingChildrenFloatKnnVectorQuery}, re-implemented as a standalone {@link VectorScorer}
- * so it can be used in OpenSearch's exact search path.
- *
- * <h2>Document Layout</h2>
- * <p>Lucene block-joins store parent and child documents in contiguous doc-id ranges:
- * <pre>
- *   [child_0, child_1, ..., child_n, PARENT, child_0, child_1, ..., child_m, PARENT, ...]
- * </pre>
- * The {@code parentBitSet} identifies which doc ids are parents. Every doc id between two
- * consecutive parent bits is a child of the later parent.
- *
- * <h2>Iteration Behavior</h2>
- * <p>Each call to {@link #iterator()}'s {@code nextDoc()} advances through one parent group:
- * <ol>
- *   <li>Finds the next child document (respecting the optional filter).</li>
- *   <li>Determines the parent for that child via {@code parentBitSet.nextSetBit()}.</li>
- *   <li>Iterates over all children belonging to that parent, scoring each one.</li>
- *   <li>Returns the doc id of the best-scoring child; {@link #score()} returns its score.</li>
- * </ol>
- *
- * <h2>Filtered vs Unfiltered</h2>
- * <ul>
- *   <li><b>Unfiltered</b> ({@code acceptedChildrenIterator == null}): every vector document is
- *       considered. The underlying vector iterator drives iteration directly.</li>
- *   <li><b>Filtered</b>: the {@code filterIdsIterator} is intersected with the vector
- *       iterator via {@link #maybeIntersectWithFilter}, producing a single iterator
- *       that yields only doc ids present in both. This keeps the two iterators in lockstep
- *       so the vector scorer is always positioned correctly when {@link #score()} is called.</li>
- * </ul>
- *
- * <h2>Example</h2>
- * <p>Given children [0,1,2,3,4] → parent 5, children [6,7,8] → parent 9, child [10] → parent 11,
- * and a filter that excludes children 2 and 7:
- * <pre>
- *   Accepted children: {0, 1, 3, 4, 6, 8, 10}
- *
- *   nextDoc() → bestChild=1  (best of {0,1,3,4} under parent 5)
- *   nextDoc() → bestChild=6  (best of {6,8} under parent 9)
- *   nextDoc() → bestChild=10 (only child under parent 11)
- *   nextDoc() → NO_MORE_DOCS
- * </pre>
+ * <p>Of that view it needs two things, which every one Lucene builds provides: a non-empty batch ascends in doc id
+ * and starts above the last doc consumed, and an empty batch means nothing is left below the bound. Group
+ * boundaries are read off the batch, so a view that broke either would mis-group the children.
  *
  * @see org.apache.lucene.search.VectorScorer
  * @see org.apache.lucene.search.join.DiversifyingChildrenFloatKnnVectorQuery
  */
 class NestedBestChildVectorScorer implements VectorScorer {
-    private final VectorScorer childrenVectorScorer;
-    private final DocIdSetIterator childIterator;
+    private final DocAndFloatFeatureBuffer buffer = new DocAndFloatFeatureBuffer();
+    private final VectorScorer.Bulk bulkScorer;
     private final BitSet parentBitSet;
     private final DocIdSetIterator iterator;
+    private final long cost;
+
+    private int currentBatchIdx = 0;
     private int bestChild = -1;
     private float currentScore = Float.NEGATIVE_INFINITY;
+    private float childScore = Float.NEGATIVE_INFINITY;
 
     /**
-     * Creates a scorer that finds the best-scoring child per parent, optionally restricted to a
-     * subset of accepted children.
+     * Creates a scorer over the children of the parents in {@code parentBitSet}, optionally restricted to the
+     * children a filter accepts. The child scorer's {@link VectorScorer.Bulk} view is built here and owns both
+     * iterators from then on, so {@code filterIdsIterator} must not have been positioned by anyone else.
      *
-     * <p>When {@code filterIdsIterator} is {@code null} (unfiltered), the scorer's own
-     * vector iterator is used to drive child iteration, matching the behavior of Lucene's
-     * {@code DiversifyingChildrenVectorScorer} but without requiring a separate filter iterator.
-     *
-     * @param filterIdsIterator iterator over the accepted child doc ids (i.e. children that
-     *                                 pass the filter). Pass {@code null} for the unfiltered case
-     *                                 where all vector documents are considered.
-     * @param parentBitSet             a {@link BitSet} with bits set at every parent doc id.
-     *                                 Used to determine parent boundaries for grouping children.
-     * @param childrenVectorScorer             the underlying scorer that computes similarity scores for
-     *                                 individual child documents against the query vector.
+     * @param filterIdsIterator    the accepted child doc ids, or {@code null} to score every child with a vector
+     * @param parentBitSet         a {@link BitSet} with a bit set at every parent doc id
+     * @param childrenVectorScorer the scorer that scores one child against the query vector
+     * @throws IOException if the child scorer cannot build its bulk view
      */
-    NestedBestChildVectorScorer(@Nullable DocIdSetIterator filterIdsIterator, BitSet parentBitSet, VectorScorer childrenVectorScorer) {
-        this.childrenVectorScorer = childrenVectorScorer;
+    NestedBestChildVectorScorer(
+        @Nullable final DocIdSetIterator filterIdsIterator,
+        final BitSet parentBitSet,
+        final VectorScorer childrenVectorScorer
+    ) throws IOException {
         this.parentBitSet = parentBitSet;
-        DocIdSetIterator vectorIterator = childrenVectorScorer.iterator();
-        this.childIterator = maybeIntersectWithFilter(vectorIterator, filterIdsIterator);
+        // The cost of the conjunction the bulk view builds, taken before that view is built because the iterator it
+        // builds is private to it. A conjunction costs the least of its inputs.
+        final long vectorCost = childrenVectorScorer.iterator().cost();
+        this.cost = filterIdsIterator == null ? vectorCost : Math.min(filterIdsIterator.cost(), vectorCost);
+        this.bulkScorer = childrenVectorScorer.bulk(filterIdsIterator);
         this.iterator = createIterator();
     }
 
@@ -116,17 +82,42 @@ class NestedBestChildVectorScorer implements VectorScorer {
     }
 
     /**
-     * Returns the vector iterator directly if no filter is provided, otherwise intersects
-     * it with the filter so that only doc ids present in both are yielded.
+     * Hands out the next scored child below {@code upTo}, exclusive, refilling the batch when it is spent, and
+     * returns its doc id with its score left in {@link #childScore}. Returns -1 when there is no such child.
      */
-    private static DocIdSetIterator maybeIntersectWithFilter(
-        DocIdSetIterator vectorIterator,
-        @Nullable DocIdSetIterator filterIdsIterator
-    ) {
-        if (filterIdsIterator == null) {
-            return vectorIterator;
+    private int nextChildBelow(final int upTo) throws IOException {
+        if (currentBatchIdx >= buffer.size) {
+            fillBuffer(upTo);
+            if (buffer.size == 0) {
+                return -1;
+            }
         }
-        return ConjunctionUtils.intersectIterators(Arrays.asList(filterIdsIterator, vectorIterator));
+        if (buffer.docs[currentBatchIdx] >= upTo) {
+            // It belongs to a later group, so it stays in the buffer for the next call.
+            return -1;
+        }
+        childScore = buffer.features[currentBatchIdx];
+        return buffer.docs[currentBatchIdx++];
+    }
+
+    /**
+     * Fills {@link #buffer} with the next batch of scored children below {@code upTo}, exclusive, and resets the
+     * read position into it. An empty batch means there are no children left below {@code upTo}. {@code upTo} must
+     * be positive, which Lucene asserts.
+     */
+    private void fillBuffer(final int upTo) throws IOException {
+        currentBatchIdx = 0;
+        try {
+            // The filter is already inside the bulk view's iterator, so there is no accept-docs set to apply.
+            bulkScorer.nextDocsAndScores(upTo, null, buffer);
+        } catch (Throwable failure) {
+            // A batch publishes its size before it scores, so a failure leaves doc ids that are still ordinals.
+            // Emptying the buffer leaves the scorer exhausted instead of resumable into them.
+            buffer.size = 0;
+            bestChild = DocIdSetIterator.NO_MORE_DOCS;
+            currentScore = Float.NEGATIVE_INFINITY;
+            throw failure;
+        }
     }
 
     /**
@@ -143,26 +134,30 @@ class NestedBestChildVectorScorer implements VectorScorer {
 
             @Override
             public int nextDoc() throws IOException {
-                int nextChild = childIterator.docID();
-                if (nextChild == -1) {
-                    nextChild = childIterator.nextDoc();
-                }
-                if (nextChild == NO_MORE_DOCS) {
-                    bestChild = NO_MORE_DOCS;
+                if (bestChild == NO_MORE_DOCS) {
                     return NO_MORE_DOCS;
                 }
-
-                currentScore = Float.NEGATIVE_INFINITY;
-                int currentParent = parentBitSet.nextSetBit(nextChild);
-
-                do {
-                    float score = childrenVectorScorer.score();
-                    if (score > currentScore) {
-                        bestChild = nextChild;
-                        currentScore = score;
+                // Unbounded, so one batch can cover several groups and the child scorer declares them together.
+                int child = nextChildBelow(NO_MORE_DOCS);
+                if (child == -1) {
+                    return bestChild = NO_MORE_DOCS;
+                }
+                // The first child of the group is kept whatever it scores, so every group yields a document.
+                bestChild = child;
+                currentScore = childScore;
+                final int currentParent = parentBitSet.nextSetBit(child);
+                if (currentParent == child) {
+                    // The doc carries a parent bit, so its group is itself. It is also what keeps doc 0 from asking
+                    // for a bound of 0.
+                    return bestChild;
+                }
+                while ((child = nextChildBelow(currentParent)) != -1) {
+                    // Strictly greater, so the first child holding the maximum wins the tie.
+                    if (childScore > currentScore) {
+                        bestChild = child;
+                        currentScore = childScore;
                     }
-                } while ((nextChild = childIterator.nextDoc()) != NO_MORE_DOCS && nextChild < currentParent);
-
+                }
                 return bestChild;
             }
 
@@ -180,7 +175,7 @@ class NestedBestChildVectorScorer implements VectorScorer {
 
             @Override
             public long cost() {
-                return childIterator.cost();
+                return cost;
             }
         };
     }

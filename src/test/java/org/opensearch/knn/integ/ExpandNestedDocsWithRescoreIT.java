@@ -307,10 +307,155 @@ public class ExpandNestedDocsWithRescoreIT extends KNNRestTestCase {
     }
 
     /**
+     * The Lucene engine's two-phase search over a quantized nested field, with a reference: every returned parent's
+     * score is its own best child's full precision score, and the child that won its group is among the parent's
+     * expanded children.
+     */
+    @SneakyThrows
+    public void testExpandNestedDocs_whenRescoreEnabled_thenInnerHitScoresMatchReference() {
+        // Threshold zero, so the graph is built and the first pass is approximate.
+        createNestedKnnIndex();
+        indexGroups();
+        refreshIndex(INDEX_NAME);
+        forceMergeKnnIndex(INDEX_NAME, 1);
+
+        final int k = 4;
+        final String responseBody = search(k, REFERENCE_QUERY, "{ \"oversample_factor\": 3.0 }", false, null, "max");
+        assertRescoredParents("expand nested with rescore", responseBody);
+        // The rescore is full precision over every sibling, so the parents that survive the reduction to k are the
+        // reference's first k.
+        assertEquals("the parents that survived the reduction to k", referenceParents().subList(0, k), parseIds(responseBody));
+        assertWinningChildIsExpanded(responseBody);
+    }
+
+    /**
+     * The same shape with the graph threshold above the document count, so the first pass is exact search rather
+     * than approximate, and the parents and their scores must then be exactly the reference's.
+     */
+    @SneakyThrows
+    public void testExpandNestedDocs_whenExactSearch_thenScoresMatchReference() {
+        createNestedKnnIndex(NO_GRAPH_THRESHOLD);
+        indexGroups();
+        refreshIndex(INDEX_NAME);
+
+        final String responseBody = search(GROUPS.size() + 5, REFERENCE_QUERY, null, false, null, "max");
+        assertEquals("the parents and their order", referenceParents(), parseIds(responseBody));
+        assertRescoredParents("expand nested with exact search", responseBody);
+        assertWinningChildIsExpanded(responseBody);
+    }
+
+    @SneakyThrows
+    public void testNestedExactSearch_whenProfileEnabled_thenTheAnswerIsUnchanged() {
+        createNestedKnnIndex(NO_GRAPH_THRESHOLD);
+        indexGroups();
+        refreshIndex(INDEX_NAME);
+
+        final String responseBody = search(GROUPS.size() + 5, REFERENCE_QUERY, null, true, null, "max");
+        assertTrue("the response carries no profile", responseBody.contains("\"profile\""));
+        // Profiling must not change the answer.
+        assertEquals("the parents and their order", referenceParents(), parseIds(responseBody));
+        assertRescoredParents("profile on", responseBody);
+    }
+
+    // ---- the parent groups the three methods above index ----
+
+    /** One parent group: how many children it has, which child must win, and which child carries no vector. */
+    private record Group(int childCount, int bestOffset, int withoutVector) {
+    }
+
+    private static final List<Group> GROUPS = List.of(
+        new Group(1, 0, -1),
+        new Group(3, 0, -1),
+        new Group(5, 4, -1),
+        new Group(65, 64, -1),   // a group longer than one bulk batch
+        new Group(4, 2, 0),      // the first child carries no vector
+        new Group(2, 1, -1)
+    );
+    private static final Object[] REFERENCE_QUERY = { 1, 1, 1 };
+    private static final int NO_GRAPH_THRESHOLD = 100000;
+
+    private void indexGroups() throws Exception {
+        for (int group = 0; group < GROUPS.size(); group++) {
+            final NestedKnnDocBuilder builder = NestedKnnDocBuilder.create(NESTED_FIELD);
+            for (int offset = 0; offset < GROUPS.get(group).childCount(); offset++) {
+                if (offset == GROUPS.get(group).withoutVector()) {
+                    builder.addMetadata(Map.of(CHILD_FILTER_FIELD, true));
+                } else {
+                    builder.addVectors(VECTOR_FIELD, childVector(group, offset));
+                }
+            }
+            addKnnDoc(INDEX_NAME, parentId(group), builder.build());
+        }
+    }
+
+    /**
+     * The group's named best child sits at distance 3(group + 1) squared from the query, so every group's winner
+     * has a distinct score and the scores fall with the group index. Every other child sits far beyond all of them.
+     */
+    private Object[] childVector(final int group, final int offset) {
+        if (offset == GROUPS.get(group).bestOffset()) {
+            final int coordinate = 2 + group;
+            return new Object[] { coordinate, coordinate, coordinate };
+        }
+        final int far = 50 + group * 10 + offset;
+        return new Object[] { far, far, far };
+    }
+
+    private float expectedBestScore(final int group) {
+        final int coordinate = 2 + group;
+        return 1.0f / (1.0f + DIMENSION * (coordinate - 1) * (coordinate - 1));
+    }
+
+    private String parentId(final int group) {
+        return "p" + group;
+    }
+
+    private List<String> referenceParents() {
+        final List<String> parents = new ArrayList<>();
+        for (int group = 0; group < GROUPS.size(); group++) {
+            parents.add(parentId(group));
+        }
+        return parents;
+    }
+
+    /** Every returned parent carries its own best child's score, and they come back in reference order. */
+    private void assertRescoredParents(final String what, final String responseBody) throws Exception {
+        final List<String> ids = parseIds(responseBody);
+        final List<Double> scores = parseScores(responseBody);
+        assertFalse(what + ": no hits at all", ids.isEmpty());
+        int previous = -1;
+        for (int i = 0; i < ids.size(); i++) {
+            final int group = Integer.parseInt(ids.get(i).substring(1));
+            assertTrue(what + ": " + ids.get(i) + " came back out of reference order", group > previous);
+            previous = group;
+            final float expected = expectedBestScore(group);
+            assertEquals(what + ": score of " + ids.get(i), expected, scores.get(i), 1.0e-5 * Math.max(1.0, expected));
+        }
+    }
+
+    /** The child that won each returned parent's group is among that parent's expanded children. */
+    private void assertWinningChildIsExpanded(final String responseBody) throws Exception {
+        final Multimap<String, Integer> docIdToOffsets = parseInnerHits(responseBody, NESTED_FIELD);
+        for (final String parent : parseIds(responseBody)) {
+            final int group = Integer.parseInt(parent.substring(1));
+            assertFalse("no inner hits for " + parent, docIdToOffsets.get(parent).isEmpty());
+            assertTrue(
+                "the winning child of " + parent + " is not among its expanded children",
+                docIdToOffsets.get(parent).contains(GROUPS.get(group).bestOffset())
+            );
+        }
+    }
+
+    /**
      * Creates the index from the issue: a nested knn_vector with 4x compression on disk, which resolves to the
      * Lucene engine and enables rescoring by default.
      */
     private void createNestedKnnIndex() throws Exception {
+        // Force the graph to be built so the query goes through approximate search plus rescoring
+        createNestedKnnIndex(0);
+    }
+
+    private void createNestedKnnIndex(final int approximateThreshold) throws Exception {
         String mapping = String.format(
             Locale.ROOT,
             "{\"properties\":{\"%s\":{\"type\":\"nested\",\"properties\":{\"%s\":"
@@ -328,8 +473,7 @@ public class ExpandNestedDocsWithRescoreIT extends KNNRestTestCase {
             .put("number_of_shards", 1)
             .put("number_of_replicas", 0)
             .put("index.knn", true)
-            // Force the graph to be built so the query goes through approximate search plus rescoring
-            .put(KNNSettings.INDEX_KNN_ADVANCED_APPROXIMATE_THRESHOLD, 0)
+            .put(KNNSettings.INDEX_KNN_ADVANCED_APPROXIMATE_THRESHOLD, approximateThreshold)
             .build();
         createKnnIndex(INDEX_NAME, settings, mapping);
     }
@@ -387,13 +531,32 @@ public class ExpandNestedDocsWithRescoreIT extends KNNRestTestCase {
      */
     private String search(final int k, final Object[] queryVector, final String rescore, final boolean profile, final String filter)
         throws Exception {
+        return search(k, queryVector, rescore, profile, filter, null);
+    }
+
+    /**
+     * @param rescore   raw json for the {@code rescore} clause, or null to leave it out and take the field default
+     * @param profile   whether to ask for the Profile API breakdown
+     * @param filter    raw json for the k-NN query's {@code filter} clause, or null for an unfiltered search
+     * @param scoreMode the nested query's score mode, or null for its default, which averages the children
+     */
+    private String search(
+        final int k,
+        final Object[] queryVector,
+        final String rescore,
+        final boolean profile,
+        final String filter,
+        final String scoreMode
+    ) throws Exception {
         String rescoreClause = rescore == null ? "" : String.format(Locale.ROOT, ",\"rescore\":%s", rescore);
         String filterClause = filter == null ? "" : String.format(Locale.ROOT, ",\"filter\":%s", filter);
+        String scoreModeClause = scoreMode == null ? "" : String.format(Locale.ROOT, "\"score_mode\":\"%s\",", scoreMode);
         String body = String.format(
             Locale.ROOT,
             "{\"_source\":false,\"profile\":"
                 + profile
                 + ",\"size\":%d,\"query\":{\"nested\":{\"path\":\"%s\","
+                + scoreModeClause
                 + "\"query\":{\"knn\":{\"%s\":{\"vector\":%s,\"k\":%d,\"expand_nested_docs\":true%s%s}}},"
                 + "\"inner_hits\":{\"size\":100,\"_source\":false}}}}",
             k,

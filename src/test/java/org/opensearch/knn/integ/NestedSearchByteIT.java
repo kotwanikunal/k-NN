@@ -17,10 +17,14 @@ import org.opensearch.knn.KNNJsonQueryBuilder;
 import org.opensearch.knn.KNNRestTestCase;
 import org.opensearch.knn.NestedKnnDocBuilder;
 import org.opensearch.knn.index.KNNSettings;
+import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.index.engine.KNNEngine;
 
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 
 import static org.opensearch.knn.common.KNNConstants.METHOD_HNSW;
 
@@ -160,6 +164,117 @@ public class NestedSearchByteIT extends KNNRestTestCase {
         deleteKNNIndex(indexName);
     }
 
+    /**
+     * A nested byte field answered by exact search, because the segment is written without a graph: every parent
+     * comes back with its own best child's score, checked against the vectors this test indexed with the space
+     * type's own similarity function.
+     */
+    @SneakyThrows
+    public void testNestedSearchByte_whenExactSearch_thenScoresMatchReference() {
+        for (SpaceType space : List.of(SpaceType.L2, SpaceType.INNER_PRODUCT)) {
+            final String indexName = "nested-exact-byte-" + space.getValue();
+            final String nestedFieldName = "nested";
+            createKnnByteIndexWithNestedField(
+                indexName,
+                nestedFieldName,
+                FIELD_NAME,
+                DIMENSION_EXACT,
+                KNNEngine.FAISS,
+                space,
+                Settings.builder()
+                    .put(getKNNDefaultIndexSettings())
+                    .put(KNNSettings.INDEX_KNN_ADVANCED_APPROXIMATE_THRESHOLD, NO_GRAPH_THRESHOLD)
+                    .build()
+            );
+
+            for (int group = 0; group < GROUPS.length; group++) {
+                final NestedKnnDocBuilder builder = NestedKnnDocBuilder.create(nestedFieldName);
+                for (int offset = 0; offset < GROUPS[group][0]; offset++) {
+                    if (offset == GROUPS[group][2]) {
+                        builder.addMetadata(Map.of(TAG_FIELD, "t" + offset));
+                        continue;
+                    }
+                    builder.addVectors(FIELD_NAME, box(childVector(group, offset)));
+                }
+                addKnnDoc(indexName, "p" + group, builder.build());
+            }
+            refreshIndex(indexName);
+
+            final int size = GROUPS.length + 5;
+            final String query = KNNJsonQueryBuilder.builder()
+                .nestedFieldName(nestedFieldName)
+                .fieldName(FIELD_NAME)
+                .vector(box(queryVector()))
+                .k(size)
+                .build()
+                .getQueryString();
+            final Response response = searchKNNIndex(indexName, query, size);
+            final String entity = EntityUtils.toString(response.getEntity());
+
+            final List<String> expectedIds = new ArrayList<>();
+            for (int group = 0; group < GROUPS.length; group++) {
+                if (GROUPS[group][0] > 0) {
+                    expectedIds.add("p" + group);
+                }
+            }
+            assertEquals("byte " + space.getValue() + ": the parents and their order", expectedIds, parseIds(entity));
+            final List<Double> scores = parseScores(entity);
+            for (int i = 0; i < expectedIds.size(); i++) {
+                final int group = Integer.parseInt(expectedIds.get(i).substring(1));
+                final float expected = space.getKnnVectorSimilarityFunction().compare(queryVector(), childVector(group, GROUPS[group][1]));
+                assertEquals(
+                    "byte " + space.getValue() + ": score of p" + group,
+                    expected,
+                    scores.get(i),
+                    1.0e-5 * Math.max(1.0, expected)
+                );
+            }
+
+            deleteKNNIndex(indexName);
+        }
+    }
+
+    // ---- the parent groups the exact search method indexes: child count, the offset that must win, and
+    // the offset that carries no vector ----
+    private static final int[][] GROUPS = { { 1, 0, -1 }, { 3, 0, -1 }, { 4, 3, -1 }, { 5, 2, 0 }, { 0, -1, -1 }, { 6, 1, 5 } };
+    private static final int DIMENSION_EXACT = 8;
+    private static final byte QUERY_VALUE = 100;
+    private static final int NO_GRAPH_THRESHOLD = 100000;
+    /** What a child with no vector carries instead, which is how a sparse nested field looks. */
+    private static final String TAG_FIELD = "tag";
+
+    private byte[] queryVector() {
+        final byte[] query = new byte[DIMENSION_EXACT];
+        Arrays.fill(query, QUERY_VALUE);
+        return query;
+    }
+
+    /**
+     * The group's named best child is the query with one coordinate pulled in by a step that grows with the group,
+     * so the winners' scores fall with the group index and every one of them beats any other child, whose
+     * coordinates alternate in sign.
+     */
+    private byte[] childVector(final int group, final int offset) {
+        final byte[] vector = queryVector();
+        if (offset == GROUPS[group][1]) {
+            vector[0] = (byte) (QUERY_VALUE - 2 * (group + 1));
+            return vector;
+        }
+        for (int i = 0; i < DIMENSION_EXACT; i++) {
+            final int magnitude = 60 + ((group * 7 + offset * 3 + i) % 30);
+            vector[i] = (byte) ((i % 2 == (offset % 2)) ? magnitude : -magnitude);
+        }
+        return vector;
+    }
+
+    private static Object[] box(final byte[] vector) {
+        final Integer[] boxed = new Integer[vector.length];
+        for (int i = 0; i < vector.length; i++) {
+            boxed[i] = (int) vector[i];
+        }
+        return boxed;
+    }
+
     private void createKnnByteIndexWithNestedField(
         final String indexName,
         final String nestedFieldName,
@@ -167,9 +282,22 @@ public class NestedSearchByteIT extends KNNRestTestCase {
         final int dimension,
         final KNNEngine knnEngine
     ) throws Exception {
+        createKnnByteIndexWithNestedField(indexName, nestedFieldName, fieldName, dimension, knnEngine, null, null);
+    }
+
+    private void createKnnByteIndexWithNestedField(
+        final String indexName,
+        final String nestedFieldName,
+        final String fieldName,
+        final int dimension,
+        final KNNEngine knnEngine,
+        final SpaceType spaceType,
+        final Settings settings
+    ) throws Exception {
         KNNJsonIndexMappingsBuilder.Method method = KNNJsonIndexMappingsBuilder.Method.builder()
             .methodName(METHOD_HNSW)
             .engine(knnEngine.getName())
+            .spaceType(spaceType == null ? null : spaceType.getValue())
             .build();
 
         String knnIndexMapping = KNNJsonIndexMappingsBuilder.builder()
@@ -181,6 +309,10 @@ public class NestedSearchByteIT extends KNNRestTestCase {
             .build()
             .getIndexMapping();
 
-        createKnnIndex(indexName, knnIndexMapping);
+        if (settings == null) {
+            createKnnIndex(indexName, knnIndexMapping);
+        } else {
+            createKnnIndex(indexName, settings, knnIndexMapping);
+        }
     }
 }

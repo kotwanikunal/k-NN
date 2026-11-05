@@ -30,6 +30,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collection;
 import java.util.List;
@@ -59,6 +60,8 @@ public class DocValueFieldsIT extends KNNCompressionRestTestCase {
     private static final float[] VECTOR_1 = { 1.0f, 2.0f, 3.0f, 4.0f };
     private static final float[] VECTOR_2 = { 5.0f, 6.0f, 7.0f, 8.0f };
     private static final float[] VECTOR_3 = { 9.0f, 10.0f, 11.0f, 12.0f };
+    /** An approximate threshold no test fixture here reaches, so the segment carries no graph. */
+    private static final int NO_GRAPH_THRESHOLD = 100000;
 
     /**
      * Verifies that docvalue_fields returns correct vectors for both Faiss and Lucene HNSW indexes
@@ -1807,6 +1810,121 @@ public class DocValueFieldsIT extends KNNCompressionRestTestCase {
         deleteKNNIndex(indexName);
     }
 
+    /**
+     * Verifies that a nested exact search returns the nested vector of every hit, through docvalue_fields and
+     * through a fields request inside inner_hits alike, and that each hit's score is its group's best child.
+     * The approximate threshold above the document count leaves the segment without a graph, which is what
+     * sends the query down the exact path.
+     */
+    @SneakyThrows
+    public void testDocValueFields_whenNestedExactSearch_thenNestedVectorIsRetrieved() {
+        String indexName = TEST_INDEX + "_nested_exact";
+        String nestedField = "paragraphs";
+        String vectorField = "embedding";
+        String nestedVectorPath = nestedField + "." + vectorField;
+
+        createNestedVectorIndex(
+            indexName,
+            nestedField,
+            vectorField,
+            DIMENSION,
+            Settings.builder().put(KNNSettings.INDEX_KNN_ADVANCED_APPROXIMATE_THRESHOLD, NO_GRAPH_THRESHOLD).build()
+        );
+        for (int group = 0; group < NESTED_GROUPS.length; group++) {
+            NestedKnnDocBuilder builder = NestedKnnDocBuilder.create(nestedField);
+            for (int offset = 0; offset < NESTED_GROUPS[group][0]; offset++) {
+                if (offset == NESTED_GROUPS[group][2]) {
+                    builder.addMetadata(Map.of(NESTED_TAG_FIELD, "t" + offset));
+                    continue;
+                }
+                builder.addVectors(vectorField, boxVector(nestedChildVector(group, offset)));
+            }
+            addKnnDoc(indexName, "p" + group, builder.build());
+        }
+        refreshIndex(indexName);
+
+        int k = NESTED_GROUPS.length + 5;
+        // One search per retrieval mechanism: both write into the inner hit's "fields" object, so asking for
+        // the same field through both at once would not say which one answered.
+        for (String retrieval : List.of("docvalue_fields", "fields")) {
+            String query = buildNestedExactSearchQuery(nestedField, nestedVectorPath, k, retrieval);
+            Response response = searchKNNIndex(indexName, query, k);
+            List<Map<String, Object>> hits = parseSearchHits(EntityUtils.toString(response.getEntity()));
+
+            List<Integer> scoringGroups = new ArrayList<>();
+            for (int group = 0; group < NESTED_GROUPS.length; group++) {
+                if (NESTED_GROUPS[group][0] > 0) {
+                    scoringGroups.add(group);
+                }
+            }
+            assertEquals(retrieval + ": one hit per group with a vector", scoringGroups.size(), hits.size());
+            for (int rank = 0; rank < hits.size(); rank++) {
+                Map<String, Object> hit = hits.get(rank);
+                int group = scoringGroups.get(rank);
+                assertEquals(retrieval + ": the parents and their order", "p" + group, hit.get("_id"));
+                float[] winner = nestedChildVector(group, NESTED_GROUPS[group][1]);
+                float expectedScore = SpaceType.L2.getKnnVectorSimilarityFunction().compare(nestedQueryVector(), winner);
+                assertEquals(
+                    retrieval + ": score of p" + group,
+                    expectedScore,
+                    ((Number) hit.get("_score")).doubleValue(),
+                    1.0e-5 * Math.max(1.0, expectedScore)
+                );
+
+                Map<String, Object> innerHits = getInnerHits(hit, nestedField);
+                assertNotNull(retrieval + ": p" + group + " has no inner hits", innerHits);
+                List<Map<String, Object>> innerHitsList = getInnerHitsList(innerHits);
+                assertFalse(retrieval + ": p" + group + " has no inner hit", innerHitsList.isEmpty());
+                List<Double> retrieved = readRetrievedVector(innerHitsList.get(0), nestedVectorPath);
+                assertNotNull(retrieval + ": p" + group + " returned no vector", retrieved);
+                assertEquals(retrieval + ": p" + group + " dimension", winner.length, retrieved.size());
+                for (int i = 0; i < winner.length; i++) {
+                    assertEquals(retrieval + ": p" + group + " value " + i, winner[i], retrieved.get(i), 1.0e-5);
+                }
+            }
+        }
+
+        deleteKNNIndex(indexName);
+    }
+
+    // ---- the parent groups the nested exact search method indexes: child count, the offset that must win,
+    // and the offset that carries no vector ----
+    private static final int[][] NESTED_GROUPS = { { 1, 0, -1 }, { 3, 0, -1 }, { 4, 3, -1 }, { 5, 2, 0 }, { 0, -1, -1 }, { 6, 1, 5 } };
+    private static final String NESTED_TAG_FIELD = "tag";
+    private static final float NESTED_QUERY_VALUE = 3.0f;
+
+    private float[] nestedQueryVector() {
+        float[] query = new float[DIMENSION];
+        Arrays.fill(query, NESTED_QUERY_VALUE);
+        return query;
+    }
+
+    /**
+     * The group's named best child is the query with one coordinate pulled in by a step that grows with the group,
+     * so the winners' scores fall with the group index and every one of them beats any other child, whose
+     * coordinates alternate in sign.
+     */
+    private float[] nestedChildVector(final int group, final int offset) {
+        float[] vector = nestedQueryVector();
+        if (offset == NESTED_GROUPS[group][1]) {
+            vector[0] = NESTED_QUERY_VALUE * (0.7f - 0.05f * group);
+            return vector;
+        }
+        for (int i = 0; i < DIMENSION; i++) {
+            float magnitude = 0.5f + ((group * 31 + offset * 7 + i) % 13) / 12.0f;
+            vector[i] = NESTED_QUERY_VALUE * magnitude * ((i % 2 == (offset % 2)) ? 1.0f : -1.0f);
+        }
+        return vector;
+    }
+
+    private static Object[] boxVector(final float[] vector) {
+        Float[] boxed = new Float[vector.length];
+        for (int i = 0; i < vector.length; i++) {
+            boxed[i] = vector[i];
+        }
+        return boxed;
+    }
+
     // Helper methods
 
     /**
@@ -2341,6 +2459,16 @@ public class DocValueFieldsIT extends KNNCompressionRestTestCase {
     }
 
     private void createNestedVectorIndex(String indexName, String nestedField, String vectorFieldName, int dimension) throws Exception {
+        createNestedVectorIndex(indexName, nestedField, vectorFieldName, dimension, null);
+    }
+
+    private void createNestedVectorIndex(
+        String indexName,
+        String nestedField,
+        String vectorFieldName,
+        int dimension,
+        Settings extraSettings
+    ) throws Exception {
         String mapping = XContentFactory.jsonBuilder()
             .startObject()
             .startObject("properties")
@@ -2362,7 +2490,67 @@ public class DocValueFieldsIT extends KNNCompressionRestTestCase {
             .endObject()
             .toString();
 
-        createKnnIndex(indexName, mapping);
+        if (extraSettings == null) {
+            createKnnIndex(indexName, mapping);
+            return;
+        }
+        createKnnIndex(indexName, Settings.builder().put(getKNNDefaultIndexSettings()).put(extraSettings).build(), mapping);
+    }
+
+    /**
+     * A nested k-NN query over the fixture's vector, with inner hits that ask for the nested vector through
+     * the named retrieval mechanism.
+     */
+    private String buildNestedExactSearchQuery(String nestedField, String nestedVectorPath, int k, String retrieval) throws IOException {
+        XContentBuilder builder = XContentFactory.jsonBuilder()
+            .startObject()
+            .field("size", k)
+            .startObject("query")
+            .startObject("nested")
+            .field("path", nestedField)
+            .startObject("query")
+            .startObject("knn")
+            .startObject(nestedVectorPath)
+            .field("vector", boxVector(nestedQueryVector()))
+            .field("k", k)
+            .endObject()
+            .endObject()
+            .endObject()
+            .startObject("inner_hits")
+            .field("size", 1);
+        if ("fields".equals(retrieval)) {
+            builder.startArray("fields").value(nestedVectorPath).endArray();
+        } else {
+            builder.startArray("docvalue_fields")
+                .startObject()
+                .field("field", nestedVectorPath)
+                .field("format", "array")
+                .endObject()
+                .endArray();
+        }
+        return builder.field("_source", false).endObject().endObject().endObject().endObject().toString();
+    }
+
+    /**
+     * The vector an inner hit carries in its "fields" object. A docvalue_fields request wraps the vector in a
+     * one element list, a fields request may hand it back flat, so this reads either shape.
+     */
+    @SuppressWarnings("unchecked")
+    private List<Double> readRetrievedVector(Map<String, Object> innerHit, String fieldName) {
+        Map<String, Object> fields = (Map<String, Object>) innerHit.get("fields");
+        if (fields == null) {
+            return null;
+        }
+        List<Object> raw = (List<Object>) fields.get(fieldName);
+        if (raw == null || raw.isEmpty()) {
+            return null;
+        }
+        List<Object> values = raw.get(0) instanceof List ? (List<Object>) raw.get(0) : raw;
+        List<Double> vector = new ArrayList<>(values.size());
+        for (Object value : values) {
+            vector.add(((Number) value).doubleValue());
+        }
+        return vector;
     }
 
     @SuppressWarnings("unchecked")

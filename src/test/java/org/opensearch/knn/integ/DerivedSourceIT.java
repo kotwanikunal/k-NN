@@ -19,13 +19,17 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.knn.CompressionTestConfig;
 import org.opensearch.knn.DerivedSourceTestCase;
 import org.opensearch.knn.DerivedSourceUtils;
+import org.opensearch.knn.NestedKnnDocBuilder;
 import org.opensearch.knn.Pair;
 import org.opensearch.knn.common.KNNConstants;
+import org.opensearch.knn.index.KNNSettings;
+import org.opensearch.knn.index.SpaceType;
 import org.opensearch.knn.index.VectorDataType;
 import org.opensearch.knn.common.annotation.ExpectRemoteBuildValidation;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Locale;
@@ -55,6 +59,12 @@ public class DerivedSourceIT extends DerivedSourceTestCase {
 
     private final String snapshot = "snapshot-test";
     private final String repository = "repo";
+
+    private static final String NESTED_EXACT_FIELD = "test_nested";
+    private static final String NESTED_EXACT_VECTOR_FIELD = "test_vector";
+    private static final int NESTED_EXACT_DIMENSION = 8;
+    /** An approximate threshold the nested exact search fixture never reaches, so its segment carries no graph. */
+    private static final int NESTED_EXACT_NO_GRAPH_THRESHOLD = 100000;
 
     @Before
     @SneakyThrows
@@ -716,6 +726,274 @@ public class DerivedSourceIT extends DerivedSourceTestCase {
         assertNestedVectors(getKnnDoc(indexName, "1"), 1.0f, 2.0f);
 
         deleteKNNIndex(indexName);
+    }
+
+    /**
+     * A nested exact search over a sparse nested vector field returns the same source with derived source on as
+     * with it off, every indexed child vector comes back in the hit's source and in its inner hits, and source
+     * includes and excludes reach the nested vector like any other nested field. The field is left uncompressed so
+     * the exact path scores the vectors as they were indexed, and the approximate threshold above the document
+     * count leaves the segment without a graph, which is what sends the query down the exact path.
+     */
+    @SneakyThrows
+    public void testDerivedSource_whenNestedExactSearch_thenSourceVectorsMatchIndexed() {
+        final List<DerivedSourceUtils.IndexConfigContext> contexts = nestedExactSearchContexts();
+        for (final DerivedSourceUtils.IndexConfigContext context : contexts) {
+            createKnnIndex(context.getIndexName(), context.getSettings(), context.getMapping());
+            validateDerivedSetting(context.getIndexName(), context.derivedEnabled);
+            for (int group = 0; group < NESTED_EXACT_GROUPS.length; group++) {
+                addKnnDoc(context.getIndexName(), String.valueOf(group + 1), nestedExactGroupDocument(group));
+            }
+            refreshIndex(context.getIndexName());
+        }
+
+        // Every document's source is the same on both indices, which is the framework's own derived source check.
+        assertDocsMatch(NESTED_EXACT_GROUPS.length, contexts.get(1).getIndexName(), contexts.get(0).getIndexName());
+
+        final String vectorPath = NESTED_EXACT_FIELD + "." + NESTED_EXACT_VECTOR_FIELD;
+        for (final DerivedSourceUtils.IndexConfigContext context : contexts) {
+            final String arm = "derived source " + context.derivedEnabled;
+            final String indexName = context.getIndexName();
+            final int k = NESTED_EXACT_GROUPS.length + 5;
+            final List<Map<String, Object>> hits = nestedExactSearchHits(indexName, k, null, null);
+
+            assertEquals(arm + ": one hit per group", NESTED_EXACT_GROUPS.length, hits.size());
+            for (int rank = 0; rank < hits.size(); rank++) {
+                final Map<String, Object> hit = hits.get(rank);
+                final String parent = String.valueOf(rank + 1);
+                assertEquals(arm + ": the parents and their order", parent, hit.get("_id"));
+                final float[] winner = nestedExactChildVector(rank, NESTED_EXACT_GROUPS[rank][1]);
+                final float expectedScore = SpaceType.L2.getKnnVectorSimilarityFunction().compare(nestedExactQueryVector(), winner);
+                assertEquals(
+                    arm + ": score of " + parent,
+                    expectedScore,
+                    ((Number) hit.get("_score")).doubleValue(),
+                    1.0e-5 * Math.max(1.0, expectedScore)
+                );
+
+                // The hit's own source carries one entry per child, in the order they were indexed, and the vector
+                // only on the children that had one.
+                final List<Map<String, Object>> nested = nestedObjects(hit, "_source");
+                assertEquals(arm + ": child count of " + parent, NESTED_EXACT_GROUPS[rank][0], nested.size());
+                for (int offset = 0; offset < NESTED_EXACT_GROUPS[rank][0]; offset++) {
+                    final Map<String, Object> entry = nested.get(offset);
+                    if (offset == NESTED_EXACT_GROUPS[rank][2]) {
+                        assertFalse(
+                            arm + ": " + parent + " child " + offset + " has a vector it never indexed",
+                            entry.containsKey(NESTED_EXACT_VECTOR_FIELD)
+                        );
+                        continue;
+                    }
+                    assertVectorEquals(
+                        arm + ": " + parent + " child " + offset,
+                        nestedExactChildVector(rank, offset),
+                        entry.get(NESTED_EXACT_VECTOR_FIELD)
+                    );
+                }
+
+                // The inner hit the query returns is the child that won the group, with its own vector.
+                final List<Map<String, Object>> innerHits = innerHitsOf(hit);
+                assertFalse(arm + ": " + parent + " has no inner hit", innerHits.isEmpty());
+                assertVectorEquals(arm + ": inner hit of " + parent, winner, sourceOf(innerHits.get(0)).get(NESTED_EXACT_VECTOR_FIELD));
+            }
+
+            // Source includes and excludes reach the nested vector like any other nested field.
+            final List<Map<String, Object>> included = nestedExactSearchHits(indexName, k, new String[] { vectorPath }, null);
+            for (final Map<String, Object> entry : nestedObjects(included.get(0), "_source")) {
+                assertFalse(arm + ": an include of the vector kept the tag", entry.containsKey(NESTED_EXACT_TAG_FIELD));
+            }
+            assertTrue(
+                arm + ": an include of the vector dropped it",
+                nestedObjects(included.get(0), "_source").stream().anyMatch(entry -> entry.containsKey(NESTED_EXACT_VECTOR_FIELD))
+            );
+
+            final List<Map<String, Object>> excluded = nestedExactSearchHits(indexName, k, null, new String[] { vectorPath });
+            for (final Map<String, Object> entry : nestedObjects(excluded.get(0), "_source")) {
+                assertFalse(arm + ": an exclude of the vector kept it", entry.containsKey(NESTED_EXACT_VECTOR_FIELD));
+            }
+            assertTrue(
+                arm + ": an exclude of the vector dropped the tag too",
+                nestedObjects(excluded.get(0), "_source").stream().anyMatch(entry -> entry.containsKey(NESTED_EXACT_TAG_FIELD))
+            );
+
+            deleteKNNIndex(indexName);
+        }
+    }
+
+    /**
+     * The mapping and the settings for the two indices the method above compares, built from the framework's own
+     * nested context so the nested vector field is described the way every other derived source test describes it.
+     */
+    private List<DerivedSourceUtils.IndexConfigContext> nestedExactSearchContexts() {
+        final List<DerivedSourceUtils.IndexConfigContext> contexts = new ArrayList<>();
+        for (final boolean derivedEnabled : List.of(true, false)) {
+            final DerivedSourceUtils.IndexConfigContext context = DerivedSourceUtils.IndexConfigContext.builder()
+                .indexName(getIndexName("derived-source", "nested-exact-" + (derivedEnabled ? "on" : "off"), false))
+                .derivedEnabled(derivedEnabled)
+                .docCount(NESTED_EXACT_GROUPS.length)
+                .random(new Random(31L))
+                .settings(
+                    Settings.builder()
+                        .put("number_of_shards", 1)
+                        .put("number_of_replicas", 0)
+                        .put("index.knn", true)
+                        .put(KNNSettings.KNN_DERIVED_SOURCE_ENABLED, derivedEnabled)
+                        .put(KNNSettings.INDEX_KNN_ADVANCED_APPROXIMATE_THRESHOLD, NESTED_EXACT_NO_GRAPH_THRESHOLD)
+                        .build()
+                )
+                .fields(
+                    List.of(
+                        DerivedSourceUtils.NestedFieldContext.builder()
+                            .fieldPath(NESTED_EXACT_FIELD)
+                            .children(
+                                List.of(
+                                    DerivedSourceUtils.KNNVectorFieldTypeContext.builder()
+                                        .dimension(NESTED_EXACT_DIMENSION)
+                                        .fieldPath(NESTED_EXACT_FIELD + "." + NESTED_EXACT_VECTOR_FIELD)
+                                        .build(),
+                                    DerivedSourceUtils.TextFieldType.builder()
+                                        .fieldPath(NESTED_EXACT_FIELD + "." + NESTED_EXACT_TAG_FIELD)
+                                        .build()
+                                )
+                            )
+                            .build()
+                    )
+                )
+                .build();
+            context.init();
+            contexts.add(context);
+        }
+        return contexts;
+    }
+
+    // ---- the parent groups the method above indexes: child count, the offset that must win, the one without a vector ----
+    private static final int[][] NESTED_EXACT_GROUPS = { { 1, 0, -1 }, { 3, 0, -1 }, { 4, 3, -1 }, { 5, 2, 0 }, { 6, 1, 5 } };
+    private static final String NESTED_EXACT_TAG_FIELD = "tag";
+    private static final float NESTED_EXACT_QUERY_VALUE = 3.0f;
+
+    private String nestedExactGroupDocument(final int group) throws IOException {
+        final NestedKnnDocBuilder builder = NestedKnnDocBuilder.create(NESTED_EXACT_FIELD);
+        for (int offset = 0; offset < NESTED_EXACT_GROUPS[group][0]; offset++) {
+            if (offset == NESTED_EXACT_GROUPS[group][2]) {
+                builder.addMetadata(Map.of(NESTED_EXACT_TAG_FIELD, "t" + offset));
+                continue;
+            }
+            builder.addVectorWithMetadata(
+                NESTED_EXACT_VECTOR_FIELD,
+                boxVector(nestedExactChildVector(group, offset)),
+                NESTED_EXACT_TAG_FIELD,
+                "t" + offset
+            );
+        }
+        return builder.build();
+    }
+
+    private float[] nestedExactQueryVector() {
+        final float[] query = new float[NESTED_EXACT_DIMENSION];
+        Arrays.fill(query, NESTED_EXACT_QUERY_VALUE);
+        return query;
+    }
+
+    /**
+     * The group's named best child is the query with one coordinate pulled in by a step that grows with the group,
+     * so the winners' scores fall with the group index and every one of them beats any other child, whose
+     * coordinates alternate in sign.
+     */
+    private float[] nestedExactChildVector(final int group, final int offset) {
+        final float[] vector = nestedExactQueryVector();
+        if (offset == NESTED_EXACT_GROUPS[group][1]) {
+            vector[0] = NESTED_EXACT_QUERY_VALUE * (0.7f - 0.05f * group);
+            return vector;
+        }
+        for (int i = 0; i < NESTED_EXACT_DIMENSION; i++) {
+            final float magnitude = 0.5f + ((group * 31 + offset * 7 + i) % 13) / 12.0f;
+            vector[i] = NESTED_EXACT_QUERY_VALUE * magnitude * ((i % 2 == (offset % 2)) ? 1.0f : -1.0f);
+        }
+        return vector;
+    }
+
+    private static Object[] boxVector(final float[] vector) {
+        final Float[] boxed = new Float[vector.length];
+        for (int i = 0; i < vector.length; i++) {
+            boxed[i] = vector[i];
+        }
+        return boxed;
+    }
+
+    /** A nested k-NN search over the group vectors, with the winning child as the one inner hit. */
+    @SneakyThrows
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> nestedExactSearchHits(String indexName, int k, String[] includes, String[] excludes) {
+        XContentBuilder builder = XContentFactory.jsonBuilder().startObject().field("size", k);
+        if (includes != null || excludes != null) {
+            builder.startObject("_source");
+            if (includes != null) {
+                builder.array("includes", includes);
+            }
+            if (excludes != null) {
+                builder.array("excludes", excludes);
+            }
+            builder.endObject();
+        }
+        String body = builder.startObject("query")
+            .startObject("nested")
+            .field("path", NESTED_EXACT_FIELD)
+            .startObject("query")
+            .startObject("knn")
+            .startObject(NESTED_EXACT_FIELD + "." + NESTED_EXACT_VECTOR_FIELD)
+            .field("vector", boxVector(nestedExactQueryVector()))
+            .field("k", k)
+            .endObject()
+            .endObject()
+            .endObject()
+            .startObject("inner_hits")
+            .field("size", 1)
+            .endObject()
+            .endObject()
+            .endObject()
+            .endObject()
+            .toString();
+
+        Request request = new Request("POST", "/" + indexName + "/_search");
+        request.setJsonEntity(body);
+        Response response = client().performRequest(request);
+        assertEquals(RestStatus.OK, RestStatus.fromCode(response.getStatusLine().getStatusCode()));
+        Map<String, Object> responseMap = entityAsMap(response);
+        Map<String, Object> hits = (Map<String, Object>) responseMap.get("hits");
+        return (List<Map<String, Object>>) hits.get("hits");
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> sourceOf(Map<String, Object> hit) {
+        return (Map<String, Object>) hit.get("_source");
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> nestedObjects(Map<String, Object> hit, String sourceKey) {
+        Map<String, Object> source = (Map<String, Object>) hit.get(sourceKey);
+        assertNotNull("the hit carries no source", source);
+        List<Map<String, Object>> nested = (List<Map<String, Object>>) source.get(NESTED_EXACT_FIELD);
+        assertNotNull("the source carries no nested objects", nested);
+        return nested;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> innerHitsOf(Map<String, Object> hit) {
+        Map<String, Object> innerHits = (Map<String, Object>) hit.get("inner_hits");
+        assertNotNull("the hit carries no inner hits", innerHits);
+        Map<String, Object> forField = (Map<String, Object>) innerHits.get(NESTED_EXACT_FIELD);
+        assertNotNull("the hit carries no inner hits for " + NESTED_EXACT_FIELD, forField);
+        Map<String, Object> wrapper = (Map<String, Object>) forField.get("hits");
+        return (List<Map<String, Object>>) wrapper.get("hits");
+    }
+
+    private void assertVectorEquals(String what, float[] expected, Object actual) {
+        assertNotNull(what + ": no vector", actual);
+        List<?> values = (List<?>) actual;
+        assertEquals(what + ": dimension", expected.length, values.size());
+        for (int i = 0; i < expected.length; i++) {
+            assertEquals(what + ": value " + i, expected[i], ((Number) values.get(i)).floatValue(), 1.0e-5f);
+        }
     }
 
     @SuppressWarnings("unchecked")

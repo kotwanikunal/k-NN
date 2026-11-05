@@ -24,6 +24,10 @@ public class KNNJsonIndexMappingsBuilder {
     @NonNull
     private Integer dimension;
     private String nestedFieldName;
+    /** A second knn_vector field of the same shape, beside {@code fieldName}. */
+    private String secondFieldName;
+    /** A knn_vector field outside the nested object, for an index that has both. */
+    private String topLevelFieldName;
     private String vectorDataType;
     private String compressionLevel;
     private String mode;
@@ -43,7 +47,15 @@ public class KNNJsonIndexMappingsBuilder {
             addVectorDataType(xContentBuilder);
             addCompression(xContentBuilder);
             addMethod(xContentBuilder);
-            xContentBuilder.endObject().endObject().endObject().endObject().endObject();
+            xContentBuilder.endObject();
+            if (secondFieldName != null) {
+                addVectorField(xContentBuilder, secondFieldName);
+            }
+            xContentBuilder.endObject().endObject();
+            if (topLevelFieldName != null) {
+                addVectorField(xContentBuilder, topLevelFieldName);
+            }
+            xContentBuilder.endObject().endObject();
             return xContentBuilder;
         } else {
             XContentBuilder xContentBuilder = XContentFactory.jsonBuilder()
@@ -62,6 +74,14 @@ public class KNNJsonIndexMappingsBuilder {
 
     public String getIndexMapping() throws IOException {
         return getIndexMappingBuilder().toString();
+    }
+
+    private void addVectorField(final XContentBuilder xContentBuilder, final String name) throws IOException {
+        xContentBuilder.startObject(name).field("type", "knn_vector").field("dimension", dimension);
+        addVectorDataType(xContentBuilder);
+        addCompression(xContentBuilder);
+        addMethod(xContentBuilder);
+        xContentBuilder.endObject();
     }
 
     private void addVectorDataType(final XContentBuilder xContentBuilder) throws IOException {
@@ -157,10 +177,22 @@ public class KNNJsonIndexMappingsBuilder {
             public static class Encoder {
                 @NonNull
                 private String name;
+                private Integer bits;
+                private Boolean enableAdc;
 
                 private void addTo(final XContentBuilder xContentBuilder) throws IOException {
                     xContentBuilder.startObject("encoder");
                     xContentBuilder.field("name", name);
+                    if (bits != null || enableAdc != null) {
+                        xContentBuilder.startObject("parameters");
+                        if (bits != null) {
+                            xContentBuilder.field("bits", bits);
+                        }
+                        if (enableAdc != null) {
+                            xContentBuilder.field("enable_adc", enableAdc);
+                        }
+                        xContentBuilder.endObject();
+                    }
                     xContentBuilder.endObject();
                 }
             }
