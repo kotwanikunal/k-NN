@@ -11,7 +11,11 @@ import lombok.SneakyThrows;
 import org.opensearch.action.admin.cluster.state.ClusterStateRequest;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest;
+import org.mockito.Mockito;
 import org.opensearch.cluster.ClusterName;
+import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.network.NetworkModule;
 import org.opensearch.common.settings.Settings;
@@ -36,6 +40,8 @@ import java.util.Collections;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 
 import static org.opensearch.test.NodeRoles.dataNode;
@@ -313,5 +319,90 @@ public class KNNSettingsTests extends KNNTestCase {
         int availableProcessors = Runtime.getRuntime().availableProcessors();
         int expected = (availableProcessors >= 32) ? 4 : 1;
         assertEquals(expected, threadQtyWithEmpty);
+    }
+
+    public void testDirectIORescoreEnabledDefaultsToFalse() {
+        assertFalse(KNNSettings.INDEX_KNN_DIRECT_IO_RESCORE_ENABLED_DEFAULT_VALUE);
+        assertFalse(KNNSettings.INDEX_KNN_DIRECT_IO_RESCORE_ENABLED_SETTING.getDefault(Settings.EMPTY));
+        assertTrue(
+            "the key must be registered, or an index could not carry it",
+            new KNNPlugin().getSettings().contains(KNNSettings.INDEX_KNN_DIRECT_IO_RESCORE_ENABLED_SETTING)
+        );
+    }
+
+    public void testDirectIORescoreEnabledRejectsANonBoolean() {
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> KNNSettings.INDEX_KNN_DIRECT_IO_RESCORE_ENABLED_SETTING.get(
+                Settings.builder().put(KNNSettings.INDEX_KNN_DIRECT_IO_RESCORE_ENABLED, "not-a-boolean").build()
+            )
+        );
+    }
+
+    public void testDirectIORescoreEnabledIsReadThroughTheAccessor() {
+        final BooleanSupplier directIO = KNNSettings.directIORescoreSwitch("V4qM8m9ZTAyRm0Nn0lOAbw");
+        publishDirectIOIndex("target-index", "V4qM8m9ZTAyRm0Nn0lOAbw", false);
+        assertFalse(directIO.getAsBoolean());
+        publishDirectIOIndex("target-index", "V4qM8m9ZTAyRm0Nn0lOAbw", true);
+        assertTrue("every ask reads the setting, so a change reaches a switch made before it", directIO.getAsBoolean());
+    }
+
+    public void testAnIndexTheClusterStateDoesNotHaveReadsAsOff() {
+        publishDirectIOIndex("target-index", "V4qM8m9ZTAyRm0Nn0lOAbw", true);
+        assertFalse(
+            "an index the cluster state does not have must read as off, not throw",
+            KNNSettings.directIORescoreSwitch("ZZZZZZZZZZZZZZZZZZZZZZ").getAsBoolean()
+        );
+    }
+
+    public void testTheDirectIORescoreSwitchKeepsTheIndexOnceFound() {
+        final BooleanSupplier directIO = KNNSettings.directIORescoreSwitch("V4qM8m9ZTAyRm0Nn0lOAbw");
+        publishDirectIOIndex("other-index", "XXXXXXXXXXXXXXXXXXXXXX", true);
+        assertFalse("off while this node's cluster state has no such index", directIO.getAsBoolean());
+        final AtomicInteger stateReads = publishDirectIOIndex("target-index", "V4qM8m9ZTAyRm0Nn0lOAbw", true);
+        assertTrue("a miss is not kept, so a later ask finds the index", directIO.getAsBoolean());
+        final int afterFinding = stateReads.get();
+        assertTrue(directIO.getAsBoolean());
+        assertEquals("once found, the index is kept, so an ask reads only the setting", afterFinding + 1, stateReads.get());
+    }
+
+    public void testAReusedIndexNameWithANewUuidDoesNotMatch() {
+        final BooleanSupplier directIO = KNNSettings.directIORescoreSwitch("V4qM8m9ZTAyRm0Nn0lOAbw");
+        publishDirectIOIndex("target-index", "V4qM8m9ZTAyRm0Nn0lOAbw", true);
+        assertTrue(directIO.getAsBoolean());
+        publishDirectIOIndex("target-index", "YYYYYYYYYYYYYYYYYYYYYY", true);
+        assertFalse(
+            "Metadata#index(Index) checks the UUID, so an index re-created under the same name is not the one the switch found",
+            directIO.getAsBoolean()
+        );
+    }
+
+    /**
+     * Publishes one index into the mocked cluster state with {@code index.knn.direct_io.rescore.enabled} set, which
+     * is what the switch reads. {@code DirectIOTestUtils.publishIndex} does the same for the store tests and is
+     * package-private to {@code index.store}, so this class carries its own copy.
+     *
+     * @param indexName the index name
+     * @param uuid      the index UUID
+     * @param enabled   the value of the setting
+     * @return how many times the published state has been read
+     */
+    private AtomicInteger publishDirectIOIndex(final String indexName, final String uuid, final boolean enabled) {
+        final Settings settings = Settings.builder()
+            .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT.id)
+            .put(IndexMetadata.SETTING_INDEX_UUID, uuid)
+            .put(KNNSettings.INDEX_KNN_DIRECT_IO_RESCORE_ENABLED, enabled)
+            .build();
+        final IndexMetadata metadata = IndexMetadata.builder(indexName).settings(settings).numberOfShards(1).numberOfReplicas(0).build();
+        final ClusterState clusterState = ClusterState.builder(new ClusterName("test"))
+            .metadata(Metadata.builder().put(metadata, false).build())
+            .build();
+        final AtomicInteger stateReads = new AtomicInteger();
+        KNNSettings.state().setClusterService(clusterService);
+        Mockito.doAnswer(invocation -> {
+            stateReads.incrementAndGet();
+            return clusterState;
+        }).when(clusterService).state();
+        return stateReads;
     }
 }

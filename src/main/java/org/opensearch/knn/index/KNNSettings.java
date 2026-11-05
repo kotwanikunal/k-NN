@@ -25,6 +25,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.settings.SecureString;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
+import org.opensearch.core.index.Index;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.mapper.MapperService;
@@ -46,6 +47,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -134,6 +137,14 @@ public class KNNSettings {
     public static final boolean DEFAULT_MEMORY_OPTIMIZED_KNN_SEARCH_MODE = false;
 
     /**
+     * Whether the full-precision vector data file of a faiss field is read with {@code O_DIRECT} instead of through
+     * the page cache. Off by default. Dynamic, so turning an index on or off reaches its open segments at the next
+     * query with no close and open.
+     */
+    public static final String INDEX_KNN_DIRECT_IO_RESCORE_ENABLED = "index.knn.direct_io.rescore.enabled";
+    public static final boolean INDEX_KNN_DIRECT_IO_RESCORE_ENABLED_DEFAULT_VALUE = false;
+
+    /**
      * Default setting values
      *
      */
@@ -187,6 +198,25 @@ public class KNNSettings {
     public static final Setting<Boolean> KNN_DISK_VECTOR_SHARD_LEVEL_RESCORING_DISABLED_SETTING = Setting.boolSetting(
         KNN_DISK_VECTOR_SHARD_LEVEL_RESCORING_DISABLED,
         KNN_DISK_VECTOR_SHARD_LEVEL_RESCORING_DISABLED_VALUE,
+        IndexScope,
+        Dynamic
+    );
+
+    /**
+     * {@code index.knn.direct_io.rescore.enabled}: whether the faiss full-precision vector data of this index is
+     * read with {@code O_DIRECT}.
+     *
+     * <ul>
+     *     <li><b>IndexScope:</b> the setting works at the index level.</li>
+     *     <li><b>Dynamic:</b> the value is read at the next route decision, so an index that is already open follows
+     *     a change without a close and open.</li>
+     * </ul>
+     *
+     * @see Setting#boolSetting(String, boolean, Setting.Property...)
+     */
+    public static final Setting<Boolean> INDEX_KNN_DIRECT_IO_RESCORE_ENABLED_SETTING = Setting.boolSetting(
+        INDEX_KNN_DIRECT_IO_RESCORE_ENABLED,
+        INDEX_KNN_DIRECT_IO_RESCORE_ENABLED_DEFAULT_VALUE,
         IndexScope,
         Dynamic
     );
@@ -777,6 +807,7 @@ public class KNNSettings {
             QUANTIZATION_STATE_CACHE_SIZE_LIMIT_SETTING,
             QUANTIZATION_STATE_CACHE_EXPIRY_TIME_MINUTES_SETTING,
             KNN_DISK_VECTOR_SHARD_LEVEL_RESCORING_DISABLED_SETTING,
+            INDEX_KNN_DIRECT_IO_RESCORE_ENABLED_SETTING,
             KNN_DERIVED_SOURCE_ENABLED_SETTING,
             MEMORY_OPTIMIZED_KNN_SEARCH_MODE_SETTING,
             // Index level remote vector build settings
@@ -1095,6 +1126,71 @@ public class KNNSettings {
      */
     public static boolean isMemoryOptimizedKnnSearchModeEnabled(@NonNull final String indexName) {
         return getIndexSettings(indexName).getAsBoolean(MEMORY_OPTIMIZED_KNN_SEARCH_MODE, DEFAULT_MEMORY_OPTIMIZED_KNN_SEARCH_MODE);
+    }
+
+    /**
+     * A switch that says whether {@code index.knn.direct_io.rescore.enabled} is on right now for the index with the
+     * given UUID, for the Direct I/O delegate, which has only the shard's path to go on. The delegate asks it once per
+     * slice and per clone, never per read, and each ask reads the setting from this node's cluster state. The first
+     * ask that finds the index keeps it. An ask that finds no index, or whose lookup fails, answers off and keeps
+     * nothing, so a reader opened before the index metadata arrived follows the setting from a later ask instead of
+     * staying off for the life of the segment.
+     *
+     * @param indexUuid the UUID taken from the shard path
+     * @return the switch
+     */
+    public static BooleanSupplier directIORescoreSwitch(@NonNull final String indexUuid) {
+        final AtomicReference<Index> found = new AtomicReference<>();
+        return () -> {
+            Index index = found.get();
+            if (index == null) {
+                try {
+                    index = findIndexByUuid(indexUuid);
+                } catch (RuntimeException e) {
+                    // A segment reader must open whatever the cluster state can answer. An index this node cannot
+                    // name reads as off, which is main's read path.
+                    logger.debug("Could not resolve the index of {} from the cluster state", indexUuid, e);
+                    return false;
+                }
+                if (index == null) {
+                    return false;
+                }
+                found.set(index);
+            }
+            return isDirectIORescoreEnabled(index);
+        };
+    }
+
+    /**
+     * The index with the given UUID, or null when this node's cluster state has no such index. This scans every index
+     * in the cluster state, which is why {@link #directIORescoreSwitch} keeps what it finds.
+     *
+     * @param indexUuid the UUID taken from the shard path
+     * @return the index, or null
+     */
+    private static Index findIndexByUuid(@NonNull final String indexUuid) {
+        for (final IndexMetadata indexMetadata : KNNSettings.state().clusterService.state().getMetadata().indices().values()) {
+            if (indexUuid.equals(indexMetadata.getIndexUUID())) {
+                return indexMetadata.getIndex();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Whether Direct I/O is on for the given index right now. False for an index this node's cluster state does not
+     * have, and false for an index whose name was reused with a different UUID, because the lookup goes through
+     * {@code Metadata#index(Index)} and that checks the UUID.
+     *
+     * @param index the index
+     * @return true if {@code index.knn.direct_io.rescore.enabled} is on for that exact index
+     */
+    private static boolean isDirectIORescoreEnabled(@NonNull final Index index) {
+        final IndexMetadata indexMetadata = KNNSettings.state().clusterService.state().getMetadata().index(index);
+        if (indexMetadata == null) {
+            return false;
+        }
+        return INDEX_KNN_DIRECT_IO_RESCORE_ENABLED_SETTING.get(indexMetadata.getSettings());
     }
 
     public static Settings getIndexSettings(@NonNull final String indexName) {
