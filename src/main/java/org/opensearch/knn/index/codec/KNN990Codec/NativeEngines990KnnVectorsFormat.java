@@ -26,6 +26,7 @@ import org.opensearch.knn.index.codec.nativeindex.NativeIndexBuildStrategyFactor
 import org.opensearch.knn.index.codec.scorer.NativeEngines990KnnVectorsScorer;
 import org.opensearch.knn.index.codec.scorer.PrefetchableFlatVectorScorer;
 import org.opensearch.knn.index.engine.KNNEngine;
+import org.opensearch.knn.index.store.KNNDirectIODirectory;
 
 import java.io.IOException;
 import java.util.Objects;
@@ -41,7 +42,8 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
         new PrefetchableFlatVectorScorer(new NativeEngines990KnnVectorsScorer(FlatVectorScorerUtil.getLucene99FlatVectorsScorer()))
     );
     static final FlatVectorsFormat FLAT_VECTORS_FORMAT_HALF_FLOAT = new KNN1040HalfFloatFlatVectorsFormat();
-    private static final String FORMAT_NAME = "NativeEngines990KnnVectorsFormat";
+    /** The format name, which every file this format writes carries in its segment suffix. */
+    public static final String FORMAT_NAME = "NativeEngines990KnnVectorsFormat";
     private final int approximateThreshold;
     private final NativeIndexBuildStrategyFactory nativeIndexBuildStrategyFactory;
     private final FlatVectorsFormat flatVectorsFormat;
@@ -91,11 +93,16 @@ public class NativeEngines990KnnVectorsFormat extends KnnVectorsFormat {
     /**
      * Returns a {@link KnnVectorsReader} to read the vectors from the index.
      *
+     * <p>The flat vector reader is given a state whose directory may be a
+     * {@link KNNDirectIODirectory}, so that this segment's full-precision vector data file can be read with
+     * {@code O_DIRECT} when the index has {@code index.knn.direct_io.rescore.enabled} on. Every other file, and this
+     * reader's own, is opened from the caller's directory.
+     *
      * @param state {@link SegmentReadState}
      */
     @Override
     public KnnVectorsReader fieldsReader(final SegmentReadState state) throws IOException {
-        return new NativeEngines990KnnVectorsReader(state, flatVectorsFormat.fieldsReader(state));
+        return new NativeEngines990KnnVectorsReader(state, flatVectorsFormat.fieldsReader(KNNDirectIODirectory.routeVectorData(state)));
     }
 
     /**
