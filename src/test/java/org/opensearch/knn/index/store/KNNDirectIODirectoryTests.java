@@ -72,7 +72,7 @@ public class KNNDirectIODirectoryTests extends KNNTestCase {
                 assertTrue("the delegate hands out a switch", file instanceof SwitchableIndexInput);
                 final IndexInput slice = file.slice("vector-data", 0, file.length());
                 assertTrue("a slice taken while the index is on reads with O_DIRECT", slice instanceof DirectIOVectorIndexInput);
-                assertEquals("one channel per settled file", 1, channels.channels().size());
+                assertEquals("one channel per initialized file", 1, channels.channels().size());
                 assertTrue("the content check read the file through that channel", channels.reads() > 0);
             }
         }
@@ -324,16 +324,8 @@ public class KNNDirectIODirectoryTests extends KNNTestCase {
         assertFalse(KNNDirectIODirectory.isSequential(null));
     }
 
-    /**
-     * A file that fails one of the checks {@code openInput} can make without a device read is the original
-     * directory's own input, of the same class and carrying the same bytes, so an index that can never route costs
-     * nothing.
-     *
-     * @param delegate  the directory the delegate wraps
-     * @param directory the delegate
-     * @param name      the file name
-     * @throws IOException if either open or read fails
-     */
+    // A file that fails a check openInput can make without a device read is the original directory's own input, of the
+    // same class and carrying the same bytes, so an index that can never route costs nothing.
     private void assertOriginalInput(final Directory delegate, final KNNDirectIODirectory directory, final String name) throws IOException {
         try (
             IndexInput fromDelegate = delegate.openInput(name, IOContext.DEFAULT);

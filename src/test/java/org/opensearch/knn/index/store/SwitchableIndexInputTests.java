@@ -35,8 +35,8 @@ import static org.opensearch.knn.index.store.DirectIOTestUtils.INDEX_UUID;
 import static org.opensearch.knn.index.store.DirectIOTestUtils.VEC_NAME;
 
 /**
- * The switch itself: the setting read when a slice or a clone is made and never per read, a slice keeping the route
- * it was made with, the file settling once however often the switch flips, the two hint rules, the switch's share of
+ * The switch itself: the setting read when a slice or a clone is made and never per read, a slice keeping the route it
+ * was made with, Direct I/O initialized once however often the switch flips, the two hint rules, the switch's share of
  * the close rules, and the reflection test that every method Lucene's mmap input overrides is forwarded.
  */
 public class SwitchableIndexInputTests extends KNNTestCase {
@@ -57,11 +57,8 @@ public class SwitchableIndexInputTests extends KNNTestCase {
         stateReads.set(0);
     }
 
-    /**
-     * Every case but the reflection test needs a real {@code O_DIRECT} channel. That one compares two reflection
-     * surfaces and must run on every platform, because it is the guard against a later Lucene adding a method to the
-     * mmap input.
-     */
+    // Every case but the reflection test needs a real O_DIRECT channel. That one compares two reflection surfaces and
+    // must run on every platform, because it is the guard against a later Lucene adding a method to the mmap input.
     private void assumeDirectIO() {
         DirectIOTestUtils.assumeDirectIOSupported();
     }
@@ -76,14 +73,14 @@ public class SwitchableIndexInputTests extends KNNTestCase {
                 on.set(true);
                 final IndexInput slice = file.slice("vector-data", 0, file.length());
                 assertTrue(slice instanceof DirectIOVectorIndexInput);
-                final int afterSettle = channels.reads();
+                final int afterInitialize = channels.reads();
                 final byte[] read = new byte[4096];
                 slice.seek(0);
                 slice.readBytes(read, 0, read.length);
                 for (int i = 0; i < read.length; i++) {
                     assertEquals("byte " + i, expected[i], read[i]);
                 }
-                assertTrue("the read went to the device", channels.reads() > afterSettle);
+                assertTrue("the read went to the device", channels.reads() > afterInitialize);
             }
         }
     }
@@ -132,7 +129,7 @@ public class SwitchableIndexInputTests extends KNNTestCase {
         }
     }
 
-    public void testTheFirstSliceWhileOnSettlesTheFileOnce() throws IOException {
+    public void testTheFirstSliceWhileOnInitializesDirectIoOnce() throws IOException {
         assumeDirectIO();
         try (Directory in = DirectIOTestUtils.fsDirectory(shardPath)) {
             DirectIOTestUtils.writeCodecFile(in, VEC_NAME, FILE_PAYLOAD_BYTES);
@@ -147,7 +144,7 @@ public class SwitchableIndexInputTests extends KNNTestCase {
                     file.clone();
                 }
                 on.set(true);
-                assertTrue("the file settled routed", file.clone() instanceof DirectIOVectorIndexInput);
+                assertTrue("Direct I/O initialized and the file routed", file.clone() instanceof DirectIOVectorIndexInput);
                 assertEquals("a file opens one channel however often the switch flips", 1, channels.channels().size());
             }
         }
@@ -166,7 +163,7 @@ public class SwitchableIndexInputTests extends KNNTestCase {
             final KNNDirectIODirectory directory = new KNNDirectIODirectory(
                 in,
                 DirectIOTestUtils.SMALL_FLOOR,
-                KNNSettings.directIORescoreSwitch(INDEX_UUID),
+                () -> KNNSettings.isDirectIORescoreEnabled(INDEX_UUID),
                 KNNDirectIODirectory.DEFAULT_CHANNEL_FACTORY,
                 KNNDirectIODirectory.DIRECT_OPEN_OPTION
             );
@@ -177,16 +174,15 @@ public class SwitchableIndexInputTests extends KNNTestCase {
                     "the clone must read with O_DIRECT, or the reads below prove nothing",
                     clone instanceof DirectIOVectorIndexInput
                 );
-                final int afterFirstDecision = stateReads.get();
-                assertTrue("the first decision reads the cluster state", afterFirstDecision > 0);
+                assertEquals("one cluster state read per clone", 1, stateReads.get());
                 final byte[] target = new byte[1024];
                 for (int i = 0; i < 20; i++) {
                     clone.seek(0);
                     clone.readBytes(target, 0, target.length);
                 }
-                assertEquals("a read never looks the setting up", afterFirstDecision, stateReads.get());
+                assertEquals("a read never looks the setting up", 1, stateReads.get());
                 file.clone();
-                assertTrue("a clone does", stateReads.get() > afterFirstDecision);
+                assertEquals("and the next clone reads it once more", 2, stateReads.get());
             }
         }
     }
@@ -215,10 +211,10 @@ public class SwitchableIndexInputTests extends KNNTestCase {
             try (IndexInput file = directory.openInput(VEC_NAME, IOContext.DEFAULT)) {
                 on.set(true);
                 final IndexInput slice = file.slice("vector-data", 0, file.length());
-                final int afterSettle = channels.reads();
+                final int afterInitialize = channels.reads();
                 slice.prefetch(0, 4096);
                 assertEquals("a routed input does not carry out a prefetch", 0, recording.recorder().prefetches());
-                assertEquals("and does not read either", afterSettle, channels.reads());
+                assertEquals("and does not read either", afterInitialize, channels.reads());
             }
         }
     }
@@ -278,10 +274,10 @@ public class SwitchableIndexInputTests extends KNNTestCase {
                 on.set(true);
                 final IndexInput routed = file.clone();
                 assertTrue(routed instanceof DirectIOVectorIndexInput);
-                final int afterSettle = channels.reads();
+                final int afterInitialize = channels.reads();
                 final RandomAccessInput table = routed.randomAccessSlice(0, 4096);
                 assertEquals(expected[64], table.readByte(64));
-                assertEquals("the ord-to-doc table is read through the original input in both states", afterSettle, channels.reads());
+                assertEquals("the ord-to-doc table is read through the original input in both states", afterInitialize, channels.reads());
             }
         }
     }
@@ -426,17 +422,12 @@ public class SwitchableIndexInputTests extends KNNTestCase {
                 again.clone().readBytes(head, 0, head.length);
                 assertEquals(expectedLength, again.length());
             }
-            assertEquals("each open settles its own file", 2, channels.channels().size());
+            assertEquals("each open initializes its own file", 2, channels.channels().size());
         }
     }
 
-    /**
-     * Every method Lucene's memory-segment input overrides out of the public input surface must be forwarded by this
-     * class, or an index that is off would behave differently from main. A method a later Lucene adds to the mmap
-     * input fails here.
-     *
-     * @throws IOException if the mmap directory cannot be opened
-     */
+    // Every method Lucene's memory-segment input overrides out of the public input surface must be forwarded by this
+    // class, or an index that is off would behave differently from main. A method a later Lucene adds fails here.
     public void testEveryMethodTheMmapInputOverridesIsForwarded() throws IOException {
         final Path path = createTempDir("mmap-surface");
         try (Directory mmap = new MMapDirectory(path)) {

@@ -30,7 +30,7 @@ public class KNN1040HalfFloatFlatVectorsFormat extends FlatVectorsFormat {
     static final String META_CODEC_NAME = "KNN1040HalfFloatFlatVectorsFormatMeta";
     static final String VECTOR_DATA_CODEC_NAME = "KNN1040HalfFloatFlatVectorsFormatData";
     static final String META_EXTENSION = "vemf";
-    static final String VECTOR_DATA_EXTENSION = "vec";
+    public static final String VECTOR_DATA_EXTENSION = "vec";
     static final int VERSION_START = 0;
     static final int VERSION_CURRENT = VERSION_START;
     static final int DIRECT_MONOTONIC_BLOCK_SHIFT = 16;

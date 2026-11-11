@@ -22,25 +22,14 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * An {@link IndexInput} over a faiss {@code .vec} that reads with blocking positional reads on the calling thread
- * from a file channel opened with {@code O_DIRECT}, so the bytes do not go through the page cache. Every read is
- * rounded out to whole blocks of the file store's block size into one reusable direct buffer per input.
- *
- * <p>An instance of this class exists only because a slice or a clone of the file was taken while the index had
- * Direct I/O on, so the route is already decided: this input never asks the setting again, and a slice or clone of it
- * is routed too. While the index is off, Lucene holds the original directory's own inputs instead, handed out by
- * {@link SwitchableIndexInput}.
+ * An {@link IndexInput} over flat vector data that reads with blocking positional reads on the calling thread from a
+ * file channel opened with {@code O_DIRECT}, so the bytes do not go through the page cache. Every read is rounded out
+ * to whole blocks of the file store's block size into one reusable direct buffer per input.
  *
  * <p>Beside the channel each instance keeps the matching input of the original directory, with the same coordinates.
- * It serves two purposes: a read that fails on the {@code O_DIRECT} channel is read again from it, from the start of
- * the whole request, and {@link #randomAccessSlice(long, long)} is always its own, because Lucene reads a sparse
- * field's ord-to-doc table through a random-access slice and a blocking aligned read per lookup would be the wrong
- * shape for it.
- *
- * <p>A read failure never fails the read. Any {@link IOException} from the channel, and a short read that leaves the
- * request uncovered, falls back to the original input, marks the file's channel failed so that every later read of
- * that file goes straight to the original input, and logs once per file. An {@link java.io.EOFException} from the
- * bounds check is thrown before any device read and is not a failure.
+ * A read that fails on the channel is read again from it, from the start of the whole request, and the file's channel
+ * is marked failed so that every later read of that file goes straight to it. So a read failure never fails a read.
+ * An {@link EOFException} from a bounds check is thrown before any device read and is not such a failure.
  *
  * <p>Neither the channel nor the original input is closed by this class: both belong to the
  * {@link SwitchableIndexInput} that opened them, which closes each exactly once.
@@ -48,11 +37,8 @@ import java.util.Optional;
 @Log4j2
 public final class DirectIOVectorIndexInput extends IndexInput {
 
-    /**
-     * One file's {@code O_DIRECT} channel, shared by every slice and clone of that file. It is opened by
-     * {@link KNNDirectIODirectory#openDirect} and owned by the {@link SwitchableIndexInput} that asked for it, which
-     * closes it exactly once. It lives here because it carries the failed mark the read fallback reads and writes.
-     */
+    // One file's O_DIRECT channel, shared by every slice and clone of that file and closed by the
+    // SwitchableIndexInput that asked for it. It lives here because it carries the failed mark the fallback reads.
     static final class Handle implements Closeable {
 
         private final Path path;
@@ -68,12 +54,6 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             this.fileLength = fileLength;
         }
 
-        /**
-         * Marks this file's channel failed, so that every later read of the file goes to the original input, and logs
-         * the first failure.
-         *
-         * @param cause what the channel did
-         */
         void markFailed(final IOException cause) {
             if (failed) {
                 return;
@@ -87,49 +67,22 @@ public final class DirectIOVectorIndexInput extends IndexInput {
             log.warn("Direct I/O read of {} failed, this file falls back to the original input until it is opened again", path, cause);
         }
 
-        /**
-         * Whether a read has already failed on this channel.
-         *
-         * @return true if the channel is not to be used again
-         */
         boolean hasFailed() {
             return failed;
         }
 
-        /**
-         * The file store's block size, which every read's offset and length are rounded out to.
-         *
-         * @return the block size in bytes
-         */
         int blockSize() {
             return blockSize;
         }
 
-        /**
-         * The path of the file this channel reads.
-         *
-         * @return the path
-         */
         Path path() {
             return path;
         }
 
-        /**
-         * The length of the file this channel reads, as the {@code O_DIRECT} open saw it.
-         *
-         * @return the length in bytes
-         */
         long fileLength() {
             return fileLength;
         }
 
-        /**
-         * The length of the file as the {@code O_DIRECT} channel sees it right now, which the content check compares
-         * against the length the directory chain reports.
-         *
-         * @return the length in bytes
-         * @throws IOException if the channel cannot be measured
-         */
         long channelSize() throws IOException {
             return channel.size();
         }
@@ -152,18 +105,6 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     private long bufferStart = -1;
     private int bufferValid;
 
-    /**
-     * Creates a routed input over a settled file. {@link SwitchableIndexInput} makes one for each slice and clone it
-     * routes, and this class makes one for each of its own.
-     *
-     * @param description   the resource description Lucene reports
-     * @param handle        the file's shared channel
-     * @param delegateInput the matching input of the original directory, with the same coordinates
-     * @param offset        this input's offset in the file
-     * @param length        this input's length
-     * @param bufferSize    the buffer size, a multiple of the block size
-     * @param filePointer   where this input starts reading
-     */
     DirectIOVectorIndexInput(
         final String description,
         @NonNull final Handle handle,
@@ -182,16 +123,7 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         this.filePointer = filePointer;
     }
 
-    /**
-     * One block-aligned positional read of a region of the file into a fresh aligned buffer. The content check in
-     * {@link KNNDirectIODirectory#contentMatches} reads through this, because an aligned read is this class's job.
-     *
-     * @param handle the open {@code O_DIRECT} channel
-     * @param start  where the region starts in the file
-     * @param length how many bytes of it to return
-     * @return the bytes of the region
-     * @throws IOException if the read fails or returns too little to cover the region
-     */
+    // One block-aligned positional read of a region into a fresh buffer, which the directory's content check uses.
     static byte[] readAt(final Handle handle, final long start, final int length) throws IOException {
         final int blockSize = handle.blockSize();
         final long alignedStart = start - Math.floorMod(start, (long) blockSize);
@@ -206,13 +138,6 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         return bytes;
     }
 
-    /**
-     * A byte count rounded up to whole blocks, which every buffer and every read length is.
-     *
-     * @param bytes     the byte count
-     * @param blockSize the file store's block size
-     * @return the count rounded up
-     */
     static int roundUpToBlock(final int bytes, final int blockSize) {
         return ((bytes + blockSize - 1) / blockSize) * blockSize;
     }
@@ -244,9 +169,6 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         return value;
     }
 
-    /** One request's worth of bytes for the fixed-width reads, which are not shared between inputs. */
-    private final byte[] scratch = new byte[Long.BYTES];
-
     @Override
     public void readBytes(final byte[] b, final int bufferOffset, final int len) throws IOException {
         ensureOpen();
@@ -263,8 +185,20 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         if (filePointer + Short.BYTES > length) {
             throw new EOFException("read past EOF: " + this);
         }
-        readWithFallback(filePointer, scratch, 0, Short.BYTES);
-        return (short) ((scratch[0] & 0xFF) | ((scratch[1] & 0xFF) << 8));
+        final long start = filePointer;
+        if (handle.hasFailed() == false) {
+            try {
+                final short value = (short) valueAt(offset + start, Short.BYTES);
+                filePointer = start + Short.BYTES;
+                return value;
+            } catch (IOException e) {
+                fallback(e);
+            }
+        }
+        delegateInput.seek(start);
+        final short value = delegateInput.readShort();
+        filePointer = start + Short.BYTES;
+        return value;
     }
 
     @Override
@@ -273,8 +207,20 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         if (filePointer + Integer.BYTES > length) {
             throw new EOFException("read past EOF: " + this);
         }
-        readWithFallback(filePointer, scratch, 0, Integer.BYTES);
-        return intAt(scratch, 0);
+        final long start = filePointer;
+        if (handle.hasFailed() == false) {
+            try {
+                final int value = (int) valueAt(offset + start, Integer.BYTES);
+                filePointer = start + Integer.BYTES;
+                return value;
+            } catch (IOException e) {
+                fallback(e);
+            }
+        }
+        delegateInput.seek(start);
+        final int value = delegateInput.readInt();
+        filePointer = start + Integer.BYTES;
+        return value;
     }
 
     @Override
@@ -283,51 +229,100 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         if (filePointer + Long.BYTES > length) {
             throw new EOFException("read past EOF: " + this);
         }
-        readWithFallback(filePointer, scratch, 0, Long.BYTES);
-        return longAt(scratch, 0);
+        final long start = filePointer;
+        if (handle.hasFailed() == false) {
+            try {
+                final long value = valueAt(offset + start, Long.BYTES);
+                filePointer = start + Long.BYTES;
+                return value;
+            } catch (IOException e) {
+                fallback(e);
+            }
+        }
+        delegateInput.seek(start);
+        final long value = delegateInput.readLong();
+        filePointer = start + Long.BYTES;
+        return value;
     }
 
     @Override
     public void readInts(final int[] dst, final int dstOffset, final int len) throws IOException {
         ensureOpen();
         Objects.checkFromIndexSize(dstOffset, len, dst.length);
-        final int bytes = len * Integer.BYTES;
+        final long bytes = (long) len * Integer.BYTES;
         if (filePointer + bytes > length) {
             throw new EOFException("read past EOF: " + this);
         }
-        final byte[] raw = new byte[bytes];
-        readWithFallback(filePointer, raw, 0, bytes);
-        for (int i = 0; i < len; i++) {
-            dst[dstOffset + i] = intAt(raw, i * Integer.BYTES);
+        final long start = filePointer;
+        if (handle.hasFailed() == false) {
+            try {
+                int done = 0;
+                while (done < len) {
+                    final long absolute = offset + start + (long) done * Integer.BYTES;
+                    final int index = fill(absolute);
+                    final int available = (bufferValid - index) / Integer.BYTES;
+                    if (available <= 0) {
+                        dst[dstOffset + done] = (int) valueAt(absolute, Integer.BYTES);
+                        done++;
+                        continue;
+                    }
+                    final int count = Math.min(len - done, available);
+                    for (int i = 0; i < count; i++) {
+                        dst[dstOffset + done + i] = buffer.getInt(index + i * Integer.BYTES);
+                    }
+                    done += count;
+                }
+                filePointer = start + bytes;
+                return;
+            } catch (IOException e) {
+                fallback(e);
+            }
         }
+        delegateInput.seek(start);
+        delegateInput.readInts(dst, dstOffset, len);
+        filePointer = start + bytes;
     }
 
     @Override
     public void readLongs(final long[] dst, final int dstOffset, final int len) throws IOException {
         ensureOpen();
         Objects.checkFromIndexSize(dstOffset, len, dst.length);
-        final int bytes = len * Long.BYTES;
+        final long bytes = (long) len * Long.BYTES;
         if (filePointer + bytes > length) {
             throw new EOFException("read past EOF: " + this);
         }
-        final byte[] raw = new byte[bytes];
-        readWithFallback(filePointer, raw, 0, bytes);
-        for (int i = 0; i < len; i++) {
-            dst[dstOffset + i] = longAt(raw, i * Long.BYTES);
+        final long start = filePointer;
+        if (handle.hasFailed() == false) {
+            try {
+                int done = 0;
+                while (done < len) {
+                    final long absolute = offset + start + (long) done * Long.BYTES;
+                    final int index = fill(absolute);
+                    final int available = (bufferValid - index) / Long.BYTES;
+                    if (available <= 0) {
+                        dst[dstOffset + done] = valueAt(absolute, Long.BYTES);
+                        done++;
+                        continue;
+                    }
+                    final int count = Math.min(len - done, available);
+                    for (int i = 0; i < count; i++) {
+                        dst[dstOffset + done + i] = buffer.getLong(index + i * Long.BYTES);
+                    }
+                    done += count;
+                }
+                filePointer = start + bytes;
+                return;
+            } catch (IOException e) {
+                fallback(e);
+            }
         }
+        delegateInput.seek(start);
+        delegateInput.readLongs(dst, dstOffset, len);
+        filePointer = start + bytes;
     }
 
-    /**
-     * Reads one whole request into an array, from the channel if it has not failed, and from the original input
-     * otherwise or when it fails here. A fallback re-reads the request from its start, so bytes a failed read already
-     * copied are overwritten, and the whole request is served once rather than byte by byte.
-     *
-     * @param start     where the request starts, in this input's coordinates
-     * @param dst       where to copy to
-     * @param dstOffset the offset in dst
-     * @param len       how many bytes
-     * @throws IOException if the original input fails too, which is what main would do
-     */
+    // A fallback re-reads the request from its start, so bytes a failed read already copied are overwritten and the
+    // file pointer ends where a read that did not fail would leave it. A failure of the original input propagates.
     private void readWithFallback(final long start, final byte[] dst, final int dstOffset, final int len) throws IOException {
         if (handle.hasFailed() == false) {
             try {
@@ -343,17 +338,10 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         filePointer = start + len;
     }
 
-    private static int intAt(final byte[] raw, final int index) {
-        return (raw[index] & 0xFF) | ((raw[index + 1] & 0xFF) << 8) | ((raw[index + 2] & 0xFF) << 16) | ((raw[index + 3] & 0xFF) << 24);
-    }
-
-    private static long longAt(final byte[] raw, final int index) {
-        return (intAt(raw, index) & 0xFFFFFFFFL) | ((long) intAt(raw, index + Integer.BYTES) << 32);
-    }
-
     @Override
     public void readFloats(final float[] dst, final int dstOffset, final int len) throws IOException {
         ensureOpen();
+        Objects.checkFromIndexSize(dstOffset, len, dst.length);
         final long bytes = (long) len * Float.BYTES;
         if (filePointer + bytes > length) {
             throw new EOFException("read past EOF: " + this);
@@ -365,22 +353,17 @@ public final class DirectIOVectorIndexInput extends IndexInput {
                 while (done < len) {
                     final long absolute = offset + start + (long) done * Float.BYTES;
                     final int index = fill(absolute);
-                    final int floatsInBuffer = (bufferValid - index) / Float.BYTES;
-                    if (floatsInBuffer <= 0) {
-                        // One float straddles the end of the buffer window: take it through the byte path.
-                        final byte[] four = new byte[Float.BYTES];
-                        copyAt(absolute, four, 0, Float.BYTES);
-                        dst[dstOffset + done] = Float.intBitsToFloat(
-                            (four[0] & 0xFF) | ((four[1] & 0xFF) << 8) | ((four[2] & 0xFF) << 16) | ((four[3] & 0xFF) << 24)
-                        );
+                    final int available = (bufferValid - index) / Float.BYTES;
+                    if (available <= 0) {
+                        dst[dstOffset + done] = Float.intBitsToFloat((int) valueAt(absolute, Float.BYTES));
                         done++;
                         continue;
                     }
-                    final int floats = Math.min(len - done, floatsInBuffer);
-                    for (int i = 0; i < floats; i++) {
+                    final int count = Math.min(len - done, available);
+                    for (int i = 0; i < count; i++) {
                         dst[dstOffset + done + i] = buffer.getFloat(index + i * Float.BYTES);
                     }
-                    done += floats;
+                    done += count;
                 }
                 filePointer = start + bytes;
                 return;
@@ -393,27 +376,32 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         filePointer = start + bytes;
     }
 
-    /**
-     * Marks this file's channel failed, so that this read and every later read of the file is served by the original
-     * input.
-     *
-     * @param cause what the channel did
-     */
+    // One value of two, four or eight bytes, read from the buffer. A value that straddles the end of the buffer window
+    // is assembled from its bytes, which is the only case the buffer's own little-endian reads cannot serve.
+    private long valueAt(final long absolute, final int width) throws IOException {
+        final int index = fill(absolute);
+        if (bufferValid - index >= width) {
+            return switch (width) {
+                case Short.BYTES -> buffer.getShort(index);
+                case Integer.BYTES -> buffer.getInt(index);
+                default -> buffer.getLong(index);
+            };
+        }
+        final byte[] value = new byte[width];
+        copyAt(absolute, value, 0, width);
+        long assembled = 0L;
+        for (int i = width - 1; i >= 0; i--) {
+            assembled = (assembled << 8) | (value[i] & 0xFFL);
+        }
+        return assembled;
+    }
+
     private void fallback(final IOException cause) {
         handle.markFailed(cause);
         bufferStart = -1;
         bufferValid = 0;
     }
 
-    /**
-     * Copies bytes out of the aligned buffer, filling it from the device as often as the span needs.
-     *
-     * @param absolute  the absolute offset in the file
-     * @param dst       where to copy to
-     * @param dstOffset the offset in dst
-     * @param len       how many bytes
-     * @throws IOException if a device read fails or returns short
-     */
     private void copyAt(final long absolute, final byte[] dst, final int dstOffset, final int len) throws IOException {
         int done = 0;
         while (done < len) {
@@ -424,14 +412,8 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         }
     }
 
-    /**
-     * Makes sure the buffer holds the byte at an absolute offset, with one block-aligned positional read when it does
-     * not, and returns that byte's index in the buffer.
-     *
-     * @param absolute the absolute offset in the file
-     * @return the index of that byte in the buffer
-     * @throws IOException if the read fails or returns too little to cover the offset
-     */
+    // Makes sure the buffer holds the byte at an absolute offset, with one aligned positional read when it does not,
+    // and returns that byte's index in the buffer.
     private int fill(final long absolute) throws IOException {
         if (bufferStart >= 0 && absolute >= bufferStart && absolute < bufferStart + bufferValid) {
             return (int) (absolute - bufferStart);
@@ -519,17 +501,15 @@ public final class DirectIOVectorIndexInput extends IndexInput {
     @Override
     public RandomAccessInput randomAccessSlice(final long sliceOffset, final long sliceLength) throws IOException {
         ensureOpen();
-        // The ord-to-doc table of a sparse field is read one lookup at a time through a random access slice, which on
-        // an aligned blocking input would be one device read per lookup. It is small next to the vectors and it stays
-        // on the original input.
+        // A sparse field's ord-to-doc table is read through this, one lookup at a time, which here would be a device
+        // read per lookup. It is small next to the vectors, so it stays on the original input.
         return delegateInput.randomAccessSlice(sliceOffset, sliceLength);
     }
 
     @Override
     public void prefetch(final long prefetchOffset, final long prefetchLength) throws IOException {
         ensureOpen();
-        // Carrying a prefetch out needs the read pool a later part adds. A blocking read on the calling thread would
-        // be a read, not a hint.
+        // A blocking read on the calling thread would be a read, not a hint.
     }
 
     @Override
@@ -545,9 +525,6 @@ public final class DirectIOVectorIndexInput extends IndexInput {
         bufferValid = 0;
     }
 
-    /**
-     * Fails once this input has been closed, as every {@link IndexInput} does.
-     */
     void ensureOpen() {
         if (closed) {
             throw new AlreadyClosedException("this input is closed: " + this);

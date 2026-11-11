@@ -52,8 +52,7 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
         private final IndexInput file;
         private final IndexInput routed;
         private final IndexInput reference;
-        /** How many device reads the content check made when this file settled, which the read counts are against. */
-        private final int readsAtSettle;
+        private final int readsAtInitialize;
 
         private Fixture() throws IOException {
             in = DirectIOTestUtils.fsDirectory(shardPath);
@@ -61,8 +60,10 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
             directory = DirectIOTestUtils.directory(in, on::get, channels);
             file = directory.openInput(VEC_NAME, IOContext.DEFAULT);
             routed = file.clone();
+            // Without this every read below would compare the original input against itself and pass.
+            assertTrue("the clone under test must read with O_DIRECT", routed instanceof DirectIOVectorIndexInput);
             reference = in.openInput(VEC_NAME, IOContext.DEFAULT);
-            readsAtSettle = channels.reads();
+            readsAtInitialize = channels.reads();
         }
 
         private int blockSize() throws IOException {
@@ -135,6 +136,27 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
                 fixture.routed.seek(offset);
                 fixture.reference.seek(offset);
                 assertEquals("readLong at " + offset, fixture.reference.readLong(), fixture.routed.readLong());
+                for (final int count : new int[] { 1, 16, 512 }) {
+                    if ((long) count * Long.BYTES > fixture.reference.length() - offset) {
+                        continue;
+                    }
+                    final int[] routedInts = new int[count];
+                    final int[] referenceInts = new int[count];
+                    fixture.routed.seek(offset);
+                    fixture.reference.seek(offset);
+                    fixture.routed.readInts(routedInts, 0, count);
+                    fixture.reference.readInts(referenceInts, 0, count);
+                    assertArrayEquals("readInts of " + count + " at " + offset, referenceInts, routedInts);
+                    assertEquals("the pointer after readInts", fixture.reference.getFilePointer(), fixture.routed.getFilePointer());
+                    final long[] routedLongs = new long[count];
+                    final long[] referenceLongs = new long[count];
+                    fixture.routed.seek(offset);
+                    fixture.reference.seek(offset);
+                    fixture.routed.readLongs(routedLongs, 0, count);
+                    fixture.reference.readLongs(referenceLongs, 0, count);
+                    assertArrayEquals("readLongs of " + count + " at " + offset, referenceLongs, routedLongs);
+                    assertEquals("the pointer after readLongs", fixture.reference.getFilePointer(), fixture.routed.getFilePointer());
+                }
             }
         }
     }
@@ -247,11 +269,11 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
             // The channel returned bytes rather than throwing, and fewer than the offset asked for, which is the
             // branch this case exists to cover: one device read was attempted, under one block, and the file then
             // reads through the original input.
-            assertEquals("one device read was attempted", fixture.readsAtSettle + 1, channels.reads());
+            assertEquals("one device read was attempted", fixture.readsAtInitialize + 1, channels.reads());
             assertTrue(DirectIOTestUtils.TestChannel.SHORT_READ_BYTES < fixture.blockSize());
             fixture.routed.seek(0);
             fixture.routed.readBytes(fromRoute, 0, fromRoute.length);
-            assertEquals("a file whose channel failed never touches it again", fixture.readsAtSettle + 1, channels.reads());
+            assertEquals("a file whose channel failed never touches it again", fixture.readsAtInitialize + 1, channels.reads());
         }
     }
 
@@ -265,7 +287,7 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
             fixture.reference.seek(2048);
             fixture.reference.readBytes(fromReference, 0, fromReference.length);
             assertArrayEquals(fromReference, fromRoute);
-            assertEquals("one device read was attempted and then the file fell back", fixture.readsAtSettle + 1, channels.reads());
+            assertEquals("one device read was attempted and then the file fell back", fixture.readsAtInitialize + 1, channels.reads());
         }
     }
 
@@ -353,7 +375,7 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
             assertEquals(78L + 64L + 64L, fixture.routed.getFilePointer());
             assertEquals(
                 "every one of those requests went to the original input after the first failure",
-                fixture.readsAtSettle + 1,
+                fixture.readsAtInitialize + 1,
                 channels.reads()
             );
         }
@@ -378,7 +400,7 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
                 fixture.reference.readFloats(fromReference, 0, floats);
                 assertArrayEquals("readFloats at " + start + " of an unaligned slice", fromReference, fromRoute, 0.0f);
             }
-            assertTrue("the straddling reads went to the device and never fell back", channels.reads() > fixture.readsAtSettle + 4);
+            assertTrue("the straddling reads went to the device and never fell back", channels.reads() > fixture.readsAtInitialize + 4);
         }
     }
 
@@ -492,7 +514,7 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
             ) {
                 final IndexInput routedSlice = file.slice("KNN1040HalfFloatFlatVectorsValuesSlice", 0, (long) vectorBytes * vectors);
                 assertTrue(routedSlice instanceof DirectIOVectorIndexInput);
-                final int afterSettle = channels.reads();
+                final int afterInitialize = channels.reads();
                 final byte[] fromRoute = new byte[vectorBytes];
                 final byte[] fromReference = new byte[vectorBytes];
                 for (int ord = 0; ord < vectors; ord++) {
@@ -502,7 +524,7 @@ public class DirectIOVectorIndexInputTests extends KNNTestCase {
                     reference.readBytes(fromReference, 0, vectorBytes);
                     assertArrayEquals("vector " + ord, fromReference, fromRoute);
                 }
-                assertTrue("the FP16 reads went to the device", channels.reads() > afterSettle);
+                assertTrue("the FP16 reads went to the device", channels.reads() > afterInitialize);
 
                 on.set(false);
                 final IndexInput offSlice = file.slice("off", 0, (long) vectorBytes * vectors);

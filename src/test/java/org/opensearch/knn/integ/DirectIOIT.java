@@ -33,27 +33,21 @@ import static org.opensearch.knn.common.KNNConstants.METHOD_HNSW;
  * ids in the same order, scores within {@link #SCORE_ULP_TOLERANCE} float32 units in the last place, a reconstructed
  * {@code _source} equal to the bit, and the setting's own behaviour.
  *
- * <p>These tests do not assert which input a file was read through. A node that cannot open an {@code O_DIRECT}
- * descriptor serves the index from the page cache and returns exactly these answers, so there is nothing here to skip
- * on. To check that the reads really go through {@code O_DIRECT}, corrupt every byte the {@code O_DIRECT} buffer
- * serves: every case below that reads vector data must then fail. Routing itself is proven by
- * {@code DirectIORoutingTests} and the unit tests under {@code index.store}.
+ * <p>No case asserts which input a file was read through, because a node that cannot open an {@code O_DIRECT}
+ * descriptor returns exactly these answers, so there is nothing here to skip on. Routing is proven by
+ * {@code DirectIORoutingTests} and the unit tests under {@code index.store}. That these cases do read through
+ * {@code O_DIRECT} is shown by corrupting every byte that buffer serves: each one that reads vector data then fails.
  */
 public class DirectIOIT extends KNNRestTestCase {
 
-    /** The setting under test, read from the production constant so there is one copy of the key. */
     private static final String DIRECT_IO_SETTING = KNNSettings.INDEX_KNN_DIRECT_IO_RESCORE_ENABLED;
 
-    /**
-     * A dimension and a document count whose product is over the 10 MiB floor: 1,024 by 3,000 floats is 12,288,000
-     * bytes of vector data.
-     */
+    // 1,024 by 3,000 floats is 12,288,000 bytes of vector data, over the 10 MiB floor.
     private static final int ROUTABLE_DIMENSION = 1024;
 
-    /** How many documents the routable fixture indexes. */
     private static final int ROUTABLE_DOC_COUNT = 3000;
 
-    /** 1,024 half floats is 2,048 bytes, so 6,000 documents is 12,288,000 bytes of vector data. */
+    // 1,024 half floats is 2,048 bytes, so 6,000 documents is 12,288,000 bytes.
     private static final int HALF_FLOAT_DOC_COUNT = 6000;
 
     private static final int K = 10;
@@ -61,13 +55,9 @@ public class DirectIOIT extends KNNRestTestCase {
     private static final String NESTED_PATH = "test_nested";
     private static final String NESTED_VECTOR_FIELD = "test_vector";
 
-    /**
-     * How many float32 units in the last place two scores of the same query may differ by when one side read the
-     * vector data with {@code O_DIRECT}. The ids and their order never change, but Lucene binds its memory-segment
-     * scorer only to an input it can take a memory segment from, so vector data read with {@code O_DIRECT} can be
-     * scored by another float32 kernel with a different accumulation order. A few units in the last place is that, and
-     * anything larger is a wrong read.
-     */
+    // Lucene binds its memory-segment scorer only to an input it can take a memory segment from, so vector data read
+    // with O_DIRECT can be scored by another float32 kernel with a different accumulation order. A few units in the last
+    // place is that, and anything larger is a wrong read. The ids and their order never change.
     private static final int SCORE_ULP_TOLERANCE = 32;
 
     // An index created on, and the default of off, answer the same.
@@ -640,32 +630,10 @@ public class DirectIOIT extends KNNRestTestCase {
 
     // The fixtures and the assertions.
 
-    /**
-     * Creates a faiss fp32 index whose vector data file is over the 10 MiB floor, indexes it, and force merges it to
-     * one segment, which is not compound because a single merged segment is the whole index against a no-CFS ratio of
-     * 0.1. That is the shape a {@code .vec} has to have to be routed at all.
-     *
-     * @param index           the index name
-     * @param directIOEnabled whether to create it with Direct I/O already on
-     * @return the vectors that were indexed, document id {@code i} holding row {@code i}
-     * @throws Exception if any request fails
-     */
     private float[][] createRoutableFaissIndex(final String index, final boolean directIOEnabled) throws Exception {
         return createFaissIndex(index, ROUTABLE_DIMENSION, ROUTABLE_DOC_COUNT, directIOEnabled, true);
     }
 
-    /**
-     * Creates a faiss fp32 index of any shape, which is how the decline and the block boundary scenarios get a file
-     * that is under the floor, a segment that is compound, or vectors that straddle a block.
-     *
-     * @param index           the index name
-     * @param dimension       the vector dimension
-     * @param docCount        how many documents to index
-     * @param directIOEnabled whether to create it with Direct I/O already on
-     * @param forceMerge      whether to force merge to one segment, which is what makes the segment non-compound
-     * @return the vectors that were indexed
-     * @throws Exception if any request fails
-     */
     private float[][] createFaissIndex(
         final String index,
         final int dimension,
@@ -693,16 +661,6 @@ public class DirectIOIT extends KNNRestTestCase {
         return vectors;
     }
 
-    /**
-     * Creates a faiss index of one vector data type, optionally with memory-optimized search on.
-     *
-     * @param index           the index name
-     * @param dataType        the vector data type
-     * @param docCount        how many documents
-     * @param memoryOptimized whether to turn memory-optimized search on
-     * @return the vectors that were indexed
-     * @throws Exception if any request fails
-     */
     private float[][] createTypedIndex(final String index, final VectorDataType dataType, final int docCount, final boolean memoryOptimized)
         throws Exception {
         final Settings.Builder settings = Settings.builder()
@@ -725,17 +683,8 @@ public class DirectIOIT extends KNNRestTestCase {
         return vectors;
     }
 
-    /**
-     * Creates a faiss index whose vector data file is under the 10 MiB floor but whose segment is not compound, which
-     * takes two flushes and then a merge: a single flushed segment is compound at the shipped defaults and a force
-     * merge of one segment is a no-op, so the floor would never be the reason it declined.
-     *
-     * @param index     the index name
-     * @param dimension the vector dimension, small enough to stay under the floor
-     * @param docCount  how many documents, split over two flushes
-     * @return the vectors that were indexed
-     * @throws Exception if any request fails
-     */
+    // Under the floor but not compound, which takes two flushes and then a merge: a single flushed segment is compound
+    // at the shipped defaults and a force merge of one segment is a no-op.
     private float[][] createSmallNonCompoundFaissIndex(final String index, final int dimension, final int docCount) throws Exception {
         final Settings settings = Settings.builder()
             .put("index.knn", true)
@@ -771,14 +720,7 @@ public class DirectIOIT extends KNNRestTestCase {
         return vectors;
     }
 
-    /**
-     * Two merged segments, each over the size floor and each therefore not compound, with concurrent segment search
-     * on so that both are searched on their own threads.
-     *
-     * @param index the index name
-     * @return the vectors that were indexed, in document id order
-     * @throws Exception if any request fails
-     */
+    // Two merged segments, each over the floor and so not compound, with concurrent segment search on.
     private float[][] createSeveralSegments(final String index) throws Exception {
         final Settings settings = Settings.builder()
             .put("index.knn", true)
@@ -816,15 +758,7 @@ public class DirectIOIT extends KNNRestTestCase {
         return vectors;
     }
 
-    /**
-     * One index of 1,000 documents with three nested vectors each, which is 3,000 vectors of 1,024 floats and
-     * 12,288,000 bytes of vector data, force merged to one segment. Every nested field is sparse, so Lucene reads its
-     * ord-to-doc table through a random access slice, which stays on the original input.
-     *
-     * @param index the index name
-     * @return the nested vectors in the order they were indexed
-     * @throws Exception if any request fails
-     */
+    // Every nested field is sparse, so Lucene reads its ord-to-doc table through a random access slice.
     private float[][] createNestedIndex(final String index) throws Exception {
         final int parents = 1000;
         final int children = 3;
@@ -872,15 +806,7 @@ public class DirectIOIT extends KNNRestTestCase {
         return vectors;
     }
 
-    /**
-     * Indexes one vector field in chunks, because a single bulk request carrying thousands of 1,024-float vectors is
-     * answered with 429.
-     *
-     * @param index   the index
-     * @param field   the vector field
-     * @param vectors the vectors, one row per document
-     * @throws Exception if a bulk request fails
-     */
+    // In chunks, because one bulk request carrying thousands of 1,024 float vectors is answered with 429.
     private void bulkAddKnnDocsInChunks(final String index, final String field, final float[][] vectors) throws Exception {
         final int chunk = 500;
         for (int from = 0; from < vectors.length; from += chunk) {
@@ -897,16 +823,7 @@ public class DirectIOIT extends KNNRestTestCase {
         }
     }
 
-    /**
-     * Indexes documents that carry the same vector in two fields, in one bulk request, which is what the mixed-field
-     * scenarios need and what {@code bulkAddKnnDocs} does not do.
-     *
-     * @param index   the index
-     * @param fieldA  the first vector field
-     * @param fieldB  the second vector field
-     * @param vectors the vectors, one row per document
-     * @throws Exception if the bulk request fails
-     */
+    // The same vector in two fields, which bulkAddKnnDocs does not do.
     private void bulkAddTwoFieldDocs(final String index, final String fieldA, final String fieldB, final float[][] vectors)
         throws Exception {
         // In chunks, because one request carrying two copies of 3,000 vectors of 1,024 floats is tens of megabytes
@@ -935,13 +852,6 @@ public class DirectIOIT extends KNNRestTestCase {
         }
     }
 
-    /**
-     * Turns Direct I/O on or off for an index, which is dynamic and reaches segments that are already open.
-     *
-     * @param index   the index, or a pattern such as {@code *}
-     * @param enabled the value to set
-     * @throws Exception if the request fails
-     */
     private void setDirectIO(final String index, final boolean enabled) throws Exception {
         updateIndexSettings(index, Settings.builder().put(DIRECT_IO_SETTING, enabled));
     }
@@ -1014,12 +924,7 @@ public class DirectIOIT extends KNNRestTestCase {
         assertScoresEqualWithinUlps(parseScores(offBody), parseScores(onBody), compressionLevel + " rescore");
     }
 
-    /**
-     * The mapping of a 1-bit quantized faiss field with asymmetric distance computation on, which is how
-     * {@code ADCIT} builds one: the switch is a parameter of the binary encoder, not of the field.
-     *
-     * @return the mapping
-     */
+    // As ADCIT builds one: the switch is a parameter of the binary encoder, not of the field.
     private String adcMapping() {
         return "{\"properties\":{\""
             + FIELD_NAME
@@ -1044,18 +949,8 @@ public class DirectIOIT extends KNNRestTestCase {
         return EntityUtils.toString(searchKNNIndex(index, query, K).getEntity());
     }
 
-    /**
-     * Queries with the vector of one document, first with the index on and then with it off, and asserts the ids, the
-     * order and the scores are the same on the three read paths a wrong read would show: an approximate search, an
-     * exact search forced by a filter, which scores from the vector data file rather than from the native index, and
-     * the derived source reconstruction of one document.
-     *
-     * @param index     the index to create
-     * @param dimension the vector dimension
-     * @param docCount  how many documents
-     * @param queryOrd  which document's vector to query with
-     * @throws Exception if any request fails
-     */
+    // The three read paths a wrong read would show: an approximate search, an exact search forced by a filter, which
+    // scores from the vector data file rather than from the native index, and the derived source of one document.
     private void assertResultsEqualOnBothRoutes(final String index, final int dimension, final int docCount, final int queryOrd)
         throws Exception {
         final float[][] vectors = createFaissIndex(index, dimension, docCount, true, true);
@@ -1077,16 +972,7 @@ public class DirectIOIT extends KNNRestTestCase {
         assertEquals("the reconstructed vector must be the same at dimension " + dimension, offSource, onSource);
     }
 
-    /**
-     * An exact search over a handful of documents, forced by a filter, which scores the candidates by reading the
-     * vector data file.
-     *
-     * @param index    the index
-     * @param vector   the query vector
-     * @param queryOrd the document whose vector it is, which must be among the filtered ids
-     * @return the response body
-     * @throws Exception if the search fails
-     */
+    // Forced by a filter, so the candidates are scored by reading the vector data file.
     private String exactSearch(final String index, final float[] vector, final int queryOrd) throws Exception {
         final StringBuilder ids = new StringBuilder();
         for (int i = Math.max(0, queryOrd - 3); i <= queryOrd + 3; i++) {
@@ -1122,33 +1008,12 @@ public class DirectIOIT extends KNNRestTestCase {
         return EntityUtils.toString(performSearch(index, query, "size=" + K).getEntity());
     }
 
-    /**
-     * Runs a k-NN query and returns the response body.
-     *
-     * @param index  the index
-     * @param field  the vector field
-     * @param vector the query vector
-     * @param k      how many neighbours
-     * @return the response body
-     * @throws Exception if the search fails
-     */
     private String knnSearch(final String index, final String field, final float[] vector, final int k) throws Exception {
         return knnSearch(index, field, vector, k, true);
     }
 
-    /**
-     * Runs a k-NN query, optionally without {@code _source}. Leaving {@code _source} out matters when a test looks at
-     * one field only: with derived source on, which is the default, fetching {@code _source} reconstructs every
-     * vector field of the hits from its vector data file, so a query on one field reads the files of the others too.
-     *
-     * @param index         the index
-     * @param field         the vector field
-     * @param vector        the query vector
-     * @param k             how many neighbours
-     * @param includeSource whether to fetch {@code _source}
-     * @return the response body
-     * @throws Exception if the search fails
-     */
+    // Leaving _source out matters when a test looks at one field only: with derived source on, which is the default,
+    // fetching _source reconstructs every vector field of the hits, so a query on one field reads the others too.
     private String knnSearch(final String index, final String field, final float[] vector, final int k, final boolean includeSource)
         throws Exception {
         final String query = "{\"size\":"
@@ -1195,29 +1060,15 @@ public class DirectIOIT extends KNNRestTestCase {
         return joiner.toString();
     }
 
-    /** The response body without the {@code took} field, which changes between two runs of the same query. */
     private String stripTook(final String body) {
         return body.replaceAll("\"took\":[0-9]+,", "");
     }
 
-    /**
-     * The response body without the scores, which are compared separately with the float32 tolerance of
-     * {@link #SCORE_ULP_TOLERANCE}.
-     *
-     * @param body the response body
-     * @return the body with every {@code _score} and {@code max_score} value removed
-     */
     private String stripScores(final String body) {
         return body.replaceAll("\"(_score|max_score)\":[0-9eE.+-]+", "\"$1\":0");
     }
 
-    /**
-     * Deterministic vectors, so that two arms of a comparison query the same data.
-     *
-     * @param count     how many vectors
-     * @param dimension how many floats each
-     * @return the vectors
-     */
+    // Deterministic, so that two arms of a comparison query the same data.
     private float[][] randomVectors(final int count, final int dimension) {
         final Random random = new Random(1_234L);
         final float[][] vectors = new float[count][dimension];
@@ -1229,15 +1080,7 @@ public class DirectIOIT extends KNNRestTestCase {
         return vectors;
     }
 
-    /**
-     * Asserts two score lists agree to within {@link #SCORE_ULP_TOLERANCE} float32 units in the last place, and
-     * returns the largest distance seen so a test can report it.
-     *
-     * @param expected the scores of one arm
-     * @param actual   the scores of the other
-     * @param what     what the query was, for the failure message
-     * @return the largest distance in float32 units in the last place
-     */
+    // Returns the largest distance seen, so a test can report it.
     private int assertScoresEqualWithinUlps(final List<Double> expected, final List<Double> actual, final String what) {
         assertEquals(what + ": the number of hits", expected.size(), actual.size());
         // Two empty lists compare equal, so a query that returned nothing would assert nothing.

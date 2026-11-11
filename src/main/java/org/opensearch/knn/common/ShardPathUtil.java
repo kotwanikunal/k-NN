@@ -15,21 +15,18 @@ import org.opensearch.index.shard.ShardPath;
 import java.nio.file.Path;
 
 /**
- * Helpers for telling which shard a Lucene {@link Directory} belongs to, for code that OpenSearch passes no shard
- * context, such as a codec reader that Lucene builds through SPI.
+ * Tells which shard a Lucene {@link Directory} belongs to, for code OpenSearch passes no shard context.
  */
 @UtilityClass
 public class ShardPathUtil {
 
     /**
-     * Returns the UUID of the index whose shard folder a directory reads. OpenSearch keeps a shard's Lucene files in
-     * {@code .../<index uuid>/<shard>/index} under both the default data path and a custom {@code index.data_path} (see
-     * {@link ShardPath}), and core's {@code RemoveCorruptedShardDataCommand} reads a shard folder the same way.
+     * Returns the UUID of the index whose shard folder a directory reads. A shard's Lucene files live in
+     * {@code .../<index uuid>/<shard>/index} under both data path layouts ({@link ShardPath}).
      *
-     * @param directory the directory to read. For a segment, pass its own directory ({@code SegmentInfo#dir}): the one
+     * @param directory The directory to read. For a segment, pass its own directory ({@code SegmentInfo#dir}): the one
      *                  a codec is handed for a compound segment has no folder.
-     * @return the index UUID, or {@code null} when the directory chain does not end in a file-system directory laid out
-     *         as a shard folder
+     * @return The index UUID, or {@code null} when the chain does not end in a file system directory laid out that way.
      */
     @Nullable
     public static String tryGetIndexUuid(@Nullable final Directory directory) {

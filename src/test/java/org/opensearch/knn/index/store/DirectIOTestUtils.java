@@ -44,11 +44,7 @@ import java.util.function.BooleanSupplier;
 import static org.junit.Assume.assumeTrue;
 
 /**
- * The one shared helper of the Direct I/O unit tests, named the way k-NN names
- * {@code PrefetchableScorerTestUtils} and {@code FaissIndexTestUtils}. It holds the file names the faiss formats
- * produce, a shard-shaped directory, a codec file with a real header and footer, the directory and input stand-ins the
- * eligibility checks need, a channel factory that counts and can be told to misbehave, and the cached check of whether
- * this JDK and file system can do {@code O_DIRECT} at all.
+ * The one shared helper of the Direct I/O tests, named as k-NN names {@code PrefetchableScorerTestUtils}.
  */
 final class DirectIOTestUtils {
 
@@ -63,36 +59,19 @@ final class DirectIOTestUtils {
     static final String CODEC_NAME = "DirectIOTestFile";
     static final int CODEC_VERSION = 1;
 
-    /** A floor low enough that a test file of a few KiB is routed. */
     static final long SMALL_FLOOR = 1024L;
 
-    /** The answer of {@link #isDirectIOSupported()}, decided once per test JVM. */
     private static volatile Boolean directIOSupported;
 
     private DirectIOTestUtils() {}
 
-    /**
-     * The default data path layout, {@code <root>/indices/<uuid>/0/index}.
-     *
-     * @param root the test's temporary directory
-     * @param uuid the index UUID
-     * @return the shard's index directory, created
-     * @throws IOException if the directories cannot be created
-     */
+    // The default data path layout, <root>/indices/<uuid>/0/index.
     static Path defaultLayoutShardPath(final Path root, final String uuid) throws IOException {
         return Files.createDirectories(root.resolve("nodes").resolve("0").resolve("indices").resolve(uuid).resolve("0").resolve("index"));
     }
 
-    /**
-     * Writes a file with a Lucene codec header, a deterministic payload and a codec footer, which is the shape every
-     * check and every integrity read in these tests needs.
-     *
-     * @param dir          the directory to write into
-     * @param name         the file name
-     * @param payloadBytes how many payload bytes to write between the header and the footer
-     * @return the bytes of the whole file
-     * @throws IOException if the write fails
-     */
+    // A file with a Lucene codec header, a deterministic payload and a codec footer, which is the shape every check
+    // and every integrity read needs.
     static byte[] writeCodecFile(final Directory dir, final String name, final int payloadBytes) throws IOException {
         final byte[] id = new byte[16];
         new Random(payloadBytes).nextBytes(id);
@@ -105,26 +84,12 @@ final class DirectIOTestUtils {
         return readAll(dir, name);
     }
 
-    /**
-     * A deterministic payload, so that a Direct I/O read and a delegate read can be compared byte for byte.
-     *
-     * @param bytes how many bytes
-     * @return the payload
-     */
     static byte[] payload(final int bytes) {
         final byte[] payload = new byte[bytes];
         new Random(42).nextBytes(payload);
         return payload;
     }
 
-    /**
-     * Reads a whole file through the directory.
-     *
-     * @param dir  the directory
-     * @param name the file name
-     * @return the bytes
-     * @throws IOException if the read fails
-     */
     static byte[] readAll(final Directory dir, final String name) throws IOException {
         try (IndexInput in = dir.openInput(name, IOContext.DEFAULT)) {
             final byte[] bytes = new byte[(int) in.length()];
@@ -133,37 +98,14 @@ final class DirectIOTestUtils {
         }
     }
 
-    /**
-     * Opens an {@link FSDirectory} on a path, which is what every routing test needs under the delegate.
-     *
-     * @param path the directory
-     * @return the directory
-     * @throws IOException if the open fails
-     */
     static Directory fsDirectory(final Path path) throws IOException {
         return FSDirectory.open(path);
     }
 
-    /**
-     * A delegate over a real directory with the test seams set: a low file size floor, a switch the test drives, and
-     * the production channel factory and open option.
-     *
-     * @param in    the directory to wrap
-     * @param route the switch
-     * @return the delegate
-     */
     static KNNDirectIODirectory directory(final Directory in, final BooleanSupplier route) {
         return directory(in, route, KNNDirectIODirectory.DEFAULT_CHANNEL_FACTORY);
     }
 
-    /**
-     * A delegate whose {@code O_DIRECT} channels the test opens itself.
-     *
-     * @param in      the directory to wrap
-     * @param route   the switch
-     * @param factory how the {@code O_DIRECT} channel is opened
-     * @return the delegate
-     */
     static KNNDirectIODirectory directory(
         final Directory in,
         final BooleanSupplier route,
@@ -172,16 +114,6 @@ final class DirectIOTestUtils {
         return directory(in, route, factory, KNNDirectIODirectory.DIRECT_OPEN_OPTION);
     }
 
-    /**
-     * A delegate with all four test seams set, including the {@code DIRECT} open option, which a test passes as null
-     * to behave as a JDK that does not have it.
-     *
-     * @param in           the directory to wrap
-     * @param route        the switch
-     * @param factory      how the {@code O_DIRECT} channel is opened
-     * @param directOption the open option, or null
-     * @return the delegate
-     */
     static KNNDirectIODirectory directory(
         final Directory in,
         final BooleanSupplier route,
@@ -191,17 +123,6 @@ final class DirectIOTestUtils {
         return new KNNDirectIODirectory(in, SMALL_FLOOR, route, factory, directOption);
     }
 
-    /**
-     * Publishes one index into a mocked cluster service's state with {@code index.knn.direct_io.rescore.enabled}
-     * set, which is what the {@link org.opensearch.knn.index.KNNSettings} accessor reads. The counter the caller
-     * passes is incremented on every read of the state, so a test can assert how often the setting was looked up.
-     *
-     * @param clusterService the mock from {@code KNNTestCase}
-     * @param indexName      the index name
-     * @param uuid           the index UUID
-     * @param enabled        the value of the setting
-     * @param stateReads     incremented on each read of the cluster state, or null
-     */
     static void publishIndex(
         final ClusterService clusterService,
         final String indexName,
@@ -227,15 +148,9 @@ final class DirectIOTestUtils {
         }).when(clusterService).state();
     }
 
-    /**
-     * Whether this JDK and this file system can open a file with {@code O_DIRECT}, decided once per test JVM in the
-     * two steps of Lucene's {@code TestDirectIODirectory.checkSupported}: the production open option is not null, then
-     * one probe file opened through the production channel factory. Every test directory comes from
-     * {@code createTempDir} under one temp root, so one probe answers for all of them. On the development desktop this
-     * must answer true.
-     *
-     * @return true if {@code O_DIRECT} is available
-     */
+    // Decided once per test JVM in the two steps of Lucene's TestDirectIODirectory.checkSupported: the production open
+    // option is not null, then one probe through the production channel factory. Every test directory comes from
+    // createTempDir under one temp root, so one probe answers for all of them.
     static boolean isDirectIOSupported() {
         Boolean answer = directIOSupported;
         if (answer != null) {
@@ -250,10 +165,7 @@ final class DirectIOTestUtils {
         }
     }
 
-    /**
-     * Skips the calling test where {@code O_DIRECT} cannot be opened, which is the construct k-NN uses for a platform
-     * capability. On the development desktop no Direct I/O test may skip.
-     */
+    // On the development desktop no Direct I/O test may skip.
     static void assumeDirectIOSupported() {
         assumeTrue("Requires O_DIRECT on this JDK and file system", isDirectIOSupported());
     }
@@ -276,11 +188,8 @@ final class DirectIOTestUtils {
         }
     }
 
-    /**
-     * A channel factory that hands out {@link TestChannel}s over real channels, keeps every one it opened, and can be
-     * told to make the reads that follow misbehave. It is how the unit tests see the device reads this plugin makes,
-     * since the plugin keeps no counters, and how they reach the two failure cases the read fallback is about.
-     */
+    // Hands out TestChannels over real channels, keeps every one it opened, and can be told to make the reads that
+    // follow misbehave. The plugin keeps no counters, so this is how a test sees the device reads it makes.
     static final class TestChannels implements KNNDirectIODirectory.ChannelFactory {
 
         private final List<TestChannel> channels = new ArrayList<>();
@@ -291,12 +200,8 @@ final class DirectIOTestUtils {
             this(false);
         }
 
-        /**
-         * @param withPlainChannel whether each channel also holds a channel on the same file opened without
-         *                         {@code O_DIRECT}, which is the only way a {@link Behaviour#SHORT} read can return
-         *                         real bytes: a 100 byte read on an {@code O_DIRECT} channel is refused with
-         *                         {@code EINVAL} because the length is not a multiple of the block size
-         */
+        // A plain channel on the same file is the only way a SHORT read can return real bytes: a 100 byte read on an
+        // O_DIRECT channel is refused with EINVAL because the length is not a multiple of the block size.
         TestChannels(final boolean withPlainChannel) {
             this.withPlainChannel = withPlainChannel;
         }
@@ -315,43 +220,22 @@ final class DirectIOTestUtils {
             return channel;
         }
 
-        /**
-         * Sets what every channel of this factory does on the reads that follow.
-         *
-         * @param behaviour the behaviour
-         */
         void behave(final Behaviour behaviour) {
             this.behaviour = behaviour;
         }
 
-        /**
-         * Every channel this factory opened, in order.
-         *
-         * @return the channels
-         */
         List<TestChannel> channels() {
             synchronized (channels) {
                 return List.copyOf(channels);
             }
         }
 
-        /**
-         * The channel this factory opened last.
-         *
-         * @return the channel
-         */
         TestChannel last() {
             synchronized (channels) {
                 return channels.get(channels.size() - 1);
             }
         }
 
-        /**
-         * How many positional reads every channel of this factory has been asked for, which is the device reads this
-         * plugin made.
-         *
-         * @return the count
-         */
         int reads() {
             int total = 0;
             for (final TestChannel channel : channels()) {
@@ -360,11 +244,6 @@ final class DirectIOTestUtils {
             return total;
         }
 
-        /**
-         * How many bytes those positional reads asked for.
-         *
-         * @return the byte count
-         */
         long readBytes() {
             long total = 0;
             for (final TestChannel channel : channels()) {
@@ -376,34 +255,23 @@ final class DirectIOTestUtils {
         }
     }
 
-    /** What a {@link TestChannel} does on the next positional read. */
     enum Behaviour {
-        /** Read normally. */
         NORMAL,
-        /**
-         * Return fewer bytes than one block, which leaves the requested offset outside what the read covered. A short
-         * read that still covers the request is not a failure and the input reads on, which is why this has to be
-         * smaller than a block.
-         */
+        // Fewer bytes than one block, which leaves the requested offset outside what the read covered. A short read that
+        // still covers the request is not a failure and the input reads on.
         SHORT,
-        /** Throw an {@link IOException}. */
         THROW,
-        /** Write one block of garbage into the buffer, then throw, which is a read that half happened. */
+        // One block of garbage into the buffer, then a throw, which is a read that half happened.
         GARBAGE_THEN_THROW
     }
 
-    /** One positional read a {@link TestChannel} was asked to make. */
     record Read(long position, int length) {
     }
 
-    /**
-     * A channel that records every positional read, counts its closes, and misbehaves on demand. Lucene's
-     * {@link FilterFileChannel} forwards every other {@link FileChannel} method, so only the positional read and the
-     * close are written here.
-     */
+    // Lucene's FilterFileChannel forwards every other FileChannel method, so only the positional read and the close
+    // are written here.
     static final class TestChannel extends FilterFileChannel {
 
-        /** How many bytes a {@link Behaviour#SHORT} read returns, which is under any file store's block size. */
         static final int SHORT_READ_BYTES = 100;
 
         private final FileChannel plain;
@@ -417,22 +285,12 @@ final class DirectIOTestUtils {
             this.owner = owner;
         }
 
-        /**
-         * Every positional read this channel was asked to make, in order.
-         *
-         * @return the reads
-         */
         List<Read> reads() {
             synchronized (reads) {
                 return List.copyOf(reads);
             }
         }
 
-        /**
-         * How many times this channel was closed.
-         *
-         * @return the count
-         */
         int closes() {
             return closes.get();
         }
@@ -480,15 +338,10 @@ final class DirectIOTestUtils {
         }
     }
 
-    /** The byte a transforming layer flips, chosen so that no region of a codec file is left unchanged. */
     static final byte XOR_MASK = (byte) 0x5A;
 
-    /**
-     * A directory shaped like encryption at rest: it extends {@link NIOFSDirectory}, so the directory chain still
-     * ends in a file-system directory and the file still has a real path, but every byte it serves is transformed.
-     * The routing rule must decline it on the content check, because the bytes an {@code O_DIRECT} read of that path
-     * returns are not the bytes a reader sees.
-     */
+    // Shaped like encryption at rest: the chain still ends in a file system directory and the file still has a real
+    // path, but every byte it serves is transformed, so the content check must decline it.
     static final class CryptoShapedFsDirectory extends NIOFSDirectory {
 
         CryptoShapedFsDirectory(final Path path) throws IOException {
@@ -501,11 +354,7 @@ final class DirectIOTestUtils {
         }
     }
 
-    /**
-     * A directory that extends {@link NIOFSDirectory} and serves one name out of another file, so that the name the
-     * delegate opens successfully resolves to a path with no file on it. That is the shape of the {@code MISSING}
-     * check: a non-default data format can place a file outside the shard's index directory.
-     */
+    // Serves one name out of another file, so that a name the delegate opens resolves to a path with no file on it.
     static final class GhostNameFsDirectory extends NIOFSDirectory {
 
         private final String ghostName;
@@ -523,11 +372,8 @@ final class DirectIOTestUtils {
         }
     }
 
-    /**
-     * A {@link org.apache.lucene.codecs.CompoundDirectory} over a real directory, which is the shape Lucene hands a
-     * codec for a compound segment. It is not a {@link FilterDirectory} and not an
-     * {@link org.apache.lucene.store.FSDirectory}, so the files behind it have no path of their own.
-     */
+    // The shape Lucene hands a codec for a compound segment: neither a FilterDirectory nor an FSDirectory, so the
+    // files behind it have no path of their own.
     static final class TestCompoundDirectory extends org.apache.lucene.codecs.CompoundDirectory {
 
         private final Directory in;
@@ -567,10 +413,7 @@ final class DirectIOTestUtils {
         }
     }
 
-    /**
-     * A plain pass-through layer, which must be crossed and routed: it changes no byte, and the content check is what
-     * proves that.
-     */
+    // A pass-through layer, which must be crossed and routed: it changes no byte.
     static final class PassThroughDirectory extends FilterDirectory {
 
         PassThroughDirectory(final Directory in) {
@@ -578,9 +421,6 @@ final class DirectIOTestUtils {
         }
     }
 
-    /**
-     * A layer that counts how often the inputs it handed out were closed, which is how the close rules are asserted.
-     */
     static final class CloseCountingDirectory extends FilterDirectory {
 
         private final AtomicInteger closes = new AtomicInteger();
@@ -596,29 +436,16 @@ final class DirectIOTestUtils {
             return new CloseCountingIndexInput(super.openInput(name, context), closes);
         }
 
-        /**
-         * How many of the inputs this directory handed out were closed.
-         *
-         * @return the count
-         */
         int closes() {
             return closes.get();
         }
 
-        /**
-         * How many inputs this directory handed out.
-         *
-         * @return the count
-         */
         int opens() {
             return opens.get();
         }
     }
 
-    /**
-     * An input that transforms every byte it serves. Its clones and slices transform too, which is what makes it a
-     * faithful stand-in for a layer that encrypts at rest.
-     */
+    // Its clones and slices transform too, which is what makes it a stand-in for a layer that encrypts at rest.
     static final class XoringIndexInput extends IndexInput {
 
         private final IndexInput in;
@@ -672,10 +499,7 @@ final class DirectIOTestUtils {
         }
     }
 
-    /**
-     * An input that counts its closes on a shared counter, and whose slices and clones count on the same one so that
-     * a test can prove a clone closes nothing.
-     */
+    // Slices and clones count on the same counter, so that a test can prove a clone closes nothing.
     static final class CloseCountingIndexInput extends IndexInput {
 
         private final IndexInput in;
@@ -764,44 +588,25 @@ final class DirectIOTestUtils {
         }
     }
 
-    /**
-     * An input that records the prefetch calls it was given and whether its cursor moved, for the hint rules.
-     */
     static final class PrefetchRecorder {
 
         private final AtomicInteger prefetches = new AtomicInteger();
         private volatile long lastOffset = -1;
         private volatile long lastLength = -1;
 
-        /**
-         * How many prefetch hints the inputs of this recorder were given.
-         *
-         * @return the count
-         */
         int prefetches() {
             return prefetches.get();
         }
 
-        /**
-         * The offset of the last prefetch hint, or -1.
-         *
-         * @return the offset
-         */
         long lastOffset() {
             return lastOffset;
         }
 
-        /**
-         * The length of the last prefetch hint, or -1.
-         *
-         * @return the length
-         */
         long lastLength() {
             return lastLength;
         }
     }
 
-    /** An input that reports every prefetch hint it is given to a shared recorder rather than carrying it out. */
     static final class PrefetchRecordingIndexInput extends IndexInput {
 
         private final IndexInput in;
@@ -861,10 +666,6 @@ final class DirectIOTestUtils {
         }
     }
 
-    /**
-     * A directory that hands out {@link PrefetchRecordingIndexInput}s over one shared recorder, so that a test sees
-     * the hints an input, a slice and a clone made without having to hold each object.
-     */
     static final class PrefetchRecordingDirectory extends FilterDirectory {
 
         private final PrefetchRecorder recorder = new PrefetchRecorder();
@@ -878,11 +679,6 @@ final class DirectIOTestUtils {
             return new PrefetchRecordingIndexInput(super.openInput(name, context), recorder);
         }
 
-        /**
-         * The recorder every input of this directory writes to.
-         *
-         * @return the recorder
-         */
         PrefetchRecorder recorder() {
             return recorder;
         }
